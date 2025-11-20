@@ -34,7 +34,7 @@ impl ShadowDir {
 
     /// Calculates the storage delta between a base directory and a shadow directory.
     /// Returns (Net Growth, Estimated Bytes Written).
-    /// 
+    ///
     /// - Net Growth: Total size of Shadow - Total size of Base (can be negative if compaction occurred).
     /// - Est. Written: Sum of size increases for all files (ignores deletions/shrinking).
     pub fn calculate_storage_delta(&self) -> std::io::Result<(i64, u64)> {
@@ -56,10 +56,11 @@ impl ShadowDir {
                 } else {
                     let shadow_len = entry.metadata()?.len();
                     let shadow_modified = entry.metadata()?.modified()?;
-                    
+
                     // Calculate the relative path to find the corresponding file in base
-                    let relative_path = path.strip_prefix(shadow_root)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    let relative_path = path
+                        .strip_prefix(shadow_root)
+                        .map_err(std::io::Error::other)?;
                     let base_path = base_root.join(relative_path);
 
                     if base_path.exists() {
@@ -69,11 +70,13 @@ impl ShadowDir {
 
                         // DEBUG PRINT
                         if base_modified != shadow_modified {
-                            println!("File changed: {path:?} (modified {base_modified:?} -> {shadow_modified:?})");
+                            println!(
+                                "File changed: {path:?} (modified {base_modified:?} -> {shadow_modified:?})"
+                            );
                         }
-                        
+
                         net_growth += diff;
-                        
+
                         // If the file grew, count the growth as writes.
                         // If it shrank (e.g. DB compaction), we don't count that as "negative writing".
                         if diff > 0 {
@@ -227,6 +230,10 @@ impl ShadowDirBuilder {
             }
         }
 
-        Ok(ShadowDir { _tmp: tmp, root, source })
+        Ok(ShadowDir {
+            _tmp: tmp,
+            root,
+            source,
+        })
     }
 }

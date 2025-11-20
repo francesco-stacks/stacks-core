@@ -1,4 +1,4 @@
-use std::fmt::{LowerHex, UpperHex};
+use std::fmt::{Display, LowerHex, UpperHex};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -104,25 +104,14 @@ impl NetworkArg {
             Self::Testnet | Self::Regtest => CHAIN_ID_TESTNET,
         }
     }
-
-    // pub fn initial_balances(&self) -> Result<Vec<(PrincipalData, u64)>> {
-    //     let use_test_chainstate_data = matches!(self, Self::Testnet | Self::Regtest);
-    //     GenesisData::new(use_test_chainstate_data)
-    //         .read_balances()
-    //         .map(|item| -> Result<(PrincipalData, u64)> {
-    //             let principal = PrincipalData::parse(&item.address)?;
-    //             Ok((principal, item.amount))
-    //         })
-    //         .collect()
-    // }
 }
 
-impl ToString for NetworkArg {
-    fn to_string(&self) -> String {
+impl Display for NetworkArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Mainnet => "mainnet".to_string(),
-            Self::Testnet => "testnet".to_string(),
-            Self::Regtest => "regtest".to_string(),
+            Self::Mainnet => write!(f, "mainnet"),
+            Self::Testnet => write!(f, "testnet"),
+            Self::Regtest => write!(f, "regtest"),
         }
     }
 }
@@ -250,11 +239,12 @@ fn collect_canonical_range(
         }
         if h <= end_height {
             // 1. Resolve Burn Info using the extracted consensus_hash
-            let snapshot = SortitionDB::get_block_snapshot_consensus(sortition_db.conn(), &consensus_hash)
-                .map_err(|e| anyhow!("SortitionDB error: {e}"))?
-                .ok_or_else(|| {
-                    anyhow!("Consensus hash {consensus_hash} not found in SortitionDB")
-                })?;
+            let snapshot =
+                SortitionDB::get_block_snapshot_consensus(sortition_db.conn(), &consensus_hash)
+                    .map_err(|e| anyhow!("SortitionDB error: {e}"))?
+                    .ok_or_else(|| {
+                        anyhow!("Consensus hash {consensus_hash} not found in SortitionDB")
+                    })?;
 
             block = block.with_burn_info(snapshot.block_height as u32, snapshot.burn_header_hash);
 
@@ -373,7 +363,8 @@ fn main() -> Result<()> {
     }
 
     println!("Building canonical chain window [{start_h}, {end_h}] (tip at {tip_height})...");
-    let blocks = collect_canonical_range(&chainstate, &sortition_db, &stacks_tip_id, start_h, end_h)?;
+    let blocks =
+        collect_canonical_range(&chainstate, &sortition_db, &stacks_tip_id, start_h, end_h)?;
     println!(
         "Collected {} canonical blocks ({}..={})",
         blocks.len(),
@@ -382,11 +373,14 @@ fn main() -> Result<()> {
     );
 
     let selected = BlockChain::new_ascending(blocks);
-    
+
     println!("Re-executing {} selected blocks...", selected.len());
     let start = Instant::now();
     for block in selected.iter() {
-        println!("Re-executing block at height {} ({})", block.height, block.id);
+        println!(
+            "Re-executing block at height {} ({})",
+            block.height, block.id
+        );
         stacks_bench::replay::re_execute_block(&mut chainstate, &mut sortition_db, block)?;
     }
     let duration = start.elapsed();
@@ -403,8 +397,14 @@ fn main() -> Result<()> {
     let (growth, written) = shadow.calculate_storage_delta()?;
 
     println!("Storage Delta:");
-    println!("  Net Growth:        {:.4} MB ({growth} bytes)", growth as f64 / 1_024.0 / 1_024.0);
-    println!("  Est. Data Written: {:.4} MB ({written} bytes)", written as f64 / 1_024.0 / 1_024.0);
+    println!(
+        "  Net Growth:        {:.4} MB ({growth} bytes)",
+        growth as f64 / 1_024.0 / 1_024.0
+    );
+    println!(
+        "  Est. Data Written: {:.4} MB ({written} bytes)",
+        written as f64 / 1_024.0 / 1_024.0
+    );
 
     Ok(())
 }

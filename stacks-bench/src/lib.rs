@@ -10,8 +10,8 @@ use clarity::types::chainstate::BurnchainHeaderHash;
 use stacks_common::types::chainstate::StacksBlockId;
 
 pub mod db;
-pub mod shadow;
 pub mod replay;
+pub mod shadow;
 
 pub struct BurnChainPath(PathBuf);
 
@@ -203,6 +203,7 @@ impl BlockChain {
     /// Clamp a height range (RangeBounds<u32>) to the canonical chain.
     /// - Missing bounds snap to nearest valid height.
     /// - If the clamped start > end, returns an empty chain.
+    ///
     /// Returns an owned BlockChain (copies the selected window).
     pub fn clamp_by_height_range<R: RangeBounds<u32>>(&self, range: R) -> Self {
         let asc = &self.0;
