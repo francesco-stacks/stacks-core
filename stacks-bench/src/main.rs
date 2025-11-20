@@ -381,7 +381,9 @@ fn main() -> Result<()> {
             "Re-executing block at height {} ({})",
             block.height, block.id
         );
-        stacks_bench::replay::re_execute_block(&mut chainstate, &mut sortition_db, block)?;
+        let metrics =
+            stacks_bench::replay::re_execute_block(&mut chainstate, &mut sortition_db, block)?;
+        println!("  Execution Metrics: {metrics:?}");
     }
     let duration = start.elapsed();
     println!("Re-executed {} blocks in {duration:.2?}", selected.len());
