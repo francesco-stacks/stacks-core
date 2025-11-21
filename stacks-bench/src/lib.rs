@@ -12,6 +12,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 pub mod db;
 pub mod replay;
 pub mod shadow;
+pub mod profiler;
 
 pub struct BurnChainPath(PathBuf);
 

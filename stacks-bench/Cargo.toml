@@ -29,3 +29,4 @@ diesel.workspace = true
 reflink-copy.workspace = true
 ignore.workspace = true
 hex.workspace = true
+libc.workspace = true

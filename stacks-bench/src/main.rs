@@ -40,6 +40,10 @@ pub struct Args {
 
     #[arg(long, conflicts_with_all = &["start-at", "end-at", "count"])]
     txid: Option<TxIdArg>,
+
+    /// Number of blocks to use for calibration of commit cost model
+    #[arg(long, default_value_t = 10)]
+    calibration: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -375,18 +379,140 @@ fn main() -> Result<()> {
     let selected = BlockChain::new_ascending(blocks);
 
     println!("Re-executing {} selected blocks...", selected.len());
+    
+    let mut metrics_buffer = Vec::new();
+    let mut cost_model = stacks_bench::replay::CostModel::default();
+    let calibration_count = args.calibration;
+    let mut calibrated = false;
+
+    // Accumulators for summary
+    let mut total_blocks = 0u64;
+    let mut total_txs = 0u64;
+    let mut total_duration = Duration::ZERO;
+    let mut total_setup = Duration::ZERO;
+    let mut total_exec = Duration::ZERO;
+    let mut total_commit = Duration::ZERO;
+    let mut total_runtime = 0u64;
+    let mut total_write_len = 0u64;
+    let mut total_read_len = 0u64;
+
     let start = Instant::now();
-    for block in selected.iter() {
+    for (i, block) in selected.iter().enumerate() {
         println!(
             "Re-executing block at height {} ({})",
             block.height, block.id
         );
-        let metrics =
+        let mut metrics =
             stacks_bench::replay::re_execute_block(&mut chainstate, &mut sortition_db, block)?;
-        println!("  Execution Metrics: {metrics:?}");
+        
+        if !calibrated {
+            metrics_buffer.push(metrics);
+            
+            if metrics_buffer.len() >= calibration_count || i == selected.len() - 1 {
+                // Perform calibration
+                cost_model = stacks_bench::replay::compute_cost_model(&metrics_buffer);
+                calibrated = true;
+                
+                println!("\n--- Calibration Complete ({} blocks) ---", metrics_buffer.len());
+                println!("  Static Overhead: {:.2?}", cost_model.static_overhead);
+                println!("  Cost per Byte:   {:.2} µs", cost_model.time_per_byte * 1_000_000.0);
+                
+                if cost_model.time_per_byte <= f64::EPSILON {
+                    println!("  [WARN] Correlation weak or negative. Falling back to default heuristic (20% static / 80% variable).");
+                }
+                println!("----------------------------------------\n");
+
+                let buffer_len = metrics_buffer.len();
+
+                // Flush buffer
+                for (j, m) in metrics_buffer.iter_mut().enumerate() {
+                    if cost_model.time_per_byte > f64::EPSILON {
+                        m.apply_cost_model(&cost_model);
+                    } else {
+                        m.apply_heuristic();
+                    }
+
+                    // Accumulate stats
+                    total_blocks += 1;
+                    total_txs += m.transactions.len() as u64;
+                    total_duration += m.total_duration;
+                    total_setup += m.setup_duration;
+                    total_exec += m.execution_duration;
+                    total_commit += m.commit_duration;
+                    total_runtime += m.total_clarity_cost.runtime;
+                    total_write_len += m.total_clarity_cost.write_length;
+                    total_read_len += m.total_clarity_cost.read_length;
+
+                    // Calculate static % for this block
+                    let static_pct = if m.commit_duration.as_secs_f64() > 0.0 {
+                        (m.commit_overhead_baseline.as_secs_f64() / m.commit_duration.as_secs_f64()) * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!("  [Buffered Block {}] Metrics: {:?} (Static Commit: {:.1}%)", i - buffer_len + j + 1, m, static_pct);
+                }
+                metrics_buffer.clear();
+            }
+        } else {
+            if cost_model.time_per_byte > f64::EPSILON {
+                metrics.apply_cost_model(&cost_model);
+            } else {
+                metrics.apply_heuristic();
+            }
+            
+            // Accumulate stats
+            total_blocks += 1;
+            total_txs += metrics.transactions.len() as u64;
+            total_duration += metrics.total_duration;
+            total_setup += metrics.setup_duration;
+            total_exec += metrics.execution_duration;
+            total_commit += metrics.commit_duration;
+            total_runtime += metrics.total_clarity_cost.runtime;
+            total_write_len += metrics.total_clarity_cost.write_length;
+            total_read_len += metrics.total_clarity_cost.read_length;
+
+            let static_pct = if metrics.commit_duration.as_secs_f64() > 0.0 {
+                (metrics.commit_overhead_baseline.as_secs_f64() / metrics.commit_duration.as_secs_f64()) * 100.0
+            } else {
+                0.0
+            };
+            println!("  Execution Metrics: {:?} (Static Commit: {:.1}%)", metrics, static_pct);
+        }
     }
     let duration = start.elapsed();
     println!("Re-executed {} blocks in {duration:.2?}", selected.len());
+
+    if total_blocks > 0 {
+        println!("\n========================================");
+        println!("           BENCHMARK SUMMARY            ");
+        println!("========================================");
+        println!("Total Blocks:       {}", total_blocks);
+        println!("Total Transactions: {}", total_txs);
+        println!("Total Duration:     {:.2?}", total_duration);
+        println!("  - Setup:          {:.2?}", total_setup);
+        println!("  - Execution:      {:.2?}", total_exec);
+        println!("  - Commit:         {:.2?}", total_commit);
+        println!("Total Clarity Runtime:  {}", total_runtime);
+        println!("Total Write Length:     {} bytes", total_write_len);
+        println!("Total Read Length:      {} bytes", total_read_len);
+        
+        let avg_duration = total_duration / total_blocks as u32;
+        let avg_setup = total_setup / total_blocks as u32;
+        let avg_exec = total_exec / total_blocks as u32;
+        let avg_commit = total_commit / total_blocks as u32;
+        let avg_txs = total_txs as f64 / total_blocks as f64;
+        
+        println!("\nAverages per Block:");
+        println!("  Duration:         {:.2?}", avg_duration);
+        println!("  Setup:            {:.2?}", avg_setup);
+        println!("  Execution:        {:.2?}", avg_exec);
+        println!("  Commit:           {:.2?}", avg_commit);
+        println!("  Transactions:     {:.1}", avg_txs);
+        println!("  Clarity Runtime:  {}", total_runtime / total_blocks);
+        println!("  Write Length:     {} bytes", total_write_len / total_blocks);
+        println!("  Read Length:      {} bytes", total_read_len / total_blocks);
+        println!("========================================\n");
+    }
 
     // Drop DBs to ensure all files are closed/databases are checkpointed before measuring storage delta
     drop(chainstate);
@@ -400,7 +526,7 @@ fn main() -> Result<()> {
 
     println!("Storage Delta:");
     println!(
-        "  Net Growth:        {:.4} MB ({growth} bytes)",
+        "  Net Change:        {:.4} MB ({growth} bytes)",
         growth as f64 / 1_024.0 / 1_024.0
     );
     println!(

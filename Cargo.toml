@@ -12,6 +12,8 @@ members = [
     "stacks-signer",
     "stacks-node",
     "stacks-bench",
+    "stacks-profiler",
+    "stacks-profiler-macros",
     "contrib/stacks-inspect",
     "contrib/stacks-cli"
 ]
@@ -20,6 +22,10 @@ exclude = ["contrib/tools/config-docs-generator"]
 
 # Dependencies we want to keep the same between workspace members
 [workspace.dependencies]
+# Local dependencies
+stacks-profiler = { path = "stacks-profiler" }
+
+# External dependencies
 ed25519-dalek = { version = "2.1.1", default-features = false }
 hashbrown = { version = "0.15.2", features = ["serde"] }
 lazy_static = "1.4.0"
@@ -41,6 +47,12 @@ diesel = { version = "2.3.3", default-features = false, features = ["sqlite", "r
 reflink-copy = { version = "0.1.28", default-features = false }
 ignore = { version = "0.4.25", default-features = false }
 hex = { version = "0.4.3", default-features = false, features = ["std"] }
+libc = { version = "0.2.177", default-features = false }
+syn = { version = "2.0.110", default-features = false, features = ["full", "extra-traits"] }
+quote = { version = "1.0.42", default-features = false, features = ["proc-macro"] }
+proc-macro2 = { version = "1.0.103", default-features = false, features = ["proc-macro", "span-locations"] }
+darling = { version = "0.21.3", default-features = false, features = ["suggestions"] }
+
 
 # Use a bit more than default optimization for
 # dev builds to speed up test execution

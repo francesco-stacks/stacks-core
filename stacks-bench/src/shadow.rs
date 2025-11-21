@@ -34,17 +34,16 @@ impl ShadowDir {
 
     /// Calculates the storage delta between a base directory and a shadow directory.
     /// Returns (Net Growth, Estimated Bytes Written).
-    ///
-    /// - Net Growth: Total size of Shadow - Total size of Base (can be negative if compaction occurred).
-    /// - Est. Written: Sum of size increases for all files (ignores deletions/shrinking).
     pub fn calculate_storage_delta(&self) -> std::io::Result<(i64, u64)> {
         let base_root = &self.source;
         let shadow_root = &self.root;
         let mut net_growth: i64 = 0;
         let mut estimated_written: u64 = 0;
 
-        // Use a stack for recursive directory traversal to avoid recursion limits
+        // Use a stack for recursive directory traversal
         let mut stack = vec![shadow_root.to_path_buf()];
+
+        println!("\n--- Storage Activity Report ---");
 
         while let Some(dir) = stack.pop() {
             for entry in fs::read_dir(dir)? {
@@ -54,42 +53,53 @@ impl ShadowDir {
                 if path.is_dir() {
                     stack.push(path);
                 } else {
-                    let shadow_len = entry.metadata()?.len();
-                    let shadow_modified = entry.metadata()?.modified()?;
+                    let shadow_meta = entry.metadata()?;
+                    let shadow_len = shadow_meta.len();
+                    let shadow_modified = shadow_meta.modified()?;
 
-                    // Calculate the relative path to find the corresponding file in base
+                    // Calculate relative path to find base file
                     let relative_path = path
                         .strip_prefix(shadow_root)
                         .map_err(std::io::Error::other)?;
                     let base_path = base_root.join(relative_path);
 
                     if base_path.exists() {
-                        let base_len = fs::metadata(&base_path)?.len();
-                        let base_modified = fs::metadata(&base_path)?.modified()?;
+                        let base_meta = fs::metadata(&base_path)?;
+                        let base_len = base_meta.len();
+                        let base_modified = base_meta.modified()?;
+                        
                         let diff = (shadow_len as i64) - (base_len as i64);
-
-                        // DEBUG PRINT
-                        if base_modified != shadow_modified {
-                            println!(
-                                "File changed: {path:?} (modified {base_modified:?} -> {shadow_modified:?})"
-                            );
-                        }
-
                         net_growth += diff;
 
-                        // If the file grew, count the growth as writes.
-                        // If it shrank (e.g. DB compaction), we don't count that as "negative writing".
-                        if diff > 0 {
-                            estimated_written += diff as u64;
+                        // If modified time changed, the file was touched
+                        if base_modified != shadow_modified {
+                            let sign = if diff > 0 { "+" } else { "" }; // negative numbers have their own sign
+                            println!(
+                                "  MODIFIED: {:<60} | Delta: {}{}", 
+                                relative_path.display(), 
+                                sign, 
+                                diff
+                            );
+                            
+                            // Count positive growth as written data
+                            if diff > 0 {
+                                estimated_written += diff as u64;
+                            }
                         }
                     } else {
-                        // New file created in shadow
+                        // New file created
                         net_growth += shadow_len as i64;
                         estimated_written += shadow_len;
+                        println!(
+                            "  CREATED:  {:<60} | Size:  {}", 
+                            relative_path.display(), 
+                            shadow_len
+                        );
                     }
                 }
             }
         }
+        println!("-------------------------------\n");
 
         Ok((net_growth, estimated_written))
     }

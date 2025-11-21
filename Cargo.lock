@@ -1935,9 +1935,9 @@ checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
 
 [[package]]
 name = "libc"
-version = "0.2.174"
+version = "0.2.177"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1171693293099992e19cddea4e8b849964e9846f4acee11b3948bcc337be8776"
+checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 
 [[package]]
 name = "libflate"
@@ -2663,9 +2663,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quote"
-version = "1.0.35"
+version = "1.0.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "291ec9ab5efd934aaf503a6466c5d5251535d108ee747472c3977cc5acc868ef"
+checksum = "a338cc41d27e6cc6dce6cefc13a0729dfbb81c262b1f519331575dd80ef3067f"
 dependencies = [
  "proc-macro2",
 ]
@@ -3550,6 +3550,7 @@ dependencies = [
  "diesel",
  "hex",
  "ignore",
+ "libc",
  "reflink-copy",
  "stacks-common 0.0.1",
  "stackslib 0.0.1",
@@ -3692,6 +3693,25 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "warp",
+]
+
+[[package]]
+name = "stacks-profiler"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "stacks-profiler-macros",
+]
+
+[[package]]
+name = "stacks-profiler-macros"
+version = "0.0.1"
+dependencies = [
+ "darling",
+ "libc",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.110",
 ]
 
 [[package]]

@@ -1,0 +1,104 @@
+use stacks_profiler::{profile, profile_scope, Profiler};
+use std::thread;
+use std::time::{Duration, Instant};
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Simulates pure CPU load (active work).
+/// We use a busy loop instead of sleep to force the CPU time counter to tick.
+fn burn_cpu(ms: u64) {
+    let start = Instant::now();
+    let target = Duration::from_millis(ms);
+    while start.elapsed() < target {
+        std::hint::spin_loop();
+    }
+}
+
+/// Simulates I/O load (waiting).
+/// The thread is suspended, so CPU time should be near 0, but Wall time increases.
+fn simulate_io(ms: u64) {
+    thread::sleep(Duration::from_millis(ms));
+}
+
+// ============================================================================
+// Profiled Functions
+// ============================================================================
+
+#[profile(name = "1. Fetch Data (I/O Bound)")]
+fn fetch_data_from_network() {
+    // Simulate network latency
+    simulate_io(100);
+}
+
+// Example of using profile_scope! with a named block
+fn process_items(count: usize) {
+    profile_scope!("2. Process Batch (CPU Bound)", {
+        for i in 0..count {
+            // Create a nested scope for every generic iteration
+            // (In a real app, you might not profile every single tight loop iteration 
+            // due to overhead, but this demonstrates the nesting capability)
+            profile_scope!("Item Processing");
+            burn_cpu(10); // 10ms of heavy math per item
+            
+            if i % 2 == 0 {
+                // Every other item needs a quick lookup (I/O)
+                profile_scope!("DB Lookup");
+                simulate_io(5);
+            }
+        }
+    });
+}
+
+#[profile] // Uses function name "save_results"
+fn save_results() {
+    // Simulate a mix of serialization (CPU) and disk write (Wait)
+    {
+        profile_scope!("Serialize (CPU)");
+        burn_cpu(20);
+    }
+    
+    {
+        profile_scope!("Disk Write (Wait)");
+        simulate_io(50);
+    }
+}
+
+fn run_pipeline() {
+    // We can wrap the entire workflow in a top-level scope
+    profile_scope!("Whole Pipeline");
+
+    println!("  -> Fetching...");
+    fetch_data_from_network();
+
+    println!("  -> Processing...");
+    process_items(3); // Process 3 items
+
+    println!("  -> Saving...");
+    save_results();
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+fn main() {
+    println!("Starting Profiler Demo...\n");
+
+    // 1. Run the actual code
+    run_pipeline();
+
+    // 2. Extract results
+    let results = Profiler::take_results();
+
+    println!("\n================ PROFILER RESULTS ================");
+    println!("Note: 'Wait' is highlighted in RED if it exceeds CPU time.");
+    println!("      This indicates where your program is blocked.\n");
+
+    // 3. Print the tree
+    for root_node in results {
+        root_node.print_tree();
+    }
+    println!("==================================================");
+}

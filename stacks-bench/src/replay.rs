@@ -15,9 +15,25 @@ use clarity::vm::costs::ExecutionCost;
 
 use crate::{Block, BlockEra};
 
+#[derive(Debug, Clone, Copy)]
+pub struct CostModel {
+    pub static_overhead: Duration,
+    pub time_per_byte: f64, // Seconds per byte
+}
+
+impl Default for CostModel {
+    fn default() -> Self {
+        Self {
+            static_overhead: Duration::ZERO,
+            time_per_byte: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BlockMetrics {
     pub total_duration: Duration,
+    pub setup_duration: Duration,
     pub execution_duration: Duration,
     pub commit_duration: Duration,
     pub total_clarity_cost: ExecutionCost,
@@ -25,10 +41,115 @@ pub struct BlockMetrics {
     pub commit_overhead_baseline: Duration,
 }
 
+impl BlockMetrics {
+    /// Apply a predictive cost model to attribute commit times.
+    /// Distributes the *actual* commit duration based on the model's predicted weights.
+    pub fn apply_cost_model(&mut self, model: &CostModel) {
+        let total_write_len = self.total_clarity_cost.write_length;
+        
+        // Calculate weights based on the model
+        let weight_static = model.static_overhead.as_secs_f64();
+        let weight_variable = total_write_len as f64 * model.time_per_byte;
+        let total_weight = weight_static + weight_variable;
+        
+        if total_weight <= f64::EPSILON {
+            // Fallback if model predicts zero cost
+            self.commit_overhead_baseline = self.commit_duration;
+            return;
+        }
+        
+        // We distribute the *actual* commit duration based on the model's predicted proportions
+        let actual_seconds = self.commit_duration.as_secs_f64();
+        
+        let allocated_static = actual_seconds * (weight_static / total_weight);
+        let allocated_variable = actual_seconds * (weight_variable / total_weight);
+        
+        self.commit_overhead_baseline = Duration::from_secs_f64(allocated_static);
+        
+        for tx in &mut self.transactions {
+            if total_write_len > 0 {
+                let share = tx.cost.write_length as f64 / total_write_len as f64;
+                tx.estimated_commit_impact = Duration::from_secs_f64(allocated_variable * share);
+            } else {
+                tx.estimated_commit_impact = Duration::ZERO;
+            }
+        }
+    }
+
+    /// Apply the default heuristic (20% static, 80% variable) for attribution.
+    pub fn apply_heuristic(&mut self) {
+        let commit_duration = self.commit_duration;
+        let baseline_overhead = commit_duration.mul_f64(0.20);
+        let variable_commit_time = commit_duration.mul_f64(0.80);
+        
+        self.commit_overhead_baseline = baseline_overhead;
+        let total_write_len = self.total_clarity_cost.write_length;
+        
+        for tx in &mut self.transactions {
+            if total_write_len > 0 {
+                let share = tx.cost.write_length as f64 / total_write_len as f64;
+                tx.estimated_commit_impact = variable_commit_time.mul_f64(share);
+            } else {
+                tx.estimated_commit_impact = Duration::ZERO;
+            }
+        }
+    }
+}
+
+/// Compute a linear regression model (y = mx + c) from block metrics.
+/// y = commit_duration
+/// x = write_length
+pub fn compute_cost_model(metrics: &[BlockMetrics]) -> CostModel {
+    // Skip the first block as it often contains initialization overhead (warmup)
+    // providing we have enough data points remaining.
+    let data = if metrics.len() > 3 {
+        &metrics[1..]
+    } else {
+        metrics
+    };
+
+    let n = data.len() as f64;
+    if n < 2.0 {
+        return CostModel::default();
+    }
+    
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_xy = 0.0;
+    let mut sum_xx = 0.0;
+    
+    for m in data {
+        let x = m.total_clarity_cost.write_length as f64;
+        let y = m.commit_duration.as_secs_f64();
+        
+        sum_x += x;
+        sum_y += y;
+        sum_xy += x * y;
+        sum_xx += x * x;
+    }
+    
+    let denominator = n * sum_xx - sum_x * sum_x;
+    if denominator.abs() <= f64::EPSILON {
+        // All x are same, cannot compute slope. Fallback to average y as static.
+        let avg_y = sum_y / n;
+        return CostModel { static_overhead: Duration::from_secs_f64(avg_y), time_per_byte: 0.0 };
+    }
+    
+    let slope = (n * sum_xy - sum_x * sum_y) / denominator;
+    let intercept = (sum_y - slope * sum_x) / n;
+    
+    // Clamp to sane values (non-negative)
+    let static_overhead = Duration::from_secs_f64(intercept.max(0.0));
+    let time_per_byte = slope.max(0.0);
+    
+    CostModel { static_overhead, time_per_byte }
+}
+
 impl Default for BlockMetrics {
     fn default() -> Self {
         Self {
             total_duration: Duration::ZERO,
+            setup_duration: Duration::ZERO,
             execution_duration: Duration::ZERO,
             commit_duration: Duration::ZERO,
             total_clarity_cost: ExecutionCost::ZERO,
@@ -256,6 +377,7 @@ where
     let mut miner_tenure_info = builder.load_tenure_info(cs, &burn_dbconn, tenure_cause)?;
     let burn_chain_height = miner_tenure_info.burn_tip_height;
     let mut tenure_tx = builder.tenure_begin(&burn_dbconn, &mut miner_tenure_info)?;
+    let setup_duration = start_total.elapsed();
 
     // 2. Execution Phase
     let start_exec = Instant::now();
@@ -319,33 +441,13 @@ where
     commit_callback(&mut builder, tenure_tx, burn_chain_height)?;
     let commit_duration = start_commit.elapsed();
 
-    // 4. Attribution Logic
-    // We assume a baseline overhead for the commit (Merkle root calc + fsync overhead)
-    // and attribute the rest based on the `write_length` of each transaction.
-    // This is a heuristic: Commit Time = Baseline + (TotalWriteLen * Factor)
-
-    // Heuristic: 20% of commit time is fixed overhead, 80% is data-dependent.
-    let baseline_overhead = commit_duration.mul_f64(0.20);
-    let variable_commit_time = commit_duration.mul_f64(0.80);
-
-    let total_write_len: u64 = tx_metrics.iter().map(|m| m.cost.write_length).sum();
-
-    for tx in &mut tx_metrics {
-        if total_write_len > 0 {
-            let share = tx.cost.write_length as f64 / total_write_len as f64;
-            tx.estimated_commit_impact = variable_commit_time.mul_f64(share);
-        } else {
-            // If no writes, distribute evenly or assume zero impact beyond execution
-            tx.estimated_commit_impact = Duration::ZERO;
-        }
-    }
-
     Ok(BlockMetrics {
         total_duration: start_total.elapsed(),
+        setup_duration,
         execution_duration,
         commit_duration,
         total_clarity_cost,
         transactions: tx_metrics,
-        commit_overhead_baseline: baseline_overhead,
+        commit_overhead_baseline: Duration::ZERO, // Will be filled by apply_* methods
     })
 }
