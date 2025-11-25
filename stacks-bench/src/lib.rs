@@ -1,18 +1,24 @@
+use std::fmt::Display;
 use std::ops::{Bound, Deref, RangeBounds};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use blockstack_lib::chainstate::nakamoto::{NakamotoBlock, NakamotoBlockHeader};
 use blockstack_lib::chainstate::stacks::StacksTransaction;
 use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use clarity::codec::StacksMessageCodec;
+use clarity::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
 use clarity::types::chainstate::BurnchainHeaderHash;
+use serde::{Deserialize, Serialize};
 use stacks_common::types::chainstate::StacksBlockId;
 
 pub mod db;
+pub mod context;
 pub mod replay;
 pub mod shadow;
 pub mod profiler;
+
 
 pub struct BurnChainPath(PathBuf);
 
@@ -48,6 +54,7 @@ pub struct ChainStatePath(PathBuf);
 
 impl ChainStatePath {
     pub const CHAINSTATE_DIR_NAME: &'static str = "chainstate";
+    pub const INDEX_DB_RELATIVE_FILE_PATH: &'static str = "vm/index.sqlite";
 
     pub fn new<P: Into<PathBuf>>(path: P) -> Self {
         ChainStatePath(path.into())
@@ -66,11 +73,130 @@ impl ChainStatePath {
             .to_str()
             .ok_or(anyhow!("Failed to convert chainstate path to str"))
     }
+
+    pub fn index_db_path(&self) -> PathBuf {
+        self.path().join(Self::INDEX_DB_RELATIVE_FILE_PATH)
+    }
 }
 
 impl AsRef<Path> for ChainStatePath {
     fn as_ref(&self) -> &Path {
         self.path()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StacksBlockRef {
+    Id(StacksBlockId),
+    Height(u32),
+}
+
+impl FromStr for StacksBlockRef {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(height) = s.parse::<u32>() {
+            Ok(Self::Height(height))
+        } else if let Ok(block_id) = StacksBlockId::from_hex(s) {
+            Ok(Self::Id(block_id))
+        } else {
+            bail!("invalid block identifier: {s} (expected u32 height or hex block hash)")
+        }
+    }
+}
+
+impl std::fmt::Display for StacksBlockRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StacksBlockRef::Id(block_id) => write!(f, "{block_id}"),
+            StacksBlockRef::Height(h) => write!(f, "{h}"),
+        }
+    }
+}
+
+impl StacksBlockRef {
+    pub fn resolve_block_height(&self, chainstate: &StacksChainState) -> Result<u32> {
+        match self {
+            StacksBlockRef::Height(h) => Ok(*h),
+            StacksBlockRef::Id(block_id) => {
+                let (consensus_hash, header_hash) = chainstate
+                    .get_block_header_hashes(block_id)
+                    .with_context(|| format!("lookup header hashes for {block_id}"))?
+                    .ok_or_else(|| anyhow!("missing header hashes for {block_id}"))?;
+
+                chainstate
+                    .get_stacks_block_height(&consensus_hash, &header_hash)
+                    .with_context(|| format!("lookup height for {block_id}"))?
+                    .ok_or_else(|| anyhow!("missing height for {block_id}"))
+                    .map(|h| h as u32)
+            }
+        }
+    }
+}
+
+/// The Stacks network from which the node data is sourced.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum Network {
+    Mainnet,
+    Testnet,
+    Regtest,
+}
+
+impl Network {
+    pub fn is_mainnet(&self) -> bool {
+        matches!(self, Self::Mainnet)
+    }
+
+    pub fn to_chain_id(&self) -> u32 {
+        match self {
+            Self::Mainnet => CHAIN_ID_MAINNET,
+            Self::Testnet | Self::Regtest => CHAIN_ID_TESTNET,
+        }
+    }
+
+    /// Validates that the provided database configuration matches this network.
+    pub fn validate_chainstate(&self, db_mainnet: bool, db_chain_id: u32) -> Result<(), String> {
+        let expected_mainnet = self.is_mainnet();
+        let expected_chain_id = self.to_chain_id();
+
+        if db_mainnet != expected_mainnet {
+            return Err(format!(
+                "Network mismatch: CLI specified {}, but DB is configured for {}",
+                self,
+                if db_mainnet { "mainnet" } else { "testnet/regtest" }
+            ));
+        }
+
+        if db_chain_id != expected_chain_id {
+            return Err(format!(
+                "Chain ID mismatch: CLI expects {} (0x{:x}), but DB has {} (0x{:x})",
+                expected_chain_id, expected_chain_id, db_chain_id, db_chain_id
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mainnet => write!(f, "mainnet"),
+            Self::Testnet => write!(f, "testnet"),
+            Self::Regtest => write!(f, "regtest"),
+        }
+    }
+}
+
+impl FromStr for Network {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "mainnet" => Ok(Self::Mainnet),
+            "testnet" => Ok(Self::Testnet),
+            "regtest" => Ok(Self::Regtest),
+            _ => Err(anyhow!("invalid network: {}", s)),
+        }
     }
 }
 

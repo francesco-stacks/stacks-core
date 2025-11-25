@@ -18,15 +18,19 @@ path = "src/main.rs"
 
 [dependencies]
 clarity = { path = "../clarity", features = ["rusqlite", "testing"] }
-stackslib = { path = "../stackslib", features = ["testing"] }
+stackslib = { path = "../stackslib", features = ["testing", "profiler"] }
 stacks-common = { path = "../stacks-common", features = ["testing"] }
 stx_genesis = { path = "../stx-genesis", package = "stx-genesis" }
 
 anyhow.workspace = true
 clap.workspace = true
+chrono.workspace = true
 tempfile.workspace = true
 diesel.workspace = true
+diesel_migrations.workspace = true
 reflink-copy.workspace = true
 ignore.workspace = true
 hex.workspace = true
-libc.workspace = true
+stacks-profiler.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -8,12 +8,23 @@ use blockstack_lib::chainstate::stacks::db::{ClarityTx, StacksChainState};
 use blockstack_lib::chainstate::stacks::miner::{
     BlockBuilder, BlockLimitFunction, TransactionResult,
 };
-use blockstack_lib::chainstate::stacks::{StacksBlock, TransactionPayload};
+use blockstack_lib::chainstate::stacks::StacksBlock;
 use clarity::codec::StacksMessageCodec;
 use clarity::types::chainstate::{ConsensusHash, StacksBlockId};
 use clarity::vm::costs::ExecutionCost;
+use stacks_profiler::{Profiler, profile_scope};
 
+use crate::context::BenchContext;
 use crate::{Block, BlockEra};
+
+/// Helper to converts a runtime String into a &'static str.
+///
+/// ⚠️ WARNING: This intentionally leaks memory and is only intended for
+/// short-lived benchmarks/debugging where you strictly need distinct span names
+/// for every item (e.g. "Tx 1", "Tx 2").
+fn runtime_name(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct CostModel {
@@ -169,36 +180,40 @@ pub struct TransactionMetrics {
 
 /// Re-execute all transactions in a block to measure execution performance.
 pub fn re_execute_block(
-    cs: &mut StacksChainState,
-    sortdb: &mut SortitionDB,
+    context: &mut BenchContext,
     block_summary: &Block,
 ) -> Result<BlockMetrics> {
     match block_summary.era {
         BlockEra::Nakamoto => {
-            let (naka_block, _size) = cs
+            let (naka_block, _size) = context
+                .chainstate()
                 .nakamoto_blocks_db()
                 .get_nakamoto_block(&block_summary.id)?
                 .ok_or_else(|| anyhow!("Nakamoto block not found"))?;
 
             // Toggle between Miner/Follower here. Currently set to Follower.
-            re_execute_nakamoto_follower(cs, sortdb, &naka_block)
+            let block_height = block_summary.height;
+            profile_scope!(runtime_name(format!("Replay Block #{block_height} (Follower)")), {
+                re_execute_nakamoto_follower(context, &naka_block)
+            })
         }
         BlockEra::PreNakamoto => {
+            let blocks_path = context.chainstate().blocks_path.clone();
             // Pre-Nakamoto metrics not fully implemented in this refactor yet
             // Returning empty metrics for now to satisfy signature
-            let (consensus_hash, header_hash) = cs
+            let (consensus_hash, header_hash) = context
+                .chainstate()
                 .get_block_header_hashes(&block_summary.id)?
                 .ok_or_else(|| anyhow!("Hashes not found"))?;
             let bytes =
-                StacksChainState::load_block_bytes(&cs.blocks_path, &consensus_hash, &header_hash)?
+                StacksChainState::load_block_bytes(&blocks_path, &consensus_hash, &header_hash)?
                     .ok_or_else(|| anyhow!("Bytes not found"))?;
             let mut cursor = std::io::Cursor::new(bytes);
             let stacks_block = StacksBlock::consensus_deserialize(&mut cursor)?;
             let block_size = stacks_block.block_size()? as u64;
 
             re_execute_prenakamoto(
-                cs,
-                sortdb,
+                context,
                 &stacks_block,
                 block_size,
                 &consensus_hash,
@@ -211,19 +226,20 @@ pub fn re_execute_block(
 }
 
 fn re_execute_prenakamoto(
-    cs: &mut StacksChainState,
-    sortdb: &mut SortitionDB,
+    context: &mut BenchContext,
     block: &StacksBlock,
     block_size: u64,
     consensus_hash: &ConsensusHash,
     block_hash: &blockstack_lib::types::chainstate::BlockHeaderHash,
 ) -> Result<()> {
+    let (chainstate, burnchain) = context.get_databases_mut();
+    
     // Load StagingBlock metadata
     let index_hash = StacksBlockId::new(consensus_hash, block_hash);
-    let staging_block = StacksChainState::load_staging_block_info(cs.db(), &index_hash)?
+    let staging_block = StacksChainState::load_staging_block_info(chainstate.db(), &index_hash)?
         .ok_or_else(|| anyhow!("Staging block info not found for {}", index_hash))?;
 
-    let (mut chainstate_tx, clarity_instance) = cs.chainstate_tx_begin()?;
+    let (mut chainstate_tx, clarity_instance) = chainstate.chainstate_tx_begin()?;
 
     let parent_header_info =
         StacksChainState::get_parent_header_info(&mut chainstate_tx, &staging_block)?
@@ -250,6 +266,8 @@ fn re_execute_prenakamoto(
         block,
         next_microblocks,
     )?;
+
+    let mut sortdb = burnchain.open_sortition_db(true)?;
 
     let snapshot = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), consensus_hash)?
         .ok_or_else(|| anyhow!("Snapshot not found"))?;
@@ -284,39 +302,40 @@ fn re_execute_prenakamoto(
     Ok(())
 }
 
-fn re_execute_nakamoto_miner(
-    cs: &mut StacksChainState,
-    sortdb: &SortitionDB,
-    block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
-) -> Result<BlockMetrics> {
-    with_executed_nakamoto_block(
-        cs,
-        sortdb,
-        block,
-        |builder, mut tenure_tx, burn_chain_height| {
-            builder.mine_nakamoto_block(&mut tenure_tx, burn_chain_height);
+// fn re_execute_nakamoto_miner(
+//     context: &mut BenchContext,
+//     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
+// ) -> Result<BlockMetrics> {
+//     with_executed_nakamoto_block(
+//         context,
+//         block,
+//         |builder, mut tenure_tx, burn_chain_height| {
+//             profile_scope!("Mining", {
+//                 builder.mine_nakamoto_block(&mut tenure_tx, burn_chain_height);
+//             });
 
-            let mut fake_consensus_hash = block.header.consensus_hash.clone();
-            fake_consensus_hash.0[0] ^= 0xFF;
-            let mut fake_block_hash = block.header.block_hash();
-            fake_block_hash.0[0] ^= 0xFF;
-            let block_id = StacksBlockId::new(&fake_consensus_hash, &fake_block_hash);
+//             let mut fake_consensus_hash = block.header.consensus_hash.clone();
+//             fake_consensus_hash.0[0] ^= 0xFF;
+//             let mut fake_block_hash = block.header.block_hash();
+//             fake_block_hash.0[0] ^= 0xFF;
+//             let block_id = StacksBlockId::new(&fake_consensus_hash, &fake_block_hash);
 
-            tenure_tx.commit_mined_block(&block_id)?;
-            Ok(())
-        },
-    )
-}
+//             profile_scope!("Block Commit", {
+//                 tenure_tx.commit_mined_block(&block_id)?;
+//             });
+
+//             Ok(())
+//         },
+//     )
+// }
 
 /// Re-execute a block simulating a FOLLOWER node.
 fn re_execute_nakamoto_follower(
-    cs: &mut StacksChainState,
-    sortdb: &SortitionDB,
+    context: &mut BenchContext,
     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
 ) -> Result<BlockMetrics> {
     with_executed_nakamoto_block(
-        cs,
-        sortdb,
+        context,
         block,
         |_builder, tenure_tx, _burn_chain_height| {
             let mut fake_consensus_hash = block.header.consensus_hash.clone();
@@ -324,15 +343,16 @@ fn re_execute_nakamoto_follower(
             let mut fake_block_hash = block.header.block_hash();
             fake_block_hash.0[0] ^= 0xAA;
 
-            tenure_tx.commit_to_block(&fake_consensus_hash, &fake_block_hash);
+            profile_scope!("Block Commit", {
+                tenure_tx.commit_to_block(&fake_consensus_hash, &fake_block_hash);
+            });
             Ok(())
         },
     )
 }
 
 fn with_executed_nakamoto_block<F>(
-    cs: &mut StacksChainState,
-    sortdb: &SortitionDB,
+    context: &mut BenchContext,
     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
     commit_callback: F,
 ) -> Result<BlockMetrics>
@@ -342,25 +362,23 @@ where
     let start_total = Instant::now();
     let parent_block_id = block.header.parent_block_id.clone();
 
-    // 1. Setup (Not counted in execution duration, but part of total)
-    let parent_header = NakamotoChainState::get_block_header(cs.db(), &parent_block_id)?
+    // Setup (Not counted in execution duration, but part of total)
+    let setup_scope = Profiler::begin_span("Setup");
+    let parent_header = NakamotoChainState::get_block_header(context.chainstate().db(), &parent_block_id)?
         .ok_or_else(|| anyhow!("Parent header not found"))?;
 
-    let tenure_change = block
-        .txs
-        .iter()
-        .find(|tx| matches!(tx.payload, TransactionPayload::TenureChange(..)));
-    let coinbase = block
-        .txs
-        .iter()
-        .find(|tx| matches!(tx.payload, TransactionPayload::Coinbase(..)));
-    let tenure_cause = tenure_change
-        .and_then(|tx| match &tx.payload {
-            TransactionPayload::TenureChange(tc) => Some(tc.into()),
-            _ => None,
-        })
+    // Find the coinbase transaction (if any)
+    let coinbase = block.get_coinbase_tx();
+    // Find the tenure change transaction (if any)
+    let tenure_change_payload = block.try_get_tenure_change_payload();
+    // If we have a tenure payload, the tx is guaranteed to be at index 0
+    let tenure_change = tenure_change_payload.and(block.txs.first());
+    // Determine the cause of the tenure change (if any). Used below for loading tenure info
+    let tenure_cause = tenure_change_payload
+        .map(|tc| MinerTenureInfoCause::from(tc.cause))
         .unwrap_or(MinerTenureInfoCause::NoTenureChange);
 
+    // Initialize the block builder
     let mut builder = NakamotoBlockBuilder::new(
         &parent_header,
         &block.header.consensus_hash,
@@ -373,13 +391,20 @@ where
         Some(block.header.timestamp),
     )?;
 
-    let burn_dbconn = sortdb.index_handle_at_block(cs, &parent_block_id)?;
-    let mut miner_tenure_info = builder.load_tenure_info(cs, &burn_dbconn, tenure_cause)?;
+    // Get db handles
+    let sortdb = context.burnchain_mut().open_sortition_db(true)?;
+    let burn_dbconn = sortdb.index_handle_at_block(context.chainstate(), &parent_block_id)?;
+
+    let mut miner_tenure_info = builder.load_tenure_info(context.chainstate_mut(), &burn_dbconn, tenure_cause)?;
     let burn_chain_height = miner_tenure_info.burn_tip_height;
+
+    // Setup tenure transaction
     let mut tenure_tx = builder.tenure_begin(&burn_dbconn, &mut miner_tenure_info)?;
+    drop(setup_scope);
     let setup_duration = start_total.elapsed();
 
-    // 2. Execution Phase
+    // Execution Phase
+    let exec_scope = Profiler::begin_span("Transaction Replay");
     let start_exec = Instant::now();
     let mut tx_metrics = Vec::new();
     let mut total_clarity_cost = ExecutionCost::ZERO;
@@ -387,14 +412,18 @@ where
     for (i, tx) in block.txs.iter().enumerate() {
         let tx_len = tx.tx_len();
         let start_tx = Instant::now();
+        let tx_scope = Profiler::begin_span(runtime_name(format!("Tx #{}", i + 1)));
 
-        let result = builder.try_mine_tx_with_len(
-            &mut tenure_tx,
-            tx,
-            tx_len,
-            &BlockLimitFunction::NO_LIMIT_HIT,
-            None,
-        );
+        let result = profile_scope!("try_mine_tx_with_len", {
+                builder.try_mine_tx_with_len(
+                &mut tenure_tx,
+                tx,
+                tx_len,
+                &BlockLimitFunction::NO_LIMIT_HIT,
+                None,
+            )
+        });
+        drop(tx_scope);
 
         let duration_tx = start_tx.elapsed();
         let mut cost = ExecutionCost::ZERO;
@@ -435,8 +464,9 @@ where
         });
     }
     let execution_duration = start_exec.elapsed();
+    drop(exec_scope);
 
-    // 3. Commit Phase
+    // Commit Phase
     let start_commit = Instant::now();
     commit_callback(&mut builder, tenure_tx, burn_chain_height)?;
     let commit_duration = start_commit.elapsed();

@@ -6,6 +6,7 @@ use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use tempfile::TempDir;
 
+#[derive(Debug)]
 pub struct ShadowDir {
     _tmp: TempDir,
     source: PathBuf,
@@ -24,6 +25,10 @@ impl ShadowDir {
 
     pub fn path(&self) -> &Path {
         &self.root
+    }
+
+    pub fn source(&self) -> &Path {
+        &self.source
     }
 
     /// Keep the temp directory instead of deleting it on drop, consuming this
