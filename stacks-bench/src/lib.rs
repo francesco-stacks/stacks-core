@@ -4,26 +4,26 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
-use blockstack_lib::chainstate::nakamoto::{NakamotoBlock, NakamotoBlockHeader};
 use blockstack_lib::chainstate::stacks::StacksTransaction;
 use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use clarity::codec::StacksMessageCodec;
 use clarity::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
+use clarity::types::StacksEpochId;
 use clarity::types::chainstate::BurnchainHeaderHash;
 use serde::{Deserialize, Serialize};
 use stacks_common::types::chainstate::StacksBlockId;
 
-pub mod db;
 pub mod context;
+pub mod db;
+pub mod profiler;
 pub mod replay;
 pub mod shadow;
-pub mod profiler;
-
 
 pub struct BurnChainPath(PathBuf);
 
 impl BurnChainPath {
     pub const BURNCHAIN_DIR_NAME: &'static str = "burnchain";
+    pub const SORTITION_DB_RELATIVE_FILE_PATH: &str = "sortition/marf.sqlite";
 
     pub fn new<P: Into<PathBuf>>(path: P) -> Self {
         BurnChainPath(path.into())
@@ -41,6 +41,10 @@ impl BurnChainPath {
         self.path()
             .to_str()
             .ok_or(anyhow!("Failed to convert burnchain path to str"))
+    }
+
+    pub fn sortition_db_path(&self) -> PathBuf {
+        self.path().join(Self::SORTITION_DB_RELATIVE_FILE_PATH)
     }
 }
 
@@ -82,6 +86,50 @@ impl ChainStatePath {
 impl AsRef<Path> for ChainStatePath {
     fn as_ref(&self) -> &Path {
         self.path()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StacksEpoch {
+    epoch_id: StacksEpochId,
+    start_block_height: u64,
+    end_block_height: u64,
+}
+
+impl StacksEpoch {
+    pub fn new(epoch_id: StacksEpochId, start_block_height: u64, end_block_height: u64) -> Self {
+        Self {
+            epoch_id,
+            start_block_height,
+            end_block_height,
+        }
+    }
+
+    pub fn epoch_id(&self) -> StacksEpochId {
+        self.epoch_id
+    }
+
+    pub fn start_block_height(&self) -> u64 {
+        self.start_block_height
+    }
+
+    pub fn end_block_height(&self) -> u64 {
+        self.end_block_height
+    }
+}
+
+pub trait ResolveEpochFromHeight {
+    fn resolve_stacks_epoch(&self, height: u64) -> Option<StacksEpochId>;
+}
+
+impl ResolveEpochFromHeight for [StacksEpoch] {
+    fn resolve_stacks_epoch(&self, height: u64) -> Option<StacksEpochId> {
+        for epoch in self {
+            if height >= epoch.start_block_height && height <= epoch.end_block_height {
+                return Some(epoch.epoch_id);
+            }
+        }
+        None
     }
 }
 
@@ -162,7 +210,11 @@ impl Network {
             return Err(format!(
                 "Network mismatch: CLI specified {}, but DB is configured for {}",
                 self,
-                if db_mainnet { "mainnet" } else { "testnet/regtest" }
+                if db_mainnet {
+                    "mainnet"
+                } else {
+                    "testnet/regtest"
+                }
             ));
         }
 
@@ -207,53 +259,56 @@ pub enum BlockEra {
 }
 
 #[derive(Debug, Clone)]
-pub struct Block {
+pub struct BlockSummary {
     pub id: StacksBlockId,
-    pub parent_id: StacksBlockId,
     pub height: u32,
-    pub era: BlockEra,
+    pub parent_id: StacksBlockId,
     pub burn_block_height: Option<u32>,
     pub burn_block_hash: Option<BurnchainHeaderHash>,
+    pub epoch: StacksEpochId,
     txs: Option<BlockTransactions>,
 }
 
-impl From<&NakamotoBlockHeader> for Block {
-    fn from(naka_header: &NakamotoBlockHeader) -> Self {
-        Block {
-            id: naka_header.block_id(),
-            parent_id: naka_header.parent_block_id.clone(),
-            height: naka_header.chain_length as u32,
-            era: BlockEra::Nakamoto,
-            burn_block_height: None,
-            burn_block_hash: None,
-            txs: None,
-        }
-    }
-}
+// impl From<&NakamotoBlockHeader> for BlockSummary {
+//     fn from(naka_header: &NakamotoBlockHeader) -> Self {
+//         BlockSummary {
+//             id: naka_header.block_id(),
+//             height: naka_header.chain_length as u32,
+//             parent_id: naka_header.parent_block_id.clone(),
+//             burn_block_height: None,
+//             burn_block_hash: None,
+//             txs: None,
+//         }
+//     }
+// }
 
-impl From<NakamotoBlock> for Block {
-    fn from(naka_block: NakamotoBlock) -> Self {
-        Block {
-            id: naka_block.block_id(),
-            parent_id: naka_block.header.parent_block_id,
-            height: naka_block.header.chain_length as u32,
-            era: BlockEra::Nakamoto,
-            burn_block_height: None,
-            burn_block_hash: None,
-            txs: None,
-        }
-    }
-}
+// impl From<NakamotoBlock> for BlockSummary {
+//     fn from(naka_block: NakamotoBlock) -> Self {
+//         BlockSummary {
+//             id: naka_block.block_id(),
+//             height: naka_block.header.chain_length as u32,
+//             parent_id: naka_block.header.parent_block_id,
+//             burn_block_height: None,
+//             burn_block_hash: None,
+//             txs: None,
+//         }
+//     }
+// }
 
-impl Block {
-    pub fn new_pre_nakamoto(id: StacksBlockId, parent_id: StacksBlockId, height: u32) -> Self {
-        Block {
+impl BlockSummary {
+    pub fn new(
+        id: StacksBlockId,
+        parent_id: StacksBlockId,
+        height: u32,
+        epoch: StacksEpochId,
+    ) -> Self {
+        BlockSummary {
             id,
-            parent_id,
             height,
-            era: BlockEra::PreNakamoto,
+            parent_id,
             burn_block_height: None,
             burn_block_hash: None,
+            epoch,
             txs: None,
         }
     }
@@ -274,16 +329,16 @@ impl Block {
     }
 }
 
-pub struct BlockChain(Vec<Block>);
+pub struct BlockChain(Vec<BlockSummary>);
 
-impl AsRef<[Block]> for BlockChain {
-    fn as_ref(&self) -> &[Block] {
+impl AsRef<[BlockSummary]> for BlockChain {
+    fn as_ref(&self) -> &[BlockSummary] {
         &self.0
     }
 }
 
 impl Deref for BlockChain {
-    type Target = Vec<Block>;
+    type Target = Vec<BlockSummary>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -291,8 +346,8 @@ impl Deref for BlockChain {
 }
 
 impl BlockChain {
-    pub fn new_ascending<I: IntoIterator<Item = Block>>(blocks: I) -> Self {
-        let mut v: Vec<Block> = blocks.into_iter().collect();
+    pub fn new_ascending<I: IntoIterator<Item = BlockSummary>>(blocks: I) -> Self {
+        let mut v: Vec<BlockSummary> = blocks.into_iter().collect();
         v.sort_unstable_by_key(|b| b.height);
 
         // Validate strictly increasing by height
@@ -304,18 +359,13 @@ impl BlockChain {
     }
 
     /// Get block by its height, if one exists.
-    pub fn get_block_by_height(&self, height: u32) -> Option<&Block> {
+    pub fn get_block_by_height(&self, height: u32) -> Option<&BlockSummary> {
         self.0.iter().find(|b| b.height == height)
     }
 
     /// Get block by its [`StacksBlockId`], if one exists.
-    pub fn get_block_by_id(&self, id: &StacksBlockId) -> Option<&Block> {
+    pub fn get_block_by_id(&self, id: &StacksBlockId) -> Option<&BlockSummary> {
         self.0.iter().find(|b| &b.id == id)
-    }
-
-    /// Find the first Nakamoto-era block in the chain, if any.
-    pub fn first_nakamoto_block(&self) -> Option<&Block> {
-        self.0.iter().find(|b| matches!(b.era, BlockEra::Nakamoto))
     }
 
     /// Total transaction count across all blocks in the chain.
@@ -353,7 +403,7 @@ impl BlockChain {
 
     /// Borrowed slice view of a clamped height range (no allocation).
     /// Returns an empty slice if out-of-range after clamping.
-    pub fn slice_by_height_range_clamped<R: RangeBounds<u32>>(&self, range: R) -> &[Block] {
+    pub fn slice_by_height_range_clamped<R: RangeBounds<u32>>(&self, range: R) -> &[BlockSummary] {
         let asc = &self.0;
         if asc.is_empty() {
             return &asc[0..0];
@@ -366,7 +416,7 @@ impl BlockChain {
 
     /// Internal: compute clamped [start,end] indices for a height range.
     fn clamp_indices_for_height_range<R: RangeBounds<u32>>(
-        asc: &[Block],
+        asc: &[BlockSummary],
         range: R,
     ) -> Option<(usize, usize)> {
         // Start index (clamped up to the next present height)
@@ -421,42 +471,42 @@ impl AsRef<[StacksTransaction]> for BlockTransactions {
 }
 
 impl BlockTransactions {
-    pub fn load(chainstate: &StacksChainState, block: &Block) -> Result<Self> {
-        match block.era {
-            BlockEra::PreNakamoto => {
-                // Need consensus/header hashes to locate the on-disk bytes
-                let (consensus_hash, header_hash) = chainstate
-                    .get_block_header_hashes(&block.id)
-                    .map_err(|_| anyhow!("Failed to get header hashes for {}", block.id))?
-                    .ok_or_else(|| anyhow!("Missing header hashes for {}", block.id))?;
+    pub fn load(
+        chainstate: &StacksChainState,
+        epoch: StacksEpochId,
+        block: &BlockSummary,
+    ) -> Result<Self> {
+        let is_nakamoto = StacksEpochId::ALL_GTE_30.contains(&epoch);
+        if !is_nakamoto {
+            // Need consensus/header hashes to locate the on-disk bytes
+            let (consensus_hash, header_hash) = chainstate
+                .get_block_header_hashes(&block.id)
+                .map_err(|_| anyhow!("Failed to get header hashes for {}", block.id))?
+                .ok_or_else(|| anyhow!("Missing header hashes for {}", block.id))?;
 
-                // Read bytes and parse an anchored StacksBlock
-                let bytes = StacksChainState::load_block_bytes(
-                    &chainstate.blocks_path,
-                    &consensus_hash,
-                    &header_hash,
-                )
-                .map_err(|e| anyhow!("load_block_bytes {}: {e}", block.id))?
-                .ok_or_else(|| anyhow!("Block bytes not found for {}", block.id))?;
+            // Read bytes and parse an anchored StacksBlock
+            let bytes = StacksChainState::load_block_bytes(
+                &chainstate.blocks_path,
+                &consensus_hash,
+                &header_hash,
+            )
+            .map_err(|e| anyhow!("load_block_bytes {}: {e}", block.id))?
+            .ok_or_else(|| anyhow!("Block bytes not found for {}", block.id))?;
 
-                // Deserialize to StacksBlock and take txs
-                let mut cursor = std::io::Cursor::new(bytes);
-                let stacks_block =
-                    blockstack_lib::chainstate::stacks::StacksBlock::consensus_deserialize(
-                        &mut cursor,
-                    )
+            // Deserialize to StacksBlock and take txs
+            let mut cursor = std::io::Cursor::new(bytes);
+            let stacks_block =
+                blockstack_lib::chainstate::stacks::StacksBlock::consensus_deserialize(&mut cursor)
                     .map_err(|e| anyhow!("Failed to deserialize StacksBlock {}: {e}", block.id))?;
-                Ok(Self(stacks_block.txs))
-            }
-            BlockEra::Nakamoto => {
-                // Get full block from the nakamoto blocks DB
-                let (naka_block, _size) = chainstate
-                    .nakamoto_blocks_db()
-                    .get_nakamoto_block(&block.id)
-                    .map_err(|e| anyhow!("nakamoto get_nakamoto_block {}: {e}", block.id))?
-                    .ok_or_else(|| anyhow!("Nakamoto block not found: {}", block.id))?;
-                Ok(Self(naka_block.txs))
-            }
+            Ok(Self(stacks_block.txs))
+        } else {
+            // Get full block from the nakamoto blocks DB
+            let (naka_block, _size) = chainstate
+                .nakamoto_blocks_db()
+                .get_nakamoto_block(&block.id)
+                .map_err(|e| anyhow!("nakamoto get_nakamoto_block {}: {e}", block.id))?
+                .ok_or_else(|| anyhow!("Nakamoto block not found: {}", block.id))?;
+            Ok(Self(naka_block.txs))
         }
     }
 
@@ -472,9 +522,9 @@ mod tests {
     use super::*;
 
     /// Test helper to create a [`Block`] with the specified height.
-    fn mk_block(height: u32) -> Block {
+    fn mk_block(height: u32) -> BlockSummary {
         let id = StacksBlockId::first_mined();
-        Block::new_pre_nakamoto(id.clone(), id, height)
+        BlockSummary::new(id.clone(), id, height, StacksEpochId::Epoch10)
     }
 
     /// Test helper to create a [`BlockChain`] from a list of heights.

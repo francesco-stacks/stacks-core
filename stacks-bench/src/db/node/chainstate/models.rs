@@ -21,7 +21,11 @@ impl DbConfig {
             bail!(
                 "Network mismatch: CLI specified {}, but DB is configured for {}",
                 network,
-                if self.mainnet { "mainnet" } else { "testnet/regtest" }
+                if self.mainnet {
+                    "mainnet"
+                } else {
+                    "testnet/regtest"
+                }
             );
         }
 
@@ -30,7 +34,10 @@ impl DbConfig {
         if db_chain_id != expected_chain_id {
             bail!(
                 "Chain ID mismatch: CLI expects {} (0x{:x}), but DB has {} (0x{:x})",
-                expected_chain_id, expected_chain_id, db_chain_id, db_chain_id
+                expected_chain_id,
+                expected_chain_id,
+                db_chain_id,
+                db_chain_id
             );
         }
 

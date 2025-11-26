@@ -1,28 +1,58 @@
-use std::{path::{Path, PathBuf}, time::{Duration, Instant}};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use blockstack_lib::{burnchains::Burnchain, chainstate::{burn::db::sortdb::SortitionDB, nakamoto::NakamotoChainState, stacks::{db::{StacksBlockHeaderTypes, StacksChainState}, index::{marf::MARFOpenOpts, storage::TrieHashCalculationMode}}}};
+use blockstack_lib::burnchains::Burnchain;
+use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
+use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
+use blockstack_lib::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksChainState};
+use blockstack_lib::chainstate::stacks::index::marf::MARFOpenOpts;
+use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
+use clarity::types::StacksEpochId;
 use clarity::types::chainstate::StacksBlockId;
 
-use crate::{Block, BlockChain, BlockTransactions, BurnChainPath, ChainStatePath, Network, StacksBlockRef, db::node::ChainStateDb, shadow::{ShadowDir, ShadowDirBuilder}};
+use crate::shadow::{ShadowDir, ShadowDirBuilder};
+use crate::{
+    BlockChain, BlockEra, BlockSummary, BlockTransactions, BurnChainPath, ChainStatePath, Network,
+    ResolveEpochFromHeight, StacksBlockRef, StacksEpoch,
+};
 
 const BURNCHAIN_NAME: &str = "bitcoin";
 
 pub struct BenchContextOpts {
     source_dir: PathBuf,
     network: Network,
+    chain_id: u32,
     start_at: Option<StacksBlockRef>,
     end_at: Option<StacksBlockRef>,
+    epochs: Vec<StacksEpoch>,
 }
 
 impl BenchContextOpts {
-    pub fn new(source_dir: PathBuf, network: Network) -> Self{
-        Self {
+    pub fn new<T, I>(
+        source_dir: PathBuf,
+        network: Network,
+        chain_id: u32,
+        epochs: I,
+    ) -> Result<Self>
+    where
+        T: TryInto<StacksEpoch>,
+        T::Error: Into<anyhow::Error>,
+        I: IntoIterator<Item = T>,
+    {
+        let epochs = epochs
+            .into_iter()
+            .map(|e| e.try_into().map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
             source_dir,
             network,
+            chain_id,
             start_at: None,
             end_at: None,
-        }
+            epochs,
+        })
     }
 
     pub fn with_start_block(mut self, start: StacksBlockRef) -> Self {
@@ -30,7 +60,7 @@ impl BenchContextOpts {
         self
     }
 
-    pub fn maybe_with_start_block(mut self, start: Option<StacksBlockRef>) -> Self {
+    pub fn with_maybe_start_block(mut self, start: Option<StacksBlockRef>) -> Self {
         if let Some(s) = start {
             self.start_at = Some(s);
         }
@@ -42,7 +72,7 @@ impl BenchContextOpts {
         self
     }
 
-    pub fn maybe_with_end_block(mut self, end: Option<StacksBlockRef>) -> Self {
+    pub fn with_maybe_end_block(mut self, end: Option<StacksBlockRef>) -> Self {
         if let Some(e) = end {
             self.end_at = Some(e);
         }
@@ -59,6 +89,7 @@ pub struct BenchContext {
     end_height: u32,
     tip_height: u32,
     tip_id: StacksBlockId,
+    epochs: Vec<StacksEpoch>,
 }
 
 impl BenchContext {
@@ -91,6 +122,14 @@ impl BenchContext {
         (self.tip_id.clone(), self.tip_height)
     }
 
+    pub fn resolve_block_era(&self, epoch: StacksEpochId) -> BlockEra {
+        if epoch >= StacksEpochId::Epoch30 {
+            BlockEra::Nakamoto
+        } else {
+            BlockEra::PreNakamoto
+        }
+    }
+
     pub fn with_databases_mut<F, R>(&mut self, func: F) -> Result<R>
     where
         F: FnOnce(&mut StacksChainState, &mut Burnchain) -> Result<R>,
@@ -111,21 +150,14 @@ impl BenchContext {
         let setup_duration = start.elapsed();
         println!(
             "Created shadow directory at {:?} in {:.2?}",
-            &shadow_dir,
-            setup_duration
+            &shadow_dir, setup_duration
         );
 
         let burnchain_path = BurnChainPath::from_node_root(&shadow_dir);
         let chainstate_path = ChainStatePath::from_node_root(&shadow_dir);
 
-        let mut chainstate_db = ChainStateDb::open_read_only(chainstate_path.index_db_path())?;
-        let db_config = chainstate_db.read_db_config()?;
-
-        // The config validates itself against the requested network
-        db_config.assert_matches_network(opts.network)?;
-
-        let is_mainnet = db_config.is_mainnet();
-        let chain_id = db_config.chain_id();
+        let chain_id = opts.chain_id;
+        let is_mainnet = opts.network.is_mainnet();
         let network_name = opts.network.to_string();
 
         let burnchain = Burnchain::new(burnchain_path.as_str()?, BURNCHAIN_NAME, &network_name)?;
@@ -171,19 +203,27 @@ impl BenchContext {
             end_height,
             tip_height,
             tip_id,
+            epochs: opts.epochs,
         })
     }
 
     pub fn select_blocks(&self) -> Result<BlockChain> {
         let sortition_db = self.burnchain().open_sortition_db(false)?;
 
-        println!("Building canonical chain window [{start_height}, {end_height}] (tip at {tip_height})...",
+        println!(
+            "Building canonical chain window [{start_height}, {end_height}] (tip at {tip_height})...",
             start_height = self.start_height,
             end_height = self.end_height,
             tip_height = self.tip_height,
         );
-        let blocks =
-            collect_canonical_range(&self.chainstate, &sortition_db, &self.tip_id, self.start_height, self.end_height)?;
+        let blocks = collect_canonical_range(
+            &self.chainstate,
+            &sortition_db,
+            &self.tip_id,
+            self.start_height,
+            self.end_height,
+            &self.epochs,
+        )?;
         println!(
             "Collected {} canonical blocks ({}..={})",
             blocks.len(),
@@ -195,7 +235,8 @@ impl BenchContext {
     }
 
     pub fn calculate_storage_delta(&self) -> Result<(i64, u64)> {
-        self.shadow_dir.calculate_storage_delta()
+        self.shadow_dir
+            .calculate_storage_delta()
             .context("Failed to calculate storage delta")
     }
 }
@@ -208,7 +249,8 @@ fn collect_canonical_range(
     tip_id: &StacksBlockId,
     start_height: u32,
     end_height: u32,
-) -> Result<Vec<Block>> {
+    epochs: &[StacksEpoch],
+) -> Result<Vec<BlockSummary>> {
     let mut current = tip_id.clone();
     let mut out_desc = Vec::new();
 
@@ -235,7 +277,7 @@ fn collect_canonical_range(
             .ok_or_else(|| anyhow!("Could not find block header for {current}"))?;
 
         // Extract block, parent, AND the consensus hash (tenure ID) from the header
-        let (mut block, parent_id, consensus_hash) = match &current_header.anchored_header {
+        let (mut block, consensus_hash) = match &current_header.anchored_header {
             StacksBlockHeaderTypes::Epoch2(_) => {
                 let block_id = current_header.index_block_hash();
                 debug_assert_eq!(block_id, current);
@@ -256,26 +298,41 @@ fn collect_canonical_range(
                     .ok_or_else(|| anyhow!("missing height for {current}"))?
                     as u32;
 
+                let epoch = epochs.resolve_stacks_epoch(height.into()).ok_or_else(|| {
+                    anyhow!("Could not resolve epoch for block at height {height}")
+                })?;
+
                 (
-                    Block::new_pre_nakamoto(current.clone(), parent.clone(), height),
-                    parent,
+                    BlockSummary::new(current.clone(), parent.clone(), height, epoch),
+                    //parent,
                     consensus_hash,
                 )
             }
             StacksBlockHeaderTypes::Nakamoto(header) => {
-                let b: Block = header.into();
-                let p = b.parent_id.clone();
-                // For Nakamoto, the consensus_hash in the header IS the tenure ID (Bitcoin block hash)
-                (b, p, header.consensus_hash.clone())
+                let height = header.chain_length;
+                let epoch = epochs.resolve_stacks_epoch(height).ok_or_else(|| {
+                    anyhow!("Could not resolve epoch for block at height {height}")
+                })?;
+
+                (
+                    BlockSummary::new(
+                        header.block_id(),
+                        header.parent_block_id.clone(),
+                        header.chain_length as u32,
+                        epoch,
+                    ),
+                    header.consensus_hash.clone(),
+                )
             }
         };
 
-        let h = block.height;
+        let parent_id = block.parent_id.clone();
+        let height = block.height;
 
-        if h < start_height {
+        if height < start_height {
             break;
         }
-        if h <= end_height {
+        if height <= end_height {
             // 1. Resolve Burn Info using the extracted consensus_hash
             let snapshot =
                 SortitionDB::get_block_snapshot_consensus(sortition_db.conn(), &consensus_hash)
@@ -285,9 +342,12 @@ fn collect_canonical_range(
                     })?;
 
             block = block.with_burn_info(snapshot.block_height as u32, snapshot.burn_header_hash);
+            let epoch = epochs
+                .resolve_stacks_epoch(height.into())
+                .ok_or_else(|| anyhow!("Could not resolve epoch for block at height {height}"))?;
 
             // 2. Attach transactions (only for in-range blocks)
-            let txs = BlockTransactions::load(chainstate, &block)
+            let txs = BlockTransactions::load(chainstate, epoch, &block)
                 .with_context(|| format!("load transactions for {}", block.id))?;
             txs_seen += txs.len();
 
@@ -295,12 +355,12 @@ fn collect_canonical_range(
 
             // Update collected window stats
             collected_max = match collected_max {
-                None => Some(h),
-                Some(prev) => Some(prev.max(h)),
+                None => Some(height),
+                Some(prev) => Some(prev.max(height)),
             };
             collected_min = match collected_min {
-                None => Some(h),
-                Some(prev) => Some(prev.min(h)),
+                None => Some(height),
+                Some(prev) => Some(prev.min(height)),
             };
         }
 
@@ -315,13 +375,13 @@ fn collect_canonical_range(
             match (collected_min, collected_max) {
                 (Some(lo), Some(hi)) => {
                     eprintln!(
-                        "  scanned {headers_seen:>8} headers in {elapsed:>6.2}s ({rate:>7.2} hdr/s), current height: {h:>8}, collected: [{lo}..={hi}] ({} blocks, {txs_seen} txs)",
+                        "  scanned {headers_seen:>8} headers in {elapsed:>6.2}s ({rate:>7.2} hdr/s), current height: {height:>8}, collected: [{lo}..={hi}] ({} blocks, {txs_seen} txs)",
                         out_desc.len()
                     );
                 }
                 _ => {
                     eprintln!(
-                        "  scanned {headers_seen:>8} headers in {elapsed:>6.2}s ({rate:>7.2} hdr/s), current height: {h:>8}, (not yet within collection window)",
+                        "  scanned {headers_seen:>8} headers in {elapsed:>6.2}s ({rate:>7.2} hdr/s), current height: {height:>8}, (not yet within collection window)",
                     );
                 }
             }

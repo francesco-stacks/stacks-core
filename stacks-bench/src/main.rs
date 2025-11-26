@@ -8,10 +8,12 @@ use chrono::Utc;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use stacks_bench::context::{BenchContext, BenchContextOpts};
+use stacks_bench::db::DbOpenForRead;
 use stacks_bench::db::app::{AppDb, models};
 use stacks_bench::db::node::ChainStateDb;
-use stacks_bench::db::node::models::chainstate::DbConfig;
-use stacks_bench::{ChainStatePath, Network, StacksBlockRef};
+use stacks_bench::db::node::chainstate::models::DbConfig;
+use stacks_bench::db::node::sortition::SortitionDb;
+use stacks_bench::{BurnChainPath, ChainStatePath, Network, StacksBlockRef, StacksEpoch};
 use stacks_profiler::Profiler;
 
 #[derive(Parser, Serialize, Deserialize)]
@@ -171,29 +173,46 @@ fn main() -> Result<()> {
         .with_context(|| format!("Failed to open or create app database at {:?}", app_db_path))?;
 
     let chainstate_path = ChainStatePath::from_node_root(&args.source_dir);
+    let burnchain_path = BurnChainPath::from_node_root(&args.source_dir);
 
-    let mut chainstate_db = ChainStateDb::open_read_only(chainstate_path.index_db_path())?;
+    let mut chainstate_db = ChainStateDb::open_for_read(chainstate_path.index_db_path())?;
     let db_config = chainstate_db.read_db_config()?;
 
     let network = args.try_determine_network(&db_config)?;
+    let chain_id = db_config.chain_id();
 
-    let context_opts = BenchContextOpts::new(args.source_dir.clone(), network)
-        .maybe_with_start_block(args.start_at.clone())
-        .maybe_with_end_block(args.end_at.clone());
+    let mut sortition_db = SortitionDb::open_for_read(burnchain_path.sortition_db_path())?;
+    let epochs = sortition_db.get_epochs()?;
+    println!("Loaded {} epochs from source sortition DB.", epochs.len());
+    for epoch in &epochs {
+        println!(
+            "  Epoch {} ({}): start_block={}, end_block={}",
+            epoch.to_stacks_epoch_id()?,
+            epoch.epoch_id(),
+            epoch.start_block_height(),
+            epoch.end_block_height()
+        );
+    }
+
+    let context_opts = BenchContextOpts::new(args.source_dir.clone(), network, chain_id, &epochs)?
+        .with_maybe_start_block(args.start_at.clone())
+        .with_maybe_end_block(args.end_at.clone());
 
     let mut bench_context = BenchContext::initialize(context_opts)?;
 
-    let selected_blocks = bench_context.select_blocks()
+    let selected_blocks = bench_context
+        .select_blocks()
         .with_context(|| "Block selection failure")?;
     let selected_block_count = selected_blocks.len();
 
     let (tip_id, tip_height) = bench_context.chain_tip();
-    
-    let chainstate_model = app_db.get_or_create_chainstate(
+
+    let (chainstate_model, _epochs_model) = app_db.get_or_create_chainstate(
         network,
         db_config.chain_id(),
-        &tip_id, 
+        &tip_id,
         tip_height,
+        &epochs,
     )?;
 
     let args_json = args.to_json()?;
@@ -208,7 +227,7 @@ fn main() -> Result<()> {
     })?;
 
     println!("Re-executing {selected_block_count} selected blocks...");
-    
+
     let mut metrics_buffer = Vec::new();
     let mut cost_model = stacks_bench::replay::CostModel::default();
     let calibration_count = args.calibration;
@@ -230,27 +249,34 @@ fn main() -> Result<()> {
     let start = Instant::now();
     for (i, block) in selected_blocks.iter().enumerate() {
         println!(
-            "Re-executing block at height {} ({})",
-            block.height, block.id
+            "Re-executing block at height {} in epoch {} ({})",
+            block.height, block.epoch, block.id
         );
 
-        let mut metrics =
-            stacks_bench::replay::re_execute_block(&mut bench_context, block)?;
-        
+        let mut metrics = stacks_bench::replay::re_execute_block(&mut bench_context, block)?;
+
         if !calibrated {
             metrics_buffer.push(metrics);
-            
+
             if metrics_buffer.len() >= calibration_count || i == selected_block_count - 1 {
                 // Perform calibration
                 cost_model = stacks_bench::replay::compute_cost_model(&metrics_buffer);
                 calibrated = true;
-                
-                println!("\n--- Calibration Complete ({} blocks) ---", metrics_buffer.len());
+
+                println!(
+                    "\n--- Calibration Complete ({} blocks) ---",
+                    metrics_buffer.len()
+                );
                 println!("  Static Overhead: {:.2?}", cost_model.static_overhead);
-                println!("  Cost per Byte:   {:.2} µs", cost_model.time_per_byte * 1_000_000.0);
-                
+                println!(
+                    "  Cost per Byte:   {:.2} µs",
+                    cost_model.time_per_byte * 1_000_000.0
+                );
+
                 if cost_model.time_per_byte <= f64::EPSILON {
-                    println!("  [WARN] Correlation weak or negative. Falling back to default heuristic (20% static / 80% variable).");
+                    println!(
+                        "  [WARN] Correlation weak or negative. Falling back to default heuristic (20% static / 80% variable)."
+                    );
                 }
                 println!("----------------------------------------\n");
 
@@ -277,11 +303,17 @@ fn main() -> Result<()> {
 
                     // Calculate static % for this block
                     let static_pct = if m.commit_duration.as_secs_f64() > 0.0 {
-                        (m.commit_overhead_baseline.as_secs_f64() / m.commit_duration.as_secs_f64()) * 100.0
+                        (m.commit_overhead_baseline.as_secs_f64() / m.commit_duration.as_secs_f64())
+                            * 100.0
                     } else {
                         0.0
                     };
-                    println!("  [Buffered Block {}] Metrics: {:?} (Static Commit: {:.1}%)", i - buffer_len + j + 1, m, static_pct);
+                    println!(
+                        "  [Buffered Block {}] Metrics: {:?} (Static Commit: {:.1}%)",
+                        i - buffer_len + j + 1,
+                        m,
+                        static_pct
+                    );
 
                     let buffered_block = &selected_blocks[i - buffer_len + j + 1];
                     save_metrics_to_db(&mut app_db, run_model.id, buffered_block, m)?;
@@ -294,7 +326,7 @@ fn main() -> Result<()> {
             } else {
                 metrics.apply_heuristic();
             }
-            
+
             // Accumulate stats
             total_blocks += 1;
             total_txs += metrics.transactions.len() as u64;
@@ -307,11 +339,16 @@ fn main() -> Result<()> {
             total_read_len += metrics.total_clarity_cost.read_length;
 
             let static_pct = if metrics.commit_duration.as_secs_f64() > 0.0 {
-                (metrics.commit_overhead_baseline.as_secs_f64() / metrics.commit_duration.as_secs_f64()) * 100.0
+                (metrics.commit_overhead_baseline.as_secs_f64()
+                    / metrics.commit_duration.as_secs_f64())
+                    * 100.0
             } else {
                 0.0
             };
-            println!("  Execution Metrics: {:?} (Static Commit: {:.1}%)", metrics, static_pct);
+            println!(
+                "  Execution Metrics: {:?} (Static Commit: {:.1}%)",
+                metrics, static_pct
+            );
             save_metrics_to_db(&mut app_db, run_model.id, block, &metrics)?;
         }
     }
@@ -335,13 +372,13 @@ fn main() -> Result<()> {
         println!("Total Clarity Runtime:  {}", total_runtime);
         println!("Total Write Length:     {} bytes", total_write_len);
         println!("Total Read Length:      {} bytes", total_read_len);
-        
+
         let avg_duration = total_duration / total_blocks as u32;
         let avg_setup = total_setup / total_blocks as u32;
         let avg_exec = total_exec / total_blocks as u32;
         let avg_commit = total_commit / total_blocks as u32;
         let avg_txs = total_txs as f64 / total_blocks as f64;
-        
+
         println!("\nAverages per Block:");
         println!("  Duration:         {:.2?}", avg_duration);
         println!("  Setup:            {:.2?}", avg_setup);
@@ -349,8 +386,14 @@ fn main() -> Result<()> {
         println!("  Commit:           {:.2?}", avg_commit);
         println!("  Transactions:     {:.1}", avg_txs);
         println!("  Clarity Runtime:  {}", total_runtime / total_blocks);
-        println!("  Write Length:     {} bytes", total_write_len / total_blocks);
-        println!("  Read Length:      {} bytes", total_read_len / total_blocks);
+        println!(
+            "  Write Length:     {} bytes",
+            total_write_len / total_blocks
+        );
+        println!(
+            "  Read Length:      {} bytes",
+            total_read_len / total_blocks
+        );
         println!("========================================\n");
     }
 
@@ -374,7 +417,6 @@ fn main() -> Result<()> {
     let profile_results = Profiler::take_results();
     let root_results = profile_results.first().unwrap();
     root_results.print_tree();
-    
 
     Ok(())
 }
@@ -383,7 +425,7 @@ fn main() -> Result<()> {
 fn save_metrics_to_db(
     app_db: &mut AppDb,
     run_id: i32,
-    block: &stacks_bench::Block,
+    block: &stacks_bench::BlockSummary,
     metrics: &stacks_bench::replay::BlockMetrics,
 ) -> Result<()> {
     // 1. Get/Create Block
@@ -409,9 +451,9 @@ fn save_metrics_to_db(
     // 3. Create Tx Stats
     let mut tx_stats_batch = Vec::with_capacity(metrics.transactions.len());
     for tx_metric in &metrics.transactions {
-        let tx_hash_bytes = hex::decode(&tx_metric.txid)
-            .map_err(|e| anyhow!("Invalid hex in txid: {}", e))?;
-        
+        let tx_hash_bytes =
+            hex::decode(&tx_metric.txid).map_err(|e| anyhow!("Invalid hex in txid: {}", e))?;
+
         // We don't have tx type in metrics yet, using "unknown"
         let tx_model = app_db.get_or_create_stacks_tx(block_model.id, &tx_hash_bytes, "unknown")?;
 

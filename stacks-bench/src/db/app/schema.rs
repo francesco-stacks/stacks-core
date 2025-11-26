@@ -14,6 +14,7 @@ table! {
         chain_id -> BigInt,
         tip_index_hash -> Binary,
         tip_height -> BigInt,
+        epochs_hash -> Binary,
     }
 }
 

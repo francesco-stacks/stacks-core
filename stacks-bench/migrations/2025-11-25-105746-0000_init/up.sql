@@ -9,9 +9,11 @@ CREATE TABLE chainstate (
   chain_id INTEGER NOT NULL,
   tip_index_hash BLOB NOT NULL,
   tip_height INTEGER NOT NULL,
+  epochs_hash BLOB NOT NULL,
   FOREIGN KEY (network_id) REFERENCES network(id),
   CHECK(length(tip_index_hash) = 32),
-  UNIQUE (network_id, chain_id, tip_index_hash)
+  CHECK(length(epochs_hash) = 32),
+  UNIQUE (network_id, chain_id, tip_index_hash, epochs_hash)
 );
 
 CREATE TABLE epoch (
@@ -27,7 +29,7 @@ CREATE TABLE epoch (
     read_count_budget INTEGER NOT NULL,
     runtime_budget INTEGER NOT NULL,
     FOREIGN KEY (chainstate_id) REFERENCES chainstate(id),
-    UNIQUE(chainstate_id, start_height, stacks_epoch_id)
+    UNIQUE(chainstate_id, stacks_epoch_id)
 );
 
 CREATE TABLE burn_block (

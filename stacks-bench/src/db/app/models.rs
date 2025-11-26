@@ -1,9 +1,11 @@
+use anyhow::Result;
 use chrono::NaiveDateTime;
+use clarity::types::StacksEpochId;
 use diesel::prelude::*;
 
 use super::schema::{
-    benchmark_run, chainstate, network, stacks_block, stacks_block_stats, stacks_tx,
-    stacks_tx_stats, epoch, burn_block,
+    benchmark_run, burn_block, chainstate, epoch, network, stacks_block, stacks_block_stats,
+    stacks_tx, stacks_tx_stats,
 };
 
 #[derive(Queryable, Selectable, Identifiable, Debug, Clone)]
@@ -28,6 +30,7 @@ pub struct Chainstate {
     pub chain_id: i64,
     pub tip_index_hash: Vec<u8>,
     pub tip_height: i64,
+    pub epochs_hash: Vec<u8>,
 }
 
 #[derive(Insertable, Debug, Clone)]
@@ -37,6 +40,7 @@ pub struct NewChainstate {
     pub chain_id: i64,
     pub tip_index_hash: Vec<u8>,
     pub tip_height: i64,
+    pub epochs_hash: Vec<u8>,
 }
 
 #[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
@@ -54,6 +58,14 @@ pub struct Epoch {
     pub read_length_budget: i64,
     pub read_count_budget: i64,
     pub runtime_budget: i64,
+}
+
+impl Epoch {
+    pub fn try_get_stacks_epoch_id(&self) -> Result<StacksEpochId> {
+        (self.stacks_epoch_id as u32)
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid StacksEpochId: {}", self.stacks_epoch_id))
+    }
 }
 
 #[derive(Insertable, Debug, Clone)]
@@ -124,7 +136,7 @@ pub struct NewStacksTx {
     pub tx_type: String,
 }
 
-// Keep Queryable as Value (Diesel can deserialize Text -> Value automatically if feature is on, 
+// Keep Queryable as Value (Diesel can deserialize Text -> Value automatically if feature is on,
 // or we can use String and deserialize manually)
 #[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(Chainstate))]
@@ -136,7 +148,7 @@ pub struct BenchmarkRun {
     pub git_commit_hash: Vec<u8>,
     pub start_time: NaiveDateTime,
     pub end_time: Option<NaiveDateTime>,
-    pub args_json: String, 
+    pub args_json: String,
 }
 
 #[derive(Insertable, Debug, Clone)]

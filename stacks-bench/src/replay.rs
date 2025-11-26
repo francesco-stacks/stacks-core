@@ -4,18 +4,19 @@ use anyhow::{Result, anyhow};
 use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
 use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
 use blockstack_lib::chainstate::nakamoto::miner::{MinerTenureInfoCause, NakamotoBlockBuilder};
+use blockstack_lib::chainstate::stacks::StacksBlock;
 use blockstack_lib::chainstate::stacks::db::{ClarityTx, StacksChainState};
 use blockstack_lib::chainstate::stacks::miner::{
     BlockBuilder, BlockLimitFunction, TransactionResult,
 };
-use blockstack_lib::chainstate::stacks::StacksBlock;
 use clarity::codec::StacksMessageCodec;
+use clarity::types::StacksEpochId;
 use clarity::types::chainstate::{ConsensusHash, StacksBlockId};
 use clarity::vm::costs::ExecutionCost;
 use stacks_profiler::{Profiler, profile_scope};
 
 use crate::context::BenchContext;
-use crate::{Block, BlockEra};
+use crate::{BlockEra, BlockSummary};
 
 /// Helper to converts a runtime String into a &'static str.
 ///
@@ -57,26 +58,26 @@ impl BlockMetrics {
     /// Distributes the *actual* commit duration based on the model's predicted weights.
     pub fn apply_cost_model(&mut self, model: &CostModel) {
         let total_write_len = self.total_clarity_cost.write_length;
-        
+
         // Calculate weights based on the model
         let weight_static = model.static_overhead.as_secs_f64();
         let weight_variable = total_write_len as f64 * model.time_per_byte;
         let total_weight = weight_static + weight_variable;
-        
+
         if total_weight <= f64::EPSILON {
             // Fallback if model predicts zero cost
             self.commit_overhead_baseline = self.commit_duration;
             return;
         }
-        
+
         // We distribute the *actual* commit duration based on the model's predicted proportions
         let actual_seconds = self.commit_duration.as_secs_f64();
-        
+
         let allocated_static = actual_seconds * (weight_static / total_weight);
         let allocated_variable = actual_seconds * (weight_variable / total_weight);
-        
+
         self.commit_overhead_baseline = Duration::from_secs_f64(allocated_static);
-        
+
         for tx in &mut self.transactions {
             if total_write_len > 0 {
                 let share = tx.cost.write_length as f64 / total_write_len as f64;
@@ -92,10 +93,10 @@ impl BlockMetrics {
         let commit_duration = self.commit_duration;
         let baseline_overhead = commit_duration.mul_f64(0.20);
         let variable_commit_time = commit_duration.mul_f64(0.80);
-        
+
         self.commit_overhead_baseline = baseline_overhead;
         let total_write_len = self.total_clarity_cost.write_length;
-        
+
         for tx in &mut self.transactions {
             if total_write_len > 0 {
                 let share = tx.cost.write_length as f64 / total_write_len as f64;
@@ -123,37 +124,43 @@ pub fn compute_cost_model(metrics: &[BlockMetrics]) -> CostModel {
     if n < 2.0 {
         return CostModel::default();
     }
-    
+
     let mut sum_x = 0.0;
     let mut sum_y = 0.0;
     let mut sum_xy = 0.0;
     let mut sum_xx = 0.0;
-    
+
     for m in data {
         let x = m.total_clarity_cost.write_length as f64;
         let y = m.commit_duration.as_secs_f64();
-        
+
         sum_x += x;
         sum_y += y;
         sum_xy += x * y;
         sum_xx += x * x;
     }
-    
+
     let denominator = n * sum_xx - sum_x * sum_x;
     if denominator.abs() <= f64::EPSILON {
         // All x are same, cannot compute slope. Fallback to average y as static.
         let avg_y = sum_y / n;
-        return CostModel { static_overhead: Duration::from_secs_f64(avg_y), time_per_byte: 0.0 };
+        return CostModel {
+            static_overhead: Duration::from_secs_f64(avg_y),
+            time_per_byte: 0.0,
+        };
     }
-    
+
     let slope = (n * sum_xy - sum_x * sum_y) / denominator;
     let intercept = (sum_y - slope * sum_x) / n;
-    
+
     // Clamp to sane values (non-negative)
     let static_overhead = Duration::from_secs_f64(intercept.max(0.0));
     let time_per_byte = slope.max(0.0);
-    
-    CostModel { static_overhead, time_per_byte }
+
+    CostModel {
+        static_overhead,
+        time_per_byte,
+    }
 }
 
 impl Default for BlockMetrics {
@@ -181,9 +188,10 @@ pub struct TransactionMetrics {
 /// Re-execute all transactions in a block to measure execution performance.
 pub fn re_execute_block(
     context: &mut BenchContext,
-    block_summary: &Block,
+    block_summary: &BlockSummary,
 ) -> Result<BlockMetrics> {
-    match block_summary.era {
+    let era = context.resolve_block_era(block_summary.epoch);
+    match era {
         BlockEra::Nakamoto => {
             let (naka_block, _size) = context
                 .chainstate()
@@ -193,9 +201,10 @@ pub fn re_execute_block(
 
             // Toggle between Miner/Follower here. Currently set to Follower.
             let block_height = block_summary.height;
-            profile_scope!(runtime_name(format!("Replay Block #{block_height} (Follower)")), {
-                re_execute_nakamoto_follower(context, &naka_block)
-            })
+            profile_scope!(
+                runtime_name(format!("Replay Block #{block_height} (Follower)")),
+                { re_execute_nakamoto_follower(context, &naka_block) }
+            )
         }
         BlockEra::PreNakamoto => {
             let blocks_path = context.chainstate().blocks_path.clone();
@@ -233,7 +242,7 @@ fn re_execute_prenakamoto(
     block_hash: &blockstack_lib::types::chainstate::BlockHeaderHash,
 ) -> Result<()> {
     let (chainstate, burnchain) = context.get_databases_mut();
-    
+
     // Load StagingBlock metadata
     let index_hash = StacksBlockId::new(consensus_hash, block_hash);
     let staging_block = StacksChainState::load_staging_block_info(chainstate.db(), &index_hash)?
@@ -334,21 +343,17 @@ fn re_execute_nakamoto_follower(
     context: &mut BenchContext,
     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
 ) -> Result<BlockMetrics> {
-    with_executed_nakamoto_block(
-        context,
-        block,
-        |_builder, tenure_tx, _burn_chain_height| {
-            let mut fake_consensus_hash = block.header.consensus_hash.clone();
-            fake_consensus_hash.0[0] ^= 0xAA;
-            let mut fake_block_hash = block.header.block_hash();
-            fake_block_hash.0[0] ^= 0xAA;
+    with_executed_nakamoto_block(context, block, |_builder, tenure_tx, _burn_chain_height| {
+        let mut fake_consensus_hash = block.header.consensus_hash.clone();
+        fake_consensus_hash.0[0] ^= 0xAA;
+        let mut fake_block_hash = block.header.block_hash();
+        fake_block_hash.0[0] ^= 0xAA;
 
-            profile_scope!("Block Commit", {
-                tenure_tx.commit_to_block(&fake_consensus_hash, &fake_block_hash);
-            });
-            Ok(())
-        },
-    )
+        profile_scope!("Block Commit", {
+            tenure_tx.commit_to_block(&fake_consensus_hash, &fake_block_hash);
+        });
+        Ok(())
+    })
 }
 
 fn with_executed_nakamoto_block<F>(
@@ -364,8 +369,9 @@ where
 
     // Setup (Not counted in execution duration, but part of total)
     let setup_scope = Profiler::begin_span("Setup");
-    let parent_header = NakamotoChainState::get_block_header(context.chainstate().db(), &parent_block_id)?
-        .ok_or_else(|| anyhow!("Parent header not found"))?;
+    let parent_header =
+        NakamotoChainState::get_block_header(context.chainstate().db(), &parent_block_id)?
+            .ok_or_else(|| anyhow!("Parent header not found"))?;
 
     // Find the coinbase transaction (if any)
     let coinbase = block.get_coinbase_tx();
@@ -395,7 +401,8 @@ where
     let sortdb = context.burnchain_mut().open_sortition_db(true)?;
     let burn_dbconn = sortdb.index_handle_at_block(context.chainstate(), &parent_block_id)?;
 
-    let mut miner_tenure_info = builder.load_tenure_info(context.chainstate_mut(), &burn_dbconn, tenure_cause)?;
+    let mut miner_tenure_info =
+        builder.load_tenure_info(context.chainstate_mut(), &burn_dbconn, tenure_cause)?;
     let burn_chain_height = miner_tenure_info.burn_tip_height;
 
     // Setup tenure transaction
@@ -415,7 +422,7 @@ where
         let tx_scope = Profiler::begin_span(runtime_name(format!("Tx #{}", i + 1)));
 
         let result = profile_scope!("try_mine_tx_with_len", {
-                builder.try_mine_tx_with_len(
+            builder.try_mine_tx_with_len(
                 &mut tenure_tx,
                 tx,
                 tx_len,

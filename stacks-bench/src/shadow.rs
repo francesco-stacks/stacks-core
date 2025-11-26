@@ -72,7 +72,7 @@ impl ShadowDir {
                         let base_meta = fs::metadata(&base_path)?;
                         let base_len = base_meta.len();
                         let base_modified = base_meta.modified()?;
-                        
+
                         let diff = (shadow_len as i64) - (base_len as i64);
                         net_growth += diff;
 
@@ -80,12 +80,12 @@ impl ShadowDir {
                         if base_modified != shadow_modified {
                             let sign = if diff > 0 { "+" } else { "" }; // negative numbers have their own sign
                             println!(
-                                "  MODIFIED: {:<60} | Delta: {}{}", 
-                                relative_path.display(), 
-                                sign, 
+                                "  MODIFIED: {:<60} | Delta: {}{}",
+                                relative_path.display(),
+                                sign,
                                 diff
                             );
-                            
+
                             // Count positive growth as written data
                             if diff > 0 {
                                 estimated_written += diff as u64;
@@ -96,8 +96,8 @@ impl ShadowDir {
                         net_growth += shadow_len as i64;
                         estimated_written += shadow_len;
                         println!(
-                            "  CREATED:  {:<60} | Size:  {}", 
-                            relative_path.display(), 
+                            "  CREATED:  {:<60} | Size:  {}",
+                            relative_path.display(),
                             shadow_len
                         );
                     }
