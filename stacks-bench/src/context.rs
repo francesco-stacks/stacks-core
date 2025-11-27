@@ -25,6 +25,7 @@ pub struct BenchContextOpts {
     chain_id: u32,
     start_at: Option<StacksBlockRef>,
     end_at: Option<StacksBlockRef>,
+    tip: Option<StacksBlockRef>,
     epochs: Vec<StacksEpoch>,
 }
 
@@ -51,6 +52,7 @@ impl BenchContextOpts {
             chain_id,
             start_at: None,
             end_at: None,
+            tip: None,
             epochs,
         })
     }
@@ -76,6 +78,11 @@ impl BenchContextOpts {
         if let Some(e) = end {
             self.end_at = Some(e);
         }
+        self
+    }
+
+    pub fn with_maybe_tip(mut self, tip: Option<StacksBlockRef>) -> Self {
+        self.tip = tip;
         self
     }
 }
@@ -177,17 +184,51 @@ impl BenchContext {
             Some(marf_opts),
         )?;
 
-        // 1. Get Node Tip (Global)
+        // 1. Get Node Tip (Global Default)
         println!("Getting canonical stacks tip block id directly from sortdb");
         let node_tip_id = sortition_db.get_canonical_stacks_tip_block_id();
         let node_tip_header = NakamotoChainState::get_block_header(chainstate.db(), &node_tip_id)?
             .ok_or(anyhow!("Failed to get tip block header"))?;
         let node_tip_height = node_tip_header.stacks_block_height;
 
-        // 2. Determine Effective Tip (Benchmark End)
-        // If an end block is specified, we treat THAT as the tip for this session.
-        // This allows us to benchmark forks or specific historical segments easily.
-        let (tip_id, tip_height) = match &opts.end_at {
+        // 2. Determine Anchor Tip
+        // This is the block we will walk backwards FROM.
+        let (anchor_id, anchor_height) = match &opts.tip {
+            Some(StacksBlockRef::Id(id)) => {
+                let header = NakamotoChainState::get_block_header(chainstate.db(), id)?
+                    .ok_or_else(|| anyhow!("Tip block {} not found", id))?;
+                (id.clone(), header.stacks_block_height)
+            }
+            Some(StacksBlockRef::Height(h)) => {
+                let h = *h;
+                if h > node_tip_height {
+                    bail!(
+                        "Requested tip height {} is beyond node tip {}",
+                        h,
+                        node_tip_height
+                    );
+                }
+                // Walk back from node tip to find the canonical block at height h
+                // (Same logic as before, but now establishing the anchor)
+                let mut curr = node_tip_id.clone();
+                let mut curr_h = node_tip_height;
+                while curr_h > h {
+                    let header = NakamotoChainState::get_block_header(chainstate.db(), &curr)?
+                        .ok_or_else(|| anyhow!("Missing header for {}", curr))?;
+                    curr = match header.anchored_header {
+                        StacksBlockHeaderTypes::Epoch2(_) => chainstate.get_parent(&curr)?,
+                        StacksBlockHeaderTypes::Nakamoto(n) => n.parent_block_id,
+                    };
+                    curr_h -= 1;
+                }
+                (curr, h)
+            }
+            None => (node_tip_id, node_tip_height),
+        };
+
+        // 3. Determine Effective End (Benchmark End)
+        // We walk back from the ANCHOR tip, not necessarily the node tip.
+        let (end_id, end_height) = match &opts.end_at {
             Some(StacksBlockRef::Id(id)) => {
                 let header = NakamotoChainState::get_block_header(chainstate.db(), id)?
                     .ok_or_else(|| anyhow!("Block {} not found", id))?;
@@ -195,24 +236,23 @@ impl BenchContext {
             }
             Some(StacksBlockRef::Height(h)) => {
                 let h = *h;
-                if h > node_tip_height {
+                if h > anchor_height {
                     bail!(
-                        "Requested end height {} is beyond node tip {}",
+                        "Requested end height {} is beyond anchor tip {}",
                         h,
-                        node_tip_height
+                        anchor_height
                     );
                 }
 
-                if h == node_tip_height {
-                    (node_tip_id, node_tip_height)
+                if h == anchor_height {
+                    (anchor_id.clone(), anchor_height)
                 } else {
-                    // Walk back from node tip to find the canonical block at height h
                     println!(
                         "Resolving canonical block at height {} (walking back from {})...",
-                        h, node_tip_height
+                        h, anchor_height
                     );
-                    let mut curr = node_tip_id.clone();
-                    let mut curr_h = node_tip_height;
+                    let mut curr = anchor_id.clone();
+                    let mut curr_h = anchor_height;
 
                     while curr_h > h {
                         let header = NakamotoChainState::get_block_header(chainstate.db(), &curr)?
@@ -227,7 +267,7 @@ impl BenchContext {
                     (curr, h)
                 }
             }
-            None => (node_tip_id, node_tip_height),
+            None => (anchor_id.clone(), anchor_height),
         };
 
         // 3. Resolve Start Height
@@ -236,8 +276,8 @@ impl BenchContext {
             None => 1, // genesis height
         };
 
-        if start_height > tip_height {
-            bail!("start height ({start_height}) > end height ({tip_height})");
+        if start_height > end_height {
+            bail!("start height ({start_height}) > end height ({end_height})");
         }
 
         Ok(Self {
@@ -246,9 +286,9 @@ impl BenchContext {
             chainstate,
             burnchain,
             start_height,
-            end_height: tip_height, // end_height is the benchmark tip height
-            tip_height,             // tip_height is now the benchmark tip height
-            tip_id,                 // tip_id is now the benchmark tip ID
+            end_height: end_height, // end_height is the benchmark tip height
+            tip_height: end_height, // tip_height is now the benchmark tip height
+            tip_id: end_id,         // tip_id is now the benchmark tip ID
             epochs: opts.epochs,
         })
     }

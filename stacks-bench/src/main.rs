@@ -36,6 +36,13 @@ pub struct Args {
     #[serde(skip_serializing_if = "Option::is_none")]
     end_at: Option<StacksBlockRef>,
 
+    /// The tip block (height or hex block id) to use as the anchor for resolving canonical history.
+    /// Defaults to the node's current canonical tip.
+    /// Useful for benchmarking forks: provide the fork's tip hash here.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tip: Option<StacksBlockRef>,
+
     /// The network to use (`mainnet`, `testnet`, `regtest`). If not specified,
     /// the network is inferred from the chainstate database.
     #[arg(long, short = 'n')]
@@ -197,7 +204,8 @@ fn main() -> Result<()> {
 
     let context_opts = BenchContextOpts::new(args.source_dir.clone(), network, chain_id, &epochs)?
         .with_maybe_start_block(args.start_at.clone())
-        .with_maybe_end_block(args.end_at.clone());
+        .with_maybe_end_block(args.end_at.clone())
+        .with_maybe_tip(args.tip.clone());
 
     let mut bench_context = BenchContext::initialize(context_opts)?;
 
@@ -289,10 +297,15 @@ fn main() -> Result<()> {
         // Load metadata from App DB
         let summary = app_db.get_block(block_id, epochs.as_slice())?;
 
-        println!(
-            "Re-executing block at height {} in epoch {} ({})",
-            summary.height, summary.epoch, summary.id
-        );
+        // println!(
+        //     "Re-executing block at height {} in epoch {} ({})",
+        //     summary.height, summary.epoch, summary.id
+        // );
+        if i == 0 || i % 5_000 == 0 || i == selected_block_count - 1 {
+            eprint!("{}", summary.height);
+        } else if i % 250 == 0 {
+            eprint!(".");
+        }
 
         // Hydrate transactions from Node DB (Heavy operation, done one-by-one)
         let txs = stacks_bench::BlockTransactions::load(
@@ -342,19 +355,19 @@ fn main() -> Result<()> {
 
                     accumulator.add(m); // Accumulate
 
-                    // Calculate static % for this block
-                    let static_pct = if m.commit_duration.as_secs_f64() > 0.0 {
-                        (m.commit_overhead_baseline.as_secs_f64() / m.commit_duration.as_secs_f64())
-                            * 100.0
-                    } else {
-                        0.0
-                    };
-                    println!(
-                        "  [Buffered Block {}] Metrics: {:?} (Static Commit: {:.1}%)",
-                        i - buffer_len + j + 1,
-                        m,
-                        static_pct
-                    );
+                    // // Calculate static % for this block
+                    // let static_pct = if m.commit_duration.as_secs_f64() > 0.0 {
+                    //     (m.commit_overhead_baseline.as_secs_f64() / m.commit_duration.as_secs_f64())
+                    //         * 100.0
+                    // } else {
+                    //     0.0
+                    // };
+                    // println!(
+                    //     "  [Buffered Block {}] Metrics: {:?} (Static Commit: {:.1}%)",
+                    //     i - buffer_len + j + 1,
+                    //     m,
+                    //     static_pct
+                    // );
 
                     // Use the buffered block ID to save metrics
                     let buffered_id = &block_ids[i - buffer_len + j + 1];
@@ -371,17 +384,17 @@ fn main() -> Result<()> {
 
             accumulator.add(&metrics); // Accumulate
 
-            let static_pct = if metrics.commit_duration.as_secs_f64() > 0.0 {
-                (metrics.commit_overhead_baseline.as_secs_f64()
-                    / metrics.commit_duration.as_secs_f64())
-                    * 100.0
-            } else {
-                0.0
-            };
-            println!(
-                "  Execution Metrics: {:?} (Static Commit: {:.1}%)",
-                metrics, static_pct
-            );
+            // let static_pct = if metrics.commit_duration.as_secs_f64() > 0.0 {
+            //     (metrics.commit_overhead_baseline.as_secs_f64()
+            //         / metrics.commit_duration.as_secs_f64())
+            //         * 100.0
+            // } else {
+            //     0.0
+            // };
+            // println!(
+            //     "  Execution Metrics: {:?} (Static Commit: {:.1}%)",
+            //     metrics, static_pct
+            // );
             app_db.save_block_metrics(run_model.id, &block.id, &metrics)?;
         }
     }
