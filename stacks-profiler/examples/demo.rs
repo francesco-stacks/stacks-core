@@ -1,6 +1,7 @@
-use stacks_profiler::{profile, profile_scope, Profiler};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use stacks_profiler::{Profiler, profile, profile_scope};
 
 // ============================================================================
 // Helper Functions
@@ -37,11 +38,11 @@ fn process_items(count: usize) {
     profile_scope!("2. Process Batch (CPU Bound)", {
         for i in 0..count {
             // Create a nested scope for every generic iteration
-            // (In a real app, you might not profile every single tight loop iteration 
+            // (In a real app, you might not profile every single tight loop iteration
             // due to overhead, but this demonstrates the nesting capability)
             profile_scope!("Item Processing");
             burn_cpu(10); // 10ms of heavy math per item
-            
+
             if i % 2 == 0 {
                 // Every other item needs a quick lookup (I/O)
                 profile_scope!("DB Lookup");
@@ -58,7 +59,7 @@ fn save_results() {
         profile_scope!("Serialize (CPU)");
         burn_cpu(20);
     }
-    
+
     {
         profile_scope!("Disk Write (Wait)");
         simulate_io(50);

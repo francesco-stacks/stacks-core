@@ -8,12 +8,12 @@
 //! **Note:** This crate is not intended to be used directly. You should use the re-exported
 //! macro from the main `stacks-profiler` crate.
 
-use proc_macro::TokenStream;
 use darling::{FromMeta, ast::NestedMeta}; // Import NestedMeta
+use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemFn, Meta};
 use syn::punctuated::Punctuated;
 use syn::token::Comma;
+use syn::{ItemFn, Meta, parse_macro_input};
 
 #[derive(Debug, FromMeta)]
 struct ProfileArgs {
@@ -62,13 +62,10 @@ struct ProfileArgs {
 pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
     // 1. Parse the attributes as a list of Meta items (e.g. name="foo", key=value)
     let attr_args = parse_macro_input!(args with Punctuated::<Meta, Comma>::parse_terminated);
-    
+
     // 2. Convert syn::Meta to darling::ast::NestedMeta
     // Darling expects NestedMeta (which can be a Meta or a Literal), so we wrap our Metas.
-    let args_vec: Vec<NestedMeta> = attr_args
-        .into_iter()
-        .map(NestedMeta::Meta)
-        .collect();
+    let args_vec: Vec<NestedMeta> = attr_args.into_iter().map(NestedMeta::Meta).collect();
 
     // 3. Process with Darling
     let args = match ProfileArgs::from_list(&args_vec) {
@@ -84,7 +81,7 @@ pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
     let vis = &input_fn.vis;
     let sig = &input_fn.sig;
     let block = &input_fn.block;
-    
+
     // 5. Determine the span name
     let span_name = match args.name {
         Some(n) => n,

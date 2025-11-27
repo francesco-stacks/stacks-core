@@ -1,6 +1,7 @@
-use stacks_profiler::{ProfileAnalyzer, ProfileStats, Profiler, profile_scope};
 use std::thread;
 use std::time::Duration;
+
+use stacks_profiler::{ProfileAnalyzer, ProfileStats, Profiler, profile_scope};
 
 // ============================================================================
 // 1. Simulation Types
@@ -41,12 +42,11 @@ fn process_transaction(tx: &Transaction) {
     // Let's stick to a generic name for the inner scope to show how it aggregates
     // *under* the specific parent.
     profile_scope!("Execute Logic", {
-        
         if tx.is_complex_contract {
             profile_scope!("Clarity VM (CPU)");
             // Simulate CPU work (hashing, vm)
             let start = std::time::Instant::now();
-            while start.elapsed() < Duration::from_millis(20) {} 
+            while start.elapsed() < Duration::from_millis(20) {}
         }
 
         if tx.needs_disk_fetch {
@@ -59,10 +59,10 @@ fn process_transaction(tx: &Transaction) {
 
 fn process_block(block: &Block) {
     for tx in &block.txs {
-        // TRICK: We format a specific name for this transaction so they 
+        // TRICK: We format a specific name for this transaction so they
         // don't merge in the tree.
         let span_name = runtime_name(format!("Tx {}", tx.id));
-        
+
         profile_scope!(span_name, {
             process_transaction(tx);
         });
@@ -80,17 +80,37 @@ fn main() {
         Block {
             height: 1,
             txs: vec![
-                Transaction { id: 1, is_complex_contract: false, needs_disk_fetch: false },
-                Transaction { id: 2, is_complex_contract: false, needs_disk_fetch: false },
+                Transaction {
+                    id: 1,
+                    is_complex_contract: false,
+                    needs_disk_fetch: false,
+                },
+                Transaction {
+                    id: 2,
+                    is_complex_contract: false,
+                    needs_disk_fetch: false,
+                },
             ],
         },
         // Block 2: Contains a "Poison" transaction (Slow I/O)
         Block {
             height: 2,
             txs: vec![
-                Transaction { id: 1, is_complex_contract: false, needs_disk_fetch: false },
-                Transaction { id: 2, is_complex_contract: false, needs_disk_fetch: true }, // <--- SLOW
-                Transaction { id: 3, is_complex_contract: true, needs_disk_fetch: false },
+                Transaction {
+                    id: 1,
+                    is_complex_contract: false,
+                    needs_disk_fetch: false,
+                },
+                Transaction {
+                    id: 2,
+                    is_complex_contract: false,
+                    needs_disk_fetch: true,
+                }, // <--- SLOW
+                Transaction {
+                    id: 3,
+                    is_complex_contract: true,
+                    needs_disk_fetch: false,
+                },
             ],
         },
     ];
@@ -104,7 +124,7 @@ fn main() {
         for block in &blocks {
             // We name the block scope specifically so they don't merge
             let block_name = runtime_name(format!("Block {}", block.height));
-            
+
             profile_scope!(block_name, {
                 process_block(block);
             });
@@ -120,19 +140,16 @@ fn main() {
 
     println!("\n=== Global Flat Profile ===\n");
     // "How much time did we spend in 'Execute Logic' across the ENTIRE program?"
-    let global_flat = results.flatten(); 
+    let global_flat = results.flatten();
     print_stats("Execute Logic", &global_flat);
 
     println!("\n=== Scoped Flat Profile ===\n");
     // Correct approach: Find 'Block 2' inside the GLOBAL flat list first.
     // The global flat list contains 'Block 2' with all its children aggregated inside it.
-    if let Some(block_2) = global_flat
-        .iter()
-        .find(|s| s.name() == "Block 2") 
-    {
-            // Now we flatten just Block 2 to see the breakdown of ITS execution
-            let block_2_flat = block_2.flatten();
-            print_stats("Execute Logic", &block_2_flat);
+    if let Some(block_2) = global_flat.iter().find(|s| s.name() == "Block 2") {
+        // Now we flatten just Block 2 to see the breakdown of ITS execution
+        let block_2_flat = block_2.flatten();
+        print_stats("Execute Logic", &block_2_flat);
     } else {
         println!("Could not find 'Block 2' in the trace.");
     }
@@ -143,7 +160,7 @@ fn print_stats(target_name: &str, flat_list: &[ProfileStats]) {
         println!("Stats for '{}':", target_name);
         println!("  Total Count: {}", stat.count);
         println!("  Total Wall:  {:?}", stat.wall_time);
-        // The children of this flat node represent the aggregated breakdown 
+        // The children of this flat node represent the aggregated breakdown
         // of what 'Execute Logic' called, across all its invocations.
     }
 }

@@ -1,7 +1,7 @@
-use stacks_profiler::{profile, profile_scope, Profiler};
-use std::panic;
-use std::thread;
 use std::time::Duration;
+use std::{panic, thread};
+
+use stacks_profiler::{Profiler, profile, profile_scope};
 
 /// Helper to ensure we start with a clean state in tests
 fn clear_profiler() {
@@ -20,11 +20,11 @@ fn test_basic_nesting() {
     });
 
     let results = Profiler::take_results();
-    
+
     assert_eq!(results.len(), 1, "Should have 1 root");
     let root = &results[0];
     assert_eq!(root.id.name, "Root");
-    
+
     assert_eq!(root.children.len(), 1, "Root should have 1 child");
     let child = &root.children[0];
     assert_eq!(child.id.name, "Child");
@@ -37,17 +37,15 @@ fn test_macro_variations() {
     // 1. Statement style (wrapped in block to force drop)
     {
         profile_scope!("Statement");
-    } 
+    }
 
     // 2. Block style
     profile_scope! {
         let _x = 1 + 1;
-    }; 
+    };
 
     // 3. Expression style
-    let res = profile_scope!("Expression", {
-        5 + 5
-    });
+    let res = profile_scope!("Expression", { 5 + 5 });
     assert_eq!(res, 10);
 
     let results = Profiler::take_results();
@@ -114,7 +112,7 @@ fn test_panic_safety() {
     // 1. "WillPanic" started.
     // 2. Panic -> stack unwind -> guard dropped -> "WillPanic" finished & recorded.
     // 3. "Recovered" started -> finished -> recorded.
-    
+
     assert_eq!(results.len(), 2, "Should have 'WillPanic' and 'Recovered'");
     assert_eq!(results[0].name(), "WillPanic");
     assert_eq!(results[1].name(), "Recovered");
@@ -124,7 +122,7 @@ fn test_panic_safety() {
 fn test_recursion() {
     clear_profiler();
 
-    #[profile(name="Recursive")]
+    #[profile(name = "Recursive")]
     fn recursive_func(depth: usize) {
         if depth > 0 {
             recursive_func(depth - 1);
@@ -135,7 +133,7 @@ fn test_recursion() {
 
     let results = Profiler::take_results();
     assert_eq!(results.len(), 1);
-    
+
     let mut current = &results[0];
     let mut depth = 0;
     assert_eq!(current.name(), "Recursive");
@@ -145,23 +143,30 @@ fn test_recursion() {
         assert_eq!(current.name(), "Recursive");
         depth += 1;
     }
-    
+
     assert_eq!(depth, 3);
 }
 
 #[test]
 fn test_zero_time_safety() {
     clear_profiler();
-    
+
     // Ensure very fast operations don't cause underflow/crashes
     for _ in 0..1000 {
         profile_scope!("Fast");
     }
 
     let results = Profiler::take_results();
-    
+
     // Because all calls happen at the same file/line, they are aggregated.
-    assert_eq!(results.len(), 1, "Should aggregate 1000 identical calls into 1 entry");
-    assert_eq!(results[0].count, 1000, "Count should reflect the loop iterations");
+    assert_eq!(
+        results.len(),
+        1,
+        "Should aggregate 1000 identical calls into 1 entry"
+    );
+    assert_eq!(
+        results[0].count, 1000,
+        "Count should reflect the loop iterations"
+    );
     assert_eq!(results[0].id.name, "Fast");
 }

@@ -10,8 +10,8 @@
 //! * **Cons:** You must call `Profiler::take_results()` on *each* thread you wish to measure.
 //!
 //! ## Asynchronous Caveat
-//! Because this uses TLS, it is **not** safe to carry a span across `await` points in a 
-//! multi-threaded runtime (like Tokio's multi-threaded scheduler), as the task may move 
+//! Because this uses TLS, it is **not** safe to carry a span across `await` points in a
+//! multi-threaded runtime (like Tokio's multi-threaded scheduler), as the task may move
 //! between threads. It is safe for synchronous code and `current_thread` runtimes.
 
 use std::cell::RefCell;
@@ -45,10 +45,13 @@ impl Style {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod platform {
     use std::time::Duration;
-    
+
     #[inline]
     pub fn thread_cpu_time() -> Duration {
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         unsafe {
             // CLOCK_THREAD_CPUTIME_ID is supported on Linux and macOS (>= 10.12).
             // On macOS, libc maps this to the correct constant (16).
@@ -155,7 +158,7 @@ impl ProfileStats {
     pub fn print_tree(&self) {
         // 1. Root Header
         self.print_node_header("", "", self, true);
-        
+
         // 2. Recurse Children
         self.print_children_recursive("");
 
@@ -164,8 +167,8 @@ impl ProfileStats {
         let gray = Style::GRAY;
         let dim = Style::DIM;
         let reset = Style::RESET;
-        
-        println!("{gray}{dim}└ {reset}{}{reset}", self.format_metrics()); 
+
+        println!("{gray}{dim}└ {reset}{}{reset}", self.format_metrics());
     }
 
     /// Internal helper to iterate children
@@ -175,14 +178,14 @@ impl ProfileStats {
         let dim = Style::DIM;
         //let red = Style::RED;
         let reset = Style::RESET;
-        
+
         for child in &self.children {
             // 1. Header
             // We pass PLAIN TEXT characters here.
             // We will colorize the entire prefix+connector string in print_node_header
             let header_connector = format!("{dim}├ {reset}");
             child.print_node_header(prefix, &header_connector, child, false);
-            
+
             // 2. Recurse
             // Build the plain text prefix for the next level
             let child_prefix = format!("{dim}{prefix}│ ");
@@ -197,7 +200,13 @@ impl ProfileStats {
     }
 
     /// Prints the "Header" line: Connector + Name + File
-    fn print_node_header(&self, prefix: &str, connector: &str, stats: &ProfileStats, is_root: bool) {
+    fn print_node_header(
+        &self,
+        prefix: &str,
+        connector: &str,
+        stats: &ProfileStats,
+        is_root: bool,
+    ) {
         let reset = Style::RESET;
         let gray = Style::GRAY;
         let bold = Style::BOLD;
@@ -205,7 +214,7 @@ impl ProfileStats {
         let dim = Style::DIM;
         let cyan = Style::CYAN;
         let white = Style::WHITE;
-        
+
         let name_icon = "┝";
         let name = self.id.name;
         let file = self.id.file;
@@ -215,13 +224,17 @@ impl ProfileStats {
 
         if is_root {
             // Root has no connector, so just print name/file
-            print!("{dim}{green}{name_icon}{reset}{bold}{white} {name}{reset} {metrics} {gray}{dim}@{reset} {cyan}{dim}{file}:{line}{reset}");
+            print!(
+                "{dim}{green}{name_icon}{reset}{bold}{white} {name}{reset} {metrics} {gray}{dim}@{reset} {cyan}{dim}{file}:{line}{reset}"
+            );
         } else {
             // Child:
             // 1. {gray}{prefix}{connector} -> The Tree Structure (Solid Gray)
             // 2. {reset}{gray}{name_icon}  -> The Arrow Icon (Solid Gray)
             // 3. {reset} {bold}{name}      -> The Name (Bold White)
-            print!("{gray}{prefix}{connector}{reset}{dim}{green}{name_icon}{reset} {bold}{white}{name}{reset} {metrics}{reset} {cyan}{dim}{file}:{line}{reset}");
+            print!(
+                "{gray}{prefix}{connector}{reset}{dim}{green}{name_icon}{reset} {bold}{white}{name}{reset} {metrics}{reset} {cyan}{dim}{file}:{line}{reset}"
+            );
         }
         println!();
     }
@@ -229,7 +242,7 @@ impl ProfileStats {
     /// Generates the formatted metrics string
     fn format_metrics(&self) -> String {
         let wait = self.wait_time();
-        
+
         let reset = Style::RESET;
         let gray = Style::GRAY;
         let red = Style::RED;
@@ -243,7 +256,9 @@ impl ProfileStats {
         let wait_color = if wait > self.cpu_time { red } else { gray };
         let count = self.count;
 
-        format!("{gray}{metrics_icon}{reset}{gray}- {wall_ms:.3}ms {reset}{dim}[{reset} {gray}busy: {cpu_ms:.3}ms {dim}/{reset} {wait_color}wait: {wait_ms:.3}ms {reset}{dim}]{reset} {gray}x{count}{reset}")
+        format!(
+            "{gray}{metrics_icon}{reset}{gray}- {wall_ms:.3}ms {reset}{dim}[{reset} {gray}busy: {cpu_ms:.3}ms {dim}/{reset} {wait_color}wait: {wait_ms:.3}ms {reset}{dim}]{reset} {gray}x{count}{reset}"
+        )
     }
 
     pub fn name(&self) -> &'static str {
@@ -299,7 +314,7 @@ impl Profiler {
             children: None, // Lazy alloc
         };
         STATE.with(|state| state.borrow_mut().active_stack.push(span));
-        
+
         // Return the guard
         ProfileGuard
     }
@@ -308,8 +323,8 @@ impl Profiler {
     ///
     /// Pops the active span from the thread-local stack, calculates durations,
     /// and appends the result to the parent span (or root list).
-    /// 
-    /// It is public so [`ProfileGuard`] can call it, but users should generally 
+    ///
+    /// It is public so [`ProfileGuard`] can call it, but users should generally
     /// rely on the guard.
     #[inline]
     #[doc(hidden)]
