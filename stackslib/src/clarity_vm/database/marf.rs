@@ -407,6 +407,7 @@ impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
     ///
     /// Returns Ok(()) on success
     /// Returns Err(InterpreterError(..)) on sqlite failure
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn commit_metadata_for_trie(&mut self, target: &StacksBlockId) -> InterpreterResult<()> {
         SqliteConnection::commit_metadata_to(self.marf.sqlite_tx(), &self.chain_tip, target)
     }
@@ -422,6 +423,7 @@ impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
 
     /// Seal the trie -- compute the root hash.
     /// NOTE: This is a one-time operation for this implementation -- a subsequent call will panic.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn seal_trie(&mut self) -> TrieHash {
         self.marf
             .seal()

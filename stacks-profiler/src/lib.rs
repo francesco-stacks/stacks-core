@@ -23,12 +23,19 @@ use std::time::{Duration, Instant};
 pub use stacks_profiler_macros::profile;
 
 struct Style;
+
+#[allow(unused)]
 impl Style {
     const RESET: &str = "\x1b[0m";
     const BOLD: &str = "\x1b[1m";
     const GRAY: &str = "\x1b[90m";
     const RED: &str = "\x1b[31m";
     const DIM: &str = "\x1b[2m";
+    const GREEN: &str = "\x1b[32m";
+    const YELLOW: &str = "\x1b[33m";
+    const CYAN: &str = "\x1b[36m";
+    const BLUE: &str = "\x1b[34m";
+    const WHITE: &str = "\x1b[37m";
 }
 
 // ==============================================================
@@ -147,7 +154,7 @@ impl ProfileStats {
     /// Recursively prints the profiling tree to stdout.
     pub fn print_tree(&self) {
         // 1. Root Header
-        self.print_node_header("", "", true);
+        self.print_node_header("", "", self, true);
         
         // 2. Recurse Children
         self.print_children_recursive("");
@@ -158,55 +165,63 @@ impl ProfileStats {
         let dim = Style::DIM;
         let reset = Style::RESET;
         
-        println!("{gray}{dim}└── {reset}{}{reset}", self.format_metrics()); 
+        println!("{gray}{dim}└ {reset}{}{reset}", self.format_metrics()); 
     }
 
     /// Internal helper to iterate children
     fn print_children_recursive(&self, prefix: &str) {
         // Use GRAY for the tree structure to match file paths/icons
-        let gray = Style::GRAY;
+        //let gray = Style::GRAY;
         let dim = Style::DIM;
+        //let red = Style::RED;
         let reset = Style::RESET;
         
         for child in &self.children {
             // 1. Header
             // We pass PLAIN TEXT characters here.
             // We will colorize the entire prefix+connector string in print_node_header
-            let header_connector = format!("{dim}├── {reset}");
-            child.print_node_header(prefix, &header_connector, false);
+            let header_connector = format!("{dim}├ {reset}");
+            child.print_node_header(prefix, &header_connector, child, false);
             
             // 2. Recurse
             // Build the plain text prefix for the next level
-            let child_prefix = format!("{dim}{prefix}│   ");
+            let child_prefix = format!("{dim}{prefix}│ ");
             child.print_children_recursive(&child_prefix);
 
             // 3. Metrics (Last Child)
             // We apply GRAY to the entire structure string at once.
             // This ensures the '│' from the prefix and the '└──' match perfectly.
-            println!("{gray}{dim}{child_prefix}└── {reset}{}", child.format_metrics());
+            //println!("{gray}{dim}{child_prefix}╰ {reset}{}", child.format_metrics());
+            //println!("{gray}{dim}{child_prefix}╰ {reset}");
         }
     }
 
     /// Prints the "Header" line: Connector + Name + File
-    fn print_node_header(&self, prefix: &str, connector: &str, is_root: bool) {
+    fn print_node_header(&self, prefix: &str, connector: &str, stats: &ProfileStats, is_root: bool) {
         let reset = Style::RESET;
         let gray = Style::GRAY;
         let bold = Style::BOLD;
+        let green = Style::GREEN;
+        let dim = Style::DIM;
+        let cyan = Style::CYAN;
+        let white = Style::WHITE;
         
-        let name_icon = if is_root { "" } else { "▶" };
+        let name_icon = "┝";
         let name = self.id.name;
         let file = self.id.file;
         let line = self.id.line;
 
+        let metrics = stats.format_metrics();
+
         if is_root {
             // Root has no connector, so just print name/file
-            print!("{bold}{name}{reset}{gray} {file}:{line}{reset}");
+            print!("{dim}{green}{name_icon}{reset}{bold}{white} {name}{reset} {metrics} {gray}{dim}@{reset} {cyan}{dim}{file}:{line}{reset}");
         } else {
             // Child:
             // 1. {gray}{prefix}{connector} -> The Tree Structure (Solid Gray)
             // 2. {reset}{gray}{name_icon}  -> The Arrow Icon (Solid Gray)
             // 3. {reset} {bold}{name}      -> The Name (Bold White)
-            print!("{gray}{prefix}{connector}{reset}{gray}{name_icon}{reset} {bold}{name}{reset}{gray} {file}:{line}{reset}");
+            print!("{gray}{prefix}{connector}{reset}{dim}{green}{name_icon}{reset} {bold}{white}{name}{reset} {metrics}{reset} {cyan}{dim}{file}:{line}{reset}");
         }
         println!();
     }
@@ -215,10 +230,11 @@ impl ProfileStats {
     fn format_metrics(&self) -> String {
         let wait = self.wait_time();
         
-        let reset = "\x1b[0m";
-        let gray = "\x1b[90m";
-        let red = "\x1b[31m";
-        let metrics_icon = "∫";
+        let reset = Style::RESET;
+        let gray = Style::GRAY;
+        let red = Style::RED;
+        let dim = Style::DIM;
+        let metrics_icon = "";
 
         let wall_ms = self.wall_time.as_secs_f64() * 1000.0;
         let cpu_ms = self.cpu_time.as_secs_f64() * 1000.0;
@@ -227,7 +243,7 @@ impl ProfileStats {
         let wait_color = if wait > self.cpu_time { red } else { gray };
         let count = self.count;
 
-        format!("{gray}{metrics_icon} [{reset}total: {wall_ms:.3}ms{gray} | {reset}busy: {cpu_ms:.3}ms{gray} | {wait_color}wait: {wait_ms:.3}ms{gray}] (x{count})")
+        format!("{gray}{metrics_icon}{reset}{gray}- {wall_ms:.3}ms {reset}{dim}[{reset} {gray}busy: {cpu_ms:.3}ms {dim}/{reset} {wait_color}wait: {wait_ms:.3}ms {reset}{dim}]{reset} {gray}x{count}{reset}")
     }
 
     pub fn name(&self) -> &'static str {

@@ -1812,12 +1812,14 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     }
 
     /// Flush uncommitted state to disk, but under the given block hash.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn flush_to(&mut self, bhh: &T) -> Result<(), Error> {
         self.inner_flush(FlushOptions::NewHeader(bhh))
     }
 
     /// Flush uncommitted state to disk for a mined block (i.e. not part of the chainstate, and not
     /// an ancestor of any block), and do so under a given block hash.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn flush_mined(&mut self, bhh: &T) -> Result<(), Error> {
         self.inner_flush(FlushOptions::MinedTable(bhh))
     }

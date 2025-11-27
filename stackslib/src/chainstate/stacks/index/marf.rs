@@ -291,6 +291,7 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
 
     /// Finish writing the next trie in the MARF, but change the hash of the current Trie's
     /// block hash to something other than what we opened it as.  This persists all changes.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn commit_to(mut self, real_bhh: &T) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);

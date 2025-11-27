@@ -201,6 +201,7 @@ pub fn get_unconfirmed_block_identifier<T: MarfTrieId>(
     .map_err(|e| e.into())
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn get_block_hash<T: MarfTrieId>(conn: &Connection, local_id: u32) -> Result<T, Error> {
     let result = conn
         .query_row(
@@ -216,6 +217,7 @@ pub fn get_block_hash<T: MarfTrieId>(conn: &Connection, local_id: u32) -> Result
 }
 
 /// Write a serialized trie to sqlite
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn write_trie_blob<T: MarfTrieId>(
     conn: &Connection,
     block_hash: &T,
@@ -238,6 +240,7 @@ pub fn write_trie_blob<T: MarfTrieId>(
 /// what guarantees that the blob is persisted.
 /// If block_id is Some(..), then an existing block ID's metadata will be updated.  Otherwise, a
 /// new row will be created.
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn inner_write_external_trie_blob<T: MarfTrieId>(
     conn: &Connection,
     block_hash: &T,
@@ -307,6 +310,7 @@ pub fn update_external_trie_blob<T: MarfTrieId>(
 /// Add a new row for an external trie blob -- i.e. we're creating a new trie whose blob will be
 /// stored in an external file, but its metadata will be in the DB.
 /// Returns the new row ID
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn write_external_trie_blob<T: MarfTrieId>(
     conn: &Connection,
     block_hash: &T,
@@ -317,6 +321,7 @@ pub fn write_external_trie_blob<T: MarfTrieId>(
 }
 
 /// Write a serialized trie blob for a trie that was mined
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn write_trie_blob_to_mined<T: MarfTrieId>(
     conn: &Connection,
     block_hash: &T,

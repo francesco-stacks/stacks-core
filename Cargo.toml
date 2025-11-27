@@ -43,7 +43,8 @@ toml = "0.5.6"
 clap = { version = "4.5.51", default-features = false, features = ["std", "derive", "color", "help", "usage", "error-context", "suggestions"] }
 anyhow = { version = "1.0.100", default-features = false }
 tempfile = { version = "3.23.0", default-features = false, features = ["getrandom"] }
-diesel = { version = "2.3.3", default-features = false, features = ["sqlite", "returning_clauses_for_sqlite_3_35", "chrono", "32-column-tables"] }
+diesel = { version = "2.3.3", default-features = false, features = ["sqlite", "returning_clauses_for_sqlite_3_35", "chrono", "32-column-tables", "serde_json"] }
+diesel_migrations = { version = "2.3.0", default-features = false, features = ["sqlite"] }
 reflink-copy = { version = "0.1.28", default-features = false }
 ignore = { version = "0.4.25", default-features = false }
 hex = { version = "0.4.3", default-features = false, features = ["std"] }
@@ -52,6 +53,8 @@ syn = { version = "2.0.110", default-features = false, features = ["full", "extr
 quote = { version = "1.0.42", default-features = false, features = ["proc-macro"] }
 proc-macro2 = { version = "1.0.103", default-features = false, features = ["proc-macro", "span-locations"] }
 darling = { version = "0.21.3", default-features = false, features = ["suggestions"] }
+chrono = { version = "0.4.42", default-features = false, features = ["serde"] }
+sha2 = { version = "0.10.9", default-features = false }
 
 
 # Use a bit more than default optimization for

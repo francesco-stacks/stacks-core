@@ -98,18 +98,18 @@ pub const MINING_COMMITMENT_FREQUENCY_NAKAMOTO: u8 = 3;
 #[repr(u32)]
 #[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Copy, Serialize, Deserialize)]
 pub enum StacksEpochId {
-    Epoch10 = 0x01000,
-    Epoch20 = 0x02000,
-    Epoch2_05 = 0x02005,
-    Epoch21 = 0x0200a,
-    Epoch22 = 0x0200f,
-    Epoch23 = 0x02014,
-    Epoch24 = 0x02019,
-    Epoch25 = 0x0201a,
-    Epoch30 = 0x03000,
-    Epoch31 = 0x03001,
-    Epoch32 = 0x03002,
-    Epoch33 = 0x03003,
+    Epoch10 = 0x01000,   // 4096
+    Epoch20 = 0x02000,   // 8192
+    Epoch2_05 = 0x02005, // 8197
+    Epoch21 = 0x0200a,   // 8202
+    Epoch22 = 0x0200f,   // 8207
+    Epoch23 = 0x02014,   // 8212
+    Epoch24 = 0x02019,   // 8217
+    Epoch25 = 0x0201a,   // 8218
+    Epoch30 = 0x03000,   // 12288
+    Epoch31 = 0x03001,   // 12289
+    Epoch32 = 0x03002,   // 12290
+    Epoch33 = 0x03003,   // 12291
 }
 
 #[derive(Debug)]
