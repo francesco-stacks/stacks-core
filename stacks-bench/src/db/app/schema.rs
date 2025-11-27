@@ -53,9 +53,27 @@ table! {
 }
 
 table! {
+    _staged_stacks_block (index_hash) {
+        index_hash -> Binary,
+        parent_index_hash -> Binary,
+        height -> BigInt,
+        burn_block_hash -> Binary,
+        burn_block_height -> BigInt,
+    }
+}
+
+table! {
     stacks_tx (id) {
         id -> BigInt,
         stacks_block_id -> BigInt,
+        tx_hash -> Binary,
+        tx_type -> Text,
+    }
+}
+
+table! {
+    _staged_stacks_tx (block_index_hash, tx_hash) {
+        block_index_hash -> Binary,
         tx_hash -> Binary,
         tx_type -> Text,
     }
@@ -126,4 +144,6 @@ allow_tables_to_appear_in_same_query!(
     benchmark_run,
     stacks_block_stats,
     stacks_tx_stats,
+    _staged_stacks_block,
+    _staged_stacks_tx,
 );

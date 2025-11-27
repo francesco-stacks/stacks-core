@@ -13,7 +13,8 @@ use stacks_bench::db::app::{AppDb, models};
 use stacks_bench::db::node::ChainStateDb;
 use stacks_bench::db::node::chainstate::models::DbConfig;
 use stacks_bench::db::node::sortition::SortitionDb;
-use stacks_bench::{BurnChainPath, ChainStatePath, Network, StacksBlockRef, StacksEpoch};
+use stacks_bench::metrics::{CostModel, MetricsAccumulator};
+use stacks_bench::{BurnChainPath, ChainStatePath, Network, StacksBlockRef};
 use stacks_profiler::Profiler;
 
 #[derive(Parser, Serialize, Deserialize)]
@@ -200,20 +201,66 @@ fn main() -> Result<()> {
 
     let mut bench_context = BenchContext::initialize(context_opts)?;
 
-    let selected_blocks = bench_context
-        .select_blocks()
-        .with_context(|| "Block selection failure")?;
-    let selected_block_count = selected_blocks.len();
-
     let (tip_id, tip_height) = bench_context.chain_tip();
 
-    let (chainstate_model, _epochs_model) = app_db.get_or_create_chainstate(
+    // Resolve the actual range we need to benchmark
+    let (start_height, end_height) = bench_context.block_height_range()?;
+    println!(
+        "Targeting block range: {} to {} (Tip: {})",
+        start_height, end_height, tip_height
+    );
+
+    let (chainstate_model, epochs) = app_db.get_or_create_chainstate(
         network,
         db_config.chain_id(),
         &tip_id,
         tip_height,
         &epochs,
     )?;
+
+    // 1. Get Canonical Block IDs (Lightweight)
+    let mut block_ids =
+        app_db.get_chain_block_ids(&tip_id, start_height as u32, end_height as u32)?;
+
+    let expected_count = (end_height - start_height + 1) as usize;
+
+    if block_ids.len() != expected_count {
+        println!(
+            "App DB index incomplete (found {}, expected {}). Indexing from Node DB...",
+            block_ids.len(),
+            expected_count
+        );
+
+        // 2. Stream from Node DB and Index
+        let stream = bench_context
+            .canonical_block_stream(start_height as u32, end_height as u32)
+            .filter_map(|r| match r {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    eprintln!("Warning: failed to load block during indexing: {}", e);
+                    None
+                }
+            });
+
+        app_db.index_blocks_streaming(stream)?;
+        println!("Checkpointing database...");
+        app_db.checkpoint()?;
+        println!("Vacuuming database...");
+        app_db.vacuum()?;
+
+        // 3. Reload IDs
+        block_ids = app_db.get_chain_block_ids(&tip_id, start_height as u32, end_height as u32)?;
+    }
+
+    if block_ids.is_empty() {
+        return Err(anyhow!(
+            "No blocks found in range {} to {}",
+            start_height,
+            end_height
+        ));
+    }
+
+    let selected_block_count = block_ids.len();
 
     let args_json = args.to_json()?;
     let git_commit_hash = get_git_hash().unwrap_or(vec![0u8; 20]); // Placeholder if git not available
@@ -229,44 +276,47 @@ fn main() -> Result<()> {
     println!("Re-executing {selected_block_count} selected blocks...");
 
     let mut metrics_buffer = Vec::new();
-    let mut cost_model = stacks_bench::replay::CostModel::default();
+    let mut cost_model = CostModel::default();
     let calibration_count = args.calibration;
     let mut calibrated = false;
 
-    // Accumulators for summary
-    let mut total_blocks = 0u64;
-    let mut total_txs = 0u64;
-    let mut total_duration = Duration::ZERO;
-    let mut total_setup = Duration::ZERO;
-    let mut total_exec = Duration::ZERO;
-    let mut total_commit = Duration::ZERO;
-    let mut total_runtime = 0u64;
-    let mut total_write_len = 0u64;
-    let mut total_read_len = 0u64;
+    let mut accumulator = MetricsAccumulator::default(); // Use accumulator
 
     let block_replay_span = Profiler::begin_span("Block Replay");
 
     let start = Instant::now();
-    for (i, block) in selected_blocks.iter().enumerate() {
+    for (i, block_id) in block_ids.iter().enumerate() {
+        // Load metadata from App DB
+        let summary = app_db.get_block(block_id, epochs.as_slice())?;
+
         println!(
             "Re-executing block at height {} in epoch {} ({})",
-            block.height, block.epoch, block.id
+            summary.height, summary.epoch, summary.id
         );
 
-        let mut metrics = stacks_bench::replay::re_execute_block(&mut bench_context, block)?;
+        // Hydrate transactions from Node DB (Heavy operation, done one-by-one)
+        let txs = stacks_bench::BlockTransactions::load(
+            bench_context.chainstate(),
+            summary.epoch,
+            &summary,
+        )?;
+        let block = summary.with_transactions(txs);
+
+        let mut metrics = stacks_bench::replay::re_execute_block(&mut bench_context, &block)?;
 
         if !calibrated {
             metrics_buffer.push(metrics);
 
             if metrics_buffer.len() >= calibration_count || i == selected_block_count - 1 {
                 // Perform calibration
-                cost_model = stacks_bench::replay::compute_cost_model(&metrics_buffer);
+                cost_model = CostModel::compute(&metrics_buffer);
                 calibrated = true;
 
                 println!(
                     "\n--- Calibration Complete ({} blocks) ---",
                     metrics_buffer.len()
                 );
+                println!("  Method:          {:?}", cost_model.source);
                 println!("  Static Overhead: {:.2?}", cost_model.static_overhead);
                 println!(
                     "  Cost per Byte:   {:.2} µs",
@@ -290,16 +340,7 @@ fn main() -> Result<()> {
                         m.apply_heuristic();
                     }
 
-                    // Accumulate stats
-                    total_blocks += 1;
-                    total_txs += m.transactions.len() as u64;
-                    total_duration += m.total_duration;
-                    total_setup += m.setup_duration;
-                    total_exec += m.execution_duration;
-                    total_commit += m.commit_duration;
-                    total_runtime += m.total_clarity_cost.runtime;
-                    total_write_len += m.total_clarity_cost.write_length;
-                    total_read_len += m.total_clarity_cost.read_length;
+                    accumulator.add(m); // Accumulate
 
                     // Calculate static % for this block
                     let static_pct = if m.commit_duration.as_secs_f64() > 0.0 {
@@ -315,8 +356,9 @@ fn main() -> Result<()> {
                         static_pct
                     );
 
-                    let buffered_block = &selected_blocks[i - buffer_len + j + 1];
-                    save_metrics_to_db(&mut app_db, run_model.id, buffered_block, m)?;
+                    // Use the buffered block ID to save metrics
+                    let buffered_id = &block_ids[i - buffer_len + j + 1];
+                    app_db.save_block_metrics(run_model.id, buffered_id, m)?;
                 }
                 metrics_buffer.clear();
             }
@@ -327,16 +369,7 @@ fn main() -> Result<()> {
                 metrics.apply_heuristic();
             }
 
-            // Accumulate stats
-            total_blocks += 1;
-            total_txs += metrics.transactions.len() as u64;
-            total_duration += metrics.total_duration;
-            total_setup += metrics.setup_duration;
-            total_exec += metrics.execution_duration;
-            total_commit += metrics.commit_duration;
-            total_runtime += metrics.total_clarity_cost.runtime;
-            total_write_len += metrics.total_clarity_cost.write_length;
-            total_read_len += metrics.total_clarity_cost.read_length;
+            accumulator.add(&metrics); // Accumulate
 
             let static_pct = if metrics.commit_duration.as_secs_f64() > 0.0 {
                 (metrics.commit_overhead_baseline.as_secs_f64()
@@ -349,7 +382,7 @@ fn main() -> Result<()> {
                 "  Execution Metrics: {:?} (Static Commit: {:.1}%)",
                 metrics, static_pct
             );
-            save_metrics_to_db(&mut app_db, run_model.id, block, &metrics)?;
+            app_db.save_block_metrics(run_model.id, &block.id, &metrics)?;
         }
     }
     let duration = start.elapsed();
@@ -359,43 +392,7 @@ fn main() -> Result<()> {
 
     println!("Re-executed {selected_block_count} blocks in {duration:.2?}");
 
-    if total_blocks > 0 {
-        println!("\n========================================");
-        println!("           BENCHMARK SUMMARY            ");
-        println!("========================================");
-        println!("Total Blocks:       {}", total_blocks);
-        println!("Total Transactions: {}", total_txs);
-        println!("Total Duration:     {:.2?}", total_duration);
-        println!("  - Setup:          {:.2?}", total_setup);
-        println!("  - Execution:      {:.2?}", total_exec);
-        println!("  - Commit:         {:.2?}", total_commit);
-        println!("Total Clarity Runtime:  {}", total_runtime);
-        println!("Total Write Length:     {} bytes", total_write_len);
-        println!("Total Read Length:      {} bytes", total_read_len);
-
-        let avg_duration = total_duration / total_blocks as u32;
-        let avg_setup = total_setup / total_blocks as u32;
-        let avg_exec = total_exec / total_blocks as u32;
-        let avg_commit = total_commit / total_blocks as u32;
-        let avg_txs = total_txs as f64 / total_blocks as f64;
-
-        println!("\nAverages per Block:");
-        println!("  Duration:         {:.2?}", avg_duration);
-        println!("  Setup:            {:.2?}", avg_setup);
-        println!("  Execution:        {:.2?}", avg_exec);
-        println!("  Commit:           {:.2?}", avg_commit);
-        println!("  Transactions:     {:.1}", avg_txs);
-        println!("  Clarity Runtime:  {}", total_runtime / total_blocks);
-        println!(
-            "  Write Length:     {} bytes",
-            total_write_len / total_blocks
-        );
-        println!(
-            "  Read Length:      {} bytes",
-            total_read_len / total_blocks
-        );
-        println!("========================================\n");
-    }
+    accumulator.print_summary(); // Print summary
 
     // Give the OS a moment to sync metadata
     std::thread::sleep(Duration::from_millis(100));
@@ -417,59 +414,6 @@ fn main() -> Result<()> {
     let profile_results = Profiler::take_results();
     let root_results = profile_results.first().unwrap();
     root_results.print_tree();
-
-    Ok(())
-}
-
-// Helper to save metrics to DB
-fn save_metrics_to_db(
-    app_db: &mut AppDb,
-    run_id: i32,
-    block: &stacks_bench::BlockSummary,
-    metrics: &stacks_bench::replay::BlockMetrics,
-) -> Result<()> {
-    // 1. Get/Create Block
-    let block_model = app_db.get_or_create_stacks_block(&block)?;
-
-    // 2. Create Block Stats
-    let block_stats = models::NewStacksBlockStats {
-        benchmark_run_id: run_id,
-        stacks_block_id: block_model.id,
-        total_duration_us: metrics.total_duration.as_micros() as i32,
-        setup_duration_us: metrics.setup_duration.as_micros() as i32,
-        execution_duration_us: metrics.execution_duration.as_micros() as i32,
-        commit_duration_us: metrics.commit_duration.as_micros() as i32,
-        commit_overhead_baseline_us: metrics.commit_overhead_baseline.as_micros() as i32,
-        clarity_write_length: metrics.total_clarity_cost.write_length as i32,
-        clarity_write_count: metrics.total_clarity_cost.write_count as i32,
-        clarity_read_length: metrics.total_clarity_cost.read_length as i32,
-        clarity_read_count: metrics.total_clarity_cost.read_count as i32,
-        clarity_runtime: metrics.total_clarity_cost.runtime as i32,
-    };
-    app_db.insert_stacks_block_stats(&[block_stats])?;
-
-    // 3. Create Tx Stats
-    let mut tx_stats_batch = Vec::with_capacity(metrics.transactions.len());
-    for tx_metric in &metrics.transactions {
-        let tx_hash_bytes =
-            hex::decode(&tx_metric.txid).map_err(|e| anyhow!("Invalid hex in txid: {}", e))?;
-
-        // We don't have tx type in metrics yet, using "unknown"
-        let tx_model = app_db.get_or_create_stacks_tx(block_model.id, &tx_hash_bytes, "unknown")?;
-
-        tx_stats_batch.push(models::NewStacksTxStats {
-            benchmark_run_id: run_id,
-            stacks_tx_id: tx_model.id,
-            duration_us: tx_metric.duration.as_micros() as i32,
-            estimated_commit_impact_us: tx_metric.estimated_commit_impact.as_micros() as i32,
-            clarity_write_length: tx_metric.cost.write_length as i32,
-            clarity_write_count: tx_metric.cost.write_count as i32,
-            clarity_read_length: tx_metric.cost.read_length as i32,
-            clarity_read_count: tx_metric.cost.read_count as i32,
-            clarity_runtime: tx_metric.cost.runtime as i32,
-        });
-    }
-    app_db.insert_stacks_tx_stats(&tx_stats_batch)?;
 
     Ok(())
 }

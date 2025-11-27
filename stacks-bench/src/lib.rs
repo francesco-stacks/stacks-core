@@ -15,6 +15,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 
 pub mod context;
 pub mod db;
+pub mod metrics;
 pub mod profiler;
 pub mod replay;
 pub mod shadow;
@@ -136,18 +137,18 @@ impl ResolveEpochFromHeight for [StacksEpoch] {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StacksBlockRef {
     Id(StacksBlockId),
-    Height(u32),
+    Height(u64),
 }
 
 impl FromStr for StacksBlockRef {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Ok(height) = s.parse::<u32>() {
+        if let Ok(height) = s.parse::<u64>() {
             Ok(Self::Height(height))
         } else if let Ok(block_id) = StacksBlockId::from_hex(s) {
             Ok(Self::Id(block_id))
         } else {
-            bail!("invalid block identifier: {s} (expected u32 height or hex block hash)")
+            bail!("invalid block identifier: {s} (expected u64 height or hex block hash)")
         }
     }
 }
@@ -162,7 +163,7 @@ impl std::fmt::Display for StacksBlockRef {
 }
 
 impl StacksBlockRef {
-    pub fn resolve_block_height(&self, chainstate: &StacksChainState) -> Result<u32> {
+    pub fn resolve_block_height(&self, chainstate: &StacksChainState) -> Result<u64> {
         match self {
             StacksBlockRef::Height(h) => Ok(*h),
             StacksBlockRef::Id(block_id) => {
@@ -175,7 +176,7 @@ impl StacksBlockRef {
                     .get_stacks_block_height(&consensus_hash, &header_hash)
                     .with_context(|| format!("lookup height for {block_id}"))?
                     .ok_or_else(|| anyhow!("missing height for {block_id}"))
-                    .map(|h| h as u32)
+                    .map(|h| h)
             }
         }
     }
@@ -261,7 +262,7 @@ pub enum BlockEra {
 #[derive(Debug, Clone)]
 pub struct BlockSummary {
     pub id: StacksBlockId,
-    pub height: u32,
+    pub height: u64,
     pub parent_id: StacksBlockId,
     pub burn_block_height: Option<u32>,
     pub burn_block_hash: Option<BurnchainHeaderHash>,
@@ -299,7 +300,7 @@ impl BlockSummary {
     pub fn new(
         id: StacksBlockId,
         parent_id: StacksBlockId,
-        height: u32,
+        height: u64,
         epoch: StacksEpochId,
     ) -> Self {
         BlockSummary {
@@ -359,7 +360,7 @@ impl BlockChain {
     }
 
     /// Get block by its height, if one exists.
-    pub fn get_block_by_height(&self, height: u32) -> Option<&BlockSummary> {
+    pub fn get_block_by_height(&self, height: u64) -> Option<&BlockSummary> {
         self.0.iter().find(|b| b.height == height)
     }
 
@@ -382,7 +383,7 @@ impl BlockChain {
     /// - If the clamped start > end, returns an empty chain.
     ///
     /// Returns an owned BlockChain (copies the selected window).
-    pub fn clamp_by_height_range<R: RangeBounds<u32>>(&self, range: R) -> Self {
+    pub fn clamp_by_height_range<R: RangeBounds<u64>>(&self, range: R) -> Self {
         let asc = &self.0;
         if asc.is_empty() {
             return Self(Vec::new());
@@ -395,7 +396,7 @@ impl BlockChain {
 
     /// Clamp by optional inclusive start/end heights (convenience).
     /// Equivalent to clamp_by_height_range(start..=end), with None unbounded.
-    pub fn clamp_by_height(&self, start: Option<u32>, end: Option<u32>) -> Self {
+    pub fn clamp_by_height(&self, start: Option<u64>, end: Option<u64>) -> Self {
         let start_bound = start.map_or(Bound::Unbounded, Bound::Included);
         let end_bound = end.map_or(Bound::Unbounded, Bound::Included);
         self.clamp_by_height_range((start_bound, end_bound))
@@ -403,7 +404,7 @@ impl BlockChain {
 
     /// Borrowed slice view of a clamped height range (no allocation).
     /// Returns an empty slice if out-of-range after clamping.
-    pub fn slice_by_height_range_clamped<R: RangeBounds<u32>>(&self, range: R) -> &[BlockSummary] {
+    pub fn slice_by_height_range_clamped<R: RangeBounds<u64>>(&self, range: R) -> &[BlockSummary] {
         let asc = &self.0;
         if asc.is_empty() {
             return &asc[0..0];
@@ -415,7 +416,7 @@ impl BlockChain {
     }
 
     /// Internal: compute clamped [start,end] indices for a height range.
-    fn clamp_indices_for_height_range<R: RangeBounds<u32>>(
+    fn clamp_indices_for_height_range<R: RangeBounds<u64>>(
         asc: &[BlockSummary],
         range: R,
     ) -> Option<(usize, usize)> {
@@ -522,13 +523,13 @@ mod tests {
     use super::*;
 
     /// Test helper to create a [`Block`] with the specified height.
-    fn mk_block(height: u32) -> BlockSummary {
+    fn mk_block(height: u64) -> BlockSummary {
         let id = StacksBlockId::first_mined();
         BlockSummary::new(id.clone(), id, height, StacksEpochId::Epoch10)
     }
 
     /// Test helper to create a [`BlockChain`] from a list of heights.
-    fn mk_chain(heights: &[u32]) -> BlockChain {
+    fn mk_chain(heights: &[u64]) -> BlockChain {
         let blocks = heights.iter().copied().map(mk_block);
         BlockChain::new_ascending(blocks)
     }
@@ -557,7 +558,7 @@ mod tests {
     fn clamp_bounds_are_clamped_to_existing() {
         let chain = mk_chain(&[100, 200, 300]);
         // Below min and above max should clamp to [100, 300]
-        let selected = chain.clamp_by_height_range(0..=u32::MAX);
+        let selected = chain.clamp_by_height_range(0..=u64::MAX);
         assert_eq!(
             selected
                 .as_ref()
@@ -579,7 +580,7 @@ mod tests {
         );
 
         // Start inside, end above max
-        let selected = chain.clamp_by_height_range(200..=u32::MAX);
+        let selected = chain.clamp_by_height_range(200..=u64::MAX);
         assert_eq!(
             selected
                 .as_ref()

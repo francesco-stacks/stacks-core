@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use blockstack_lib::burnchains::Burnchain;
@@ -8,12 +8,12 @@ use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
 use blockstack_lib::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksChainState};
 use blockstack_lib::chainstate::stacks::index::marf::MARFOpenOpts;
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
-use clarity::types::StacksEpochId;
-use clarity::types::chainstate::StacksBlockId;
+use stacks_common::types::StacksEpochId;
+use stacks_common::types::chainstate::StacksBlockId;
 
 use crate::shadow::{ShadowDir, ShadowDirBuilder};
 use crate::{
-    BlockChain, BlockEra, BlockSummary, BlockTransactions, BurnChainPath, ChainStatePath, Network,
+    BlockEra, BlockSummary, BlockTransactions, BurnChainPath, ChainStatePath, Network,
     ResolveEpochFromHeight, StacksBlockRef, StacksEpoch,
 };
 
@@ -85,9 +85,9 @@ pub struct BenchContext {
     shadow_dir: ShadowDir,
     chainstate: StacksChainState,
     burnchain: Burnchain,
-    start_height: u32,
-    end_height: u32,
-    tip_height: u32,
+    start_height: u64,
+    end_height: u64,
+    tip_height: u64,
     tip_id: StacksBlockId,
     epochs: Vec<StacksEpoch>,
 }
@@ -117,8 +117,8 @@ impl BenchContext {
         self.shadow_dir.source()
     }
 
-    /// Returns the Stacks chain tip as a `(StacksBlockId, u32)`] tuple.
-    pub fn chain_tip(&self) -> (StacksBlockId, u32) {
+    /// Returns the Stacks chain tip as a `(StacksBlockId, u64)`] tuple.
+    pub fn chain_tip(&self) -> (StacksBlockId, u64) {
         (self.tip_id.clone(), self.tip_height)
     }
 
@@ -128,6 +128,11 @@ impl BenchContext {
         } else {
             BlockEra::PreNakamoto
         }
+    }
+
+    /// Returns the target block range as `(start_height, end_height)`.
+    pub fn block_height_range(&self) -> Result<(u64, u64)> {
+        Ok((self.start_height, self.end_height))
     }
 
     pub fn with_databases_mut<F, R>(&mut self, func: F) -> Result<R>
@@ -172,26 +177,67 @@ impl BenchContext {
             Some(marf_opts),
         )?;
 
+        // 1. Get Node Tip (Global)
         println!("Getting canonical stacks tip block id directly from sortdb");
-        let tip_id = sortition_db.get_canonical_stacks_tip_block_id();
-        let tip_header = NakamotoChainState::get_block_header(chainstate.db(), &tip_id)?
+        let node_tip_id = sortition_db.get_canonical_stacks_tip_block_id();
+        let node_tip_header = NakamotoChainState::get_block_header(chainstate.db(), &node_tip_id)?
             .ok_or(anyhow!("Failed to get tip block header"))?;
-        let tip_height = tip_header.stacks_block_height as u32;
+        let node_tip_height = node_tip_header.stacks_block_height;
 
-        // Resolve height bounds before walking
+        // 2. Determine Effective Tip (Benchmark End)
+        // If an end block is specified, we treat THAT as the tip for this session.
+        // This allows us to benchmark forks or specific historical segments easily.
+        let (tip_id, tip_height) = match &opts.end_at {
+            Some(StacksBlockRef::Id(id)) => {
+                let header = NakamotoChainState::get_block_header(chainstate.db(), id)?
+                    .ok_or_else(|| anyhow!("Block {} not found", id))?;
+                (id.clone(), header.stacks_block_height)
+            }
+            Some(StacksBlockRef::Height(h)) => {
+                let h = *h;
+                if h > node_tip_height {
+                    bail!(
+                        "Requested end height {} is beyond node tip {}",
+                        h,
+                        node_tip_height
+                    );
+                }
+
+                if h == node_tip_height {
+                    (node_tip_id, node_tip_height)
+                } else {
+                    // Walk back from node tip to find the canonical block at height h
+                    println!(
+                        "Resolving canonical block at height {} (walking back from {})...",
+                        h, node_tip_height
+                    );
+                    let mut curr = node_tip_id.clone();
+                    let mut curr_h = node_tip_height;
+
+                    while curr_h > h {
+                        let header = NakamotoChainState::get_block_header(chainstate.db(), &curr)?
+                            .ok_or_else(|| anyhow!("Missing header for {}", curr))?;
+
+                        curr = match header.anchored_header {
+                            StacksBlockHeaderTypes::Epoch2(_) => chainstate.get_parent(&curr)?,
+                            StacksBlockHeaderTypes::Nakamoto(n) => n.parent_block_id,
+                        };
+                        curr_h -= 1;
+                    }
+                    (curr, h)
+                }
+            }
+            None => (node_tip_id, node_tip_height),
+        };
+
+        // 3. Resolve Start Height
         let start_height = match &opts.start_at {
             Some(block_ref) => block_ref.resolve_block_height(&chainstate)?,
             None => 1, // genesis height
         };
-        let mut end_height = match &opts.end_at {
-            Some(block_ref) => block_ref.resolve_block_height(&chainstate)?,
-            None => tip_height,
-        };
-        if start_height > end_height {
-            bail!("start height ({start_height}) > end height ({end_height})");
-        }
-        if end_height > tip_height {
-            end_height = tip_height;
+
+        if start_height > tip_height {
+            bail!("start height ({start_height}) > end height ({tip_height})");
         }
 
         Ok(Self {
@@ -200,38 +246,11 @@ impl BenchContext {
             chainstate,
             burnchain,
             start_height,
-            end_height,
-            tip_height,
-            tip_id,
+            end_height: tip_height, // end_height is the benchmark tip height
+            tip_height,             // tip_height is now the benchmark tip height
+            tip_id,                 // tip_id is now the benchmark tip ID
             epochs: opts.epochs,
         })
-    }
-
-    pub fn select_blocks(&self) -> Result<BlockChain> {
-        let sortition_db = self.burnchain().open_sortition_db(false)?;
-
-        println!(
-            "Building canonical chain window [{start_height}, {end_height}] (tip at {tip_height})...",
-            start_height = self.start_height,
-            end_height = self.end_height,
-            tip_height = self.tip_height,
-        );
-        let blocks = collect_canonical_range(
-            &self.chainstate,
-            &sortition_db,
-            &self.tip_id,
-            self.start_height,
-            self.end_height,
-            &self.epochs,
-        )?;
-        println!(
-            "Collected {} canonical blocks ({}..={})",
-            blocks.len(),
-            blocks.first().map(|b| b.height).unwrap_or(0),
-            blocks.last().map(|b| b.height).unwrap_or(0)
-        );
-
-        Ok(BlockChain::new_ascending(blocks))
     }
 
     pub fn calculate_storage_delta(&self) -> Result<(i64, u64)> {
@@ -239,167 +258,140 @@ impl BenchContext {
             .calculate_storage_delta()
             .context("Failed to calculate storage delta")
     }
-}
 
-/// Collect canonical blocks within `[start_height, end_height]` inclusive, in ascending order.
-/// Walks from tip down and breaks once below `start_height`. Prints periodic status.
-fn collect_canonical_range(
-    chainstate: &StacksChainState,
-    sortition_db: &SortitionDB,
-    tip_id: &StacksBlockId,
-    start_height: u32,
-    end_height: u32,
-    epochs: &[StacksEpoch],
-) -> Result<Vec<BlockSummary>> {
-    let mut current = tip_id.clone();
-    let mut out_desc = Vec::new();
+    /// Returns an iterator over canonical blocks in the range [start_height, end_height].
+    /// The iterator yields blocks in descending order (from end_height down to start_height).
+    /// This is efficient because it follows parent links from the tip.
+    pub fn canonical_block_stream(
+        &self,
+        start_height: u32,
+        end_height: u32,
+    ) -> impl Iterator<Item = Result<BlockSummary>> + '_ {
+        let start_height = start_height as u64;
+        let end_height = end_height as u64;
 
-    let started = Instant::now();
-    let mut last_report = started;
-    let report_every = Duration::from_secs(1);
-    let mut headers_seen = 0;
-    let mut txs_seen = 0;
+        let mut current_id = self.tip_id.clone();
+        // We'll lazily initialize the sortition DB to avoid keeping it open if not needed immediately,
+        // but for an iterator we need it.
+        let sortition_db = self
+            .burnchain
+            .open_sortition_db(false)
+            .expect("Failed to open sortition DB");
 
-    // Track collected window stats
-    let mut collected_min: Option<u32> = None;
-    let mut collected_max: Option<u32> = None;
+        std::iter::from_fn(move || {
+            loop {
+                // 1. Get Header
+                // Note: NakamotoChainState::get_block_header returns Result<Option<Header>>
+                let header_res =
+                    NakamotoChainState::get_block_header(self.chainstate.db(), &current_id);
+                let header = match header_res {
+                    Ok(Some(h)) => h,
+                    Ok(None) => return Some(Err(anyhow!("Missing header for {}", current_id))),
+                    Err(e) => return Some(Err(anyhow!("DB error: {}", e))),
+                };
 
-    eprintln!(
-        "Scanning canonical chain downwards, target window [{}, {}]...",
-        start_height, end_height
-    );
+                let current_height = header.stacks_block_height;
 
-    loop {
-        if current == StacksBlockId::first_mined() {
-            break;
-        }
-        let current_header = NakamotoChainState::get_block_header(chainstate.db(), &current)?
-            .ok_or_else(|| anyhow!("Could not find block header for {current}"))?;
-
-        // Extract block, parent, AND the consensus hash (tenure ID) from the header
-        let (mut block, consensus_hash) = match &current_header.anchored_header {
-            StacksBlockHeaderTypes::Epoch2(_) => {
-                let block_id = current_header.index_block_hash();
-                debug_assert_eq!(block_id, current);
-
-                let parent = chainstate
-                    .get_parent(&current)
-                    .with_context(|| format!("get_parent({current})"))?;
-
-                // For Pre-Nakamoto, we must look up the consensus hash from the index
-                let (consensus_hash, header_hash) = chainstate
-                    .get_block_header_hashes(&current)
-                    .with_context(|| format!("get_block_header_hashes({current})"))?
-                    .ok_or_else(|| anyhow!("missing hashes for {current}"))?;
-
-                let height = chainstate
-                    .get_stacks_block_height(&consensus_hash, &header_hash)
-                    .with_context(|| format!("get_stacks_block_height({current})"))?
-                    .ok_or_else(|| anyhow!("missing height for {current}"))?
-                    as u32;
-
-                let epoch = epochs.resolve_stacks_epoch(height.into()).ok_or_else(|| {
-                    anyhow!("Could not resolve epoch for block at height {height}")
-                })?;
-
-                (
-                    BlockSummary::new(current.clone(), parent.clone(), height, epoch),
-                    //parent,
-                    consensus_hash,
-                )
-            }
-            StacksBlockHeaderTypes::Nakamoto(header) => {
-                let height = header.chain_length;
-                let epoch = epochs.resolve_stacks_epoch(height).ok_or_else(|| {
-                    anyhow!("Could not resolve epoch for block at height {height}")
-                })?;
-
-                (
-                    BlockSummary::new(
-                        header.block_id(),
-                        header.parent_block_id.clone(),
-                        header.chain_length as u32,
-                        epoch,
-                    ),
-                    header.consensus_hash.clone(),
-                )
-            }
-        };
-
-        let parent_id = block.parent_id.clone();
-        let height = block.height;
-
-        if height < start_height {
-            break;
-        }
-        if height <= end_height {
-            // 1. Resolve Burn Info using the extracted consensus_hash
-            let snapshot =
-                SortitionDB::get_block_snapshot_consensus(sortition_db.conn(), &consensus_hash)
-                    .map_err(|e| anyhow!("SortitionDB error: {e}"))?
-                    .ok_or_else(|| {
-                        anyhow!("Consensus hash {consensus_hash} not found in SortitionDB")
-                    })?;
-
-            block = block.with_burn_info(snapshot.block_height as u32, snapshot.burn_header_hash);
-            let epoch = epochs
-                .resolve_stacks_epoch(height.into())
-                .ok_or_else(|| anyhow!("Could not resolve epoch for block at height {height}"))?;
-
-            // 2. Attach transactions (only for in-range blocks)
-            let txs = BlockTransactions::load(chainstate, epoch, &block)
-                .with_context(|| format!("load transactions for {}", block.id))?;
-            txs_seen += txs.len();
-
-            out_desc.push(block.with_transactions(txs));
-
-            // Update collected window stats
-            collected_max = match collected_max {
-                None => Some(height),
-                Some(prev) => Some(prev.max(height)),
-            };
-            collected_min = match collected_min {
-                None => Some(height),
-                Some(prev) => Some(prev.min(height)),
-            };
-        }
-
-        headers_seen += 1;
-        if last_report.elapsed() >= report_every {
-            let elapsed = started.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 {
-                headers_seen as f64 / elapsed
-            } else {
-                0.0
-            };
-            match (collected_min, collected_max) {
-                (Some(lo), Some(hi)) => {
-                    eprintln!(
-                        "  scanned {headers_seen:>8} headers in {elapsed:>6.2}s ({rate:>7.2} hdr/s), current height: {height:>8}, collected: [{lo}..={hi}] ({} blocks, {txs_seen} txs)",
-                        out_desc.len()
-                    );
+                if current_height < start_height {
+                    return None;
                 }
-                _ => {
-                    eprintln!(
-                        "  scanned {headers_seen:>8} headers in {elapsed:>6.2}s ({rate:>7.2} hdr/s), current height: {height:>8}, (not yet within collection window)",
-                    );
-                }
-            }
-            last_report = Instant::now();
-        }
 
-        current = parent_id;
+                // 2. Resolve BlockSummary
+                let (summary, consensus_hash) = match &header.anchored_header {
+                    StacksBlockHeaderTypes::Epoch2(_) => {
+                        let parent_res = self.chainstate.get_parent(&current_id);
+                        let parent = match parent_res {
+                            Ok(p) => p,
+                            Err(e) => return Some(Err(anyhow!("Failed to get parent: {}", e))),
+                        };
+
+                        let hashes_res = self.chainstate.get_block_header_hashes(&current_id);
+                        let (consensus_hash, _) = match hashes_res {
+                            Ok(Some(h)) => h,
+                            Ok(None) => {
+                                return Some(Err(anyhow!("Missing hashes for {}", current_id)));
+                            }
+                            Err(e) => return Some(Err(anyhow!("DB error: {}", e))),
+                        };
+
+                        let epoch = match self.epochs.resolve_stacks_epoch(current_height) {
+                            Some(e) => e,
+                            None => {
+                                return Some(Err(anyhow!(
+                                    "Unknown epoch for height {}",
+                                    current_height
+                                )));
+                            }
+                        };
+
+                        (
+                            BlockSummary::new(current_id.clone(), parent, current_height, epoch),
+                            consensus_hash,
+                        )
+                    }
+                    StacksBlockHeaderTypes::Nakamoto(h) => {
+                        let epoch = match self.epochs.resolve_stacks_epoch(current_height) {
+                            Some(e) => e,
+                            None => {
+                                return Some(Err(anyhow!(
+                                    "Unknown epoch for height {}",
+                                    current_height
+                                )));
+                            }
+                        };
+                        (
+                            BlockSummary::new(
+                                h.block_id(),
+                                h.parent_block_id.clone(),
+                                h.chain_length,
+                                epoch,
+                            ),
+                            h.consensus_hash.clone(),
+                        )
+                    }
+                };
+
+                // Prepare next ID
+                let parent_id = summary.parent_id.clone();
+                let should_yield = current_height <= end_height;
+
+                current_id = parent_id;
+
+                if should_yield {
+                    let snapshot_res = SortitionDB::get_block_snapshot_consensus(
+                        sortition_db.conn(),
+                        &consensus_hash,
+                    );
+                    let snapshot = match snapshot_res {
+                        Ok(Some(s)) => s,
+                        Ok(None) => {
+                            return Some(Err(anyhow!(
+                                "Consensus hash {} not found in SortitionDB",
+                                consensus_hash
+                            )));
+                        }
+                        Err(e) => return Some(Err(anyhow!("SortitionDB error: {}", e))),
+                    };
+
+                    let summary = summary
+                        .with_burn_info(snapshot.block_height as u32, snapshot.burn_header_hash);
+
+                    let txs_res =
+                        BlockTransactions::load(&self.chainstate, summary.epoch, &summary);
+                    let txs = match txs_res {
+                        Ok(t) => t,
+                        Err(e) => return Some(Err(anyhow!("Failed to load txs: {}", e))),
+                    };
+
+                    println!(
+                        "canonical_block_stream: Yielding block at height {}",
+                        summary.height
+                    );
+                    return Some(Ok(summary.with_transactions(txs)));
+                }
+
+                // If not yielding (because we are above end_height), loop continues to walk back
+            }
+        })
     }
-
-    out_desc.reverse();
-
-    let elapsed = started.elapsed().as_secs_f64();
-    eprintln!(
-        "Done. Selected {} blocks [{}..={}] in {elapsed:.2}s",
-        out_desc.len(),
-        out_desc.first().map(|b| b.height).unwrap_or(0),
-        out_desc.last().map(|b| b.height).unwrap_or(0),
-    );
-
-    Ok(out_desc)
 }

@@ -1,12 +1,13 @@
 use anyhow::Result;
 use chrono::NaiveDateTime;
-use clarity::types::StacksEpochId;
 use diesel::prelude::*;
+use stacks_common::types::StacksEpochId;
 
 use super::schema::{
-    benchmark_run, burn_block, chainstate, epoch, network, stacks_block, stacks_block_stats,
-    stacks_tx, stacks_tx_stats,
+    _staged_stacks_block, _staged_stacks_tx, benchmark_run, burn_block, chainstate, epoch, network,
+    stacks_block, stacks_block_stats, stacks_tx, stacks_tx_stats,
 };
+use crate::ResolveEpochFromHeight;
 
 #[derive(Queryable, Selectable, Identifiable, Debug, Clone)]
 #[diesel(table_name = network)]
@@ -68,6 +69,20 @@ impl Epoch {
     }
 }
 
+impl ResolveEpochFromHeight for [Epoch] {
+    fn resolve_stacks_epoch(&self, height: u64) -> Option<StacksEpochId> {
+        let height_i64: i64 = height.try_into().ok()?;
+        for epoch in self {
+            if height_i64 >= epoch.start_height && height_i64 <= epoch.end_height {
+                let epoch_id_u32: u32 = epoch.stacks_epoch_id.try_into().ok()?;
+                let stacks_epoch_id: StacksEpochId = epoch_id_u32.try_into().ok()?;
+                return Some(stacks_epoch_id);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Insertable, Debug, Clone)]
 #[diesel(table_name = epoch)]
 pub struct NewEpoch {
@@ -118,12 +133,30 @@ pub struct NewStacksBlock {
     pub burn_block_id: i64,
 }
 
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = _staged_stacks_block)]
+pub struct StagedStacksBlock {
+    pub index_hash: Vec<u8>,
+    pub parent_index_hash: Vec<u8>,
+    pub height: i64,
+    pub burn_block_hash: Vec<u8>,
+    pub burn_block_height: i64,
+}
+
 #[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(StacksBlock))]
 #[diesel(table_name = stacks_tx)]
 pub struct StacksTx {
     pub id: i64,
     pub stacks_block_id: i64,
+    pub tx_hash: Vec<u8>,
+    pub tx_type: String,
+}
+
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = _staged_stacks_tx)]
+pub struct StagedStacksTx {
+    pub block_index_hash: Vec<u8>,
     pub tx_hash: Vec<u8>,
     pub tx_type: String,
 }

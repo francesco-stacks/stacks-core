@@ -1,13 +1,14 @@
 use anyhow::Result;
-use clarity::types::StacksEpochId;
 use diesel::backend::Backend;
 use diesel::deserialize::{self, FromSql, FromSqlRow};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
 use diesel::sqlite::Sqlite;
 use serde::Deserialize;
+use stacks_common::types::StacksEpochId;
 
 use super::schema;
+use crate::ResolveEpochFromHeight;
 
 #[derive(Debug, Deserialize, Clone, FromSqlRow)]
 pub struct ExecutionCost {
@@ -69,5 +70,19 @@ impl TryFrom<&Epoch> for crate::StacksEpoch {
             start_block_height: epoch.start_block_height(),
             end_block_height: epoch.end_block_height(),
         })
+    }
+}
+
+impl ResolveEpochFromHeight for [Epoch] {
+    fn resolve_stacks_epoch(&self, height: u64) -> Option<StacksEpochId> {
+        let height_i64: i64 = height.try_into().ok()?;
+        for epoch in self {
+            if height_i64 >= epoch.start_block_height && height_i64 <= epoch.end_block_height {
+                let epoch_id_u32: u32 = epoch.epoch_id.try_into().ok()?;
+                let stacks_epoch_id: StacksEpochId = epoch_id_u32.try_into().ok()?;
+                return Some(stacks_epoch_id);
+            }
+        }
+        None
     }
 }

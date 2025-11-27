@@ -1,19 +1,26 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
+use blockstack_lib::chainstate::stacks::index::ClarityMarfTrieId;
 use chrono::NaiveDateTime;
-use clarity::types::chainstate::StacksBlockId;
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
+use diesel::sql_types::Binary;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use sha2::{Digest, Sha256};
+use stacks_common::types::chainstate::StacksBlockId;
 
-use crate::{BlockSummary, Network};
+use crate::metrics::BlockMetrics;
+use crate::{BlockSummary, Network, ResolveEpochFromHeight};
 
 pub mod models;
 pub mod schema;
 
 // This macro embeds the SQL files from the "migrations" directory into the binary
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+const MERGE_STAGING_SQL: &str = include_str!("merge_staging.sql");
 
 pub struct AppDb {
     conn: SqliteConnection,
@@ -34,6 +41,9 @@ impl AppDb {
         let mut conn = SqliteConnection::establish(database_url)
             .with_context(|| format!("Failed to connect to app DB at {}", database_url))?;
 
+        // Use WAL mode
+        diesel::sql_query("PRAGMA journal_mode=WAL").execute(&mut conn)?;
+
         // 1. Run Migrations (Create tables if they don't exist)
         // This will automatically apply the SQL defined in step 2
         conn.run_pending_migrations(MIGRATIONS)
@@ -42,10 +52,21 @@ impl AppDb {
         // 2. Ensure foreign keys are enforced (SQLite defaults to OFF)
         diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut conn)?;
 
-        // Ensure foreign keys are enforced
-        diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut conn)?;
-
         Ok(AppDb { conn })
+    }
+
+    pub fn checkpoint(&mut self) -> Result<()> {
+        diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&mut self.conn)
+            .context("Failed to perform WAL checkpoint")?;
+        Ok(())
+    }
+
+    pub fn vacuum(&mut self) -> Result<()> {
+        diesel::sql_query("VACUUM")
+            .execute(&mut self.conn)
+            .context("Failed to vacuum the database")?;
+        Ok(())
     }
 
     /// Maps the Network enum to the static IDs defined in the initial migration.
@@ -63,7 +84,7 @@ impl AppDb {
         network: Network,
         chain_id: u32,
         tip_block_id: &StacksBlockId,
-        tip_height: u32,
+        tip_height: u64,
         source_epochs: &[crate::db::node::sortition::models::Epoch],
     ) -> Result<(models::Chainstate, Vec<models::Epoch>)> {
         use self::schema::{chainstate, epoch};
@@ -174,7 +195,7 @@ impl AppDb {
     ) -> Result<models::StacksBlock> {
         use self::schema::stacks_block::dsl;
 
-        let height_i64: i64 = block.height.into();
+        let height_i64: i64 = block.height.try_into()?;
 
         // 1. Resolve Burn Block ID
         let burn_hash = block
@@ -297,6 +318,300 @@ impl AppDb {
                 .context("Failed to insert stacks tx stats chunk")?;
         }
         Ok(())
+    }
+
+    /// Retrieves the internal DB ID for a Stacks block by its hash.
+    pub fn get_stacks_block_id(&mut self, block_id: &StacksBlockId) -> Result<i64> {
+        use self::schema::stacks_block::dsl;
+        dsl::stacks_block
+            .select(dsl::id)
+            .filter(dsl::index_hash.eq(block_id.as_bytes()))
+            .first(&mut self.conn)
+            .optional()?
+            .ok_or_else(|| anyhow!("Stacks block not found in DB"))
+    }
+
+    /// Saves execution metrics for a block and its transactions.
+    /// Assumes the block and transactions have already been indexed.
+    pub fn save_block_metrics(
+        &mut self,
+        run_id: i32,
+        block_id: &StacksBlockId,
+        metrics: &BlockMetrics,
+    ) -> Result<()> {
+        use self::schema::stacks_tx::dsl as tx_dsl;
+
+        // 1. Get Block ID
+        let block_id = self.get_stacks_block_id(block_id)?;
+
+        // 2. Insert Block Stats
+        let block_stats = models::NewStacksBlockStats {
+            benchmark_run_id: run_id,
+            stacks_block_id: block_id,
+            total_duration_us: metrics.total_duration.as_micros() as i32,
+            setup_duration_us: metrics.setup_duration.as_micros() as i32,
+            execution_duration_us: metrics.execution_duration.as_micros() as i32,
+            commit_duration_us: metrics.commit_duration.as_micros() as i32,
+            commit_overhead_baseline_us: metrics.commit_overhead_baseline.as_micros() as i32,
+            clarity_write_length: metrics.total_clarity_cost.write_length as i32,
+            clarity_write_count: metrics.total_clarity_cost.write_count as i32,
+            clarity_read_length: metrics.total_clarity_cost.read_length as i32,
+            clarity_read_count: metrics.total_clarity_cost.read_count as i32,
+            clarity_runtime: metrics.total_clarity_cost.runtime as i32,
+        };
+        self.insert_stacks_block_stats(&[block_stats])?;
+
+        // 3. Insert Tx Stats
+        // Optimization: Fetch all tx IDs for this block in one query to avoid N lookups
+        let tx_map: HashMap<Vec<u8>, i64> = tx_dsl::stacks_tx
+            .select((tx_dsl::tx_hash, tx_dsl::id))
+            .filter(tx_dsl::stacks_block_id.eq(block_id))
+            .load::<(Vec<u8>, i64)>(&mut self.conn)?
+            .into_iter()
+            .collect();
+
+        let mut tx_stats_batch = Vec::with_capacity(metrics.transactions.len());
+        for tx_metric in &metrics.transactions {
+            let tx_hash_bytes =
+                hex::decode(&tx_metric.txid).map_err(|e| anyhow!("Invalid hex in txid: {}", e))?;
+
+            if let Some(&tx_id) = tx_map.get(&tx_hash_bytes) {
+                tx_stats_batch.push(models::NewStacksTxStats {
+                    benchmark_run_id: run_id,
+                    stacks_tx_id: tx_id,
+                    duration_us: tx_metric.duration.as_micros() as i32,
+                    estimated_commit_impact_us: tx_metric.estimated_commit_impact.as_micros()
+                        as i32,
+                    clarity_write_length: tx_metric.cost.write_length as i32,
+                    clarity_write_count: tx_metric.cost.write_count as i32,
+                    clarity_read_length: tx_metric.cost.read_length as i32,
+                    clarity_read_count: tx_metric.cost.read_count as i32,
+                    clarity_runtime: tx_metric.cost.runtime as i32,
+                });
+            }
+        }
+
+        if !tx_stats_batch.is_empty() {
+            self.insert_stacks_tx_stats(&tx_stats_batch)?;
+        }
+
+        Ok(())
+    }
+
+    /// Retrieves the ordered list of block IDs for the canonical chain segment.
+    /// This is lightweight and suitable for driving a lazy iterator.
+    pub fn get_chain_block_ids(
+        &mut self,
+        tip_index_hash: &StacksBlockId,
+        start_height: u32,
+        end_height: u32,
+    ) -> Result<Vec<StacksBlockId>> {
+        use diesel::sql_query;
+        use diesel::sql_types::{BigInt, Binary};
+
+        // Recursive CTE to walk backwards from tip, then order ascending
+        let query = r#"
+            WITH RECURSIVE chain(index_hash, height, parent_stacks_block_id) AS (
+                SELECT index_hash, height, parent_stacks_block_id
+                FROM stacks_block
+                WHERE index_hash = ?
+                UNION ALL
+                SELECT p.index_hash, p.height, p.parent_stacks_block_id
+                FROM stacks_block p
+                INNER JOIN chain c ON c.parent_stacks_block_id = p.id
+                WHERE c.height > ?
+            )
+            SELECT index_hash
+            FROM chain
+            WHERE height <= ? AND height >= ?
+            ORDER BY height ASC
+        "#;
+
+        #[derive(Debug, QueryableByName)]
+        struct RawId {
+            #[diesel(sql_type = Binary)]
+            index_hash: Vec<u8>,
+        }
+
+        let raw_ids: Vec<RawId> = sql_query(query)
+            .bind::<Binary, _>(tip_index_hash.as_bytes())
+            .bind::<BigInt, _>(start_height as i64)
+            .bind::<BigInt, _>(end_height as i64)
+            .bind::<BigInt, _>(start_height as i64)
+            .load(&mut self.conn)
+            .context("Failed to query chain block IDs")?;
+
+        let ids = raw_ids
+            .into_iter()
+            .map(|r| {
+                StacksBlockId::from_vec(&r.index_hash)
+                    .ok_or_else(|| anyhow!("Invalid hash in DB: {:?}", r.index_hash))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(ids)
+    }
+
+    /// Fetches a single block summary by ID, resolving parent and burn info.
+    pub fn get_block<EpochResolver>(
+        &mut self,
+        id: &StacksBlockId,
+        epochs: &EpochResolver,
+    ) -> Result<BlockSummary>
+    where
+        EpochResolver: ResolveEpochFromHeight + ?Sized,
+    {
+        use diesel::dsl::sql;
+
+        use self::schema::{burn_block, stacks_block};
+
+        // We need the block, its burn info, and its parent's hash.
+        // We use a subselect for the parent hash to avoid a complex self-join alias in Diesel DSL
+        let (height, burn_hash, burn_height, parent_hash) = stacks_block::dsl::stacks_block
+            .inner_join(burn_block::dsl::burn_block)
+            .select((
+                stacks_block::dsl::height,
+                burn_block::dsl::block_hash,
+                burn_block::dsl::height,
+                sql::<diesel::sql_types::Nullable<Binary>>("(SELECT index_hash FROM stacks_block p WHERE p.id = stacks_block.parent_stacks_block_id)"),
+            ))
+            .filter(stacks_block::dsl::index_hash.eq(id.as_bytes()))
+            .first::<(i64, Vec<u8>, i64, Option<Vec<u8>>)>(&mut self.conn)
+            .optional()?
+            .ok_or_else(|| anyhow!("Block {} not found in App DB", id))?;
+
+        let parent_id = if let Some(ph) = parent_hash {
+            StacksBlockId::from_vec(&ph)
+                .ok_or_else(|| anyhow!("Invalid parent hash in DB for block {id}: {ph:?}"))?
+        } else {
+            StacksBlockId::sentinel()
+        };
+
+        let epoch = epochs.resolve_stacks_epoch(height as u64).ok_or_else(|| {
+            anyhow!(
+                "Could not resolve epoch for block {} at height {}",
+                id,
+                height
+            )
+        })?;
+
+        let burn_hash_obj =
+            clarity::types::chainstate::BurnchainHeaderHash::from_vec(&burn_hash)
+                .ok_or_else(|| anyhow!("Invalid burn hash in DB for block {id}: {burn_hash:?}"))?;
+
+        Ok(
+            BlockSummary::new(id.clone(), parent_id, height as u64, epoch)
+                .with_burn_info(burn_height as u32, burn_hash_obj),
+        )
+    }
+
+    pub fn index_blocks_streaming<I>(&mut self, blocks: I) -> Result<()>
+    where
+        I: IntoIterator<Item = BlockSummary>,
+    {
+        use self::models::{StagedStacksBlock, StagedStacksTx};
+        use self::schema::{_staged_stacks_block, _staged_stacks_tx};
+
+        // 1. Process Iterator in Chunks
+        const CHUNK_SIZE: usize = 1000;
+        let mut block_count: u64 = 0;
+        let mut tx_count: u64 = 0;
+        let mut block_buffer = Vec::with_capacity(CHUNK_SIZE);
+        let mut tx_buffer = Vec::with_capacity(CHUNK_SIZE * 2000);
+
+        let flush = |conn: &mut SqliteConnection,
+                     blocks: &mut Vec<StagedStacksBlock>,
+                     txs: &mut Vec<StagedStacksTx>|
+         -> Result<()> {
+            println!(
+                "Flushing {} blocks and {} txs to staging tables",
+                blocks.len(),
+                txs.len()
+            );
+            if !blocks.is_empty() {
+                diesel::insert_into(_staged_stacks_block::table)
+                    .values(&*blocks)
+                    .execute(conn)?;
+                blocks.clear();
+            }
+            if !txs.is_empty() {
+                for chunk in txs.chunks(2000) {
+                    diesel::insert_into(_staged_stacks_tx::table)
+                        .values(chunk)
+                        .execute(conn)?;
+                }
+                txs.clear();
+            }
+            Ok(())
+        };
+
+        self.conn.transaction::<_, anyhow::Error, _>(|conn| {
+            // 0. Truncate Staging Tables (Clean start)
+            println!("Truncating staging tables");
+            // Diesel optimizes delete without filter to TRUNCATE or equivalent
+            diesel::delete(_staged_stacks_block::table).execute(conn)?;
+            diesel::delete(_staged_stacks_tx::table).execute(conn)?;
+
+            println!("Beginning block indexing");
+            for block in blocks {
+                block_count += 1;
+                let burn_hash = block
+                    .burn_block_hash
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Block {} missing burn block hash", block.id))?;
+                let burn_height = block
+                    .burn_block_height
+                    .ok_or_else(|| anyhow!("Block {} missing burn block height", block.id))?;
+
+                block_buffer.push(StagedStacksBlock {
+                    index_hash: block.id.0.to_vec(),
+                    parent_index_hash: block.parent_id.0.to_vec(),
+                    height: block.height as i64,
+                    burn_block_hash: burn_hash.0.to_vec(),
+                    burn_block_height: burn_height as i64,
+                });
+
+                if let Some(txs) = block.transactions() {
+                    for tx in txs {
+                        tx_count += 1;
+                        tx_buffer.push(StagedStacksTx {
+                            block_index_hash: block.id.0.to_vec(),
+                            tx_hash: tx.txid().0.to_vec(),
+                            tx_type: "unknown".to_string(),
+                        });
+                    }
+                }
+
+                if block_buffer.len() >= CHUNK_SIZE {
+                    flush(conn, &mut block_buffer, &mut tx_buffer)?;
+                }
+            }
+            // Final flush
+            flush(conn, &mut block_buffer, &mut tx_buffer)?;
+
+            // 3. Execute Merge Logic
+            // We invoke the SQL script as if it were a stored procedure
+            println!("Merging staged data into main tables");
+            conn.batch_execute(MERGE_STAGING_SQL)
+                .context("Failed to execute merge_staging.sql")?;
+
+            // 4. Cleanup (Truncate again to save space)
+            println!("Cleaning up staging tables");
+            let deleted_staging_blocks =
+                diesel::delete(_staged_stacks_block::table).execute(conn)?;
+            let deleted_staging_transactions =
+                diesel::delete(_staged_stacks_tx::table).execute(conn)?;
+            println!(
+                "Deleted {} staged blocks and {} staged transactions",
+                deleted_staging_blocks, deleted_staging_transactions
+            );
+
+            println!(
+                "Indexing complete: {} blocks and {} txs indexed",
+                block_count, tx_count
+            );
+            Ok(())
+        })
     }
 
     /// Computes a deterministic hash of the epoch configuration.

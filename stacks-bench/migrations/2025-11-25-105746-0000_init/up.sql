@@ -50,6 +50,15 @@ CREATE TABLE stacks_block (
   CHECK(length(index_hash) = 32)
 );
 
+CREATE TABLE _staged_stacks_block (
+    index_hash BLOB PRIMARY KEY,
+    parent_index_hash BLOB NOT NULL,
+    height INTEGER NOT NULL,
+    burn_block_hash BLOB NOT NULL,
+    burn_block_height INTEGER NOT NULL
+);
+
+
 CREATE TABLE stacks_tx (
   id INTEGER PRIMARY KEY NOT NULL,
   stacks_block_id INTEGER NOT NULL,
@@ -58,6 +67,12 @@ CREATE TABLE stacks_tx (
   FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
   UNIQUE(stacks_block_id, tx_hash),
   CHECK(length(tx_hash) = 32)
+);
+
+CREATE TABLE _staged_stacks_tx (
+    block_index_hash BLOB NOT NULL,
+    tx_hash BLOB NOT NULL,
+    tx_type TEXT NOT NULL
 );
 
 CREATE TABLE benchmark_run (
