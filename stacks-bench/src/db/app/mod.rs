@@ -633,4 +633,281 @@ impl AppDb {
         }
         hasher.finalize().to_vec()
     }
+
+    pub fn save_profiler_data(
+        &mut self,
+        run_id: i32,
+        block_id: &StacksBlockId,
+        results: Vec<stacks_profiler::ProfileStats>,
+        tx_metrics: &[crate::metrics::TransactionMetrics],
+    ) -> Result<()> {
+        use self::models::{NewProfilerLocation, NewProfilerRecord, NewProfilerSpan};
+
+        // 1. Resolve Block ID (DB Primary Key)
+        let block_pk: i64 = schema::stacks_block::table
+            .select(schema::stacks_block::id)
+            .filter(schema::stacks_block::index_hash.eq(block_id.as_bytes()))
+            .first(&mut self.conn)?;
+
+        // 2. Resolve Tx IDs (DB Primary Keys) for mapping
+        // We assume tx_metrics are in execution order. We fetch their DB IDs.
+        let mut tx_db_ids = Vec::with_capacity(tx_metrics.len());
+        for tx in tx_metrics {
+            let tx_hash_bytes = hex::decode(&tx.txid)?;
+            let tid: Option<i64> = schema::stacks_tx::table
+                .select(schema::stacks_tx::id)
+                .filter(schema::stacks_tx::tx_hash.eq(tx_hash_bytes))
+                .first(&mut self.conn)
+                .optional()?;
+            tx_db_ids.push(tid);
+        }
+
+        // 3. Recursive Insert Function
+        // We use a closure to handle the recursion and state
+        fn insert_node(
+            conn: &mut SqliteConnection,
+            node: &stacks_profiler::ProfileStats,
+            run_id: i32,
+            parent_id: Option<i32>,
+            child_index: i32,
+            depth: i32,
+            block_pk: i64,
+            tx_db_ids: &[Option<i64>],
+            active_tx_id: Option<i64>, // Propagates down from "Transaction" nodes
+        ) -> Result<()> {
+            // A. Resolve/Insert Location
+            let loc_id: i32 = {
+                use self::schema::profiler_location::dsl::*;
+                diesel::insert_into(profiler_location)
+                    .values(&NewProfilerLocation {
+                        file: &node.file(),
+                        line: node.line() as i32,
+                    })
+                    .on_conflict((file, line))
+                    .do_update()
+                    .set(line.eq(line)) // No-op to return ID
+                    .returning(id)
+                    .get_result(conn)?
+            };
+
+            // B. Resolve/Insert Span Name
+            let span_id: i32 = {
+                use self::schema::profiler_span::dsl::*;
+                diesel::insert_into(profiler_span)
+                    .values(&NewProfilerSpan { name: &node.name() })
+                    .on_conflict(name)
+                    .do_update()
+                    .set(name.eq(name))
+                    .returning(id)
+                    .get_result(conn)?
+            };
+
+            // C. Determine Context (Block vs Tx)
+            let mut current_tx_id = active_tx_id;
+
+            // If this node is a "Transaction" root, we map it to a specific Tx ID
+            if node.name() == "Transaction" {
+                // We rely on the fact that "Transaction" spans appear in the "Transaction Replay"
+                // parent's children list in the exact order of execution.
+                // However, `insert_node` is called for *this* node.
+                // We need to know *which* transaction this is.
+                // The `child_index` passed here is the index in the parent's list.
+                if let Some(tid) = tx_db_ids.get(child_index as usize).and_then(|x| *x) {
+                    current_tx_id = Some(tid);
+                }
+            }
+
+            // D. Insert Record
+            let record_id: i32 = diesel::insert_into(schema::profiler_record::table)
+                .values(&NewProfilerRecord {
+                    benchmark_run_id: run_id,
+                    parent_id,
+                    profiler_span_id: span_id,
+                    profiler_location_id: loc_id,
+                    child_index,
+                    depth,
+                    stacks_block_id: if current_tx_id.is_none() {
+                        Some(block_pk)
+                    } else {
+                        None
+                    },
+                    stacks_tx_id: current_tx_id,
+                    wall_time_us: node.wall_time.as_micros() as i64,
+                    cpu_time_us: 0, // Profiler doesn't capture CPU time yet
+                    call_count: 1,
+                })
+                .returning(schema::profiler_record::id)
+                .get_result(conn)?;
+
+            // E. Recurse
+            for (idx, child) in node.children.iter().enumerate() {
+                insert_node(
+                    conn,
+                    child,
+                    run_id,
+                    Some(record_id),
+                    idx as i32,
+                    depth + 1,
+                    block_pk,
+                    tx_db_ids,
+                    current_tx_id,
+                )?;
+            }
+
+            Ok(())
+        }
+
+        // 4. Start Insertion
+        for (i, root) in results.iter().enumerate() {
+            insert_node(
+                &mut self.conn,
+                root,
+                run_id,
+                None,
+                i as i32,
+                0,
+                block_pk,
+                &tx_db_ids,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn save_profiler_data_batch(
+        &mut self,
+        run_id: i32,
+        batch: &mut Vec<(
+            StacksBlockId,
+            Vec<stacks_profiler::ProfileStats>,
+            Vec<crate::metrics::TransactionMetrics>,
+        )>,
+    ) -> Result<()> {
+        use diesel::connection::Connection;
+        use diesel::prelude::*;
+
+        use self::models::{NewProfilerLocation, NewProfilerRecord, NewProfilerSpan};
+        use self::schema::{stacks_block, stacks_tx};
+
+        // Take ownership of the batch data to process it
+        let batch_data = std::mem::take(batch);
+
+        self.conn.transaction(|conn| {
+            for (block_id, results, tx_metrics) in batch_data {
+                // 1. Resolve Block ID (DB Primary Key)
+                let block_pk: i64 = stacks_block::table
+                    .select(stacks_block::id)
+                    .filter(stacks_block::index_hash.eq(block_id.as_bytes()))
+                    .first(conn)?;
+
+                // 2. Resolve Tx IDs (DB Primary Keys) for mapping
+                let mut tx_db_ids = Vec::with_capacity(tx_metrics.len());
+                for tx in tx_metrics {
+                    let tx_hash_bytes = hex::decode(&tx.txid)?;
+                    let tid: Option<i64> = stacks_tx::table
+                        .select(stacks_tx::id)
+                        .filter(stacks_tx::tx_hash.eq(tx_hash_bytes))
+                        .first(conn)
+                        .optional()?;
+                    tx_db_ids.push(tid);
+                }
+
+                // 3. Recursive Insert Function
+                fn insert_node(
+                    conn: &mut SqliteConnection,
+                    node: &stacks_profiler::ProfileStats,
+                    run_id: i32,
+                    parent_id: Option<i32>,
+                    child_index: i32,
+                    depth: i32,
+                    block_pk: i64,
+                    tx_db_ids: &[Option<i64>],
+                    active_tx_id: Option<i64>,
+                ) -> Result<()> {
+                    use crate::db::app::schema::{
+                        profiler_location, profiler_record, profiler_span,
+                    };
+
+                    // A. Resolve/Insert Location
+                    let loc_id: i32 = {
+                        diesel::insert_into(profiler_location::table)
+                            .values(&NewProfilerLocation {
+                                file: &node.file(),
+                                line: node.line() as i32,
+                            })
+                            .on_conflict((profiler_location::file, profiler_location::line))
+                            .do_update()
+                            .set(profiler_location::line.eq(profiler_location::line))
+                            .returning(profiler_location::id)
+                            .get_result(conn)?
+                    };
+
+                    // B. Resolve/Insert Span Name
+                    let span_id: i32 = {
+                        diesel::insert_into(profiler_span::table)
+                            .values(&NewProfilerSpan { name: &node.name() })
+                            .on_conflict(profiler_span::name)
+                            .do_update()
+                            .set(profiler_span::name.eq(profiler_span::name))
+                            .returning(profiler_span::id)
+                            .get_result(conn)?
+                    };
+
+                    // C. Determine Context (Block vs Tx)
+                    let mut current_tx_id = active_tx_id;
+                    if node.name() == "Transaction" {
+                        if let Some(tid) = tx_db_ids.get(child_index as usize).and_then(|x| *x) {
+                            current_tx_id = Some(tid);
+                        }
+                    }
+
+                    // D. Insert Record
+                    let record_id: i32 = diesel::insert_into(profiler_record::table)
+                        .values(&NewProfilerRecord {
+                            benchmark_run_id: run_id,
+                            parent_id,
+                            profiler_span_id: span_id,
+                            profiler_location_id: loc_id,
+                            child_index,
+                            depth,
+                            stacks_block_id: if current_tx_id.is_none() {
+                                Some(block_pk)
+                            } else {
+                                None
+                            },
+                            stacks_tx_id: current_tx_id,
+                            wall_time_us: node.wall_time.as_micros() as i64,
+                            cpu_time_us: 0,
+                            call_count: 1,
+                        })
+                        .returning(profiler_record::id)
+                        .get_result(conn)?;
+
+                    // E. Recurse
+                    for (idx, child) in node.children.iter().enumerate() {
+                        insert_node(
+                            conn,
+                            child,
+                            run_id,
+                            Some(record_id),
+                            idx as i32,
+                            depth + 1,
+                            block_pk,
+                            tx_db_ids,
+                            current_tx_id,
+                        )?;
+                    }
+                    Ok(())
+                }
+
+                // 4. Start Insertion for this block
+                for (i, root) in results.iter().enumerate() {
+                    insert_node(
+                        conn, root, run_id, None, i as i32, 0, block_pk, &tx_db_ids, None,
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
 }

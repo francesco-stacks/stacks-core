@@ -5,7 +5,8 @@ use stacks_common::types::StacksEpochId;
 
 use super::schema::{
     _staged_stacks_block, _staged_stacks_tx, benchmark_run, burn_block, chainstate, epoch, network,
-    stacks_block, stacks_block_stats, stacks_tx, stacks_tx_stats,
+    profiler_location, profiler_record, profiler_span, stacks_block, stacks_block_stats, stacks_tx,
+    stacks_tx_stats,
 };
 use crate::ResolveEpochFromHeight;
 
@@ -261,4 +262,71 @@ pub struct NewStacksTxStats {
     pub clarity_read_length: i32,
     pub clarity_read_count: i32,
     pub clarity_runtime: i32,
+}
+
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = profiler_location)]
+pub struct NewProfilerLocation<'a> {
+    pub file: &'a str,
+    pub line: i32,
+}
+
+#[derive(Queryable, Selectable, Identifiable, Debug, Clone)]
+#[diesel(table_name = profiler_location)]
+pub struct ProfilerLocation {
+    pub id: i32,
+    pub file: String,
+    pub line: i32,
+}
+
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = profiler_span)]
+pub struct NewProfilerSpan<'a> {
+    pub name: &'a str,
+}
+
+#[derive(Queryable, Selectable, Identifiable, Debug, Clone)]
+#[diesel(table_name = profiler_span)]
+pub struct ProfilerSpan {
+    pub id: i32,
+    pub name: String,
+}
+
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = profiler_record)]
+pub struct NewProfilerRecord {
+    pub benchmark_run_id: i32,
+    pub parent_id: Option<i32>,
+    pub profiler_span_id: i32,
+    pub profiler_location_id: i32,
+    pub child_index: i32,
+    pub depth: i32,
+    pub stacks_block_id: Option<i64>,
+    pub stacks_tx_id: Option<i64>,
+    pub wall_time_us: i64,
+    pub cpu_time_us: i64,
+    pub call_count: i32,
+}
+
+#[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[diesel(belongs_to(BenchmarkRun))]
+#[diesel(belongs_to(ProfilerSpan))]
+#[diesel(belongs_to(ProfilerLocation))]
+#[diesel(belongs_to(StacksBlock))]
+#[diesel(belongs_to(StacksTx))]
+#[diesel(belongs_to(ProfilerRecord, foreign_key = parent_id))]
+#[diesel(table_name = profiler_record)]
+pub struct ProfilerRecord {
+    pub id: i32,
+    pub benchmark_run_id: i32,
+    pub parent_id: Option<i32>,
+    pub profiler_span_id: i32,
+    pub profiler_location_id: i32,
+    pub child_index: i32,
+    pub depth: i32,
+    pub stacks_block_id: Option<i64>,
+    pub stacks_tx_id: Option<i64>,
+    pub wall_time_us: i64,
+    pub cpu_time_us: i64,
+    pub call_count: i32,
 }

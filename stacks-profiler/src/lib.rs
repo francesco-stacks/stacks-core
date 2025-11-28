@@ -375,6 +375,16 @@ impl Profiler {
             std::mem::take(&mut state.completed_roots)
         })
     }
+
+    /// Clears all profiling data for the current thread.
+    #[inline]
+    pub fn clear() {
+        STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            state.completed_roots.clear();
+            state.active_stack.clear();
+        });
+    }
 }
 
 /// A RAII guard that calls `Profiler::end_span()` when dropped.

@@ -124,6 +124,38 @@ table! {
     }
 }
 
+table! {
+    profiler_location (id) {
+        id -> Integer,
+        file -> Text,
+        line -> Integer,
+    }
+}
+
+table! {
+    profiler_span (id) {
+        id -> Integer,
+        name -> Text,
+    }
+}
+
+table! {
+    profiler_record (id) {
+        id -> Integer,
+        benchmark_run_id -> Integer,
+        parent_id -> Nullable<Integer>,
+        profiler_span_id -> Integer,
+        profiler_location_id -> Integer,
+        child_index -> Integer,
+        depth -> Integer,
+        stacks_block_id -> Nullable<BigInt>,
+        stacks_tx_id -> Nullable<BigInt>,
+        wall_time_us -> BigInt,
+        cpu_time_us -> BigInt,
+        call_count -> Integer,
+    }
+}
+
 joinable!(chainstate -> network (network_id));
 joinable!(epoch -> chainstate (chainstate_id));
 joinable!(benchmark_run -> chainstate (chainstate_id));
@@ -133,6 +165,11 @@ joinable!(stacks_block_stats -> benchmark_run (benchmark_run_id));
 joinable!(stacks_block_stats -> stacks_block (stacks_block_id));
 joinable!(stacks_tx_stats -> benchmark_run (benchmark_run_id));
 joinable!(stacks_tx_stats -> stacks_tx (stacks_tx_id));
+joinable!(profiler_record -> benchmark_run (benchmark_run_id));
+joinable!(profiler_record -> profiler_span (profiler_span_id));
+joinable!(profiler_record -> profiler_location (profiler_location_id));
+joinable!(profiler_record -> stacks_block (stacks_block_id));
+joinable!(profiler_record -> stacks_tx (stacks_tx_id));
 
 allow_tables_to_appear_in_same_query!(
     network,
@@ -146,4 +183,7 @@ allow_tables_to_appear_in_same_query!(
     stacks_tx_stats,
     _staged_stacks_block,
     _staged_stacks_tx,
+    profiler_location,
+    profiler_span,
+    profiler_record,
 );

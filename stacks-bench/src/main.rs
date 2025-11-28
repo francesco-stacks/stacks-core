@@ -13,7 +13,8 @@ use stacks_bench::db::app::{AppDb, models};
 use stacks_bench::db::node::ChainStateDb;
 use stacks_bench::db::node::chainstate::models::DbConfig;
 use stacks_bench::db::node::sortition::SortitionDb;
-use stacks_bench::metrics::{CostModel, MetricsAccumulator};
+use stacks_bench::metrics::{CostModel, MetricsAccumulator, ModelSource};
+use stacks_bench::replay::ReplayMode;
 use stacks_bench::{BurnChainPath, ChainStatePath, Network, StacksBlockRef};
 use stacks_profiler::Profiler;
 
@@ -285,15 +286,22 @@ fn main() -> Result<()> {
 
     let mut metrics_buffer = Vec::new();
     let mut cost_model = CostModel::default();
-    let calibration_count = args.calibration;
+
+    const PROFILER_BATCH_SIZE: usize = 1_000;
+    let mut profiler_buffer = Vec::with_capacity(PROFILER_BATCH_SIZE);
+
+    // Dynamic calibration window
+    let min_calibration_count = args.calibration;
+    // Allow buffer to grow if we can't find variance. Empty blocks are small, so 500 is memory-safe.
+    let max_calibration_buffer = 500;
     let mut calibrated = false;
 
-    let mut accumulator = MetricsAccumulator::default(); // Use accumulator
-
-    let block_replay_span = Profiler::begin_span("Block Replay");
+    let mut accumulator = MetricsAccumulator::default();
 
     let start = Instant::now();
     for (i, block_id) in block_ids.iter().enumerate() {
+        Profiler::clear();
+
         // Load metadata from App DB
         let summary = app_db.get_block(block_id, epochs.as_slice())?;
 
@@ -315,65 +323,84 @@ fn main() -> Result<()> {
         )?;
         let block = summary.with_transactions(txs);
 
-        let mut metrics = stacks_bench::replay::re_execute_block(&mut bench_context, &block)?;
+        // Start block-level span
+        let block_span = Profiler::begin_span("Block Replay");
+
+        // Replay the block
+        let mut metrics =
+            stacks_bench::replay::replay_block(&mut bench_context, ReplayMode::Follower, &block)?;
+
+        // End block-level span to capture the full tree
+        drop(block_span);
+
+        let profiler_results = Profiler::take_results();
+        // We clone the transaction metrics because 'metrics' is needed below for calibration/stats.
+        // The buffer takes ownership of the data.
+        profiler_buffer.push((
+            block.id.clone(),
+            profiler_results,
+            metrics.transactions.clone(),
+        ));
+
+        // Flush buffer if full
+        if profiler_buffer.len() >= PROFILER_BATCH_SIZE {
+            app_db.save_profiler_data_batch(run_model.id, &mut profiler_buffer)?;
+        }
 
         if !calibrated {
             metrics_buffer.push(metrics);
 
-            if metrics_buffer.len() >= calibration_count || i == selected_block_count - 1 {
-                // Perform calibration
-                cost_model = CostModel::compute(&metrics_buffer);
-                calibrated = true;
+            let buffer_len = metrics_buffer.len();
+            let is_last_block = i == selected_block_count - 1;
 
-                println!(
-                    "\n--- Calibration Complete ({} blocks) ---",
-                    metrics_buffer.len()
-                );
-                println!("  Method:          {:?}", cost_model.source);
-                println!("  Static Overhead: {:.2?}", cost_model.static_overhead);
-                println!(
-                    "  Cost per Byte:   {:.2} µs",
-                    cost_model.time_per_byte * 1_000_000.0
-                );
+            // Only attempt calibration if we met the minimum count
+            if buffer_len >= min_calibration_count {
+                let candidate_model = CostModel::compute(&metrics_buffer);
 
-                if cost_model.time_per_byte <= f64::EPSILON {
+                // A model is "good" if we found variance (not SingleBlock) and a positive correlation
+                let is_good_model = candidate_model.source != ModelSource::SingleBlock
+                    && candidate_model.time_per_byte > f64::EPSILON;
+
+                // We force calibration if:
+                // 1. We found a good model
+                // 2. We hit the hard memory limit
+                // 3. We ran out of blocks
+                if is_good_model || buffer_len >= max_calibration_buffer || is_last_block {
+                    cost_model = candidate_model;
+                    calibrated = true;
+
+                    println!("\n--- Calibration Complete ({} blocks) ---", buffer_len);
+                    println!("  Method:          {:?}", cost_model.source);
+                    println!("  Static Overhead: {:.2?}", cost_model.static_overhead);
                     println!(
-                        "  [WARN] Correlation weak or negative. Falling back to default heuristic (20% static / 80% variable)."
+                        "  Cost per Byte:   {:.2} µs",
+                        cost_model.time_per_byte * 1_000_000.0
                     );
-                }
-                println!("----------------------------------------\n");
 
-                let buffer_len = metrics_buffer.len();
-
-                // Flush buffer
-                for (j, m) in metrics_buffer.iter_mut().enumerate() {
-                    if cost_model.time_per_byte > f64::EPSILON {
-                        m.apply_cost_model(&cost_model);
-                    } else {
-                        m.apply_heuristic();
+                    if cost_model.time_per_byte <= f64::EPSILON {
+                        println!(
+                            "  [WARN] Correlation weak or negative. Falling back to default heuristic (20% static / 80% variable)."
+                        );
                     }
+                    println!("----------------------------------------\n");
 
-                    accumulator.add(m); // Accumulate
+                    // Flush buffer
+                    for (j, m) in metrics_buffer.iter_mut().enumerate() {
+                        if cost_model.time_per_byte > f64::EPSILON {
+                            m.apply_cost_model(&cost_model);
+                        } else {
+                            m.apply_heuristic();
+                        }
 
-                    // // Calculate static % for this block
-                    // let static_pct = if m.commit_duration.as_secs_f64() > 0.0 {
-                    //     (m.commit_overhead_baseline.as_secs_f64() / m.commit_duration.as_secs_f64())
-                    //         * 100.0
-                    // } else {
-                    //     0.0
-                    // };
-                    // println!(
-                    //     "  [Buffered Block {}] Metrics: {:?} (Static Commit: {:.1}%)",
-                    //     i - buffer_len + j + 1,
-                    //     m,
-                    //     static_pct
-                    // );
+                        accumulator.add(m); // Accumulate
 
-                    // Use the buffered block ID to save metrics
-                    let buffered_id = &block_ids[i - buffer_len + j + 1];
-                    app_db.save_block_metrics(run_model.id, buffered_id, m)?;
+                        // Use the buffered block ID to save metrics
+                        let buffered_id = &block_ids[i - buffer_len + j + 1];
+                        app_db.save_block_metrics(run_model.id, buffered_id, m)?;
+                    }
+                    metrics_buffer.clear();
                 }
-                metrics_buffer.clear();
+                // Else: continue collecting blocks to find variance
             }
         } else {
             if cost_model.time_per_byte > f64::EPSILON {
@@ -398,8 +425,13 @@ fn main() -> Result<()> {
             app_db.save_block_metrics(run_model.id, &block.id, &metrics)?;
         }
     }
+
+    // Flush any remaining profiler data after the loop
+    if !profiler_buffer.is_empty() {
+        app_db.save_profiler_data_batch(run_model.id, &mut profiler_buffer)?;
+    }
+
     let duration = start.elapsed();
-    drop(block_replay_span);
 
     app_db.finish_benchmark_run(run_model.id, Utc::now().naive_utc())?;
 
@@ -421,12 +453,6 @@ fn main() -> Result<()> {
         "  Est. Data Written: {:.4} MB ({written} bytes)",
         written as f64 / 1_024.0 / 1_024.0
     );
-
-    println!();
-    println!("Profiler Results:");
-    let profile_results = Profiler::take_results();
-    let root_results = profile_results.first().unwrap();
-    root_results.print_tree();
 
     Ok(())
 }

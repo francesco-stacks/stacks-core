@@ -19,22 +19,19 @@ use crate::context::BenchContext;
 use crate::metrics::{BlockMetrics, TransactionMetrics};
 use crate::{BlockEra, BlockSummary};
 
-/// Helper to converts a runtime String into a &'static str.
-///
-/// ⚠️ WARNING: This intentionally leaks memory and is only intended for
-/// short-lived benchmarks/debugging where you strictly need distinct span names
-/// for every item (e.g. "Tx 1", "Tx 2").
-fn runtime_name(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
+pub enum ReplayMode {
+    Miner,
+    Follower,
+    Ephemeral,
 }
 
 /// Re-execute all transactions in a block to measure execution performance.
-pub fn re_execute_block(
+pub fn replay_block(
     context: &mut BenchContext,
+    mode: ReplayMode,
     block_summary: &BlockSummary,
 ) -> Result<BlockMetrics> {
-    let era = context.resolve_block_era(block_summary.epoch);
-    match era {
+    match context.resolve_block_era(block_summary.epoch) {
         BlockEra::Nakamoto => {
             let (naka_block, _size) = context
                 .chainstate()
@@ -42,12 +39,21 @@ pub fn re_execute_block(
                 .get_nakamoto_block(&block_summary.id)?
                 .ok_or_else(|| anyhow!("Nakamoto block not found"))?;
 
-            // Toggle between Miner/Follower here. Currently set to Follower.
-            let block_height = block_summary.height;
-            profile_scope!(
-                runtime_name(format!("Replay Block #{block_height} (Follower)")),
-                { re_execute_nakamoto_follower(context, &naka_block) }
-            )
+            match mode {
+                ReplayMode::Miner => {
+                    // Currently not implemented in this refactor
+                    Err(anyhow!("Nakamoto Miner replay not implemented"))
+                }
+                ReplayMode::Follower => {
+                    profile_scope!("Block Replay (Nakamoto Follower)", {
+                        re_execute_nakamoto_follower(context, &naka_block)
+                    })
+                }
+                ReplayMode::Ephemeral => {
+                    // Currently not implemented in this refactor
+                    Err(anyhow!("Nakamoto Ephemeral replay not implemented"))
+                }
+            }
         }
         BlockEra::PreNakamoto => {
             let blocks_path = context.chainstate().blocks_path.clone();
@@ -64,13 +70,15 @@ pub fn re_execute_block(
             let stacks_block = StacksBlock::consensus_deserialize(&mut cursor)?;
             let block_size = stacks_block.block_size()? as u64;
 
-            re_execute_prenakamoto(
-                context,
-                &stacks_block,
-                block_size,
-                &consensus_hash,
-                &header_hash,
-            )?;
+            profile_scope!("Block Replay (Pre-Nakamoto)", {
+                re_execute_prenakamoto(
+                    context,
+                    &stacks_block,
+                    block_size,
+                    &consensus_hash,
+                    &header_hash,
+                )?;
+            });
 
             Ok(BlockMetrics::default())
         }
@@ -262,7 +270,7 @@ where
     for (i, tx) in block.txs.iter().enumerate() {
         let tx_len = tx.tx_len();
         let start_tx = Instant::now();
-        let tx_scope = Profiler::begin_span(runtime_name(format!("Tx #{}", i + 1)));
+        let tx_scope = Profiler::begin_span("Transaction");
 
         let result = profile_scope!("try_mine_tx_with_len", {
             builder.try_mine_tx_with_len(
