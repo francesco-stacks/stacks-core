@@ -836,8 +836,7 @@ impl AppDb {
                                 line: node.line() as i32,
                             })
                             .on_conflict((profiler_location::file, profiler_location::line))
-                            .do_update()
-                            .set(profiler_location::line.eq(profiler_location::line))
+                            .do_nothing()
                             .returning(profiler_location::id)
                             .get_result(conn)?
                     };
@@ -847,8 +846,7 @@ impl AppDb {
                         diesel::insert_into(profiler_span::table)
                             .values(&NewProfilerSpan { name: &node.name() })
                             .on_conflict(profiler_span::name)
-                            .do_update()
-                            .set(profiler_span::name.eq(profiler_span::name))
+                            .do_nothing()
                             .returning(profiler_span::id)
                             .get_result(conn)?
                     };
@@ -870,11 +868,7 @@ impl AppDb {
                             profiler_location_id: loc_id,
                             child_index,
                             depth,
-                            stacks_block_id: if current_tx_id.is_none() {
-                                Some(block_pk)
-                            } else {
-                                None
-                            },
+                            stacks_block_id: Some(block_pk),
                             stacks_tx_id: current_tx_id,
                             wall_time_us: node.wall_time.as_micros() as i64,
                             cpu_time_us: 0,

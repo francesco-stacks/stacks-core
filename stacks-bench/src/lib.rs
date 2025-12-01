@@ -1,6 +1,5 @@
 use std::fmt::Display;
 use std::ops::{Bound, Deref, RangeBounds};
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,79 +15,10 @@ use stacks_common::types::chainstate::StacksBlockId;
 pub mod context;
 pub mod db;
 pub mod metrics;
+pub mod paths;
 pub mod profiler;
 pub mod replay;
 pub mod shadow;
-
-pub struct BurnChainPath(PathBuf);
-
-impl BurnChainPath {
-    pub const BURNCHAIN_DIR_NAME: &'static str = "burnchain";
-    pub const SORTITION_DB_RELATIVE_FILE_PATH: &str = "sortition/marf.sqlite";
-
-    pub fn new<P: Into<PathBuf>>(path: P) -> Self {
-        BurnChainPath(path.into())
-    }
-
-    pub fn from_node_root<P: AsRef<Path>>(node_root: P) -> Self {
-        Self::new(node_root.as_ref().join("burnchain"))
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-
-    pub fn as_str(&self) -> Result<&str> {
-        self.path()
-            .to_str()
-            .ok_or(anyhow!("Failed to convert burnchain path to str"))
-    }
-
-    pub fn sortition_db_path(&self) -> PathBuf {
-        self.path().join(Self::SORTITION_DB_RELATIVE_FILE_PATH)
-    }
-}
-
-impl AsRef<Path> for BurnChainPath {
-    fn as_ref(&self) -> &Path {
-        self.path()
-    }
-}
-
-pub struct ChainStatePath(PathBuf);
-
-impl ChainStatePath {
-    pub const CHAINSTATE_DIR_NAME: &'static str = "chainstate";
-    pub const INDEX_DB_RELATIVE_FILE_PATH: &'static str = "vm/index.sqlite";
-
-    pub fn new<P: Into<PathBuf>>(path: P) -> Self {
-        ChainStatePath(path.into())
-    }
-
-    pub fn from_node_root<P: AsRef<Path>>(node_root: P) -> Self {
-        Self::new(node_root.as_ref().join("chainstate"))
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-
-    pub fn as_str(&self) -> Result<&str> {
-        self.path()
-            .to_str()
-            .ok_or(anyhow!("Failed to convert chainstate path to str"))
-    }
-
-    pub fn index_db_path(&self) -> PathBuf {
-        self.path().join(Self::INDEX_DB_RELATIVE_FILE_PATH)
-    }
-}
-
-impl AsRef<Path> for ChainStatePath {
-    fn as_ref(&self) -> &Path {
-        self.path()
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct StacksEpoch {

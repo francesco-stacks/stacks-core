@@ -11,10 +11,11 @@ use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 
+use crate::paths::{BurnChainPath, ChainStatePath};
 use crate::shadow::{ShadowDir, ShadowDirBuilder};
 use crate::{
-    BlockEra, BlockSummary, BlockTransactions, BurnChainPath, ChainStatePath, Network,
-    ResolveEpochFromHeight, StacksBlockRef, StacksEpoch,
+    BlockEra, BlockSummary, BlockTransactions, Network, ResolveEpochFromHeight, StacksBlockRef,
+    StacksEpoch,
 };
 
 const BURNCHAIN_NAME: &str = "bitcoin";

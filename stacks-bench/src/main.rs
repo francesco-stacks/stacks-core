@@ -1,11 +1,19 @@
+use std::collections::HashMap;
 use std::fmt::{LowerHex, UpperHex};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+use bollard::Docker;
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
+    StartContainerOptionsBuilder, StopContainerOptions, WaitContainerOptions,
+};
+use bollard::secret::{ContainerCreateBody, HostConfig, PortBinding};
 use chrono::Utc;
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use stacks_bench::context::{BenchContext, BenchContextOpts};
 use stacks_bench::db::DbOpenForRead;
@@ -14,13 +22,43 @@ use stacks_bench::db::node::ChainStateDb;
 use stacks_bench::db::node::chainstate::models::DbConfig;
 use stacks_bench::db::node::sortition::SortitionDb;
 use stacks_bench::metrics::{CostModel, MetricsAccumulator, ModelSource};
+use stacks_bench::paths::{AppDataPath, BurnChainPath, ChainStatePath};
 use stacks_bench::replay::ReplayMode;
-use stacks_bench::{BurnChainPath, ChainStatePath, Network, StacksBlockRef};
-use stacks_profiler::Profiler;
+use stacks_bench::{Network, StacksBlockRef};
+use stacks_profiler::{Profiler, profile_scope};
 
-#[derive(Parser, Serialize, Deserialize)]
+const METABASE_IMAGE_TAG: &str = "v0.57.4.3";
+
+#[derive(Parser, Debug)]
 #[command(name = "stacks-bench", about)]
-pub struct Args {
+pub struct Cli {
+    /// The path to the application database (SQLite). If not specified, the database
+    /// will be created in the same directory as the `stacks-bench` binary.
+    #[arg(long = "db", value_name = "DB_PATH")]
+    db_path: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Run the benchmark
+    Bench(BenchArgs),
+    /// Launch a pre-configured Metabase instance to analyze results
+    Metabase {
+        /// Port to expose Metabase on (default: 3000)
+        #[arg(long, default_value = "3000")]
+        port: u16,
+
+        /// Metabase Docker image tag to use (defaults to [`METABASE_IMAGE_TAG`]).
+        #[arg(long, default_value = METABASE_IMAGE_TAG)]
+        image_tag: String,
+    },
+}
+
+#[derive(clap::Args, Debug, Serialize, Deserialize)]
+pub struct BenchArgs {
     /// Stacks node data dir (the directory containing the `chainstate` folder).
     #[arg(long = "source", short = 's')]
     source_dir: PathBuf,
@@ -63,15 +101,9 @@ pub struct Args {
     /// Number of blocks to use for calibration of the commit cost model.
     #[arg(long, value_name = "CALIBRATION_BLOCKS", default_value_t = 10)]
     calibration: usize,
-
-    /// The path to the application database (SQLite). If not specified, the database
-    /// will be created in the same directory as the `stacks-bench` binary.
-    #[arg(long = "db", value_name = "DB_PATH")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    db_path: Option<PathBuf>,
 }
 
-impl Args {
+impl BenchArgs {
     pub fn try_determine_network(&self, chainstate_db_config: &DbConfig) -> Result<Network> {
         if let Some(network) = self.network {
             chainstate_db_config.assert_matches_network(network)?;
@@ -83,38 +115,8 @@ impl Args {
         }
     }
 
-    pub fn app_db_path(&self) -> PathBuf {
-        // Use the explicit path if provided
-        if let Some(path) = &self.db_path {
-            // If the user pointed to an existing directory, put the default file inside it
-            if path.is_dir() {
-                return path.join(AppDb::DEFAULT_DB_FILENAME);
-            }
-
-            // If the path has no extension, assume they meant a file prefix and add .sqlite
-            // e.g. "--db my-run" -> "my-run.sqlite"
-            if path.extension().is_none() {
-                let mut p = path.clone();
-                p.set_extension("sqlite");
-                return p;
-            }
-
-            // Otherwise use exactly what they gave (allowing .db, .sqlite3, etc.)
-            return path.clone();
-        }
-
-        // Otherwise, resolve default: <exe_dir>/stacks-bench.sqlite
-        // Fallback to current directory (".") if executable path cannot be determined.
-        let base_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        base_dir.join(AppDb::DEFAULT_DB_FILENAME)
-    }
-
     pub fn to_json(&self) -> Result<String> {
-        serde_json::to_string(self).context("Failed to serialize Args to JSON")
+        serde_json::to_string(self).context("Failed to serialize BenchArgs to JSON")
     }
 }
 
@@ -175,11 +177,20 @@ fn get_git_hash() -> Option<Vec<u8>> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    let app_db_path = args.app_db_path();
-    let mut app_db = AppDb::open(&app_db_path)
-        .with_context(|| format!("Failed to open or create app database at {:?}", app_db_path))?;
+    // Use AppDataPath to resolve locations
+    let app_data = AppDataPath::resolve_from_opt(cli.db_path.as_ref())?;
+
+    match cli.command {
+        Commands::Metabase { port, image_tag } => run_metabase(&app_data, port, image_tag),
+        Commands::Bench(args) => run_bench(&app_data, args),
+    }
+}
+
+fn run_bench(app_data: &AppDataPath, args: BenchArgs) -> Result<()> {
+    let app_db_path = app_data.app_db_path();
+    let mut app_db = AppDb::open(&app_db_path)?;
 
     let chainstate_path = ChainStatePath::from_node_root(&args.source_dir);
     let burnchain_path = BurnChainPath::from_node_root(&args.source_dir);
@@ -323,15 +334,10 @@ fn main() -> Result<()> {
         )?;
         let block = summary.with_transactions(txs);
 
-        // Start block-level span
-        let block_span = Profiler::begin_span("Block Replay");
-
         // Replay the block
-        let mut metrics =
-            stacks_bench::replay::replay_block(&mut bench_context, ReplayMode::Follower, &block)?;
-
-        // End block-level span to capture the full tree
-        drop(block_span);
+        let mut metrics = profile_scope!("Block Replay", {
+            stacks_bench::replay::replay_block(&mut bench_context, ReplayMode::Follower, &block)?
+        });
 
         let profiler_results = Profiler::take_results();
         // We clone the transaction metrics because 'metrics' is needed below for calibration/stats.
@@ -453,6 +459,289 @@ fn main() -> Result<()> {
         "  Est. Data Written: {:.4} MB ({written} bytes)",
         written as f64 / 1_024.0 / 1_024.0
     );
+
+    Ok(())
+}
+
+fn run_metabase(app_data: &AppDataPath, port: u16, image_tag: String) -> Result<()> {
+    let db_path = app_data.app_db_path();
+
+    // db_path is the full path to the database file.
+    if !db_path.exists() {
+        anyhow::bail!(
+            "Database not found at {:?}. Run a benchmark first.",
+            db_path
+        );
+    }
+
+    // Docker requires absolute paths for volume mounts
+    let abs_data_dir = app_data
+        .as_ref()
+        .canonicalize()
+        .context("Failed to resolve absolute path for source directory")?;
+
+    // We store postgres data in a subdirectory
+    let pg_data_dir = abs_data_dir.join("metabase-postgres");
+
+    if pg_data_dir.exists()
+        && pg_data_dir
+            .read_dir()
+            .map(|mut i| i.next().is_some())
+            .unwrap_or(false)
+    {
+        println!("  - Status:      Loading existing dashboards/users (Postgres)");
+    } else {
+        println!("  - Status:      Initializing new configuration (Postgres)");
+    }
+
+    println!("Starting Metabase on http://localhost:{}", port);
+    println!("  - App DB:      {:?}", db_path);
+    println!("  - Postgres DB: {:?}", pg_data_dir);
+
+    if pg_data_dir.exists()
+        && pg_data_dir
+            .read_dir()
+            .map(|mut i| i.next().is_some())
+            .unwrap_or(false)
+    {
+        println!("  - Status:      Loading existing dashboards/users (Postgres)");
+    } else {
+        println!("  - Status:      Initializing new configuration (Postgres)");
+    }
+
+    // Create a runtime to execute the async Docker operations
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move { run_metabase_container(&abs_data_dir, port, image_tag).await })
+}
+
+async fn run_metabase_container(data_dir: &PathBuf, port: u16, image_tag: String) -> Result<()> {
+    let docker =
+        Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
+
+    let mb_image = format!("metabase/metabase:{image_tag}");
+    let pg_image = "postgres:18.1-alpine3.22";
+
+    let net_name = "stacks-bench-net";
+    let pg_container_name = "stacks-bench-postgres";
+    let mb_container_name = "stacks-bench-metabase";
+
+    // 1. Check/Pull images
+    for image in [&mb_image, pg_image] {
+        if docker.inspect_image(image).await.is_err() {
+            println!("Image {} not found locally. Pulling...", image);
+            let mut pull_stream = docker.create_image(
+                Some(
+                    CreateImageOptionsBuilder::default()
+                        .from_image(image)
+                        .build(),
+                ),
+                None,
+                None,
+            );
+
+            while let Some(msg) = pull_stream.next().await {
+                match msg {
+                    Ok(_) => {}
+                    Err(e) => {
+                        bail!(
+                            "Docker pull failed: {e}. \nHint: This is usually a Docker Desktop issue. Try restarting Docker or running 'docker system prune'."
+                        );
+                    }
+                }
+            }
+        } else {
+            println!("Image {} found locally. Skipping pull.", image);
+        }
+    }
+
+    // 2. Cleanup existing resources (containers & network)
+    // We ignore errors here (e.g. if they don't exist)
+    let _ = docker
+        .remove_container(
+            mb_container_name,
+            Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+        )
+        .await;
+    let _ = docker
+        .remove_container(
+            pg_container_name,
+            Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+        )
+        .await;
+    let _ = docker.remove_network(net_name).await;
+
+    // 3. Create Network
+    docker
+        .create_network(bollard::models::NetworkCreateRequest {
+            name: net_name.to_string(),
+            ..Default::default()
+        })
+        .await
+        .context("Failed to create docker network")?;
+
+    // 4. Start Postgres
+    let pg_data_dir = data_dir.join("metabase-postgres");
+    std::fs::create_dir_all(&pg_data_dir).context("Failed to create postgres data dir")?;
+
+    let pg_host_config = HostConfig {
+        binds: Some(vec![format!(
+            "{}:/var/lib/postgresql/data",
+            pg_data_dir.to_string_lossy()
+        )]),
+        network_mode: Some(net_name.to_string()),
+        auto_remove: Some(false),
+        ..Default::default()
+    };
+
+    let pg_config = ContainerCreateBody {
+        image: Some(pg_image.to_string()),
+        env: Some(vec![
+            "POSTGRES_DB=metabase".to_string(),
+            "POSTGRES_USER=metabase".to_string(),
+            "POSTGRES_PASSWORD=metabase".to_string(),
+        ]),
+        host_config: Some(pg_host_config),
+        healthcheck: Some(bollard::secret::HealthConfig {
+            test: Some(vec![
+                "CMD-SHELL".to_string(),
+                "pg_isready -U metabase".to_string(),
+            ]),
+            start_interval: Some(0),      // Start immediately
+            interval: Some(100_000_000),  // 100ms
+            timeout: Some(5_000_000_000), // 5s
+            retries: Some(100),
+            start_period: Some(2_000_000_000), // 2s grace
+        }),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(pg_container_name)
+                    .build(),
+            ),
+            pg_config,
+        )
+        .await
+        .context("Failed to create Postgres container")?;
+
+    docker
+        .start_container(
+            pg_container_name,
+            Some(StartContainerOptionsBuilder::default().build()),
+        )
+        .await
+        .context("Failed to start Postgres container")?;
+
+    println!("Postgres started. Waiting for readiness...");
+
+    // Wait loop for Postgres Health
+    let start_wait = Instant::now();
+    loop {
+        if start_wait.elapsed() > Duration::from_secs(30) {
+            bail!("Timeout waiting for Postgres to become ready.");
+        }
+
+        let inspect = docker
+            .inspect_container(
+                pg_container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+
+        if let Some(state) = inspect.state {
+            // Fail fast if container died
+            if state.running == Some(false) {
+                bail!(
+                    "Postgres container stopped unexpectedly. Check logs with: docker logs {}",
+                    pg_container_name
+                );
+            }
+
+            if let Some(health) = state.health {
+                if health.status == Some(bollard::models::HealthStatusEnum::HEALTHY) {
+                    break;
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    println!("Postgres is ready.");
+
+    // 5. Start Metabase
+    let mb_host_config = HostConfig {
+        binds: Some(vec![format!("{}:/data", data_dir.to_string_lossy())]),
+        port_bindings: Some(HashMap::from([(
+            "3000/tcp".to_string(),
+            Some(vec![PortBinding {
+                host_port: Some(port.to_string()),
+                ..Default::default()
+            }]),
+        )])),
+        network_mode: Some(net_name.to_string()),
+        auto_remove: Some(false),
+        ..Default::default()
+    };
+
+    let mb_config = ContainerCreateBody {
+        image: Some(mb_image.to_string()),
+        env: Some(vec![
+            "MB_DB_TYPE=postgres".to_string(),
+            "MB_DB_DBNAME=metabase".to_string(),
+            "MB_DB_PORT=5432".to_string(),
+            "MB_DB_USER=metabase".to_string(),
+            "MB_DB_PASS=metabase".to_string(),
+            "MB_DB_HOST=stacks-bench-postgres".to_string(),
+        ]),
+        host_config: Some(mb_host_config),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(mb_container_name)
+                    .build(),
+            ),
+            mb_config,
+        )
+        .await
+        .context("Failed to create Metabase container")?;
+
+    docker
+        .start_container(
+            mb_container_name,
+            Some(StartContainerOptionsBuilder::default().build()),
+        )
+        .await
+        .context("Failed to start Metabase container")?;
+
+    println!("\nMetabase is running (backed by Postgres).");
+    println!("Open http://localhost:{} in your browser.", port);
+    println!("Press Ctrl-C to stop.");
+
+    // 6. Wait for Ctrl-C or Container Exit
+    let wait_stream = docker.wait_container(mb_container_name, None::<WaitContainerOptions>);
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            println!("\nStopping containers...");
+            let _ = docker.stop_container(mb_container_name, None::<StopContainerOptions>).await;
+            let _ = docker.stop_container(pg_container_name, None::<StopContainerOptions>).await;
+            println!("Stopped.");
+        }
+        _ = async {
+            wait_stream.collect::<Vec<_>>().await
+        } => {
+            println!("\nMetabase container exited unexpectedly.");
+            // Ensure postgres is stopped too
+            let _ = docker.stop_container(pg_container_name, None::<StopContainerOptions>).await;
+        }
+    }
 
     Ok(())
 }
