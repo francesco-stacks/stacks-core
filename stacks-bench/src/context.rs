@@ -11,11 +11,11 @@ use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 
-use crate::paths::{BurnChainPath, ChainStatePath};
+use crate::paths::{BurnChainDir, ChainStateDir};
 use crate::shadow::{ShadowDir, ShadowDirBuilder};
 use crate::{
-    BlockEra, BlockSummary, BlockTransactions, Network, ResolveEpochFromHeight, StacksBlockRef,
-    StacksEpoch,
+    BlockEra, BlockSummary, BlockTransactions, ChainCache, Network, ResolveEpochFromHeight,
+    StacksBlockRef, StacksEpoch,
 };
 
 const BURNCHAIN_NAME: &str = "bitcoin";
@@ -154,7 +154,10 @@ impl BenchContext {
         (&mut self.chainstate, &mut self.burnchain)
     }
 
-    pub fn initialize(opts: BenchContextOpts) -> Result<Self> {
+    pub fn initialize<Cache: ChainCache>(
+        opts: BenchContextOpts,
+        mut cache: Option<&mut Cache>,
+    ) -> Result<Self> {
         let start = Instant::now();
         let shadow_dir = ShadowDirBuilder::new(&opts.source_dir)
             .glob("burnchain/**")
@@ -166,8 +169,8 @@ impl BenchContext {
             &shadow_dir, setup_duration
         );
 
-        let burnchain_path = BurnChainPath::from_node_root(&shadow_dir);
-        let chainstate_path = ChainStatePath::from_node_root(&shadow_dir);
+        let burnchain_path = BurnChainDir::from_node_root(&shadow_dir);
+        let chainstate_path = ChainStateDir::from_node_root(&shadow_dir);
 
         let chain_id = opts.chain_id;
         let is_mainnet = opts.network.is_mainnet();
@@ -255,6 +258,24 @@ impl BenchContext {
                     let mut curr = anchor_id.clone();
                     let mut curr_h = anchor_height;
 
+                    // Check cache to jump closer if we know an ancestor (this saves quite a bit of
+                    // walking time when targeting older blocks)
+                    if let Some(c) = &mut cache {
+                        if let Ok(Some((cached_id, cached_h))) =
+                            c.find_closest_ancestor(&anchor_id, h)
+                        {
+                            // Ensure the cached block is actually useful (between current and target)
+                            if cached_h < curr_h && cached_h >= h {
+                                println!(
+                                    "  [Cache Hit] Jumping from height {} to {} ({})",
+                                    curr_h, cached_h, cached_id
+                                );
+                                curr = cached_id;
+                                curr_h = cached_h;
+                            }
+                        }
+                    }
+
                     while curr_h > h {
                         let header = NakamotoChainState::get_block_header(chainstate.db(), &curr)?
                             .ok_or_else(|| anyhow!("Missing header for {}", curr))?;
@@ -264,7 +285,20 @@ impl BenchContext {
                             StacksBlockHeaderTypes::Nakamoto(n) => n.parent_block_id,
                         };
                         curr_h -= 1;
+
+                        // Populate cache periodically (every 1,000 blocks)
+                        if curr_h % 1_000 == 0 {
+                            if let Some(c) = &mut cache {
+                                let _ = c.cache_ancestor(&anchor_id, curr_h, &curr);
+                            }
+                        }
                     }
+
+                    // Cache the final result too
+                    if let Some(c) = &mut cache {
+                        let _ = c.cache_ancestor(&anchor_id, curr_h, &curr);
+                    }
+
                     (curr, h)
                 }
             }
@@ -339,7 +373,7 @@ impl BenchContext {
 
                 // 2. Resolve BlockSummary
                 let (summary, consensus_hash) = match &header.anchored_header {
-                    StacksBlockHeaderTypes::Epoch2(_) => {
+                    StacksBlockHeaderTypes::Epoch2(header) => {
                         let parent_res = self.chainstate.get_parent(&current_id);
                         let parent = match parent_res {
                             Ok(p) => p,
@@ -366,7 +400,13 @@ impl BenchContext {
                         };
 
                         (
-                            BlockSummary::new(current_id.clone(), parent, current_height, epoch),
+                            BlockSummary::new(
+                                current_id.clone(),
+                                header.block_hash(),
+                                parent,
+                                current_height,
+                                epoch,
+                            ),
                             consensus_hash,
                         )
                     }
@@ -383,6 +423,7 @@ impl BenchContext {
                         (
                             BlockSummary::new(
                                 h.block_id(),
+                                h.block_hash(),
                                 h.parent_block_id.clone(),
                                 h.chain_length,
                                 epoch,
@@ -424,10 +465,6 @@ impl BenchContext {
                         Err(e) => return Some(Err(anyhow!("Failed to load txs: {}", e))),
                     };
 
-                    println!(
-                        "canonical_block_stream: Yielding block at height {}",
-                        summary.height
-                    );
                     return Some(Ok(summary.with_transactions(txs)));
                 }
 

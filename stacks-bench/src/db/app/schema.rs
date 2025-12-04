@@ -35,9 +35,51 @@ table! {
 }
 
 table! {
+    stacks_tx_type (id) {
+        id -> Integer,
+        name -> Text,
+    }
+}
+
+table! {
+    _staged_stacks_tx_type (name) {
+        name -> Text,
+    }
+}
+
+table! {
+    principal (id) {
+        id -> Integer,
+        address -> Text,
+    }
+}
+
+table! {
+    _staged_principal (address) {
+        address -> Text,
+    }
+}
+
+table! {
+    contract (id) {
+        id -> Integer,
+        issuer_principal_id -> Integer,
+        name -> Text,
+    }
+}
+
+table! {
+    _staged_contract (issuer_address, name) {
+        issuer_address -> Text,
+        name -> Text,
+    }
+}
+
+table! {
     burn_block (id) {
         id -> BigInt,
         block_hash -> Binary,
+        block_hash_hex -> Text,
         height -> BigInt,
     }
 }
@@ -46,6 +88,9 @@ table! {
     stacks_block (id) {
         id -> BigInt,
         index_hash -> Binary,
+        index_hash_hex -> Text,
+        block_hash -> Binary,
+        block_hash_hex -> Text,
         height -> BigInt,
         parent_stacks_block_id -> Nullable<BigInt>,
         burn_block_id -> BigInt,
@@ -55,6 +100,7 @@ table! {
 table! {
     _staged_stacks_block (index_hash) {
         index_hash -> Binary,
+        block_hash -> Binary,
         parent_index_hash -> Binary,
         height -> BigInt,
         burn_block_hash -> Binary,
@@ -67,7 +113,10 @@ table! {
         id -> BigInt,
         stacks_block_id -> BigInt,
         tx_hash -> Binary,
-        tx_type -> Text,
+        tx_hash_hex -> Text,
+        stacks_tx_type_id -> Integer,
+        caller_principal_id -> Integer,
+        contract_id -> Nullable<Integer>,
     }
 }
 
@@ -76,6 +125,9 @@ table! {
         block_index_hash -> Binary,
         tx_hash -> Binary,
         tx_type -> Text,
+        caller_address -> Text,
+        contract_issuer_address -> Nullable<Text>,
+        contract_name -> Nullable<Text>,
     }
 }
 
@@ -152,7 +204,17 @@ table! {
         stacks_tx_id -> Nullable<BigInt>,
         wall_time_us -> BigInt,
         cpu_time_us -> BigInt,
+        self_wall_time_us -> BigInt,
+        self_cpu_time_us -> BigInt,
         call_count -> Integer,
+    }
+}
+
+table! {
+    chain_tip_cache (tip_index_hash, height) {
+        tip_index_hash -> Binary,
+        height -> BigInt,
+        index_hash -> Binary,
     }
 }
 
@@ -161,6 +223,9 @@ joinable!(epoch -> chainstate (chainstate_id));
 joinable!(benchmark_run -> chainstate (chainstate_id));
 joinable!(stacks_block -> burn_block (burn_block_id));
 joinable!(stacks_tx -> stacks_block (stacks_block_id));
+joinable!(stacks_tx -> stacks_tx_type (stacks_tx_type_id));
+joinable!(stacks_tx -> principal (caller_principal_id));
+joinable!(stacks_tx -> contract (contract_id));
 joinable!(stacks_block_stats -> benchmark_run (benchmark_run_id));
 joinable!(stacks_block_stats -> stacks_block (stacks_block_id));
 joinable!(stacks_tx_stats -> benchmark_run (benchmark_run_id));
@@ -175,6 +240,9 @@ allow_tables_to_appear_in_same_query!(
     network,
     chainstate,
     epoch,
+    stacks_tx_type,
+    principal,
+    contract,
     burn_block,
     stacks_block,
     stacks_tx,
@@ -183,7 +251,11 @@ allow_tables_to_appear_in_same_query!(
     stacks_tx_stats,
     _staged_stacks_block,
     _staged_stacks_tx,
+    _staged_stacks_tx_type,
+    _staged_principal,
+    _staged_contract,
     profiler_location,
     profiler_span,
     profiler_record,
+    chain_tip_cache,
 );

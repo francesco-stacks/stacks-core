@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
+use blockstack_lib::chainstate::stacks::TransactionPayload;
 use blockstack_lib::chainstate::stacks::index::ClarityMarfTrieId;
 use chrono::NaiveDateTime;
+use clarity::types::chainstate::BlockHeaderHash;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_types::Binary;
@@ -12,7 +14,7 @@ use sha2::{Digest, Sha256};
 use stacks_common::types::chainstate::StacksBlockId;
 
 use crate::metrics::BlockMetrics;
-use crate::{BlockSummary, Network, ResolveEpochFromHeight};
+use crate::{BlockSummary, ChainCache, Network, ResolveEpochFromHeight};
 
 pub mod models;
 pub mod schema;
@@ -23,7 +25,12 @@ pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 const MERGE_STAGING_SQL: &str = include_str!("merge_staging.sql");
 
 pub struct AppDb {
+    /// Underlying Diesel SQLite connection.
     conn: SqliteConnection,
+    /// Cache of profiler span name to ID mappings.
+    profiler_span_cache: HashMap<String, i32>,
+    /// Cache of profiler location (file,line) to ID mappings.
+    profiler_loc_cache: HashMap<(String, i32), i32>,
 }
 
 impl AppDb {
@@ -43,16 +50,46 @@ impl AppDb {
 
         // Use WAL mode
         diesel::sql_query("PRAGMA journal_mode=WAL").execute(&mut conn)?;
+        // Use NORMAL locking mode for better concurrency
+        diesel::sql_query("PRAGMA locking_mode = NORMAL;").execute(&mut conn)?;
+        // Set synchronous to NORMAL for a balance of performance and durability
+        diesel::sql_query("PRAGMA synchronous = NORMAL;").execute(&mut conn)?;
+        // Store temporary tables in memory for speed
+        diesel::sql_query("PRAGMA temp_store = MEMORY;").execute(&mut conn)?;
+        // Set page size to 8KB for better performance with larger datasets
+        diesel::sql_query("PRAGMA page_size = 8192;").execute(&mut conn)?;
+        // Set cache size to 256MB
+        diesel::sql_query("PRAGMA cache_size = -262144;").execute(&mut conn)?;
+        // Use max mmap size (will be limited by OS)
+        diesel::sql_query("PRAGMA mmap_size = 30000000000;").execute(&mut conn)?;
 
-        // 1. Run Migrations (Create tables if they don't exist)
-        // This will automatically apply the SQL defined in step 2
-        conn.run_pending_migrations(MIGRATIONS)
-            .map_err(|e| anyhow!("Failed to run database migrations: {}", e))?;
+        let pending_migrations = conn
+            .pending_migrations(MIGRATIONS)
+            .map_err(|e| anyhow!("Failed to check pending migrations: {}", e))?;
 
-        // 2. Ensure foreign keys are enforced (SQLite defaults to OFF)
+        if pending_migrations.is_empty() {
+            println!("App DB is up to date at {}", database_url);
+        } else {
+            println!(
+                "App DB at {database_url} has {} pending migrations. Applying...",
+                pending_migrations.len(),
+            );
+
+            // Run migrations
+            conn.run_pending_migrations(MIGRATIONS)
+                .map_err(|e| anyhow!("Failed to run migrations: {}", e))?;
+
+            println!("Database migration(s) complete");
+        }
+
+        // Ensure foreign keys are enforced. Run after migrations in case any migrations disable them without re-enabling.
         diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut conn)?;
 
-        Ok(AppDb { conn })
+        Ok(AppDb {
+            conn,
+            profiler_span_cache: HashMap::new(),
+            profiler_loc_cache: HashMap::new(),
+        })
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
@@ -90,8 +127,12 @@ impl AppDb {
         use self::schema::{chainstate, epoch};
 
         let network_id = Self::resolve_network_id(network);
-        let chain_id_i32 = chain_id.try_into()?;
-        let tip_height_i32 = tip_height.try_into()?;
+
+        // CHANGE: Explicitly type these as i64 to match schema::BigInt.
+        // chain_id is u32, so .into() is safe.
+        let chain_id_val: i64 = chain_id.into();
+        // tip_height is u64, so .try_into() is needed.
+        let tip_height_val: i64 = tip_height.try_into()?;
 
         // 1. Compute the configuration hash
         let epochs_hash = Self::compute_epochs_hash(source_epochs);
@@ -101,7 +142,7 @@ impl AppDb {
                 // 2. Try to find existing chainstate with matching config
                 let existing = chainstate::dsl::chainstate
                     .filter(chainstate::dsl::network_id.eq(network_id))
-                    .filter(chainstate::dsl::chain_id.eq(chain_id_i32))
+                    .filter(chainstate::dsl::chain_id.eq(chain_id_val))
                     .filter(chainstate::dsl::tip_index_hash.eq(tip_block_id.as_bytes()))
                     .filter(chainstate::dsl::epochs_hash.eq(&epochs_hash))
                     .first::<models::Chainstate>(conn)
@@ -117,40 +158,43 @@ impl AppDb {
                     Ok((chainstate, epochs))
                 } else {
                     // 3b. Not found! Create new chainstate
-                    let new_chainstate = models::NewChainstate {
-                        network_id,
-                        chain_id: chain_id_i32,
-                        tip_index_hash: tip_block_id.0.to_vec(),
-                        tip_height: tip_height_i32,
-                        epochs_hash,
-                    };
-
                     let chainstate: models::Chainstate =
                         diesel::insert_into(chainstate::dsl::chainstate)
-                            .values(&new_chainstate)
+                            .values((
+                                chainstate::dsl::network_id.eq(network_id),
+                                chainstate::dsl::chain_id.eq(chain_id_val),
+                                chainstate::dsl::tip_index_hash.eq(tip_block_id.0.to_vec()),
+                                chainstate::dsl::tip_height.eq(tip_height_val),
+                                chainstate::dsl::epochs_hash.eq(epochs_hash),
+                            ))
                             .get_result(conn)?;
 
                     // 4. Insert epochs for this new chainstate
                     let new_epochs_data = source_epochs
                         .iter()
                         .map(|e| {
-                            Ok(models::NewEpoch {
-                                chainstate_id: chainstate.id,
-                                stacks_epoch_id: e.epoch_id() as i32,
-                                network_epoch_id: e.network_epoch_id() as i32,
-                                start_height: e.start_block_height() as i64,
-                                end_height: e.end_block_height() as i64,
-                                write_length_budget: e.block_limits.write_length.try_into()?,
-                                write_count_budget: e.block_limits.write_count.try_into()?,
-                                read_length_budget: e.block_limits.read_length.try_into()?,
-                                read_count_budget: e.block_limits.read_count.try_into()?,
-                                runtime_budget: e.block_limits.runtime.try_into()?,
-                            })
+                            Ok((
+                                epoch::dsl::chainstate_id.eq(chainstate.id),
+                                epoch::dsl::stacks_epoch_id.eq(e.epoch_id() as i32),
+                                epoch::dsl::network_epoch_id.eq(e.network_epoch_id() as i32),
+                                epoch::dsl::start_height.eq(e.start_block_height() as i64),
+                                epoch::dsl::end_height.eq(e.end_block_height() as i64),
+                                epoch::dsl::write_length_budget
+                                    .eq(TryInto::<i64>::try_into(e.block_limits.write_length)?),
+                                epoch::dsl::write_count_budget
+                                    .eq(TryInto::<i64>::try_into(e.block_limits.write_count)?),
+                                epoch::dsl::read_length_budget
+                                    .eq(TryInto::<i64>::try_into(e.block_limits.read_length)?),
+                                epoch::dsl::read_count_budget
+                                    .eq(TryInto::<i64>::try_into(e.block_limits.read_count)?),
+                                epoch::dsl::runtime_budget
+                                    .eq(TryInto::<i64>::try_into(e.block_limits.runtime)?),
+                            ))
                         })
                         .collect::<Result<Vec<_>>>()?;
 
                     let epochs: Vec<models::Epoch> = diesel::insert_into(epoch::dsl::epoch)
-                        .values(&new_epochs_data)
+                        .values(new_epochs_data)
                         .get_results(conn)?;
 
                     Ok((chainstate, epochs))
@@ -164,122 +208,41 @@ impl AppDb {
         hash: &[u8],
         height: u32,
     ) -> Result<models::BurnBlock> {
-        use self::schema::burn_block::dsl;
+        use self::schema::burn_block;
 
         let height_i64: i64 = height.into();
 
-        self.conn
-            .transaction(|conn| {
-                if let Some(existing) = dsl::burn_block
-                    .filter(dsl::block_hash.eq(hash))
-                    .first::<models::BurnBlock>(conn)
-                    .optional()?
-                {
-                    Ok(existing)
-                } else {
-                    let new_burn = models::NewBurnBlock {
-                        block_hash: hash.to_vec(),
-                        height: height_i64,
-                    };
-                    diesel::insert_into(dsl::burn_block)
-                        .values(&new_burn)
-                        .get_result(conn)
-                }
-            })
+        // Optimization: Use Upsert with dummy update to always return the row
+        diesel::insert_into(burn_block::table)
+            .values((
+                burn_block::block_hash.eq(hash.to_vec()),
+                burn_block::height.eq(height_i64),
+            ))
+            .on_conflict(burn_block::block_hash)
+            .do_update()
+            .set(burn_block::height.eq(height_i64)) // Dummy update (or actual update if height changed)
+            .get_result(&mut self.conn)
             .context("Failed to get or create burn_block")
-    }
-
-    pub fn get_or_create_stacks_block(
-        &mut self,
-        block: &BlockSummary,
-    ) -> Result<models::StacksBlock> {
-        use self::schema::stacks_block::dsl;
-
-        let height_i64: i64 = block.height.try_into()?;
-
-        // 1. Resolve Burn Block ID
-        let burn_hash = block
-            .burn_block_hash
-            .as_ref()
-            .ok_or_else(|| anyhow!("Block {} missing burn block hash", block.id))?;
-        let burn_height = block
-            .burn_block_height
-            .ok_or_else(|| anyhow!("Block {} missing burn block height", block.id))?;
-
-        let burn_block = self.get_or_create_burn_block(&burn_hash.0, burn_height)?;
-
-        // 2. Try to resolve Parent ID (if it exists in DB)
-        // We do this inside the transaction to ensure consistency
-        self.conn
-            .transaction(|conn| {
-                // Check if block already exists
-                if let Some(existing) = dsl::stacks_block
-                    .filter(dsl::index_hash.eq(block.id.as_bytes()))
-                    .first::<models::StacksBlock>(conn)
-                    .optional()?
-                {
-                    return Ok(existing);
-                }
-
-                // Try to find parent by hash
-                let parent_id_val = dsl::stacks_block
-                    .select(dsl::id)
-                    .filter(dsl::index_hash.eq(block.parent_id.as_bytes()))
-                    .first::<i64>(conn)
-                    .optional()?;
-
-                let new_block = models::NewStacksBlock {
-                    index_hash: block.id.0.to_vec(),
-                    height: height_i64,
-                    parent_stacks_block_id: parent_id_val,
-                    burn_block_id: burn_block.id,
-                };
-
-                diesel::insert_into(dsl::stacks_block)
-                    .values(&new_block)
-                    .get_result(conn)
-            })
-            .context("Failed to get or create stacks_block")
-    }
-
-    pub fn get_or_create_stacks_tx(
-        &mut self,
-        block_id: i64,
-        hash: &[u8],
-        type_str: &str,
-    ) -> Result<models::StacksTx> {
-        use self::schema::stacks_tx::dsl::*;
-
-        self.conn
-            .transaction(|conn| {
-                if let Some(existing) = stacks_tx
-                    .filter(tx_hash.eq(hash))
-                    .first::<models::StacksTx>(conn)
-                    .optional()?
-                {
-                    Ok(existing)
-                } else {
-                    let new_tx = models::NewStacksTx {
-                        stacks_block_id: block_id,
-                        tx_hash: hash.to_vec(),
-                        tx_type: type_str.to_string(),
-                    };
-                    diesel::insert_into(stacks_tx)
-                        .values(&new_tx)
-                        .get_result(conn)
-                }
-            })
-            .context("Failed to get or create stacks_tx")
     }
 
     pub fn create_benchmark_run(
         &mut self,
-        new_run: models::NewBenchmarkRun,
+        chainstate_id: i32,
+        start_time: NaiveDateTime,
+        git_commit_hash: Vec<u8>,
+        run_name: Option<String>,
+        args_json: String,
     ) -> Result<models::BenchmarkRun> {
-        use self::schema::benchmark_run::dsl::*;
+        use self::schema::benchmark_run::dsl;
 
-        diesel::insert_into(benchmark_run)
-            .values(&new_run)
+        diesel::insert_into(dsl::benchmark_run)
+            .values((
+                dsl::chainstate_id.eq(chainstate_id),
+                dsl::start_time.eq(start_time),
+                dsl::git_commit_hash.eq(git_commit_hash),
+                dsl::run_name.eq(run_name),
+                dsl::args_json.eq(args_json),
+            ))
             .get_result(&mut self.conn)
             .context("Failed to create benchmark run")
     }
@@ -291,32 +254,6 @@ impl AppDb {
             .set(end_time.eq(end_ts))
             .execute(&mut self.conn)
             .context("Failed to update benchmark run end time")?;
-        Ok(())
-    }
-
-    pub fn insert_stacks_block_stats(
-        &mut self,
-        stats: &[models::NewStacksBlockStats],
-    ) -> Result<()> {
-        use self::schema::stacks_block_stats::dsl::*;
-
-        diesel::insert_into(stacks_block_stats)
-            .values(stats)
-            .execute(&mut self.conn)
-            .context("Failed to insert stacks block stats")?;
-        Ok(())
-    }
-
-    pub fn insert_stacks_tx_stats(&mut self, stats: &[models::NewStacksTxStats]) -> Result<()> {
-        use self::schema::stacks_tx_stats::dsl::*;
-
-        // Chunking to avoid SQLite variable limit issues with large batches
-        for chunk in stats.chunks(500) {
-            diesel::insert_into(stacks_tx_stats)
-                .values(chunk)
-                .execute(&mut self.conn)
-                .context("Failed to insert stacks tx stats chunk")?;
-        }
         Ok(())
     }
 
@@ -339,27 +276,37 @@ impl AppDb {
         block_id: &StacksBlockId,
         metrics: &BlockMetrics,
     ) -> Result<()> {
+        use self::schema::stacks_block_stats::dsl as block_stats_dsl;
         use self::schema::stacks_tx::dsl as tx_dsl;
+        use self::schema::stacks_tx_stats::dsl as tx_stats_dsl;
 
         // 1. Get Block ID
         let block_id = self.get_stacks_block_id(block_id)?;
 
         // 2. Insert Block Stats
-        let block_stats = models::NewStacksBlockStats {
-            benchmark_run_id: run_id,
-            stacks_block_id: block_id,
-            total_duration_us: metrics.total_duration.as_micros() as i32,
-            setup_duration_us: metrics.setup_duration.as_micros() as i32,
-            execution_duration_us: metrics.execution_duration.as_micros() as i32,
-            commit_duration_us: metrics.commit_duration.as_micros() as i32,
-            commit_overhead_baseline_us: metrics.commit_overhead_baseline.as_micros() as i32,
-            clarity_write_length: metrics.total_clarity_cost.write_length as i32,
-            clarity_write_count: metrics.total_clarity_cost.write_count as i32,
-            clarity_read_length: metrics.total_clarity_cost.read_length as i32,
-            clarity_read_count: metrics.total_clarity_cost.read_count as i32,
-            clarity_runtime: metrics.total_clarity_cost.runtime as i32,
-        };
-        self.insert_stacks_block_stats(&[block_stats])?;
+        diesel::insert_into(block_stats_dsl::stacks_block_stats)
+            .values((
+                block_stats_dsl::benchmark_run_id.eq(run_id),
+                block_stats_dsl::stacks_block_id.eq(block_id),
+                block_stats_dsl::total_duration_us.eq(metrics.total_duration.as_micros() as i32),
+                block_stats_dsl::setup_duration_us.eq(metrics.setup_duration.as_micros() as i32),
+                block_stats_dsl::execution_duration_us
+                    .eq(metrics.execution_duration.as_micros() as i32),
+                block_stats_dsl::commit_duration_us.eq(metrics.commit_duration.as_micros() as i32),
+                block_stats_dsl::commit_overhead_baseline_us
+                    .eq(metrics.commit_overhead_baseline.as_micros() as i32),
+                block_stats_dsl::clarity_write_length
+                    .eq(metrics.total_clarity_cost.write_length as i32),
+                block_stats_dsl::clarity_write_count
+                    .eq(metrics.total_clarity_cost.write_count as i32),
+                block_stats_dsl::clarity_read_length
+                    .eq(metrics.total_clarity_cost.read_length as i32),
+                block_stats_dsl::clarity_read_count
+                    .eq(metrics.total_clarity_cost.read_count as i32),
+                block_stats_dsl::clarity_runtime.eq(metrics.total_clarity_cost.runtime as i32),
+            ))
+            .execute(&mut self.conn)
+            .context("Failed to insert stacks block stats")?;
 
         // 3. Insert Tx Stats
         // Optimization: Fetch all tx IDs for this block in one query to avoid N lookups
@@ -376,23 +323,28 @@ impl AppDb {
                 hex::decode(&tx_metric.txid).map_err(|e| anyhow!("Invalid hex in txid: {}", e))?;
 
             if let Some(&tx_id) = tx_map.get(&tx_hash_bytes) {
-                tx_stats_batch.push(models::NewStacksTxStats {
-                    benchmark_run_id: run_id,
-                    stacks_tx_id: tx_id,
-                    duration_us: tx_metric.duration.as_micros() as i32,
-                    estimated_commit_impact_us: tx_metric.estimated_commit_impact.as_micros()
-                        as i32,
-                    clarity_write_length: tx_metric.cost.write_length as i32,
-                    clarity_write_count: tx_metric.cost.write_count as i32,
-                    clarity_read_length: tx_metric.cost.read_length as i32,
-                    clarity_read_count: tx_metric.cost.read_count as i32,
-                    clarity_runtime: tx_metric.cost.runtime as i32,
-                });
+                tx_stats_batch.push((
+                    tx_stats_dsl::benchmark_run_id.eq(run_id),
+                    tx_stats_dsl::stacks_tx_id.eq(tx_id),
+                    tx_stats_dsl::duration_us.eq(tx_metric.duration.as_micros() as i32),
+                    tx_stats_dsl::estimated_commit_impact_us
+                        .eq(tx_metric.estimated_commit_impact.as_micros() as i32),
+                    tx_stats_dsl::clarity_write_length.eq(tx_metric.cost.write_length as i32),
+                    tx_stats_dsl::clarity_write_count.eq(tx_metric.cost.write_count as i32),
+                    tx_stats_dsl::clarity_read_length.eq(tx_metric.cost.read_length as i32),
+                    tx_stats_dsl::clarity_read_count.eq(tx_metric.cost.read_count as i32),
+                    tx_stats_dsl::clarity_runtime.eq(tx_metric.cost.runtime as i32),
+                ));
             }
         }
 
         if !tx_stats_batch.is_empty() {
-            self.insert_stacks_tx_stats(&tx_stats_batch)?;
+            for chunk in tx_stats_batch.chunks(500) {
+                diesel::insert_into(tx_stats_dsl::stacks_tx_stats)
+                    .values(chunk)
+                    .execute(&mut self.conn)
+                    .context("Failed to insert stacks tx stats chunk")?;
+            }
         }
 
         Ok(())
@@ -467,16 +419,17 @@ impl AppDb {
 
         // We need the block, its burn info, and its parent's hash.
         // We use a subselect for the parent hash to avoid a complex self-join alias in Diesel DSL
-        let (height, burn_hash, burn_height, parent_hash) = stacks_block::dsl::stacks_block
+        let (block_hash, height, burn_hash, burn_height, parent_hash) = stacks_block::dsl::stacks_block
             .inner_join(burn_block::dsl::burn_block)
             .select((
+                stacks_block::dsl::block_hash,
                 stacks_block::dsl::height,
                 burn_block::dsl::block_hash,
                 burn_block::dsl::height,
                 sql::<diesel::sql_types::Nullable<Binary>>("(SELECT index_hash FROM stacks_block p WHERE p.id = stacks_block.parent_stacks_block_id)"),
             ))
             .filter(stacks_block::dsl::index_hash.eq(id.as_bytes()))
-            .first::<(i64, Vec<u8>, i64, Option<Vec<u8>>)>(&mut self.conn)
+            .first::<(Vec<u8>, i64, Vec<u8>, i64, Option<Vec<u8>>)>(&mut self.conn)
             .optional()?
             .ok_or_else(|| anyhow!("Block {} not found in App DB", id))?;
 
@@ -499,8 +452,11 @@ impl AppDb {
             clarity::types::chainstate::BurnchainHeaderHash::from_vec(&burn_hash)
                 .ok_or_else(|| anyhow!("Invalid burn hash in DB for block {id}: {burn_hash:?}"))?;
 
+        let block_hash = BlockHeaderHash::from_vec(&block_hash)
+            .ok_or_else(|| anyhow!("Invalid block hash in DB for block {id}: {block_hash:?}"))?;
+
         Ok(
-            BlockSummary::new(id.clone(), parent_id, height as u64, epoch)
+            BlockSummary::new(id.clone(), block_hash, parent_id, height as u64, epoch)
                 .with_burn_info(burn_height as u32, burn_hash_obj),
         )
     }
@@ -509,25 +465,80 @@ impl AppDb {
     where
         I: IntoIterator<Item = BlockSummary>,
     {
-        use self::models::{StagedStacksBlock, StagedStacksTx};
-        use self::schema::{_staged_stacks_block, _staged_stacks_tx};
+        use self::models::{
+            StagedContract, StagedPrincipal, StagedStacksBlock, StagedStacksTx, StagedStacksTxType,
+        };
+        use self::schema::{
+            _staged_contract, _staged_principal, _staged_stacks_block, _staged_stacks_tx,
+            _staged_stacks_tx_type,
+        };
 
-        // 1. Process Iterator in Chunks
+        // Chunk size for batch inserts
         const CHUNK_SIZE: usize = 1000;
+
+        // Counters
         let mut block_count: u64 = 0;
         let mut tx_count: u64 = 0;
+
+        // Block and tx buffers
         let mut block_buffer = Vec::with_capacity(CHUNK_SIZE);
         let mut tx_buffer = Vec::with_capacity(CHUNK_SIZE * 2000);
 
+        // Dimension deduplication sets (flushed per chunk to keep memory low)
+        let mut staged_tx_types = HashSet::new();
+        let mut staged_principals = HashSet::new();
+        let mut staged_contracts = HashSet::new(); // Set of (issuer_address, name)
+
         let flush = |conn: &mut SqliteConnection,
                      blocks: &mut Vec<StagedStacksBlock>,
-                     txs: &mut Vec<StagedStacksTx>|
+                     txs: &mut Vec<StagedStacksTx>,
+                     tx_types: &mut HashSet<String>,
+                     principals: &mut HashSet<String>,
+                     contracts: &mut HashSet<(String, String)>|
          -> Result<()> {
             println!(
-                "Flushing {} blocks and {} txs to staging tables",
+                "Flushing {} blocks, {} txs, {} principals, {} contracts",
                 blocks.len(),
-                txs.len()
+                txs.len(),
+                principals.len(),
+                contracts.len()
             );
+
+            // A. Flush Dimensions first (Principals, Types, Contracts)
+            if !tx_types.is_empty() {
+                let type_records = tx_types
+                    .drain()
+                    .map(|name| StagedStacksTxType { name })
+                    .collect::<Vec<StagedStacksTxType>>();
+                diesel::insert_into(_staged_stacks_tx_type::table)
+                    .values(&type_records)
+                    .execute(conn)?;
+            }
+
+            if !principals.is_empty() {
+                let principal_records = principals
+                    .drain()
+                    .map(|address| StagedPrincipal { address })
+                    .collect::<Vec<StagedPrincipal>>();
+                diesel::insert_into(_staged_principal::table)
+                    .values(&principal_records)
+                    .execute(conn)?;
+            }
+
+            if !contracts.is_empty() {
+                let contract_records = contracts
+                    .drain()
+                    .map(|(issuer_address, name)| models::StagedContract {
+                        issuer_address,
+                        name,
+                    })
+                    .collect::<Vec<StagedContract>>();
+                diesel::insert_into(schema::_staged_contract::table)
+                    .values(&contract_records)
+                    .execute(conn)?;
+            }
+
+            // B. Flush Facts
             if !blocks.is_empty() {
                 diesel::insert_into(_staged_stacks_block::table)
                     .values(&*blocks)
@@ -546,11 +557,13 @@ impl AppDb {
         };
 
         self.conn.transaction::<_, anyhow::Error, _>(|conn| {
-            // 0. Truncate Staging Tables (Clean start)
+            // Truncate staging tables
             println!("Truncating staging tables");
-            // Diesel optimizes delete without filter to TRUNCATE or equivalent
             diesel::delete(_staged_stacks_block::table).execute(conn)?;
             diesel::delete(_staged_stacks_tx::table).execute(conn)?;
+            diesel::delete(_staged_stacks_tx_type::table).execute(conn)?;
+            diesel::delete(_staged_principal::table).execute(conn)?;
+            diesel::delete(_staged_contract::table).execute(conn)?;
 
             println!("Beginning block indexing");
             for block in blocks {
@@ -565,6 +578,7 @@ impl AppDb {
 
                 block_buffer.push(StagedStacksBlock {
                     index_hash: block.id.0.to_vec(),
+                    block_hash: block.block_hash.0.to_vec(),
                     parent_index_hash: block.parent_id.0.to_vec(),
                     height: block.height as i64,
                     burn_block_hash: burn_hash.0.to_vec(),
@@ -574,37 +588,87 @@ impl AppDb {
                 if let Some(txs) = block.transactions() {
                     for tx in txs {
                         tx_count += 1;
+
+                        let block_index_hash = block.id.as_bytes().to_vec();
+                        let tx_hash = tx.txid().as_bytes().to_vec();
+                        let tx_type = tx.payload.name().to_string();
+
+                        // Stage tx type
+                        staged_tx_types.insert(tx_type.clone());
+
+                        // Stage caller address
+                        let caller_address = tx.origin_address().to_string();
+                        staged_principals.insert(caller_address.clone());
+
+                        let mut contract_issuer_address = None;
+                        let mut contract_name = None;
+
+                        // Stage contract info for contract deploys
+                        if let TransactionPayload::SmartContract(sc, _) = &tx.payload {
+                            // For deploy, issuer is caller
+                            contract_issuer_address = Some(caller_address.clone());
+                            let c_name = sc.name.to_string();
+                            contract_name = Some(c_name.clone());
+
+                            // Stage contract (caller principal is already staged above)
+                            staged_contracts.insert((caller_address.clone(), c_name));
+                        }
+
+                        // Stage contract info for contract calls
+                        if let TransactionPayload::ContractCall(cc) = &tx.payload {
+                            let issuer_address =
+                                cc.contract_identifier().issuer.to_address().to_string();
+                            let name = cc.contract_name.to_string();
+
+                            // Stage issuer principal and contract
+                            staged_principals.insert(issuer_address.clone());
+                            staged_contracts.insert((issuer_address, name));
+                        }
+
                         tx_buffer.push(StagedStacksTx {
-                            block_index_hash: block.id.0.to_vec(),
-                            tx_hash: tx.txid().0.to_vec(),
-                            tx_type: "unknown".to_string(),
+                            block_index_hash,
+                            tx_hash,
+                            tx_type,
+                            caller_address,
+                            contract_issuer_address,
+                            contract_name,
                         });
                     }
                 }
 
                 if block_buffer.len() >= CHUNK_SIZE {
-                    flush(conn, &mut block_buffer, &mut tx_buffer)?;
+                    flush(
+                        conn,
+                        &mut block_buffer,
+                        &mut tx_buffer,
+                        &mut staged_tx_types,
+                        &mut staged_principals,
+                        &mut staged_contracts,
+                    )?;
                 }
             }
             // Final flush
-            flush(conn, &mut block_buffer, &mut tx_buffer)?;
+            flush(
+                conn,
+                &mut block_buffer,
+                &mut tx_buffer,
+                &mut staged_tx_types,
+                &mut staged_principals,
+                &mut staged_contracts,
+            )?;
 
             // 3. Execute Merge Logic
-            // We invoke the SQL script as if it were a stored procedure
             println!("Merging staged data into main tables");
             conn.batch_execute(MERGE_STAGING_SQL)
                 .context("Failed to execute merge_staging.sql")?;
 
-            // 4. Cleanup (Truncate again to save space)
+            // 4. Cleanup
             println!("Cleaning up staging tables");
-            let deleted_staging_blocks =
-                diesel::delete(_staged_stacks_block::table).execute(conn)?;
-            let deleted_staging_transactions =
-                diesel::delete(_staged_stacks_tx::table).execute(conn)?;
-            println!(
-                "Deleted {} staged blocks and {} staged transactions",
-                deleted_staging_blocks, deleted_staging_transactions
-            );
+            diesel::delete(_staged_stacks_block::table).execute(conn)?;
+            diesel::delete(_staged_stacks_tx::table).execute(conn)?;
+            diesel::delete(_staged_stacks_tx_type::table).execute(conn)?;
+            diesel::delete(_staged_principal::table).execute(conn)?;
+            diesel::delete(_staged_contract::table).execute(conn)?;
 
             println!(
                 "Indexing complete: {} blocks and {} txs indexed",
@@ -634,146 +698,6 @@ impl AppDb {
         hasher.finalize().to_vec()
     }
 
-    pub fn save_profiler_data(
-        &mut self,
-        run_id: i32,
-        block_id: &StacksBlockId,
-        results: Vec<stacks_profiler::ProfileStats>,
-        tx_metrics: &[crate::metrics::TransactionMetrics],
-    ) -> Result<()> {
-        use self::models::{NewProfilerLocation, NewProfilerRecord, NewProfilerSpan};
-
-        // 1. Resolve Block ID (DB Primary Key)
-        let block_pk: i64 = schema::stacks_block::table
-            .select(schema::stacks_block::id)
-            .filter(schema::stacks_block::index_hash.eq(block_id.as_bytes()))
-            .first(&mut self.conn)?;
-
-        // 2. Resolve Tx IDs (DB Primary Keys) for mapping
-        // We assume tx_metrics are in execution order. We fetch their DB IDs.
-        let mut tx_db_ids = Vec::with_capacity(tx_metrics.len());
-        for tx in tx_metrics {
-            let tx_hash_bytes = hex::decode(&tx.txid)?;
-            let tid: Option<i64> = schema::stacks_tx::table
-                .select(schema::stacks_tx::id)
-                .filter(schema::stacks_tx::tx_hash.eq(tx_hash_bytes))
-                .first(&mut self.conn)
-                .optional()?;
-            tx_db_ids.push(tid);
-        }
-
-        // 3. Recursive Insert Function
-        // We use a closure to handle the recursion and state
-        fn insert_node(
-            conn: &mut SqliteConnection,
-            node: &stacks_profiler::ProfileStats,
-            run_id: i32,
-            parent_id: Option<i32>,
-            child_index: i32,
-            depth: i32,
-            block_pk: i64,
-            tx_db_ids: &[Option<i64>],
-            active_tx_id: Option<i64>, // Propagates down from "Transaction" nodes
-        ) -> Result<()> {
-            // A. Resolve/Insert Location
-            let loc_id: i32 = {
-                use self::schema::profiler_location::dsl::*;
-                diesel::insert_into(profiler_location)
-                    .values(&NewProfilerLocation {
-                        file: &node.file(),
-                        line: node.line() as i32,
-                    })
-                    .on_conflict((file, line))
-                    .do_update()
-                    .set(line.eq(line)) // No-op to return ID
-                    .returning(id)
-                    .get_result(conn)?
-            };
-
-            // B. Resolve/Insert Span Name
-            let span_id: i32 = {
-                use self::schema::profiler_span::dsl::*;
-                diesel::insert_into(profiler_span)
-                    .values(&NewProfilerSpan { name: &node.name() })
-                    .on_conflict(name)
-                    .do_update()
-                    .set(name.eq(name))
-                    .returning(id)
-                    .get_result(conn)?
-            };
-
-            // C. Determine Context (Block vs Tx)
-            let mut current_tx_id = active_tx_id;
-
-            // If this node is a "Transaction" root, we map it to a specific Tx ID
-            if node.name() == "Transaction" {
-                // We rely on the fact that "Transaction" spans appear in the "Transaction Replay"
-                // parent's children list in the exact order of execution.
-                // However, `insert_node` is called for *this* node.
-                // We need to know *which* transaction this is.
-                // The `child_index` passed here is the index in the parent's list.
-                if let Some(tid) = tx_db_ids.get(child_index as usize).and_then(|x| *x) {
-                    current_tx_id = Some(tid);
-                }
-            }
-
-            // D. Insert Record
-            let record_id: i32 = diesel::insert_into(schema::profiler_record::table)
-                .values(&NewProfilerRecord {
-                    benchmark_run_id: run_id,
-                    parent_id,
-                    profiler_span_id: span_id,
-                    profiler_location_id: loc_id,
-                    child_index,
-                    depth,
-                    stacks_block_id: if current_tx_id.is_none() {
-                        Some(block_pk)
-                    } else {
-                        None
-                    },
-                    stacks_tx_id: current_tx_id,
-                    wall_time_us: node.wall_time.as_micros() as i64,
-                    cpu_time_us: 0, // Profiler doesn't capture CPU time yet
-                    call_count: 1,
-                })
-                .returning(schema::profiler_record::id)
-                .get_result(conn)?;
-
-            // E. Recurse
-            for (idx, child) in node.children.iter().enumerate() {
-                insert_node(
-                    conn,
-                    child,
-                    run_id,
-                    Some(record_id),
-                    idx as i32,
-                    depth + 1,
-                    block_pk,
-                    tx_db_ids,
-                    current_tx_id,
-                )?;
-            }
-
-            Ok(())
-        }
-
-        // 4. Start Insertion
-        for (i, root) in results.iter().enumerate() {
-            insert_node(
-                &mut self.conn,
-                root,
-                run_id,
-                None,
-                i as i32,
-                0,
-                block_pk,
-                &tx_db_ids,
-                None,
-            )?;
-        }
-        Ok(())
-    }
-
     pub fn save_profiler_data_batch(
         &mut self,
         run_id: i32,
@@ -783,10 +707,6 @@ impl AppDb {
             Vec<crate::metrics::TransactionMetrics>,
         )>,
     ) -> Result<()> {
-        use diesel::connection::Connection;
-        use diesel::prelude::*;
-
-        use self::models::{NewProfilerLocation, NewProfilerRecord, NewProfilerSpan};
         use self::schema::{stacks_block, stacks_tx};
 
         // Take ownership of the batch data to process it
@@ -801,16 +721,23 @@ impl AppDb {
                     .first(conn)?;
 
                 // 2. Resolve Tx IDs (DB Primary Keys) for mapping
-                let mut tx_db_ids = Vec::with_capacity(tx_metrics.len());
-                for tx in tx_metrics {
-                    let tx_hash_bytes = hex::decode(&tx.txid)?;
-                    let tid: Option<i64> = stacks_tx::table
-                        .select(stacks_tx::id)
-                        .filter(stacks_tx::tx_hash.eq(tx_hash_bytes))
-                        .first(conn)
-                        .optional()?;
-                    tx_db_ids.push(tid);
-                }
+                let tx_hashes: Vec<Vec<u8>> = tx_metrics
+                    .iter()
+                    .map(|tx| hex::decode(&tx.txid))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let tx_lookup: HashMap<Vec<u8>, i64> = stacks_tx::table
+                    .select((stacks_tx::tx_hash, stacks_tx::id))
+                    .filter(stacks_tx::tx_hash.eq_any(&tx_hashes))
+                    .load(conn)?
+                    .into_iter()
+                    .collect();
+
+                // Map the metrics order to the resolved IDs
+                let tx_db_ids: Vec<Option<i64>> = tx_hashes
+                    .iter()
+                    .map(|h| tx_lookup.get(h).cloned())
+                    .collect();
 
                 // 3. Recursive Insert Function
                 fn insert_node(
@@ -823,33 +750,19 @@ impl AppDb {
                     block_pk: i64,
                     tx_db_ids: &[Option<i64>],
                     active_tx_id: Option<i64>,
+                    span_cache: &mut HashMap<String, i32>,
+                    loc_cache: &mut HashMap<(String, i32), i32>,
                 ) -> Result<()> {
-                    use crate::db::app::schema::{
-                        profiler_location, profiler_record, profiler_span,
-                    };
+                    // A. Resolve/Insert Location (With Caching)
+                    let loc_id = AppDb::resolve_profiler_location(
+                        conn,
+                        loc_cache,
+                        &node.file(),
+                        node.line() as i32,
+                    )?;
 
-                    // A. Resolve/Insert Location
-                    let loc_id: i32 = {
-                        diesel::insert_into(profiler_location::table)
-                            .values(&NewProfilerLocation {
-                                file: &node.file(),
-                                line: node.line() as i32,
-                            })
-                            .on_conflict((profiler_location::file, profiler_location::line))
-                            .do_nothing()
-                            .returning(profiler_location::id)
-                            .get_result(conn)?
-                    };
-
-                    // B. Resolve/Insert Span Name
-                    let span_id: i32 = {
-                        diesel::insert_into(profiler_span::table)
-                            .values(&NewProfilerSpan { name: &node.name() })
-                            .on_conflict(profiler_span::name)
-                            .do_nothing()
-                            .returning(profiler_span::id)
-                            .get_result(conn)?
-                    };
+                    // B. Resolve/Insert Span Name (With Caching)
+                    let span_id = AppDb::resolve_profiler_span(conn, span_cache, &node.name())?;
 
                     // C. Determine Context (Block vs Tx)
                     let mut current_tx_id = active_tx_id;
@@ -859,22 +772,43 @@ impl AppDb {
                         }
                     }
 
+                    // Calculate Metrics
+                    let wall_time_us = node.wall_time.as_micros() as i64;
+                    let children_wall_time_us: i64 = node
+                        .children
+                        .iter()
+                        .map(|c| c.wall_time.as_micros() as i64)
+                        .sum();
+                    // Use saturating_sub to handle potential clock skew or precision issues
+                    let self_wall_time_us = wall_time_us.saturating_sub(children_wall_time_us);
+
+                    // CPU time is not yet captured by ProfileStats, defaulting to 0
+                    let cpu_time_us = node.cpu_time.as_micros() as i64;
+                    let children_cpu_time_us: i64 = node
+                        .children
+                        .iter()
+                        .map(|c| c.cpu_time.as_micros() as i64)
+                        .sum();
+                    let self_cpu_time_us = cpu_time_us.saturating_sub(children_cpu_time_us);
+
                     // D. Insert Record
-                    let record_id: i32 = diesel::insert_into(profiler_record::table)
-                        .values(&NewProfilerRecord {
-                            benchmark_run_id: run_id,
-                            parent_id,
-                            profiler_span_id: span_id,
-                            profiler_location_id: loc_id,
-                            child_index,
-                            depth,
-                            stacks_block_id: Some(block_pk),
-                            stacks_tx_id: current_tx_id,
-                            wall_time_us: node.wall_time.as_micros() as i64,
-                            cpu_time_us: 0,
-                            call_count: 1,
-                        })
-                        .returning(profiler_record::id)
+                    let record_id: i32 = diesel::insert_into(schema::profiler_record::table)
+                        .values((
+                            schema::profiler_record::benchmark_run_id.eq(run_id),
+                            schema::profiler_record::parent_id.eq(parent_id),
+                            schema::profiler_record::profiler_span_id.eq(span_id),
+                            schema::profiler_record::profiler_location_id.eq(loc_id),
+                            schema::profiler_record::child_index.eq(child_index),
+                            schema::profiler_record::depth.eq(depth),
+                            schema::profiler_record::stacks_block_id.eq(Some(block_pk)),
+                            schema::profiler_record::stacks_tx_id.eq(current_tx_id),
+                            schema::profiler_record::wall_time_us.eq(wall_time_us),
+                            schema::profiler_record::cpu_time_us.eq(cpu_time_us),
+                            schema::profiler_record::self_wall_time_us.eq(self_wall_time_us),
+                            schema::profiler_record::self_cpu_time_us.eq(self_cpu_time_us),
+                            schema::profiler_record::call_count.eq(node.count as i32),
+                        ))
+                        .returning(schema::profiler_record::id)
                         .get_result(conn)?;
 
                     // E. Recurse
@@ -889,6 +823,8 @@ impl AppDb {
                             block_pk,
                             tx_db_ids,
                             current_tx_id,
+                            span_cache,
+                            loc_cache,
                         )?;
                     }
                     Ok(())
@@ -897,11 +833,142 @@ impl AppDb {
                 // 4. Start Insertion for this block
                 for (i, root) in results.iter().enumerate() {
                     insert_node(
-                        conn, root, run_id, None, i as i32, 0, block_pk, &tx_db_ids, None,
+                        conn,
+                        root,
+                        run_id,
+                        None,
+                        i as i32,
+                        0,
+                        block_pk,
+                        &tx_db_ids,
+                        None,
+                        &mut self.profiler_span_cache,
+                        &mut self.profiler_loc_cache,
                     )?;
                 }
             }
             Ok(())
         })
+    }
+
+    fn resolve_profiler_location(
+        conn: &mut SqliteConnection,
+        cache: &mut HashMap<(String, i32), i32>,
+        file: &str,
+        line: i32,
+    ) -> Result<i32> {
+        use schema::profiler_location;
+
+        let loc_key = (file.to_string(), line);
+        if let Some(&id) = cache.get(&loc_key) {
+            return Ok(id);
+        }
+
+        // Try insert, handle conflict by doing nothing
+        // We use .optional() because if the row exists, do_nothing() returns no rows
+        let id_opt: Option<i32> = diesel::insert_into(profiler_location::table)
+            .values((
+                profiler_location::file.eq(file),
+                profiler_location::line.eq(line),
+            ))
+            .on_conflict((profiler_location::file, profiler_location::line))
+            .do_nothing()
+            .returning(profiler_location::id)
+            .get_result(conn)
+            .optional()?;
+
+        let id = if let Some(id) = id_opt {
+            id
+        } else {
+            // Fallback: Select existing ID if insert did nothing
+            profiler_location::table
+                .select(profiler_location::id)
+                .filter(profiler_location::file.eq(file))
+                .filter(profiler_location::line.eq(line))
+                .first(conn)?
+        };
+
+        cache.insert(loc_key, id);
+        Ok(id)
+    }
+
+    fn resolve_profiler_span(
+        conn: &mut SqliteConnection,
+        cache: &mut HashMap<String, i32>,
+        name: &str,
+    ) -> Result<i32> {
+        use schema::profiler_span;
+
+        if let Some(&id) = cache.get(name) {
+            return Ok(id);
+        }
+
+        let id_opt: Option<i32> = diesel::insert_into(profiler_span::table)
+            .values(profiler_span::name.eq(name))
+            .on_conflict(profiler_span::name)
+            .do_nothing()
+            .returning(profiler_span::id)
+            .get_result(conn)
+            .optional()?;
+
+        let id = if let Some(id) = id_opt {
+            id
+        } else {
+            profiler_span::table
+                .select(profiler_span::id)
+                .filter(profiler_span::name.eq(name))
+                .first(conn)?
+        };
+
+        cache.insert(name.to_string(), id);
+        Ok(id)
+    }
+}
+
+impl ChainCache for AppDb {
+    fn find_closest_ancestor(
+        &mut self,
+        tip: &StacksBlockId,
+        target_height: u64,
+    ) -> Result<Option<(StacksBlockId, u64)>> {
+        use self::schema::chain_tip_cache;
+
+        // Find the block with the smallest height that is still >= target_height
+        // This gives us the closest point we can jump to without overshooting.
+        let result = chain_tip_cache::table
+            .select((chain_tip_cache::index_hash, chain_tip_cache::height))
+            .filter(chain_tip_cache::tip_index_hash.eq(tip.as_bytes()))
+            .filter(chain_tip_cache::height.ge(target_height as i64))
+            .order(chain_tip_cache::height.asc())
+            .first::<(Vec<u8>, i64)>(&mut self.conn)
+            .optional()?;
+
+        if let Some((hash, height)) = result {
+            let id =
+                StacksBlockId::from_vec(&hash).ok_or_else(|| anyhow!("Invalid hash in cache"))?;
+            Ok(Some((id, height as u64)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn cache_ancestor(
+        &mut self,
+        tip: &StacksBlockId,
+        height: u64,
+        block: &StacksBlockId,
+    ) -> Result<()> {
+        use self::schema::chain_tip_cache;
+
+        diesel::insert_into(chain_tip_cache::table)
+            .values((
+                chain_tip_cache::tip_index_hash.eq(tip.as_bytes()),
+                chain_tip_cache::height.eq(height as i64),
+                chain_tip_cache::index_hash.eq(block.as_bytes()),
+            ))
+            .on_conflict((chain_tip_cache::tip_index_hash, chain_tip_cache::height))
+            .do_nothing()
+            .execute(&mut self.conn)?;
+        Ok(())
     }
 }

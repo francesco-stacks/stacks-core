@@ -1,2 +1,0 @@
-DROP TABLE IF EXISTS profile_record;
-DROP TABLE IF EXISTS span_def;

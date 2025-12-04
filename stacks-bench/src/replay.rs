@@ -270,9 +270,8 @@ where
     for (i, tx) in block.txs.iter().enumerate() {
         let tx_len = tx.tx_len();
         let start_tx = Instant::now();
-        let tx_scope = Profiler::begin_span("Transaction");
 
-        let result = profile_scope!("try_mine_tx_with_len", {
+        let result = profile_scope!("Transaction", {
             builder.try_mine_tx_with_len(
                 &mut tenure_tx,
                 tx,
@@ -281,7 +280,6 @@ where
                 None,
             )
         });
-        drop(tx_scope);
 
         let duration_tx = start_tx.elapsed();
         let mut cost = ExecutionCost::ZERO;

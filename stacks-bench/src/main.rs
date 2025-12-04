@@ -17,12 +17,12 @@ use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use stacks_bench::context::{BenchContext, BenchContextOpts};
 use stacks_bench::db::DbOpenForRead;
-use stacks_bench::db::app::{AppDb, models};
+use stacks_bench::db::app::AppDb;
 use stacks_bench::db::node::ChainStateDb;
 use stacks_bench::db::node::chainstate::models::DbConfig;
 use stacks_bench::db::node::sortition::SortitionDb;
 use stacks_bench::metrics::{CostModel, MetricsAccumulator, ModelSource};
-use stacks_bench::paths::{AppDataPath, BurnChainPath, ChainStatePath};
+use stacks_bench::paths::{AppDataDir, BurnChainDir, ChainStateDir};
 use stacks_bench::replay::ReplayMode;
 use stacks_bench::{Network, StacksBlockRef};
 use stacks_profiler::{Profiler, profile_scope};
@@ -34,8 +34,8 @@ const METABASE_IMAGE_TAG: &str = "v0.57.4.3";
 pub struct Cli {
     /// The path to the application database (SQLite). If not specified, the database
     /// will be created in the same directory as the `stacks-bench` binary.
-    #[arg(long = "db", value_name = "DB_PATH")]
-    db_path: Option<PathBuf>,
+    #[arg(long = "db", value_name = "APP_DATA_DIR")]
+    app_data_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -57,6 +57,7 @@ pub enum Commands {
     },
 }
 
+// TODO: Add a `--contract` arg to filter by qualified contract id
 #[derive(clap::Args, Debug, Serialize, Deserialize)]
 pub struct BenchArgs {
     /// Stacks node data dir (the directory containing the `chainstate` folder).
@@ -180,7 +181,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Use AppDataPath to resolve locations
-    let app_data = AppDataPath::resolve_from_opt(cli.db_path.as_ref())?;
+    let app_data = AppDataDir::resolve_from_opt(cli.app_data_dir.as_ref())?;
 
     match cli.command {
         Commands::Metabase { port, image_tag } => run_metabase(&app_data, port, image_tag),
@@ -188,12 +189,12 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_bench(app_data: &AppDataPath, args: BenchArgs) -> Result<()> {
+fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     let app_db_path = app_data.app_db_path();
     let mut app_db = AppDb::open(&app_db_path)?;
 
-    let chainstate_path = ChainStatePath::from_node_root(&args.source_dir);
-    let burnchain_path = BurnChainPath::from_node_root(&args.source_dir);
+    let chainstate_path = ChainStateDir::from_node_root(&args.source_dir);
+    let burnchain_path = BurnChainDir::from_node_root(&args.source_dir);
 
     let mut chainstate_db = ChainStateDb::open_for_read(chainstate_path.index_db_path())?;
     let db_config = chainstate_db.read_db_config()?;
@@ -219,7 +220,7 @@ fn run_bench(app_data: &AppDataPath, args: BenchArgs) -> Result<()> {
         .with_maybe_end_block(args.end_at.clone())
         .with_maybe_tip(args.tip.clone());
 
-    let mut bench_context = BenchContext::initialize(context_opts)?;
+    let mut bench_context = BenchContext::initialize(context_opts, Some(&mut app_db))?;
 
     let (tip_id, tip_height) = bench_context.chain_tip();
 
@@ -282,16 +283,20 @@ fn run_bench(app_data: &AppDataPath, args: BenchArgs) -> Result<()> {
 
     let selected_block_count = block_ids.len();
 
+    let run_name = format!(
+        "{} - Blocks({start_height}..{end_height})",
+        Utc::now().format("%Y.%m.%d %H.%M.%S")
+    );
+
     let args_json = args.to_json()?;
     let git_commit_hash = get_git_hash().unwrap_or(vec![0u8; 20]); // Placeholder if git not available
-    let run_model = app_db.create_benchmark_run(models::NewBenchmarkRun {
-        run_name: None,
-        chainstate_id: chainstate_model.id,
+    let run_model = app_db.create_benchmark_run(
+        chainstate_model.id,
+        Utc::now().naive_utc(),
         git_commit_hash,
-        start_time: Utc::now().naive_utc(),
-        end_time: None,
+        Some(run_name),
         args_json,
-    })?;
+    )?;
 
     println!("Re-executing {selected_block_count} selected blocks...");
 
@@ -460,10 +465,16 @@ fn run_bench(app_data: &AppDataPath, args: BenchArgs) -> Result<()> {
         written as f64 / 1_024.0 / 1_024.0
     );
 
+    println!();
+    println!("Cleaning up and checkpointing/vacuuming database...");
+    app_db.checkpoint()?;
+    app_db.vacuum()?;
+    println!("Benchmark run complete");
+
     Ok(())
 }
 
-fn run_metabase(app_data: &AppDataPath, port: u16, image_tag: String) -> Result<()> {
+fn run_metabase(app_data: &AppDataDir, port: u16, image_tag: String) -> Result<()> {
     let db_path = app_data.app_db_path();
 
     // db_path is the full path to the database file.
@@ -474,14 +485,8 @@ fn run_metabase(app_data: &AppDataPath, port: u16, image_tag: String) -> Result<
         );
     }
 
-    // Docker requires absolute paths for volume mounts
-    let abs_data_dir = app_data
-        .as_ref()
-        .canonicalize()
-        .context("Failed to resolve absolute path for source directory")?;
-
     // We store postgres data in a subdirectory
-    let pg_data_dir = abs_data_dir.join("metabase-postgres");
+    let pg_data_dir = app_data.postgres_data_dir();
 
     if pg_data_dir.exists()
         && pg_data_dir
@@ -511,10 +516,13 @@ fn run_metabase(app_data: &AppDataPath, port: u16, image_tag: String) -> Result<
 
     // Create a runtime to execute the async Docker operations
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move { run_metabase_container(&abs_data_dir, port, image_tag).await })
+    rt.block_on(async move { run_metabase_container(&app_data, port, image_tag).await })
 }
 
-async fn run_metabase_container(data_dir: &PathBuf, port: u16, image_tag: String) -> Result<()> {
+async fn run_metabase_container(app_data: &AppDataDir, port: u16, image_tag: String) -> Result<()> {
+    let pg_data_dir = app_data.postgres_data_dir();
+    let app_db_dir = app_data.app_db_dir();
+
     let docker =
         Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
 
@@ -580,7 +588,6 @@ async fn run_metabase_container(data_dir: &PathBuf, port: u16, image_tag: String
         .context("Failed to create docker network")?;
 
     // 4. Start Postgres
-    let pg_data_dir = data_dir.join("metabase-postgres");
     std::fs::create_dir_all(&pg_data_dir).context("Failed to create postgres data dir")?;
 
     let pg_host_config = HostConfig {
@@ -673,7 +680,7 @@ async fn run_metabase_container(data_dir: &PathBuf, port: u16, image_tag: String
 
     // 5. Start Metabase
     let mb_host_config = HostConfig {
-        binds: Some(vec![format!("{}:/data", data_dir.to_string_lossy())]),
+        binds: Some(vec![format!("{}:/data", app_db_dir.to_string_lossy())]),
         port_bindings: Some(HashMap::from([(
             "3000/tcp".to_string(),
             Some(vec![PortBinding {

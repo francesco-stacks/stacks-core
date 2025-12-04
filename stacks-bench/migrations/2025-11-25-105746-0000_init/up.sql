@@ -1,8 +1,21 @@
+-- ==========================================
+-- Enum table for Bitcoin (and implicitly Stacks) networks.
+-- ==========================================
 CREATE TABLE network (
   id INTEGER PRIMARY KEY NOT NULL,
   name TEXT NOT NULL UNIQUE
 );
 
+-- Default networks
+INSERT INTO network (id, name) VALUES 
+  (1, 'mainnet'), 
+  (2, 'testnet'), 
+  (3, 'regtest');
+
+-- ==========================================
+-- Chainstate snapshot tracking, effectively unique per (network, chain_id, 
+-- tip, epochs).
+-- ==========================================
 CREATE TABLE chainstate (
   id INTEGER PRIMARY KEY NOT NULL,
   network_id INTEGER NOT NULL,
@@ -16,6 +29,10 @@ CREATE TABLE chainstate (
   UNIQUE (network_id, chain_id, tip_index_hash, epochs_hash)
 );
 
+-- ==========================================
+-- Dimension for epochs, unique per chainstate. Pulled from the Stacks
+-- sortition database.
+-- ==========================================
 CREATE TABLE epoch (
     id INTEGER PRIMARY KEY NOT NULL,
     chainstate_id INTEGER NOT NULL,
@@ -32,49 +49,145 @@ CREATE TABLE epoch (
     UNIQUE(chainstate_id, stacks_epoch_id)
 );
 
+-- ==========================================
+-- Dimension for Stacks transaction types which have been seen.
+-- ==========================================
+CREATE TABLE stacks_tx_type (
+    id INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE _staged_stacks_tx_type (
+    name TEXT NOT NULL
+);
+
+-- ==========================================
+-- Dimension for Stacks principals which have been seen.
+-- ==========================================
+CREATE TABLE principal (
+    id INTEGER PRIMARY KEY NOT NULL,
+    address TEXT NOT NULL UNIQUE
+);
+
+-- ==========================================
+-- Staging table for Stacks principals during bulk import.
+-- ==========================================
+CREATE TABLE _staged_principal (
+    address TEXT NOT NULL
+);
+
+-- ==========================================
+-- Dimension for Stacks contracts which have been seen.
+-- ==========================================
+CREATE TABLE contract (
+    id INTEGER PRIMARY KEY NOT NULL,
+    issuer_principal_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    FOREIGN KEY (issuer_principal_id) REFERENCES principal(id),
+    UNIQUE(issuer_principal_id, name)
+);
+
+CREATE INDEX idx_contract_principal ON contract(issuer_principal_id);
+CREATE INDEX idx_contract_name ON contract(name);
+
+-- ==========================================
+-- Staging table for Stacks contracts during bulk import.
+-- ==========================================
+CREATE TABLE _staged_contract (
+    issuer_address TEXT NOT NULL,
+    name TEXT NOT NULL
+);
+
+-- ==========================================
+-- Dimension for burn (Bitcoin) blocks. Not linked to any specific
+-- chainstate as they are cryptographically deterministic.
+-- ==========================================
 CREATE TABLE burn_block (
     id INTEGER PRIMARY KEY NOT NULL,
     block_hash BLOB NOT NULL UNIQUE,
+    block_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(block_hash))) STORED,
     height INTEGER NOT NULL,
+    CHECK(height >= 0),
     CHECK(length(block_hash) = 32)
 );
 
+CREATE INDEX idx_burn_block_height ON burn_block(height);
+CREATE INDEX idx_burn_block_block_hash_hex ON burn_block(block_hash_hex);
+
+-- ==========================================
+-- Dimension for Stacks blocks. Not linked to any specific chainstate as they
+-- are cryptographically deterministic.
+-- ==========================================
 CREATE TABLE stacks_block (
   id INTEGER PRIMARY KEY NOT NULL,
   index_hash BLOB NOT NULL UNIQUE,
+  index_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(index_hash))) STORED,
+  block_hash BLOB NOT NULL,
+  block_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(block_hash))) STORED,
   height INTEGER NOT NULL,
   parent_stacks_block_id INTEGER DEFAULT NULL,
   burn_block_id INTEGER NOT NULL,
   FOREIGN KEY (burn_block_id) REFERENCES burn_block(id),
   FOREIGN KEY (parent_stacks_block_id) REFERENCES stacks_block(id),
+  CHECK(height >= 0),
   CHECK(length(index_hash) = 32)
 );
 
+CREATE INDEX idx_stacks_block_height ON stacks_block(height);
+CREATE INDEX idx_stacks_block_index_hash_hex ON stacks_block(index_hash_hex);
+CREATE INDEX idx_stacks_block_block_hash_hex ON stacks_block(block_hash_hex);
+
+-- ==========================================
+-- Staging table for Stacks blocks during bulk import.
+-- ==========================================
 CREATE TABLE _staged_stacks_block (
-    index_hash BLOB PRIMARY KEY,
+    index_hash BLOB NOT NULL,
+    block_hash BLOB NOT NULL,
     parent_index_hash BLOB NOT NULL,
     height INTEGER NOT NULL,
     burn_block_hash BLOB NOT NULL,
     burn_block_height INTEGER NOT NULL
 );
 
-
+-- ==========================================
+-- Dimension for Stacks transactions. Not linked to any specific chainstate as 
+-- they are cryptographically deterministic.
+-- ==========================================
 CREATE TABLE stacks_tx (
   id INTEGER PRIMARY KEY NOT NULL,
   stacks_block_id INTEGER NOT NULL,
   tx_hash BLOB NOT NULL UNIQUE,
-  tx_type TEXT NOT NULL,
+  tx_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(tx_hash))) STORED,
+  stacks_tx_type_id INTEGER NOT NULL,
+  caller_principal_id INTEGER NOT NULL,
+  contract_id INTEGER,
   FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
+  FOREIGN KEY (stacks_tx_type_id) REFERENCES stacks_tx_type(id),
+  FOREIGN KEY (caller_principal_id) REFERENCES principal(id),
+  FOREIGN KEY (contract_id) REFERENCES contract(id),
   UNIQUE(stacks_block_id, tx_hash),
   CHECK(length(tx_hash) = 32)
 );
 
+CREATE INDEX idx_tx_tx_hash_hex ON stacks_tx(tx_hash_hex);
+CREATE INDEX idx_tx_caller_principal ON stacks_tx(caller_principal_id);
+CREATE INDEX idx_tx_contract ON stacks_tx(contract_id);
+
+-- ==========================================
+-- Staging table for Stacks transactions during bulk import.
+-- ==========================================
 CREATE TABLE _staged_stacks_tx (
     block_index_hash BLOB NOT NULL,
     tx_hash BLOB NOT NULL,
-    tx_type TEXT NOT NULL
+    tx_type TEXT NOT NULL,
+    caller_address TEXT NOT NULL,
+    contract_issuer_address TEXT,
+    contract_name TEXT
 );
 
+-- ==========================================
+-- Dimension for benchmark runs.
+-- ==========================================
 CREATE TABLE benchmark_run (
   id INTEGER PRIMARY KEY NOT NULL,
   run_name TEXT,
@@ -87,6 +200,9 @@ CREATE TABLE benchmark_run (
   CHECK(length(git_commit_hash) = 20)
 );
 
+-- ==========================================
+-- Fact table for benchmark statistics per Stacks block.
+-- ==========================================
 CREATE TABLE stacks_block_stats (
   id INTEGER PRIMARY KEY NOT NULL,
   benchmark_run_id INTEGER NOT NULL,
@@ -111,6 +227,11 @@ CREATE TABLE stacks_block_stats (
   UNIQUE (benchmark_run_id, stacks_block_id)
 );
 
+CREATE INDEX idx_stacks_block_stats_block ON stacks_block_stats (stacks_block_id);
+
+-- ==========================================
+-- Fact table for benchmark statistics per Stacks transaction.
+-- ==========================================
 CREATE TABLE stacks_tx_stats (
   id INTEGER PRIMARY KEY NOT NULL,
   benchmark_run_id INTEGER NOT NULL,
@@ -132,41 +253,82 @@ CREATE TABLE stacks_tx_stats (
   UNIQUE (benchmark_run_id, stacks_tx_id)
 );
 
--- stacks_block lookups by height
-CREATE INDEX idx_stacks_block_height
-  ON stacks_block(height);
+CREATE INDEX idx_stacks_tx_stats_tx ON stacks_tx_stats (stacks_tx_id);
 
--- stacks_tx lookups by parent stacks_block
-CREATE INDEX idx_tx_stacks_block
-  ON stacks_tx(stacks_block_id);
+-- ==========================================
+-- Dimension table for profiler locations (file + line).
+-- ==========================================
+CREATE TABLE profiler_location (
+  id INTEGER PRIMARY KEY NOT NULL,
+  file TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  UNIQUE(file, line)
+);
 
--- benchmark_run: helpful for lookups/filtering
-CREATE INDEX idx_benchmark_run_chainstate_id
-  ON benchmark_run(chainstate_id);
+-- ==========================================
+-- Dimension table for profiler spans (named code regions).
+-- ==========================================
+CREATE TABLE profiler_span (
+  id INTEGER PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL,
+  UNIQUE(name)
+);
 
-CREATE INDEX idx_benchmark_run_git_commit_hash
-  ON benchmark_run(git_commit_hash);
+-- ==========================================
+-- Dimension table for profiler records (hierarchical timing data, per span and parent).
+-- ==========================================
+CREATE TABLE profiler_record (
+  id INTEGER PRIMARY KEY NOT NULL,
+  benchmark_run_id INTEGER NOT NULL,
 
-CREATE INDEX idx_benchmark_run_start_time
-  ON benchmark_run(start_time);
+  -- Hierarchy
+  parent_id INTEGER,
+  profiler_span_id INTEGER NOT NULL,
+  profiler_location_id INTEGER NOT NULL,
+  child_index INTEGER NOT NULL, -- Preserves execution order for flamegraphs
+  depth INTEGER NOT NULL,       -- Optimization for UI rendering
 
-CREATE INDEX idx_benchmark_run_end_time
-  ON benchmark_run(end_time);
+  -- Context
+  stacks_block_id INTEGER,
+  stacks_tx_id INTEGER,
 
-CREATE INDEX idx_stacks_block_stats_run
-  ON stacks_block_stats (benchmark_run_id);
+  -- Metrics
+  wall_time_us INTEGER NOT NULL,
+  cpu_time_us INTEGER NOT NULL,
+  -- Exclusive wall time (wall_time - sum(children.wall_time))
+  self_wall_time_us INTEGER NOT NULL,
+  -- Exclusive CPU time (cpu_time - sum(children.cpu_time))
+  self_cpu_time_us INTEGER NOT NULL,
+  call_count INTEGER NOT NULL,
 
-CREATE INDEX idx_stacks_block_stats_block
-  ON stacks_block_stats (stacks_block_id);
+  -- Constraints
+  FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id) ON DELETE CASCADE,
+  FOREIGN KEY (parent_id) REFERENCES profiler_record(id) ON DELETE CASCADE,
+  FOREIGN KEY (profiler_span_id) REFERENCES profiler_span(id),
+  FOREIGN KEY (profiler_location_id) REFERENCES profiler_location(id),
+  FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
+  FOREIGN KEY (stacks_tx_id) REFERENCES stacks_tx(id)
+);
 
-CREATE INDEX idx_stacks_tx_stats_run
-  ON stacks_tx_stats (benchmark_run_id);
+CREATE INDEX idx_prof_run_block 
+  ON profiler_record(benchmark_run_id, stacks_block_id)
+  WHERE stacks_block_id IS NOT NULL;
+CREATE INDEX idx_prof_run_tx 
+  ON profiler_record(benchmark_run_id, stacks_tx_id)
+  WHERE stacks_tx_id IS NOT NULL;
+CREATE INDEX idx_prof_parent ON profiler_record(parent_id);
+CREATE INDEX idx_prof_profiler_span ON profiler_record(profiler_span_id);
 
-CREATE INDEX idx_stacks_tx_stats_tx
-  ON stacks_tx_stats (stacks_tx_id);
-
--- Seed Network Data
-INSERT INTO network (id, name) VALUES 
-  (1, 'mainnet'), 
-  (2, 'testnet'), 
-  (3, 'regtest');
+-- ==========================================
+-- Cache table for chain tip lookups to speed up ancestor queries (e.g. when
+-- determining the Stacks block at a given height for a specific tip).
+-- ==========================================
+CREATE TABLE chain_tip_cache (
+  tip_index_hash BLOB NOT NULL,
+  height BIGINT NOT NULL,
+  index_hash BLOB NOT NULL,
+  PRIMARY KEY (tip_index_hash, height),
+  CHECK(LENGTH(tip_index_hash) = 32),
+  CHECK(LENGTH(index_hash) = 32),
+  CHECK(height >= 0)
+);

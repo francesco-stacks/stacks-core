@@ -8,7 +8,7 @@ use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use clarity::codec::StacksMessageCodec;
 use clarity::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
 use clarity::types::StacksEpochId;
-use clarity::types::chainstate::BurnchainHeaderHash;
+use clarity::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash};
 use serde::{Deserialize, Serialize};
 use stacks_common::types::chainstate::StacksBlockId;
 
@@ -19,6 +19,25 @@ pub mod paths;
 pub mod profiler;
 pub mod replay;
 pub mod shadow;
+
+/// Trait for caching and retrieving block ancestors to speed up chain walking.
+pub trait ChainCache {
+    /// Finds the closest known ancestor of `tip` that has a height >= `target_height`.
+    /// Returns `Some((block_id, height))` if found.
+    fn find_closest_ancestor(
+        &mut self,
+        tip: &StacksBlockId,
+        target_height: u64,
+    ) -> Result<Option<(StacksBlockId, u64)>>;
+
+    /// Caches a known ancestor for a given tip.
+    fn cache_ancestor(
+        &mut self,
+        tip: &StacksBlockId,
+        height: u64,
+        block: &StacksBlockId,
+    ) -> Result<()>;
+}
 
 #[derive(Debug, Clone)]
 pub struct StacksEpoch {
@@ -192,6 +211,7 @@ pub enum BlockEra {
 #[derive(Debug, Clone)]
 pub struct BlockSummary {
     pub id: StacksBlockId,
+    pub block_hash: BlockHeaderHash,
     pub height: u64,
     pub parent_id: StacksBlockId,
     pub burn_block_height: Option<u32>,
@@ -229,12 +249,14 @@ pub struct BlockSummary {
 impl BlockSummary {
     pub fn new(
         id: StacksBlockId,
+        block_hash: BlockHeaderHash,
         parent_id: StacksBlockId,
         height: u64,
         epoch: StacksEpochId,
     ) -> Self {
         BlockSummary {
             id,
+            block_hash,
             height,
             parent_id,
             burn_block_height: None,
@@ -455,7 +477,13 @@ mod tests {
     /// Test helper to create a [`Block`] with the specified height.
     fn mk_block(height: u64) -> BlockSummary {
         let id = StacksBlockId::first_mined();
-        BlockSummary::new(id.clone(), id, height, StacksEpochId::Epoch10)
+        BlockSummary::new(
+            id.clone(),
+            [0; 32].into(),
+            id,
+            height,
+            StacksEpochId::Epoch10,
+        )
     }
 
     /// Test helper to create a [`BlockChain`] from a list of heights.

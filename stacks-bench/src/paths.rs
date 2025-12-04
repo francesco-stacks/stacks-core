@@ -4,31 +4,31 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::db::app::AppDb;
 
-pub struct AppDataPath(PathBuf);
+pub struct AppDataDir(PathBuf);
 
-impl AsRef<Path> for AppDataPath {
+impl AsRef<Path> for AppDataDir {
     fn as_ref(&self) -> &Path {
         self.path()
     }
 }
 
-impl TryFrom<PathBuf> for AppDataPath {
+impl TryFrom<PathBuf> for AppDataDir {
     type Error = anyhow::Error;
 
     fn try_from(value: PathBuf) -> Result<Self, Self::Error> {
-        Ok(AppDataPath(value.canonicalize()?))
+        Ok(AppDataDir(value.canonicalize()?))
     }
 }
 
-impl TryFrom<&Path> for AppDataPath {
+impl TryFrom<&Path> for AppDataDir {
     type Error = anyhow::Error;
 
     fn try_from(value: &Path) -> Result<Self, Self::Error> {
-        Ok(AppDataPath(value.canonicalize()?))
+        Ok(AppDataDir(value.canonicalize()?))
     }
 }
 
-impl AppDataPath {
+impl AppDataDir {
     pub const APP_DATA_DIR_NAME: &'static str = ".stacks-bench";
 
     /// Resolves the app data directory from the CLI `db_path` option.
@@ -82,19 +82,27 @@ impl AppDataPath {
             .ok_or(anyhow!("Failed to convert app data path to str"))
     }
 
+    pub fn app_db_dir(&self) -> PathBuf {
+        self.path().join("appdata")
+    }
+
     pub fn app_db_path(&self) -> PathBuf {
-        self.path().join(AppDb::DEFAULT_DB_FILENAME)
+        self.app_db_dir().join(AppDb::DEFAULT_DB_FILENAME)
+    }
+
+    pub fn postgres_data_dir(&self) -> PathBuf {
+        self.path().join("pgdata")
     }
 }
 
-pub struct BurnChainPath(PathBuf);
+pub struct BurnChainDir(PathBuf);
 
-impl BurnChainPath {
+impl BurnChainDir {
     pub const BURNCHAIN_DIR_NAME: &'static str = "burnchain";
     pub const SORTITION_DB_RELATIVE_FILE_PATH: &str = "sortition/marf.sqlite";
 
     pub fn new<P: Into<PathBuf>>(path: P) -> Self {
-        BurnChainPath(path.into())
+        BurnChainDir(path.into())
     }
 
     pub fn from_node_root<P: AsRef<Path>>(node_root: P) -> Self {
@@ -116,20 +124,20 @@ impl BurnChainPath {
     }
 }
 
-impl AsRef<Path> for BurnChainPath {
+impl AsRef<Path> for BurnChainDir {
     fn as_ref(&self) -> &Path {
         self.path()
     }
 }
 
-pub struct ChainStatePath(PathBuf);
+pub struct ChainStateDir(PathBuf);
 
-impl ChainStatePath {
+impl ChainStateDir {
     pub const CHAINSTATE_DIR_NAME: &'static str = "chainstate";
     pub const INDEX_DB_RELATIVE_FILE_PATH: &'static str = "vm/index.sqlite";
 
     pub fn new<P: Into<PathBuf>>(path: P) -> Self {
-        ChainStatePath(path.into())
+        ChainStateDir(path.into())
     }
 
     pub fn from_node_root<P: AsRef<Path>>(node_root: P) -> Self {
@@ -151,7 +159,7 @@ impl ChainStatePath {
     }
 }
 
-impl AsRef<Path> for ChainStatePath {
+impl AsRef<Path> for ChainStateDir {
     fn as_ref(&self) -> &Path {
         self.path()
     }

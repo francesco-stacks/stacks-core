@@ -9,8 +9,12 @@ use super::schema::{
     stacks_tx_stats,
 };
 use crate::ResolveEpochFromHeight;
+use crate::db::app::schema::{
+    _staged_contract, _staged_principal, _staged_stacks_tx_type, chain_tip_cache, contract,
+    principal, stacks_tx_type,
+};
 
-#[derive(Queryable, Selectable, Identifiable, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
 #[diesel(table_name = network)]
 pub struct Network {
     pub id: i32,
@@ -23,7 +27,7 @@ impl Network {
     pub const REGTEST: i32 = 3;
 }
 
-#[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(Network))]
 #[diesel(table_name = chainstate)]
 pub struct Chainstate {
@@ -35,17 +39,7 @@ pub struct Chainstate {
     pub epochs_hash: Vec<u8>,
 }
 
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = chainstate)]
-pub struct NewChainstate {
-    pub network_id: i32,
-    pub chain_id: i64,
-    pub tip_index_hash: Vec<u8>,
-    pub tip_height: i64,
-    pub epochs_hash: Vec<u8>,
-}
-
-#[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(Chainstate))]
 #[diesel(table_name = epoch)]
 pub struct Epoch {
@@ -84,51 +78,66 @@ impl ResolveEpochFromHeight for [Epoch] {
     }
 }
 
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = epoch)]
-pub struct NewEpoch {
-    pub chainstate_id: i32,
-    pub stacks_epoch_id: i32,
-    pub network_epoch_id: i32,
-    pub start_height: i64,
-    pub end_height: i64,
-    pub write_length_budget: i64,
-    pub write_count_budget: i64,
-    pub read_length_budget: i64,
-    pub read_count_budget: i64,
-    pub runtime_budget: i64,
+#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
+#[diesel(table_name = stacks_tx_type)]
+pub struct StacksTxType {
+    pub id: i32,
+    pub name: String,
 }
 
-#[derive(Queryable, Selectable, Identifiable, Debug, Clone)]
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = _staged_stacks_tx_type)]
+pub struct StagedStacksTxType {
+    pub name: String,
+}
+
+#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
+#[diesel(table_name = principal)]
+pub struct Principal {
+    pub id: i32,
+    pub address: String,
+}
+
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = _staged_principal)]
+pub struct StagedPrincipal {
+    pub address: String,
+}
+
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[diesel(belongs_to(Principal, foreign_key = issuer_principal_id))]
+#[diesel(table_name = contract)]
+pub struct Contract {
+    pub id: i32,
+    pub issuer_principal_id: i32,
+    pub name: String,
+}
+
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = _staged_contract)]
+pub struct StagedContract {
+    pub issuer_address: String,
+    pub name: String,
+}
+
+#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
 #[diesel(table_name = burn_block)]
 pub struct BurnBlock {
     pub id: i64,
     pub block_hash: Vec<u8>,
+    pub block_hash_hex: String,
     pub height: i64,
 }
 
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = burn_block)]
-pub struct NewBurnBlock {
-    pub block_hash: Vec<u8>,
-    pub height: i64,
-}
-
-#[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(BurnBlock))]
 #[diesel(table_name = stacks_block)]
 pub struct StacksBlock {
     pub id: i64,
     pub index_hash: Vec<u8>,
-    pub height: i64,
-    pub parent_stacks_block_id: Option<i64>,
-    pub burn_block_id: i64,
-}
-
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = stacks_block)]
-pub struct NewStacksBlock {
-    pub index_hash: Vec<u8>,
+    pub index_hash_hex: String,
+    pub block_hash: Vec<u8>,
+    pub block_hash_hex: String,
     pub height: i64,
     pub parent_stacks_block_id: Option<i64>,
     pub burn_block_id: i64,
@@ -138,20 +147,24 @@ pub struct NewStacksBlock {
 #[diesel(table_name = _staged_stacks_block)]
 pub struct StagedStacksBlock {
     pub index_hash: Vec<u8>,
+    pub block_hash: Vec<u8>,
     pub parent_index_hash: Vec<u8>,
     pub height: i64,
     pub burn_block_hash: Vec<u8>,
     pub burn_block_height: i64,
 }
 
-#[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(StacksBlock))]
 #[diesel(table_name = stacks_tx)]
 pub struct StacksTx {
     pub id: i64,
     pub stacks_block_id: i64,
     pub tx_hash: Vec<u8>,
-    pub tx_type: String,
+    pub tx_hash_hex: String,
+    pub stacks_tx_type_id: i32,
+    pub caller_principal_id: i32,
+    pub contract_id: Option<i32>,
 }
 
 #[derive(Insertable, Debug, Clone)]
@@ -160,19 +173,14 @@ pub struct StagedStacksTx {
     pub block_index_hash: Vec<u8>,
     pub tx_hash: Vec<u8>,
     pub tx_type: String,
-}
-
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = stacks_tx)]
-pub struct NewStacksTx {
-    pub stacks_block_id: i64,
-    pub tx_hash: Vec<u8>,
-    pub tx_type: String,
+    pub caller_address: String,
+    pub contract_issuer_address: Option<String>,
+    pub contract_name: Option<String>,
 }
 
 // Keep Queryable as Value (Diesel can deserialize Text -> Value automatically if feature is on,
 // or we can use String and deserialize manually)
-#[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(Chainstate))]
 #[diesel(table_name = benchmark_run)]
 pub struct BenchmarkRun {
@@ -185,18 +193,7 @@ pub struct BenchmarkRun {
     pub args_json: String,
 }
 
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = benchmark_run)]
-pub struct NewBenchmarkRun {
-    pub run_name: Option<String>,
-    pub chainstate_id: i32,
-    pub git_commit_hash: Vec<u8>,
-    pub start_time: NaiveDateTime,
-    pub end_time: Option<NaiveDateTime>,
-    pub args_json: String,
-}
-
-#[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(BenchmarkRun))]
 #[diesel(belongs_to(StacksBlock))]
 #[diesel(table_name = stacks_block_stats)]
@@ -216,24 +213,7 @@ pub struct StacksBlockStats {
     pub clarity_runtime: i32,
 }
 
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = stacks_block_stats)]
-pub struct NewStacksBlockStats {
-    pub benchmark_run_id: i32,
-    pub stacks_block_id: i64,
-    pub total_duration_us: i32,
-    pub setup_duration_us: i32,
-    pub execution_duration_us: i32,
-    pub commit_duration_us: i32,
-    pub commit_overhead_baseline_us: i32,
-    pub clarity_write_length: i32,
-    pub clarity_write_count: i32,
-    pub clarity_read_length: i32,
-    pub clarity_read_count: i32,
-    pub clarity_runtime: i32,
-}
-
-#[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(BenchmarkRun))]
 #[diesel(belongs_to(StacksTx))]
 #[diesel(table_name = stacks_tx_stats)]
@@ -250,28 +230,7 @@ pub struct StacksTxStats {
     pub clarity_runtime: i32,
 }
 
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = stacks_tx_stats)]
-pub struct NewStacksTxStats {
-    pub benchmark_run_id: i32,
-    pub stacks_tx_id: i64,
-    pub duration_us: i32,
-    pub estimated_commit_impact_us: i32,
-    pub clarity_write_length: i32,
-    pub clarity_write_count: i32,
-    pub clarity_read_length: i32,
-    pub clarity_read_count: i32,
-    pub clarity_runtime: i32,
-}
-
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = profiler_location)]
-pub struct NewProfilerLocation<'a> {
-    pub file: &'a str,
-    pub line: i32,
-}
-
-#[derive(Queryable, Selectable, Identifiable, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
 #[diesel(table_name = profiler_location)]
 pub struct ProfilerLocation {
     pub id: i32,
@@ -279,36 +238,14 @@ pub struct ProfilerLocation {
     pub line: i32,
 }
 
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = profiler_span)]
-pub struct NewProfilerSpan<'a> {
-    pub name: &'a str,
-}
-
-#[derive(Queryable, Selectable, Identifiable, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
 #[diesel(table_name = profiler_span)]
 pub struct ProfilerSpan {
     pub id: i32,
     pub name: String,
 }
 
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = profiler_record)]
-pub struct NewProfilerRecord {
-    pub benchmark_run_id: i32,
-    pub parent_id: Option<i32>,
-    pub profiler_span_id: i32,
-    pub profiler_location_id: i32,
-    pub child_index: i32,
-    pub depth: i32,
-    pub stacks_block_id: Option<i64>,
-    pub stacks_tx_id: Option<i64>,
-    pub wall_time_us: i64,
-    pub cpu_time_us: i64,
-    pub call_count: i32,
-}
-
-#[derive(Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(BenchmarkRun))]
 #[diesel(belongs_to(ProfilerSpan))]
 #[diesel(belongs_to(ProfilerLocation))]
@@ -328,5 +265,16 @@ pub struct ProfilerRecord {
     pub stacks_tx_id: Option<i64>,
     pub wall_time_us: i64,
     pub cpu_time_us: i64,
+    pub self_wall_time_us: i64,
+    pub self_cpu_time_us: i64,
     pub call_count: i32,
+}
+
+#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
+#[diesel(table_name = chain_tip_cache)]
+#[diesel(primary_key(tip_index_hash, height))] // Explicitly define composite key
+pub struct ChainTipCache {
+    pub tip_index_hash: Vec<u8>,
+    pub height: i64,
+    pub index_hash: Vec<u8>,
 }
