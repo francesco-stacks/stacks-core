@@ -16,11 +16,12 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use stacks_bench::context::{BenchContext, BenchContextOpts};
-use stacks_bench::db::DbOpenForRead;
+use stacks_bench::db::DbOpenForRead as _;
 use stacks_bench::db::app::AppDb;
 use stacks_bench::db::node::ChainStateDb;
 use stacks_bench::db::node::chainstate::models::DbConfig;
 use stacks_bench::db::node::sortition::SortitionDb;
+use stacks_bench::indexer::ChainstateIndexer;
 use stacks_bench::metrics::{CostModel, MetricsAccumulator, ModelSource};
 use stacks_bench::paths::{AppDataDir, BurnChainDir, ChainStateDir};
 use stacks_bench::replay::ReplayMode;
@@ -45,6 +46,8 @@ pub struct Cli {
 pub enum Commands {
     /// Run the benchmark
     Bench(BenchArgs),
+    /// Manage chainstate data
+    Chainstate(ChainstateArgs),
     /// Launch a pre-configured Metabase instance to analyze results
     Metabase {
         /// Port to expose Metabase on (default: 3000)
@@ -57,6 +60,81 @@ pub enum Commands {
     },
 }
 
+#[derive(clap::Args, Debug)]
+pub struct ChainstateArgs {
+    #[command(subcommand)]
+    command: ChainstateCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ChainstateCommands {
+    /// Index a range of blocks from the node database
+    Index(IndexArgs),
+}
+
+pub trait IndexerArgs {
+    fn source_dir(&self) -> &PathBuf;
+    fn start_at(&self) -> Option<&StacksBlockRef>;
+    fn end_at(&self) -> Option<&StacksBlockRef>;
+    fn block_count(&self) -> Option<u32>;
+    fn tip(&self) -> Option<&StacksBlockRef>;
+    fn network(&self) -> Option<Network>;
+}
+
+#[derive(clap::Args, Debug, Serialize, Deserialize)]
+pub struct IndexArgs {
+    /// Stacks node data dir (the directory containing the `chainstate` folder).
+    #[arg(long = "source", short = 's')]
+    source_dir: PathBuf,
+
+    /// The Stacks block (height or hex block id) to start at, inclusive.
+    #[arg(long, default_value = "1")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_at: Option<StacksBlockRef>,
+
+    /// The Stacks block (height or hex block id) to end at, inclusive. Cannot
+    /// be used with the `count` flag.
+    #[arg(long, conflicts_with_all = &["block_count"])]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_at: Option<StacksBlockRef>,
+
+    /// The number of blocks to process, starting from `start-at`.
+    #[arg(long = "count", short = 'c', conflicts_with_all = &["end_at"], requires = "start_at")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_count: Option<u32>,
+
+    /// The tip block (height or hex block id) to use as the anchor for resolving canonical history.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tip: Option<StacksBlockRef>,
+
+    /// The network to use (`mainnet`, `testnet`, `regtest`).
+    #[arg(long, short = 'n', alias = "net")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<Network>,
+}
+
+impl IndexerArgs for IndexArgs {
+    fn source_dir(&self) -> &PathBuf {
+        &self.source_dir
+    }
+    fn start_at(&self) -> Option<&StacksBlockRef> {
+        self.start_at.as_ref()
+    }
+    fn end_at(&self) -> Option<&StacksBlockRef> {
+        self.end_at.as_ref()
+    }
+    fn block_count(&self) -> Option<u32> {
+        self.block_count
+    }
+    fn tip(&self) -> Option<&StacksBlockRef> {
+        self.tip.as_ref()
+    }
+    fn network(&self) -> Option<Network> {
+        self.network
+    }
+}
+
 // TODO: Add a `--contract` arg to filter by qualified contract id
 #[derive(clap::Args, Debug, Serialize, Deserialize)]
 pub struct BenchArgs {
@@ -66,19 +144,19 @@ pub struct BenchArgs {
 
     /// The Stacks block (height or hex block id) to start at, inclusive. Cannot
     /// be used with the `txid` flag.
-    #[arg(long, conflicts_with = "txid")]
+    #[arg(long, conflicts_with = "txid", default_value = "1")]
     #[serde(skip_serializing_if = "Option::is_none")]
     start_at: Option<StacksBlockRef>,
 
     /// The Stacks block (height or hex block id) to end at, inclusive. Cannot
     /// be used with the `txid` or `count` flags.
-    #[arg(long, conflicts_with_all = &["txid", "count"])]
+    #[arg(long, conflicts_with_all = &["txid", "block_count"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     end_at: Option<StacksBlockRef>,
 
-    /// The tip block (height or hex block id) to use as the anchor for resolving canonical history.
-    /// Defaults to the node's current canonical tip.
-    /// Useful for benchmarking forks: provide the fork's tip hash here.
+    /// The tip block (height or hex block id) to use as the anchor for
+    /// resolving canonical history. Defaults to the node's current canonical
+    /// tip. Useful for benchmarking in forks: provide the fork's tip hash here.
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     tip: Option<StacksBlockRef>,
@@ -90,7 +168,7 @@ pub struct BenchArgs {
     network: Option<Network>,
 
     /// The number of blocks to process, starting from `start-at`.
-    #[arg(long, short = 'c', conflicts_with_all = &["end_at", "txid"], requires = "start_at")]
+    #[arg(long = "count", short = 'c', conflicts_with_all = &["end_at", "txid"], requires = "start_at")]
     #[serde(skip_serializing_if = "Option::is_none")]
     block_count: Option<u32>,
 
@@ -102,6 +180,27 @@ pub struct BenchArgs {
     /// Number of blocks to use for calibration of the commit cost model.
     #[arg(long, value_name = "CALIBRATION_BLOCKS", default_value_t = 20)]
     calibration: usize,
+}
+
+impl IndexerArgs for BenchArgs {
+    fn source_dir(&self) -> &PathBuf {
+        &self.source_dir
+    }
+    fn start_at(&self) -> Option<&StacksBlockRef> {
+        self.start_at.as_ref()
+    }
+    fn end_at(&self) -> Option<&StacksBlockRef> {
+        self.end_at.as_ref()
+    }
+    fn block_count(&self) -> Option<u32> {
+        self.block_count
+    }
+    fn tip(&self) -> Option<&StacksBlockRef> {
+        self.tip.as_ref()
+    }
+    fn network(&self) -> Option<Network> {
+        self.network
+    }
 }
 
 impl BenchArgs {
@@ -178,6 +277,13 @@ fn get_git_hash() -> Option<Vec<u8>> {
 }
 
 fn main() -> Result<()> {
+    // SAFETY: This is the first thing we do in the process, before any
+    // potential threads are spawned or any FFI into C libraries that might read
+    // the environment.
+    unsafe {
+        std::env::set_var("STACKS_LOG_CRITONLY", "1");
+    }
+
     let cli = Cli::parse();
 
     // Use AppDataPath to resolve locations
@@ -186,107 +292,106 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Metabase { port, image_tag } => run_metabase(&app_data, port, image_tag),
         Commands::Bench(args) => run_bench(&app_data, args),
+        Commands::Chainstate(args) => match args.command {
+            ChainstateCommands::Index(index_args) => run_chainstate_index(&app_data, index_args),
+        },
     }
+}
+
+fn setup_bench_context<T: IndexerArgs>(
+    app_db: &mut AppDb,
+    args: &T,
+) -> Result<(
+    BenchContext,
+    Network,
+    u32,
+    Vec<stacks_bench::db::node::sortition::models::Epoch>,
+)> {
+    let chainstate_path = ChainStateDir::from_node_root(args.source_dir());
+    let burnchain_path = BurnChainDir::from_node_root(args.source_dir());
+
+    let mut chainstate_db = ChainStateDb::open_for_read(chainstate_path.index_db_path())?;
+    let db_config = chainstate_db.read_db_config()?;
+
+    let network = if let Some(n) = args.network() {
+        db_config.assert_matches_network(n)?;
+        n
+    } else if db_config.is_mainnet() {
+        Network::Mainnet
+    } else {
+        Network::Testnet
+    };
+
+    println!("Using network: {}", network.to_string().to_uppercase());
+
+    let chain_id = db_config.chain_id();
+
+    let mut sortition_db = SortitionDb::open_for_read(burnchain_path.sortition_db_path())?;
+    let epochs = sortition_db.get_epochs()?;
+    let epochs_str = epochs
+        .iter()
+        .map(|e| {
+            e.to_stacks_epoch_id()
+                .map(|id| {
+                    format!(
+                        "[Epoch {id} ({}..{})]",
+                        e.start_block_height(),
+                        e.end_block_height()
+                    )
+                })
+                .unwrap_or_else(|_| "err".to_string())
+        })
+        .collect::<Vec<String>>()
+        .join(" → ");
+    println!(
+        "Loaded {} epochs from source sortition DB: {epochs_str}",
+        epochs.len()
+    );
+
+    let context_opts = BenchContextOpts::new(args.source_dir().into(), network, chain_id, &epochs)?
+        .with_maybe_start_block(args.start_at().cloned())
+        .with_maybe_end_block(args.end_at().cloned())
+        .with_maybe_block_count(args.block_count())
+        .with_maybe_tip(args.tip().cloned());
+
+    let bench_context = BenchContext::initialize(context_opts, Some(app_db))?;
+
+    Ok((bench_context, network, chain_id, epochs))
+}
+
+fn run_chainstate_index(app_data: &AppDataDir, args: IndexArgs) -> Result<()> {
+    let app_db_path = app_data.app_db_path();
+    let mut app_db = AppDb::open(&app_db_path)?;
+
+    let (mut bench_context, network, chain_id, epochs) = setup_bench_context(&mut app_db, &args)?;
+
+    let mut indexer = ChainstateIndexer::new(&mut app_db, &mut bench_context);
+    indexer.index_chainstate(network, chain_id, &epochs)?;
+
+    println!("Indexing complete.");
+    Ok(())
 }
 
 fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     let app_db_path = app_data.app_db_path();
     let mut app_db = AppDb::open(&app_db_path)?;
 
-    let chainstate_path = ChainStateDir::from_node_root(&args.source_dir);
-    let burnchain_path = BurnChainDir::from_node_root(&args.source_dir);
+    let (mut bench_context, network, chain_id, epochs) = setup_bench_context(&mut app_db, &args)?;
 
-    let mut chainstate_db = ChainStateDb::open_for_read(chainstate_path.index_db_path())?;
-    let db_config = chainstate_db.read_db_config()?;
-
-    let network = args.try_determine_network(&db_config)?;
-    let chain_id = db_config.chain_id();
-
-    let mut sortition_db = SortitionDb::open_for_read(burnchain_path.sortition_db_path())?;
-    let epochs = sortition_db.get_epochs()?;
-    println!("Loaded {} epochs from source sortition DB.", epochs.len());
-    for epoch in &epochs {
-        println!(
-            "  Epoch {} ({}): start_block={}, end_block={}",
-            epoch.to_stacks_epoch_id()?,
-            epoch.epoch_id(),
-            epoch.start_block_height(),
-            epoch.end_block_height()
-        );
-    }
-
-    let context_opts = BenchContextOpts::new(args.source_dir.clone(), network, chain_id, &epochs)?
-        .with_maybe_start_block(args.start_at.clone())
-        .with_maybe_end_block(args.end_at.clone())
-        .with_maybe_tip(args.tip.clone());
-
-    let mut bench_context = BenchContext::initialize(context_opts, Some(&mut app_db))?;
-
-    let (tip_id, tip_height) = bench_context.chain_tip();
-
-    // Resolve the actual range we need to benchmark
-    let (start_height, end_height) = bench_context.block_height_range()?;
-    println!(
-        "Targeting block range: {} to {} (Tip: {})",
-        start_height, end_height, tip_height
-    );
-
-    let (chainstate_model, epochs) = app_db.get_or_create_chainstate(
+    let (chainstate_model, _) = app_db.get_or_create_chainstate(
         network,
-        db_config.chain_id(),
-        &tip_id,
-        tip_height,
+        chain_id,
+        &bench_context.chain_tip().0,
+        bench_context.chain_tip().1,
         &epochs,
     )?;
 
-    // 1. Get Canonical Block IDs (Lightweight)
-    let mut block_ids =
-        app_db.get_chain_block_ids(&tip_id, start_height as u32, end_height as u32)?;
-
-    let expected_count = (end_height - start_height + 1) as usize;
-
-    if block_ids.len() != expected_count {
-        println!(
-            "App DB index incomplete (found {}, expected {}). Indexing from Node DB...",
-            block_ids.len(),
-            expected_count
-        );
-
-        // 2. Stream from Node DB and Index
-        let stream = bench_context
-            .canonical_block_stream(start_height as u32, end_height as u32)
-            .filter_map(|r| match r {
-                Ok(b) => Some(b),
-                Err(e) => {
-                    eprintln!("Warning: failed to load block during indexing: {}", e);
-                    None
-                }
-            });
-
-        app_db.index_blocks_streaming(stream)?;
-        println!("Checkpointing database...");
-        app_db.checkpoint()?;
-        println!("Vacuuming database...");
-        app_db.vacuum()?;
-
-        // 3. Reload IDs
-        block_ids = app_db.get_chain_block_ids(&tip_id, start_height as u32, end_height as u32)?;
-    }
-
-    if block_ids.is_empty() {
-        return Err(anyhow!(
-            "No blocks found in range {} to {}",
-            start_height,
-            end_height
-        ));
-    }
+    let mut indexer = ChainstateIndexer::new(&mut app_db, &mut bench_context);
+    let block_ids = indexer.index_chainstate(network, chain_id, &epochs)?;
 
     let selected_block_count = block_ids.len();
 
-    let run_name = format!(
-        "{} - Blocks({start_height}..{end_height})",
-        Utc::now().format("%Y.%m.%d %H.%M.%S")
-    );
+    let run_name = format!("{}", Utc::now().format("%Y%m%d-%H%M%S"));
 
     let args_json = args.to_json()?;
     let git_commit_hash = get_git_hash().unwrap_or(vec![0u8; 20]); // Placeholder if git not available
@@ -311,6 +416,9 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     // Allow buffer to grow if we can't find variance. Empty blocks are small, so 500 is memory-safe.
     let max_calibration_buffer = 500;
     let mut calibrated = false;
+    // Tracker for hydration time
+    let mut total_hydration_duration = Duration::ZERO;
+    let mut total_clarity_db_checkpoint_duration = Duration::ZERO;
 
     let mut accumulator = MetricsAccumulator::default();
 
@@ -321,10 +429,6 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
         // Load metadata from App DB
         let summary = app_db.get_block(block_id, epochs.as_slice())?;
 
-        // println!(
-        //     "Re-executing block at height {} in epoch {} ({})",
-        //     summary.height, summary.epoch, summary.id
-        // );
         if i == 0 || i % 5_000 == 0 || i == selected_block_count - 1 {
             eprint!("{}", summary.height);
         } else if i % 250 == 0 {
@@ -332,11 +436,14 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
         }
 
         // Hydrate transactions from Node DB (Heavy operation, done one-by-one)
+        let hydrate_start = Instant::now();
         let txs = stacks_bench::BlockTransactions::load(
             bench_context.chainstate(),
             summary.epoch,
             &summary,
         )?;
+        total_hydration_duration += hydrate_start.elapsed();
+
         let block = summary.with_transactions(txs);
 
         // Replay the block
@@ -345,6 +452,10 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
         });
 
         let profiler_results = Profiler::take_results();
+
+        let checkpoint_start = Instant::now();
+        bench_context.chainstate().checkpoint_clarity_state()?;
+        total_clarity_db_checkpoint_duration += checkpoint_start.elapsed();
 
         // We clone the transaction metrics because 'metrics' is needed below for calibration/stats.
         // The buffer takes ownership of the data.
@@ -422,18 +533,6 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
             }
 
             accumulator.add(&metrics); // Accumulate
-
-            // let static_pct = if metrics.commit_duration.as_secs_f64() > 0.0 {
-            //     (metrics.commit_overhead_baseline.as_secs_f64()
-            //         / metrics.commit_duration.as_secs_f64())
-            //         * 100.0
-            // } else {
-            //     0.0
-            // };
-            // println!(
-            //     "  Execution Metrics: {:?} (Static Commit: {:.1}%)",
-            //     metrics, static_pct
-            // );
             app_db.save_block_metrics(run_model.id, &block.id, &metrics)?;
         }
     }
@@ -446,6 +545,7 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     // Flush any remaining metrics in the calibration buffer
     if !metrics_buffer.is_empty() {
         let buffer_len = metrics_buffer.len(); // Capture length before mutable borrow
+        println!();
         println!(
             "Flushing remaining {} blocks from calibration buffer...",
             buffer_len
@@ -471,15 +571,45 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     app_db.finish_benchmark_run(run_model.id, Utc::now().naive_utc())?;
 
     println!("Re-executed {selected_block_count} blocks in {duration:.2?}");
+    println!("  - Transaction Hydration: {total_hydration_duration:.2?}");
+    println!("  - Clarity DB Checkpointing: {total_clarity_db_checkpoint_duration:.2?}");
+    println!(
+        "  - Benchmarking Overhead: {:.2?}",
+        duration - total_hydration_duration - total_clarity_db_checkpoint_duration
+    );
 
     accumulator.print_summary(); // Print summary
 
     // Give the OS a moment to sync metadata
     std::thread::sleep(Duration::from_millis(100));
 
-    let (growth, written) = bench_context.generate_delta_report()?;
+    let storage_delta_report = bench_context.calculate_storage_delta()?;
+    let growth = storage_delta_report.net_growth_bytes;
+    let written = storage_delta_report.estimated_bytes_written;
 
-    println!("Storage Delta:");
+    println!("\n========================================");
+    println!("          STORAGE DELTA REPORT          ");
+    println!("========================================");
+    for file_report in &storage_delta_report.file_reports {
+        let status = if !file_report.was_modified {
+            "CREATED "
+        } else {
+            "MODIFIED"
+        };
+
+        let sign = if file_report.size_delta_bytes > 0 {
+            "+"
+        } else {
+            ""
+        };
+
+        println!(
+            "  {status}: {:<60} | Delta: {sign}{:.4} MB",
+            file_report.path.display(),
+            file_report.size_delta_bytes as f64 / 1_024.0 / 1_024.0
+        );
+    }
+    println!();
     println!(
         "  Net Change:        {:.4} MB ({growth} bytes)",
         growth as f64 / 1_024.0 / 1_024.0
@@ -488,11 +618,17 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
         "  Est. Data Written: {:.4} MB ({written} bytes)",
         written as f64 / 1_024.0 / 1_024.0
     );
+    println!("========================================");
 
     println!();
-    println!("Cleaning up and checkpointing/vacuuming database...");
+    println!("Checkpointing/vacuuming database...");
     app_db.checkpoint()?;
     app_db.vacuum()?;
+
+    println!("Cleaning up (this may take a few moments for large chainstates)...");
+    // Dropping the context will clean up the shadow dir
+    drop(bench_context);
+
     println!("Benchmark run complete");
 
     Ok(())

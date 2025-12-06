@@ -6,11 +6,24 @@ use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use tempfile::TempDir;
 
+pub struct FileDeltaReport {
+    pub path: PathBuf,
+    pub size_delta_bytes: i64,
+    pub was_modified: bool,
+}
+
+pub struct ShadowDirDeltaReport {
+    pub net_growth_bytes: i64,
+    pub estimated_bytes_written: u64,
+    pub file_reports: Vec<FileDeltaReport>,
+}
+
 #[derive(Debug)]
 pub struct ShadowDir {
     _tmp: TempDir,
     source: PathBuf,
     root: PathBuf,
+    watched_files: Vec<PathBuf>,
 }
 
 impl AsRef<Path> for ShadowDir {
@@ -31,6 +44,10 @@ impl ShadowDir {
         &self.source
     }
 
+    pub fn watch_file<P: AsRef<Path>>(&mut self, path: P) {
+        self.watched_files.push(path.as_ref().to_path_buf());
+    }
+
     /// Keep the temp directory instead of deleting it on drop, consuming this
     /// [`ShadowDir`] and returning its path.
     pub fn keep(self) -> PathBuf {
@@ -38,12 +55,68 @@ impl ShadowDir {
     }
 
     /// Calculates the storage delta between a base directory and a shadow directory.
-    /// Returns (Net Growth, Estimated Bytes Written).
-    pub fn calculate_storage_delta(&self) -> std::io::Result<(i64, u64)> {
+    /// Returns a detailed report.
+    pub fn calculate_storage_delta(&self) -> std::io::Result<ShadowDirDeltaReport> {
         let base_root = &self.source;
         let shadow_root = &self.root;
         let mut net_growth: i64 = 0;
         let mut estimated_written: u64 = 0;
+        let mut file_reports = Vec::new();
+
+        // If watched files are defined, only check them, avoiding a full recursive directory walk
+        // which is slow on large chainstates.
+        if !self.watched_files.is_empty() {
+            for relative_path in &self.watched_files {
+                let shadow_path = shadow_root.join(relative_path);
+
+                // We only care if the file exists in the shadow dir (it's the active state)
+                if let Ok(shadow_meta) = fs::metadata(&shadow_path) {
+                    let shadow_len = shadow_meta.len();
+                    let shadow_modified = shadow_meta.modified()?;
+
+                    let base_path = base_root.join(relative_path);
+
+                    if let Ok(base_meta) = fs::metadata(&base_path) {
+                        let base_len = base_meta.len();
+                        let base_modified = base_meta.modified()?;
+
+                        let diff = (shadow_len as i64) - (base_len as i64);
+                        net_growth += diff;
+
+                        // If modified time changed, the file was touched
+                        let was_modified = base_modified != shadow_modified;
+                        if was_modified {
+                            // Count positive growth as written data
+                            if diff > 0 {
+                                estimated_written += diff as u64;
+                            }
+                        }
+
+                        if was_modified || diff != 0 {
+                            file_reports.push(FileDeltaReport {
+                                path: relative_path.clone(),
+                                size_delta_bytes: diff,
+                                was_modified,
+                            });
+                        }
+                    } else {
+                        // New file created (or didn't exist in source)
+                        net_growth += shadow_len as i64;
+                        estimated_written += shadow_len;
+                        file_reports.push(FileDeltaReport {
+                            path: relative_path.clone(),
+                            size_delta_bytes: shadow_len as i64,
+                            was_modified: true,
+                        });
+                    }
+                }
+            }
+            return Ok(ShadowDirDeltaReport {
+                net_growth_bytes: net_growth,
+                estimated_bytes_written: estimated_written,
+                file_reports,
+            });
+        }
 
         // Use a stack for recursive directory traversal
         let mut stack = vec![shadow_root.to_path_buf()];
@@ -63,8 +136,9 @@ impl ShadowDir {
                     // Calculate relative path to find base file
                     let relative_path = path
                         .strip_prefix(shadow_root)
-                        .map_err(std::io::Error::other)?;
-                    let base_path = base_root.join(relative_path);
+                        .map_err(std::io::Error::other)?
+                        .to_path_buf();
+                    let base_path = base_root.join(&relative_path);
 
                     if base_path.exists() {
                         let base_meta = fs::metadata(&base_path)?;
@@ -75,94 +149,40 @@ impl ShadowDir {
                         net_growth += diff;
 
                         // If modified time changed, the file was touched
-                        if base_modified != shadow_modified {
+                        let was_modified = base_modified != shadow_modified;
+                        if was_modified {
                             // Count positive growth as written data
                             if diff > 0 {
                                 estimated_written += diff as u64;
                             }
                         }
-                    } else {
-                        // New file created
-                        net_growth += shadow_len as i64;
-                        estimated_written += shadow_len;
-                    }
-                }
-            }
-        }
 
-        Ok((net_growth, estimated_written))
-    }
-
-    /// Calculates the storage delta between a base directory and a shadow directory.
-    /// Returns (Net Growth, Estimated Bytes Written).
-    pub fn generate_delta_report(&self) -> std::io::Result<(i64, u64)> {
-        let base_root = &self.source;
-        let shadow_root = &self.root;
-        let mut net_growth: i64 = 0;
-        let mut estimated_written: u64 = 0;
-
-        // Use a stack for recursive directory traversal
-        let mut stack = vec![shadow_root.to_path_buf()];
-
-        println!("\n--- Storage Activity Report ---");
-
-        while let Some(dir) = stack.pop() {
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
-                let path = entry.path();
-
-                if path.is_dir() {
-                    stack.push(path);
-                } else {
-                    let shadow_meta = entry.metadata()?;
-                    let shadow_len = shadow_meta.len();
-                    let shadow_modified = shadow_meta.modified()?;
-
-                    // Calculate relative path to find base file
-                    let relative_path = path
-                        .strip_prefix(shadow_root)
-                        .map_err(std::io::Error::other)?;
-                    let base_path = base_root.join(relative_path);
-
-                    if base_path.exists() {
-                        let base_meta = fs::metadata(&base_path)?;
-                        let base_len = base_meta.len();
-                        let base_modified = base_meta.modified()?;
-
-                        let diff = (shadow_len as i64) - (base_len as i64);
-                        net_growth += diff;
-
-                        // If modified time changed, the file was touched
-                        if base_modified != shadow_modified {
-                            let sign = if diff > 0 { "+" } else { "" }; // negative numbers have their own sign
-                            println!(
-                                "  MODIFIED: {:<60} | Delta: {}{}",
-                                relative_path.display(),
-                                sign,
-                                diff
-                            );
-
-                            // Count positive growth as written data
-                            if diff > 0 {
-                                estimated_written += diff as u64;
-                            }
+                        if was_modified || diff != 0 {
+                            file_reports.push(FileDeltaReport {
+                                path: relative_path,
+                                size_delta_bytes: diff,
+                                was_modified,
+                            });
                         }
                     } else {
                         // New file created
                         net_growth += shadow_len as i64;
                         estimated_written += shadow_len;
-                        println!(
-                            "  CREATED:  {:<60} | Size:  {}",
-                            relative_path.display(),
-                            shadow_len
-                        );
+                        file_reports.push(FileDeltaReport {
+                            path: relative_path,
+                            size_delta_bytes: shadow_len as i64,
+                            was_modified: true,
+                        });
                     }
                 }
             }
         }
-        println!("-------------------------------\n");
 
-        Ok((net_growth, estimated_written))
+        Ok(ShadowDirDeltaReport {
+            net_growth_bytes: net_growth,
+            estimated_bytes_written: estimated_written,
+            file_reports,
+        })
     }
 }
 
@@ -172,6 +192,7 @@ pub struct ShadowDirBuilder {
     source: PathBuf,
     globs: Vec<String>,
     allow_plain_copy: bool, // false => strict reflink
+    watch_files: Vec<PathBuf>,
 }
 
 impl ShadowDirBuilder {
@@ -180,6 +201,7 @@ impl ShadowDirBuilder {
             source: source.into(),
             globs: Vec::new(),
             allow_plain_copy: false,
+            watch_files: Vec::new(),
         }
     }
 
@@ -192,6 +214,12 @@ impl ShadowDirBuilder {
     // Allow plain copies (disables strict reflink requirement)
     pub fn allow_plain_copy(mut self) -> Self {
         self.allow_plain_copy = true;
+        self
+    }
+
+    /// Watch a specific file for changes (relative path from source)
+    pub fn watch<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.watch_files.push(path.as_ref().to_path_buf());
         self
     }
 
@@ -305,6 +333,7 @@ impl ShadowDirBuilder {
             _tmp: tmp,
             root,
             source,
+            watched_files: self.watch_files,
         })
     }
 }

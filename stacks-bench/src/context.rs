@@ -12,7 +12,7 @@ use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 
 use crate::paths::{BurnChainDir, ChainStateDir};
-use crate::shadow::{ShadowDir, ShadowDirBuilder};
+use crate::shadow::{ShadowDir, ShadowDirBuilder, ShadowDirDeltaReport};
 use crate::{
     BlockEra, BlockSummary, BlockTransactions, ChainCache, Network, ResolveEpochFromHeight,
     StacksBlockRef, StacksEpoch,
@@ -26,6 +26,7 @@ pub struct BenchContextOpts {
     chain_id: u32,
     start_at: Option<StacksBlockRef>,
     end_at: Option<StacksBlockRef>,
+    block_count: Option<u32>,
     /// The chain tip to be used by the context.
     tip: Option<StacksBlockRef>,
     /// The epochs which are applicable for the context.
@@ -55,6 +56,7 @@ impl BenchContextOpts {
             chain_id,
             start_at: None,
             end_at: None,
+            block_count: None,
             tip: None,
             epochs,
         })
@@ -86,6 +88,11 @@ impl BenchContextOpts {
 
     pub fn with_maybe_tip(mut self, tip: Option<StacksBlockRef>) -> Self {
         self.tip = tip;
+        self
+    }
+
+    pub fn with_maybe_block_count(mut self, count: Option<u32>) -> Self {
+        self.block_count = count;
         self
     }
 }
@@ -161,7 +168,8 @@ impl BenchContext {
     /// Calculates the storage delta since the last call to this function.
     /// Updates the internal tracker.
     pub fn update_storage_delta(&mut self) -> Result<i64> {
-        let (current_growth, _) = self.shadow_dir.calculate_storage_delta()?;
+        let report = self.shadow_dir.calculate_storage_delta()?;
+        let current_growth = report.net_growth_bytes;
         let delta = current_growth - self.last_storage_delta;
         self.last_storage_delta = current_growth;
         Ok(delta)
@@ -171,10 +179,15 @@ impl BenchContext {
         opts: BenchContextOpts,
         mut cache: Option<&mut Cache>,
     ) -> Result<Self> {
+        println!("Creating shadow directory (this may take a few moments)...");
         let start = Instant::now();
         let shadow_dir = ShadowDirBuilder::new(&opts.source_dir)
             .glob("burnchain/**")
             .glob("chainstate/**")
+            .watch("chainstate/vm/clarity/marf.sqlite")
+            .watch("chainstate/vm/clarity/marf.sqlite.blobs")
+            .watch("chainstate/vm/clarity/marf.sqlite-wal")
+            .watch("chainstate/vm/index.sqlite")
             .copy()?;
         let setup_duration = start.elapsed();
         println!(
@@ -226,7 +239,6 @@ impl BenchContext {
                     );
                 }
                 // Walk back from node tip to find the canonical block at height h
-                // (Same logic as before, but now establishing the anchor)
                 let mut curr = node_tip_id.clone();
                 let mut curr_h = node_tip_height;
                 while curr_h > h {
@@ -243,16 +255,40 @@ impl BenchContext {
             None => (node_tip_id, node_tip_height),
         };
 
-        // 3. Determine Effective End (Benchmark End)
+        // Resolve start height
+        // We resolve this before `end_height` so we can support `block_count`
+        let start_height = match &opts.start_at {
+            Some(block_ref) => {
+                let h = block_ref.resolve_block_height(&chainstate)?;
+                if h == 0 {
+                    bail!(
+                        "Start height cannot be 0 (genesis block). Please start at height 1 or greater."
+                    );
+                }
+                h
+            }
+            None => 1,
+        };
+
+        // Determine effective end block
         // We walk back from the ANCHOR tip, not necessarily the node tip.
-        let (end_id, end_height) = match &opts.end_at {
+        let target_end_ref = if let Some(count) = opts.block_count {
+            if count == 0 {
+                bail!("Block count must be greater than 0");
+            }
+            Some(StacksBlockRef::Height(start_height + count as u64 - 1))
+        } else {
+            opts.end_at.clone()
+        };
+
+        let (end_id, end_height) = match target_end_ref {
             Some(StacksBlockRef::Id(id)) => {
-                let header = NakamotoChainState::get_block_header(chainstate.db(), id)?
+                let header = NakamotoChainState::get_block_header(chainstate.db(), &id)?
                     .ok_or_else(|| anyhow!("Block {} not found", id))?;
                 (id.clone(), header.stacks_block_height)
             }
             Some(StacksBlockRef::Height(h)) => {
-                let h = *h;
+                let h = h;
                 if h > anchor_height {
                     bail!(
                         "Requested end height {} is beyond anchor tip {}",
@@ -318,12 +354,6 @@ impl BenchContext {
             None => (anchor_id.clone(), anchor_height),
         };
 
-        // 3. Resolve Start Height
-        let start_height = match &opts.start_at {
-            Some(block_ref) => block_ref.resolve_block_height(&chainstate)?,
-            None => 1, // genesis height
-        };
-
         if start_height > end_height {
             bail!("start height ({start_height}) > end height ({end_height})");
         }
@@ -342,16 +372,10 @@ impl BenchContext {
         })
     }
 
-    pub fn calculate_storage_delta(&self) -> Result<(i64, u64)> {
+    pub fn calculate_storage_delta(&self) -> Result<ShadowDirDeltaReport> {
         self.shadow_dir
             .calculate_storage_delta()
             .context("Failed to calculate storage delta")
-    }
-
-    pub fn generate_delta_report(&self) -> Result<(i64, u64)> {
-        self.shadow_dir
-            .generate_delta_report()
-            .context("Failed to generate storage delta report")
     }
 
     /// Returns an iterator over canonical blocks in the range [start_height, end_height].

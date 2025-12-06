@@ -377,6 +377,10 @@ impl ClarityInstance {
         }
     }
 
+    pub fn checkpoint(&self) -> Result<(), DatabaseError> {
+        self.datastore.checkpoint()
+    }
+
     pub fn with_marf<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce(&mut MARF<StacksBlockId>) -> R,

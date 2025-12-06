@@ -22,7 +22,7 @@ pub trait DbOpenForRead: Sized {
 }
 
 pub trait DbOpenForWrite: Sized {
-    fn open_for_read(path: PathBuf) -> Result<Self>;
+    fn open_for_write(path: PathBuf) -> Result<Self>;
 }
 
 impl<T> DbOpenForRead for T
@@ -38,7 +38,7 @@ impl<T> DbOpenForWrite for T
 where
     T: DbOpen<ReadWrite>,
 {
-    fn open_for_read(path: PathBuf) -> Result<T> {
+    fn open_for_write(path: PathBuf) -> Result<T> {
         T::open(path)
     }
 }

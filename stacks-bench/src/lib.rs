@@ -14,6 +14,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 
 pub mod context;
 pub mod db;
+pub mod indexer;
 pub mod metrics;
 pub mod paths;
 pub mod profiler;

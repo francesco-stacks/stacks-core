@@ -135,6 +135,7 @@ pub struct ChainStateDir(PathBuf);
 impl ChainStateDir {
     pub const CHAINSTATE_DIR_NAME: &'static str = "chainstate";
     pub const INDEX_DB_RELATIVE_FILE_PATH: &'static str = "vm/index.sqlite";
+    pub const CLARITY_DB_RELATIVE_FILE_PATH: &'static str = "vm/clarity/marf.sqlite";
 
     pub fn new<P: Into<PathBuf>>(path: P) -> Self {
         ChainStateDir(path.into())
@@ -156,6 +157,10 @@ impl ChainStateDir {
 
     pub fn index_db_path(&self) -> PathBuf {
         self.path().join(Self::INDEX_DB_RELATIVE_FILE_PATH)
+    }
+
+    pub fn clarity_db_path(&self) -> PathBuf {
+        self.path().join(Self::CLARITY_DB_RELATIVE_FILE_PATH)
     }
 }
 

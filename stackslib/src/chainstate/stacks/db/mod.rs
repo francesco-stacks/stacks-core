@@ -1788,6 +1788,11 @@ impl StacksChainState {
         Ok(state_index.into_sqlite_conn())
     }
 
+    /// Checkpoint the Clarity state DB.
+    pub fn checkpoint_clarity_state(&self) -> Result<(), db_error> {
+        self.clarity_state.checkpoint()
+    }
+
     pub fn blocks_path(mut path: PathBuf) -> PathBuf {
         path.push("blocks");
         path

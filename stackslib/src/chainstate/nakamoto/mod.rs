@@ -2749,6 +2749,7 @@ impl NakamotoChainState {
     /// sortition identified by the consensus hash.
     ///
     /// `tip_block_id` is the chain tip from which to perform the query.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_tenure_start_block_header<SDBI: StacksDBIndexed>(
         chainstate_conn: &mut SDBI,
         tip_block_id: &StacksBlockId,
@@ -2772,6 +2773,7 @@ impl NakamotoChainState {
     }
 
     /// Get the first block header in a Nakamoto tenure
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_nakamoto_tenure_start_block_header<SDBI: StacksDBIndexed>(
         chainstate_conn: &mut SDBI,
         tip_block_id: &StacksBlockId,
@@ -2786,6 +2788,7 @@ impl NakamotoChainState {
     }
 
     /// Get the first canonical block header in a vector of height-ordered candidates
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn get_highest_canonical_block_header_from_candidates(
         sort_db: &SortitionDB,
         candidates: Vec<StacksHeaderInfo>,
@@ -3923,6 +3926,7 @@ impl NakamotoChainState {
     /// `SetupBlockResult`.
     ///
     /// Called as part of block processing
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn setup_normal_block_processing<'a, 'b>(
         chainstate_tx: &'b mut ChainstateTx,
         clarity_instance: &'a mut ClarityInstance,
@@ -4048,6 +4052,7 @@ impl NakamotoChainState {
     /// microblock fees, microblock burns, list of microblock tx receipts,
     /// miner rewards tuples, the stacks epoch id, and a boolean that
     /// represents whether the epoch transition has been applied.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn inner_setup_block<'a, 'b>(
         chainstate_tx: &'b mut ChainstateTx,
         clarity_instance: &'a mut ClarityInstance,
@@ -4523,6 +4528,7 @@ impl NakamotoChainState {
 
     /// Append a Nakamoto Stacks block to the Stacks chain state.
     /// NOTE: This does _not_ set the block as processed!  The caller must do this.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn append_block<'a>(
         chainstate_tx: &mut ChainstateTx,
         clarity_instance: &'a mut ClarityInstance,
@@ -5291,6 +5297,7 @@ impl StacksMessageCodec for NakamotoBlock {
         write_next(fd, &self.txs)
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn consensus_deserialize<R: std::io::Read>(fd: &mut R) -> Result<Self, CodecError> {
         let (header, txs) = {
             let mut bound_read = BoundReader::from_reader(fd, u64::from(MAX_MESSAGE_LEN));
