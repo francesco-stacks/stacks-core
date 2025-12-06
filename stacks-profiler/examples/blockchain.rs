@@ -1,12 +1,13 @@
 use std::thread;
 use std::time::Duration;
 
-use stacks_profiler::{ProfileAnalyzer, ProfileStats, Profiler, profile_scope};
+use stacks_profiler::{ProfileAnalyzer, ProfileStats, Profiler};
 
 // ============================================================================
 // 1. Simulation Types
 // ============================================================================
 
+#[allow(unused)]
 struct Transaction {
     id: usize,
     is_complex_contract: bool, // Simulates CPU heavy
@@ -19,38 +20,20 @@ struct Block {
 }
 
 // ============================================================================
-// 2. Helper for Dynamic Names (The "Leak" Trick)
-// ============================================================================
-
-/// HELPER: Converts a runtime String into a &'static str.
-///
-/// ⚠️ WARNING: This intentionally leaks memory!
-/// Use this ONLY for short-lived benchmarks/debugging where you strictly
-/// need distinct span names for every item (e.g. "Tx 1", "Tx 2").
-/// Do not use in a long-running server loop.
-fn runtime_name(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
-}
-
-// ============================================================================
 // 3. Processing Logic
 // ============================================================================
 
 fn process_transaction(tx: &Transaction) {
-    // In a real app, this generic name causes all Txs to merge into one stats entry.
-    // But here, we might want to see if specific ones are slow.
-    // Let's stick to a generic name for the inner scope to show how it aggregates
-    // *under* the specific parent.
-    profile_scope!("Execute Logic", {
+    stacks_profiler::measure!("Execute Logic", {
         if tx.is_complex_contract {
-            profile_scope!("Clarity VM (CPU)");
+            let _guard = stacks_profiler::span!("Clarity VM (CPU)");
             // Simulate CPU work (hashing, vm)
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_millis(20) {}
         }
 
         if tx.needs_disk_fetch {
-            profile_scope!("State Fetch (Wait)");
+            let _guard = stacks_profiler::span!("State Fetch (Wait)");
             // Simulate Disk I/O
             thread::sleep(Duration::from_millis(50));
         }
@@ -59,11 +42,7 @@ fn process_transaction(tx: &Transaction) {
 
 fn process_block(block: &Block) {
     for tx in &block.txs {
-        // TRICK: We format a specific name for this transaction so they
-        // don't merge in the tree.
-        let span_name = runtime_name(format!("Tx {}", tx.id));
-
-        profile_scope!(span_name, {
+        stacks_profiler::measure!("Transaction", tx.id, {
             process_transaction(tx);
         });
     }
@@ -119,13 +98,10 @@ fn main() {
 
     // Root scope
     {
-        profile_scope!("Chain Processing");
+        let _guard = stacks_profiler::span!("Chain Processing");
 
         for block in &blocks {
-            // We name the block scope specifically so they don't merge
-            let block_name = runtime_name(format!("Block {}", block.height));
-
-            profile_scope!(block_name, {
+            stacks_profiler::measure!("Block", block.height, {
                 process_block(block);
             });
         }
@@ -159,7 +135,7 @@ fn print_stats(target_name: &str, flat_list: &[ProfileStats]) {
     if let Some(stat) = flat_list.iter().find(|s| s.id.name == target_name) {
         println!("Stats for '{}':", target_name);
         println!("  Total Count: {}", stat.count);
-        println!("  Total Wall:  {:?}", stat.wall_time);
+        println!("  Total Wall:  {:?}ns", stat.wall_time_ns);
         // The children of this flat node represent the aggregated breakdown
         // of what 'Execute Logic' called, across all its invocations.
     }

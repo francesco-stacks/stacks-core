@@ -28,7 +28,7 @@ pub struct AppDb {
     /// Underlying Diesel SQLite connection.
     conn: SqliteConnection,
     /// Cache of profiler span name to ID mappings.
-    profiler_span_cache: HashMap<String, i32>,
+    profiler_span_cache: HashMap<(Option<&'static str>, &'static str), i32>,
     /// Cache of profiler location (file,line) to ID mappings.
     profiler_loc_cache: HashMap<(String, i32), i32>,
 }
@@ -280,10 +280,10 @@ impl AppDb {
         use self::schema::stacks_tx::dsl as tx_dsl;
         use self::schema::stacks_tx_stats::dsl as tx_stats_dsl;
 
-        // 1. Get Block ID
+        // Get block ID
         let block_id = self.get_stacks_block_id(block_id)?;
 
-        // 2. Insert Block Stats
+        // Insert block stats
         diesel::insert_into(block_stats_dsl::stacks_block_stats)
             .values((
                 block_stats_dsl::benchmark_run_id.eq(run_id),
@@ -304,12 +304,13 @@ impl AppDb {
                 block_stats_dsl::clarity_read_count
                     .eq(metrics.total_clarity_cost.read_count as i32),
                 block_stats_dsl::clarity_runtime.eq(metrics.total_clarity_cost.runtime as i32),
+                block_stats_dsl::total_storage_delta.eq(metrics.total_storage_delta),
             ))
             .execute(&mut self.conn)
             .context("Failed to insert stacks block stats")?;
 
-        // 3. Insert Tx Stats
-        // Optimization: Fetch all tx IDs for this block in one query to avoid N lookups
+        // Insert tx stats
+        // Fetch all tx IDs for this block in one query to avoid N lookups
         let tx_map: HashMap<Vec<u8>, i64> = tx_dsl::stacks_tx
             .select((tx_dsl::tx_hash, tx_dsl::id))
             .filter(tx_dsl::stacks_block_id.eq(block_id))
@@ -351,7 +352,6 @@ impl AppDb {
     }
 
     /// Retrieves the ordered list of block IDs for the canonical chain segment.
-    /// This is lightweight and suitable for driving a lazy iterator.
     pub fn get_chain_block_ids(
         &mut self,
         tip_index_hash: &StacksBlockId,
@@ -622,7 +622,11 @@ impl AppDb {
 
                             // Stage issuer principal and contract
                             staged_principals.insert(issuer_address.clone());
-                            staged_contracts.insert((issuer_address, name));
+                            staged_contracts.insert((issuer_address.clone(), name.clone()));
+
+                            // Set contract info
+                            contract_issuer_address = Some(issuer_address);
+                            contract_name = Some(name);
                         }
 
                         tx_buffer.push(StagedStacksTx {
@@ -750,19 +754,24 @@ impl AppDb {
                     block_pk: i64,
                     tx_db_ids: &[Option<i64>],
                     active_tx_id: Option<i64>,
-                    span_cache: &mut HashMap<String, i32>,
+                    span_cache: &mut HashMap<(Option<&'static str>, &'static str), i32>,
                     loc_cache: &mut HashMap<(String, i32), i32>,
                 ) -> Result<()> {
                     // A. Resolve/Insert Location (With Caching)
                     let loc_id = AppDb::resolve_profiler_location(
                         conn,
                         loc_cache,
-                        &node.file(),
-                        node.line() as i32,
+                        &node.source_file(),
+                        node.source_line() as i32,
                     )?;
 
                     // B. Resolve/Insert Span Name (With Caching)
-                    let span_id = AppDb::resolve_profiler_span(conn, span_cache, &node.name())?;
+                    let span_id = AppDb::resolve_profiler_span(
+                        conn,
+                        span_cache,
+                        node.context(),
+                        &node.name(),
+                    )?;
 
                     // C. Determine Context (Block vs Tx)
                     let mut current_tx_id = active_tx_id;
@@ -772,26 +781,26 @@ impl AppDb {
                         }
                     }
 
-                    // Calculate Metrics
-                    let wall_time_us = node.wall_time.as_micros() as i64;
+                    // Calculate metrics
+                    let wall_time_us = node.wall_time_micros() as i64;
                     let children_wall_time_us: i64 = node
                         .children
                         .iter()
-                        .map(|c| c.wall_time.as_micros() as i64)
+                        .map(|c| c.wall_time_micros() as i64)
                         .sum();
                     // Use saturating_sub to handle potential clock skew or precision issues
                     let self_wall_time_us = wall_time_us.saturating_sub(children_wall_time_us);
 
-                    // CPU time is not yet captured by ProfileStats, defaulting to 0
-                    let cpu_time_us = node.cpu_time.as_micros() as i64;
+                    // CPU time
+                    let cpu_time_us = node.cpu_time_micros() as i64;
                     let children_cpu_time_us: i64 = node
                         .children
                         .iter()
-                        .map(|c| c.cpu_time.as_micros() as i64)
+                        .map(|c| c.cpu_time_micros() as i64)
                         .sum();
                     let self_cpu_time_us = cpu_time_us.saturating_sub(children_cpu_time_us);
 
-                    // D. Insert Record
+                    // Insert record
                     let record_id: i32 = diesel::insert_into(schema::profiler_record::table)
                         .values((
                             schema::profiler_record::benchmark_run_id.eq(run_id),
@@ -811,7 +820,7 @@ impl AppDb {
                         .returning(schema::profiler_record::id)
                         .get_result(conn)?;
 
-                    // E. Recurse
+                    // Recurse
                     for (idx, child) in node.children.iter().enumerate() {
                         insert_node(
                             conn,
@@ -830,7 +839,7 @@ impl AppDb {
                     Ok(())
                 }
 
-                // 4. Start Insertion for this block
+                // Start insertion for this block
                 for (i, root) in results.iter().enumerate() {
                     insert_node(
                         conn,
@@ -894,18 +903,22 @@ impl AppDb {
 
     fn resolve_profiler_span(
         conn: &mut SqliteConnection,
-        cache: &mut HashMap<String, i32>,
-        name: &str,
+        cache: &mut HashMap<(Option<&'static str>, &'static str), i32>,
+        context: Option<&'static str>,
+        name: &'static str,
     ) -> Result<i32> {
         use schema::profiler_span;
 
-        if let Some(&id) = cache.get(name) {
+        if let Some(&id) = cache.get(&(context, name)) {
             return Ok(id);
         }
 
         let id_opt: Option<i32> = diesel::insert_into(profiler_span::table)
-            .values(profiler_span::name.eq(name))
-            .on_conflict(profiler_span::name)
+            .values((
+                profiler_span::context.eq(context),
+                profiler_span::name.eq(name),
+            ))
+            .on_conflict((profiler_span::context, profiler_span::name))
             .do_nothing()
             .returning(profiler_span::id)
             .get_result(conn)
@@ -916,11 +929,12 @@ impl AppDb {
         } else {
             profiler_span::table
                 .select(profiler_span::id)
+                .filter(profiler_span::context.eq(context))
                 .filter(profiler_span::name.eq(name))
                 .first(conn)?
         };
 
-        cache.insert(name.to_string(), id);
+        cache.insert((context, name), id);
         Ok(id)
     }
 }

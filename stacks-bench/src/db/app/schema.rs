@@ -158,6 +158,7 @@ table! {
         clarity_read_length -> Integer,
         clarity_read_count -> Integer,
         clarity_runtime -> Integer,
+        total_storage_delta -> BigInt,
     }
 }
 
@@ -188,6 +189,7 @@ table! {
     profiler_span (id) {
         id -> Integer,
         name -> Text,
+        context -> Nullable<Text>,
     }
 }
 

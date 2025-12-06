@@ -1,7 +1,7 @@
 use std::time::Duration;
 use std::{panic, thread};
 
-use stacks_profiler::{Profiler, profile, profile_scope};
+use stacks_profiler::{Profiler, profile};
 
 /// Helper to ensure we start with a clean state in tests
 fn clear_profiler() {
@@ -12,9 +12,9 @@ fn clear_profiler() {
 fn test_basic_nesting() {
     clear_profiler();
 
-    profile_scope!("Root", {
+    stacks_profiler::measure!("Root", {
         thread::sleep(Duration::from_millis(1));
-        profile_scope!("Child", {
+        stacks_profiler::measure!("Child", {
             thread::sleep(Duration::from_millis(1));
         });
     });
@@ -36,16 +36,16 @@ fn test_macro_variations() {
 
     // 1. Statement style (wrapped in block to force drop)
     {
-        profile_scope!("Statement");
+        stacks_profiler::span!("Statement");
     }
 
     // 2. Block style
-    profile_scope! {
+    stacks_profiler::measure! {
         let _x = 1 + 1;
     };
 
     // 3. Expression style
-    let res = profile_scope!("Expression", { 5 + 5 });
+    let res = stacks_profiler::measure!("Expression", { 5 + 5 });
     assert_eq!(res, 10);
 
     let results = Profiler::take_results();
@@ -63,7 +63,7 @@ fn test_multi_threading_isolation() {
     let t = thread::spawn(|| {
         // Wrap in block so guard drops BEFORE take_results
         {
-            profile_scope!("ThreadWork");
+            let _span = stacks_profiler::span!("ThreadWork");
             thread::sleep(Duration::from_millis(10));
         }
         // Return the results to the main thread
@@ -72,7 +72,7 @@ fn test_multi_threading_isolation() {
 
     // Do work on main thread simultaneously
     {
-        profile_scope!("MainWork");
+        let _span = stacks_profiler::span!("MainWork");
         thread::sleep(Duration::from_millis(10));
     } // Drops here, finishing the span
 
@@ -96,14 +96,14 @@ fn test_panic_safety() {
     clear_profiler();
 
     let result = panic::catch_unwind(|| {
-        profile_scope!("WillPanic");
+        let _span = stacks_profiler::span!("WillPanic");
         panic!("Oops");
     });
     assert!(result.is_err());
 
     // Run a normal profile to prove the stack recovered
     {
-        profile_scope!("Recovered");
+        let _span = stacks_profiler::span!("Recovered");
     } // Drops here
 
     let results = Profiler::take_results();
@@ -153,7 +153,7 @@ fn test_zero_time_safety() {
 
     // Ensure very fast operations don't cause underflow/crashes
     for _ in 0..1000 {
-        profile_scope!("Fast");
+        stacks_profiler::span!("Fast");
     }
 
     let results = Profiler::take_results();

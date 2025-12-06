@@ -26,7 +26,9 @@ pub struct BenchContextOpts {
     chain_id: u32,
     start_at: Option<StacksBlockRef>,
     end_at: Option<StacksBlockRef>,
+    /// The chain tip to be used by the context.
     tip: Option<StacksBlockRef>,
+    /// The epochs which are applicable for the context.
     epochs: Vec<StacksEpoch>,
 }
 
@@ -98,6 +100,8 @@ pub struct BenchContext {
     tip_height: u64,
     tip_id: StacksBlockId,
     epochs: Vec<StacksEpoch>,
+    /// Tracks the cumulative storage growth to calculate per-block deltas
+    last_storage_delta: i64,
 }
 
 impl BenchContext {
@@ -152,6 +156,15 @@ impl BenchContext {
 
     pub fn get_databases_mut(&mut self) -> (&mut StacksChainState, &mut Burnchain) {
         (&mut self.chainstate, &mut self.burnchain)
+    }
+
+    /// Calculates the storage delta since the last call to this function.
+    /// Updates the internal tracker.
+    pub fn update_storage_delta(&mut self) -> Result<i64> {
+        let (current_growth, _) = self.shadow_dir.calculate_storage_delta()?;
+        let delta = current_growth - self.last_storage_delta;
+        self.last_storage_delta = current_growth;
+        Ok(delta)
     }
 
     pub fn initialize<Cache: ChainCache>(
@@ -325,6 +338,7 @@ impl BenchContext {
             tip_height: end_height, // tip_height is now the benchmark tip height
             tip_id: end_id,         // tip_id is now the benchmark tip ID
             epochs: opts.epochs,
+            last_storage_delta: 0,
         })
     }
 
@@ -332,6 +346,12 @@ impl BenchContext {
         self.shadow_dir
             .calculate_storage_delta()
             .context("Failed to calculate storage delta")
+    }
+
+    pub fn generate_delta_report(&self) -> Result<(i64, u64)> {
+        self.shadow_dir
+            .generate_delta_report()
+            .context("Failed to generate storage delta report")
     }
 
     /// Returns an iterator over canonical blocks in the range [start_height, end_height].

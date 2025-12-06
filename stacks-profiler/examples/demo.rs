@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use stacks_profiler::{Profiler, profile, profile_scope};
+use stacks_profiler::{Profiler, profile};
 
 // ============================================================================
 // Helper Functions
@@ -27,7 +27,7 @@ fn simulate_io(ms: u64) {
 // Profiled Functions
 // ============================================================================
 
-#[profile(name = "1. Fetch Data (I/O Bound)")]
+#[profile(name = "Fetch Data (I/O Bound)")]
 fn fetch_data_from_network() {
     // Simulate network latency
     simulate_io(100);
@@ -35,17 +35,17 @@ fn fetch_data_from_network() {
 
 // Example of using profile_scope! with a named block
 fn process_items(count: usize) {
-    profile_scope!("2. Process Batch (CPU Bound)", {
+    stacks_profiler::measure!("Process Batch (CPU Bound)", {
         for i in 0..count {
             // Create a nested scope for every generic iteration
             // (In a real app, you might not profile every single tight loop iteration
             // due to overhead, but this demonstrates the nesting capability)
-            profile_scope!("Item Processing");
+            let _span = stacks_profiler::span!("Item Processing", i);
             burn_cpu(10); // 10ms of heavy math per item
 
             if i % 2 == 0 {
                 // Every other item needs a quick lookup (I/O)
-                profile_scope!("DB Lookup");
+                let _span = stacks_profiler::span!("DB Lookup");
                 simulate_io(5);
             }
         }
@@ -56,19 +56,19 @@ fn process_items(count: usize) {
 fn save_results() {
     // Simulate a mix of serialization (CPU) and disk write (Wait)
     {
-        profile_scope!("Serialize (CPU)");
+        let _guard = stacks_profiler::span!("Serialize (CPU)");
         burn_cpu(20);
     }
 
     {
-        profile_scope!("Disk Write (Wait)");
+        let _guard = stacks_profiler::span!("Disk Write (Wait)");
         simulate_io(50);
     }
 }
 
 fn run_pipeline() {
     // We can wrap the entire workflow in a top-level scope
-    profile_scope!("Whole Pipeline");
+    let _guard = stacks_profiler::span!("Whole Pipeline");
 
     println!("  -> Fetching...");
     fetch_data_from_network();

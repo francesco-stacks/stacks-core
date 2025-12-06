@@ -48,6 +48,62 @@ impl ShadowDir {
         // Use a stack for recursive directory traversal
         let mut stack = vec![shadow_root.to_path_buf()];
 
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let shadow_meta = entry.metadata()?;
+                    let shadow_len = shadow_meta.len();
+                    let shadow_modified = shadow_meta.modified()?;
+
+                    // Calculate relative path to find base file
+                    let relative_path = path
+                        .strip_prefix(shadow_root)
+                        .map_err(std::io::Error::other)?;
+                    let base_path = base_root.join(relative_path);
+
+                    if base_path.exists() {
+                        let base_meta = fs::metadata(&base_path)?;
+                        let base_len = base_meta.len();
+                        let base_modified = base_meta.modified()?;
+
+                        let diff = (shadow_len as i64) - (base_len as i64);
+                        net_growth += diff;
+
+                        // If modified time changed, the file was touched
+                        if base_modified != shadow_modified {
+                            // Count positive growth as written data
+                            if diff > 0 {
+                                estimated_written += diff as u64;
+                            }
+                        }
+                    } else {
+                        // New file created
+                        net_growth += shadow_len as i64;
+                        estimated_written += shadow_len;
+                    }
+                }
+            }
+        }
+
+        Ok((net_growth, estimated_written))
+    }
+
+    /// Calculates the storage delta between a base directory and a shadow directory.
+    /// Returns (Net Growth, Estimated Bytes Written).
+    pub fn generate_delta_report(&self) -> std::io::Result<(i64, u64)> {
+        let base_root = &self.source;
+        let shadow_root = &self.root;
+        let mut net_growth: i64 = 0;
+        let mut estimated_written: u64 = 0;
+
+        // Use a stack for recursive directory traversal
+        let mut stack = vec![shadow_root.to_path_buf()];
+
         println!("\n--- Storage Activity Report ---");
 
         while let Some(dir) = stack.pop() {

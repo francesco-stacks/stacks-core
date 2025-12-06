@@ -211,6 +211,7 @@ pub struct StacksBlockStats {
     pub clarity_read_length: i32,
     pub clarity_read_count: i32,
     pub clarity_runtime: i32,
+    pub total_storage_delta: i64,
 }
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
@@ -242,6 +243,7 @@ pub struct ProfilerLocation {
 #[diesel(table_name = profiler_span)]
 pub struct ProfilerSpan {
     pub id: i32,
+    pub context: Option<String>,
     pub name: String,
 }
 

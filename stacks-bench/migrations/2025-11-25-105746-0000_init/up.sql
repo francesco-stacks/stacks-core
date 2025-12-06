@@ -222,6 +222,9 @@ CREATE TABLE stacks_block_stats (
   clarity_read_count   INTEGER NOT NULL,
   clarity_runtime      INTEGER NOT NULL,
 
+  -- Total storage delta (in bytes) resulting from block processing
+  total_storage_delta INTEGER NOT NULL,
+
   FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id),
   FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
   UNIQUE (benchmark_run_id, stacks_block_id)
@@ -270,8 +273,9 @@ CREATE TABLE profiler_location (
 -- ==========================================
 CREATE TABLE profiler_span (
   id INTEGER PRIMARY KEY NOT NULL,
+  context TEXT,
   name TEXT NOT NULL,
-  UNIQUE(name)
+  UNIQUE(context, name)
 );
 
 -- ==========================================

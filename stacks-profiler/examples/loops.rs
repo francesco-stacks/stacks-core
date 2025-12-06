@@ -1,7 +1,7 @@
-use stacks_profiler::{Profiler, profile_scope};
+use stacks_profiler::Profiler;
 
 fn sub_task() {
-    profile_scope!("Sub Task");
+    let _span = stacks_profiler::span!("Sub Task");
     // Do a little work
     let mut _x = 0;
     for _ in 0..1000 {
@@ -13,13 +13,13 @@ fn main() {
     println!("Running Loop Benchmark...");
 
     {
-        profile_scope!("Main Loop");
+        let _span = stacks_profiler::span!("Main Loop");
 
         // This loop runs 100 times.
         // Without aggregation, the tree would have 100 entries.
         // With aggregation, we expect 1 entry with count=100.
         for i in 0..100 {
-            profile_scope!("Iteration");
+            let _span = stacks_profiler::span!("Iteration");
 
             sub_task();
 

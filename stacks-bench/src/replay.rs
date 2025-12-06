@@ -13,7 +13,6 @@ use clarity::codec::StacksMessageCodec;
 use clarity::types::chainstate::ConsensusHash;
 use clarity::vm::costs::ExecutionCost;
 use stacks_common::types::chainstate::StacksBlockId;
-use stacks_profiler::{Profiler, profile_scope};
 
 use crate::context::BenchContext;
 use crate::metrics::{BlockMetrics, TransactionMetrics};
@@ -45,9 +44,13 @@ pub fn replay_block(
                     Err(anyhow!("Nakamoto Miner replay not implemented"))
                 }
                 ReplayMode::Follower => {
-                    profile_scope!("Block Replay (Nakamoto Follower)", {
-                        re_execute_nakamoto_follower(context, &naka_block)
-                    })
+                    let mut metrics =
+                        stacks_profiler::measure!("Block Replay (Nakamoto Follower)", {
+                            re_execute_nakamoto_follower(context, &naka_block)
+                        })?;
+                    // Calculate storage impact of this block
+                    metrics.total_storage_delta = context.update_storage_delta()?;
+                    Ok(metrics)
                 }
                 ReplayMode::Ephemeral => {
                     // Currently not implemented in this refactor
@@ -70,7 +73,7 @@ pub fn replay_block(
             let stacks_block = StacksBlock::consensus_deserialize(&mut cursor)?;
             let block_size = stacks_block.block_size()? as u64;
 
-            profile_scope!("Block Replay (Pre-Nakamoto)", {
+            stacks_profiler::measure!("Block Replay (Pre-Nakamoto)", {
                 re_execute_prenakamoto(
                     context,
                     &stacks_block,
@@ -80,7 +83,10 @@ pub fn replay_block(
                 )?;
             });
 
-            Ok(BlockMetrics::default())
+            let mut metrics = BlockMetrics::default();
+            metrics.total_storage_delta = context.update_storage_delta()?;
+
+            Ok(metrics)
         }
     }
 }
@@ -200,7 +206,7 @@ fn re_execute_nakamoto_follower(
         let mut fake_block_hash = block.header.block_hash();
         fake_block_hash.0[0] ^= 0xAA;
 
-        profile_scope!("Block Commit", {
+        stacks_profiler::measure!("Block Commit", {
             tenure_tx.commit_to_block(&fake_consensus_hash, &fake_block_hash);
         });
         Ok(())
@@ -218,24 +224,26 @@ where
     let start_total = Instant::now();
     let parent_block_id = block.header.parent_block_id.clone();
 
-    // Setup (Not counted in execution duration, but part of total)
-    let setup_scope = Profiler::begin_span("Setup");
+    // ========================================================================
+    // 1. Setup Phase
+    // ========================================================================
+    // We use manual begin_span/drop here because the DB handles created
+    // in this phase are self-referential (tenure_tx borrows burn_dbconn).
+    // A block-scoped macro cannot return both the owner and the borrower safely.
+    let setup_guard = stacks_profiler::span!("Setup");
+
     let parent_header =
         NakamotoChainState::get_block_header(context.chainstate().db(), &parent_block_id)?
             .ok_or_else(|| anyhow!("Parent header not found"))?;
 
-    // Find the coinbase transaction (if any)
     let coinbase = block.get_coinbase_tx();
-    // Find the tenure change transaction (if any)
     let tenure_change_payload = block.try_get_tenure_change_payload();
-    // If we have a tenure payload, the tx is guaranteed to be at index 0
     let tenure_change = tenure_change_payload.and(block.txs.first());
-    // Determine the cause of the tenure change (if any). Used below for loading tenure info
+
     let tenure_cause = tenure_change_payload
         .map(|tc| MinerTenureInfoCause::from(tc.cause))
         .unwrap_or(MinerTenureInfoCause::NoTenureChange);
 
-    // Initialize the block builder
     let mut builder = NakamotoBlockBuilder::new(
         &parent_header,
         &block.header.consensus_hash,
@@ -248,83 +256,97 @@ where
         Some(block.header.timestamp),
     )?;
 
-    // Get db handles
+    // These handles must live for the duration of the function
     let sortdb = context.burnchain_mut().open_sortition_db(true)?;
     let burn_dbconn = sortdb.index_handle_at_block(context.chainstate(), &parent_block_id)?;
 
     let mut miner_tenure_info =
         builder.load_tenure_info(context.chainstate_mut(), &burn_dbconn, tenure_cause)?;
-    let burn_chain_height = miner_tenure_info.burn_tip_height;
 
-    // Setup tenure transaction
+    let burn_chain_height = miner_tenure_info.burn_tip_height;
     let mut tenure_tx = builder.tenure_begin(&burn_dbconn, &mut miner_tenure_info)?;
-    drop(setup_scope);
+
+    // Explicitly end the Setup span here, but the variables stay alive!
+    drop(setup_guard);
+
     let setup_duration = start_total.elapsed();
 
-    // Execution Phase
-    let exec_scope = Profiler::begin_span("Transaction Replay");
+    // ========================================================================
+    // 2. Execution Phase
+    // ========================================================================
     let start_exec = Instant::now();
-    let mut tx_metrics = Vec::new();
-    let mut total_clarity_cost = ExecutionCost::ZERO;
 
-    for (i, tx) in block.txs.iter().enumerate() {
-        let tx_len = tx.tx_len();
-        let start_tx = Instant::now();
+    // This block is safe because we only return 'tx_metrics' and 'cost',
+    // which do NOT borrow from the builder or tenure_tx.
+    let (tx_metrics, total_clarity_cost) = stacks_profiler::measure!("Transaction Replay", {
+        let mut tx_metrics = Vec::with_capacity(block.txs.len());
+        let mut total_clarity_cost = ExecutionCost::ZERO;
 
-        let result = profile_scope!("Transaction", {
-            builder.try_mine_tx_with_len(
-                &mut tenure_tx,
-                tx,
-                tx_len,
-                &BlockLimitFunction::NO_LIMIT_HIT,
-                None,
-            )
-        });
+        for (i, tx) in block.txs.iter().enumerate() {
+            let tx_len = tx.tx_len();
+            let start_tx = Instant::now();
 
-        let duration_tx = start_tx.elapsed();
-        let mut cost = ExecutionCost::ZERO;
+            let result = stacks_profiler::measure!("Transaction", {
+                builder.try_mine_tx_with_len(
+                    &mut tenure_tx,
+                    tx,
+                    tx_len,
+                    &BlockLimitFunction::NO_LIMIT_HIT,
+                    None,
+                )
+            });
 
-        match result {
-            TransactionResult::Success(ref success_data) => {
-                // Cost is available in the receipt
-                cost = success_data.receipt.execution_cost.clone();
-                total_clarity_cost
-                    .add(&cost)
-                    .map_err(|e| anyhow!("Execution cost addition failure: {:?}", e))?;
+            let duration_tx = start_tx.elapsed();
+            let mut cost = ExecutionCost::ZERO;
+
+            match result {
+                TransactionResult::Success(ref success_data) => {
+                    cost = success_data.receipt.execution_cost.clone();
+                    total_clarity_cost
+                        .add(&cost)
+                        .map_err(|e| anyhow!("Execution cost addition failure: {:?}", e))?;
+                }
+                TransactionResult::ProcessingError(ref error_data) => {
+                    eprintln!("  Tx #{i} (0x{}) failed: {:?}", tx.txid(), error_data.error);
+                }
+                TransactionResult::Skipped(ref skipped_data) => {
+                    eprintln!(
+                        "  Tx #{i} (0x{}) skipped: {:?}",
+                        tx.txid(),
+                        skipped_data.error
+                    );
+                }
+                TransactionResult::Problematic(ref prob_data) => {
+                    eprintln!(
+                        "  Tx #{i} (0x{}) problematic: {:?}",
+                        tx.txid(),
+                        prob_data.error
+                    );
+                }
             }
-            TransactionResult::ProcessingError(ref error_data) => {
-                // TransactionError does not expose cost, so we track 0
-                eprintln!("  Tx #{i} (0x{}) failed: {:?}", tx.txid(), error_data.error);
-            }
-            TransactionResult::Skipped(ref skipped_data) => {
-                eprintln!(
-                    "  Tx #{i} (0x{}) skipped: {:?}",
-                    tx.txid(),
-                    skipped_data.error
-                );
-            }
-            TransactionResult::Problematic(ref prob_data) => {
-                eprintln!(
-                    "  Tx #{i} (0x{}) problematic: {:?}",
-                    tx.txid(),
-                    prob_data.error
-                );
-            }
+
+            tx_metrics.push(TransactionMetrics {
+                txid: tx.txid().to_string(),
+                duration: duration_tx,
+                cost,
+                estimated_commit_impact: Duration::ZERO,
+            });
         }
 
-        tx_metrics.push(TransactionMetrics {
-            txid: tx.txid().to_string(),
-            duration: duration_tx,
-            cost,
-            estimated_commit_impact: Duration::ZERO, // Calculated below
-        });
-    }
-    let execution_duration = start_exec.elapsed();
-    drop(exec_scope);
+        (tx_metrics, total_clarity_cost)
+    });
 
-    // Commit Phase
+    let execution_duration = start_exec.elapsed();
+
+    // ========================================================================
+    // 3. Commit Phase
+    // ========================================================================
     let start_commit = Instant::now();
-    commit_callback(&mut builder, tenure_tx, burn_chain_height)?;
+
+    stacks_profiler::measure!("Commit", {
+        commit_callback(&mut builder, tenure_tx, burn_chain_height)?;
+    });
+
     let commit_duration = start_commit.elapsed();
 
     Ok(BlockMetrics {
@@ -334,6 +356,7 @@ where
         commit_duration,
         total_clarity_cost,
         transactions: tx_metrics,
-        commit_overhead_baseline: Duration::ZERO, // Will be filled by apply_* methods
+        commit_overhead_baseline: Duration::ZERO,
+        total_storage_delta: 0,
     })
 }

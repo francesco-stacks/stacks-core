@@ -25,7 +25,7 @@ use stacks_bench::metrics::{CostModel, MetricsAccumulator, ModelSource};
 use stacks_bench::paths::{AppDataDir, BurnChainDir, ChainStateDir};
 use stacks_bench::replay::ReplayMode;
 use stacks_bench::{Network, StacksBlockRef};
-use stacks_profiler::{Profiler, profile_scope};
+use stacks_profiler::Profiler;
 
 const METABASE_IMAGE_TAG: &str = "v0.57.4.3";
 
@@ -100,7 +100,7 @@ pub struct BenchArgs {
     txid: Option<TxIdArg>,
 
     /// Number of blocks to use for calibration of the commit cost model.
-    #[arg(long, value_name = "CALIBRATION_BLOCKS", default_value_t = 10)]
+    #[arg(long, value_name = "CALIBRATION_BLOCKS", default_value_t = 20)]
     calibration: usize,
 }
 
@@ -340,11 +340,12 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
         let block = summary.with_transactions(txs);
 
         // Replay the block
-        let mut metrics = profile_scope!("Block Replay", {
+        let mut metrics = stacks_profiler::measure!("Block Replay", {
             stacks_bench::replay::replay_block(&mut bench_context, ReplayMode::Follower, &block)?
         });
 
         let profiler_results = Profiler::take_results();
+
         // We clone the transaction metrics because 'metrics' is needed below for calibration/stats.
         // The buffer takes ownership of the data.
         profiler_buffer.push((
@@ -442,6 +443,29 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
         app_db.save_profiler_data_batch(run_model.id, &mut profiler_buffer)?;
     }
 
+    // Flush any remaining metrics in the calibration buffer
+    if !metrics_buffer.is_empty() {
+        let buffer_len = metrics_buffer.len(); // Capture length before mutable borrow
+        println!(
+            "Flushing remaining {} blocks from calibration buffer...",
+            buffer_len
+        );
+
+        for (j, m) in metrics_buffer.iter_mut().enumerate() {
+            // Apply heuristic since we didn't finish calibration
+            m.apply_heuristic();
+
+            accumulator.add(m);
+
+            // Calculate correct block ID index
+            // The buffer contains the LAST N blocks processed.
+            let start_index = selected_block_count - buffer_len;
+            let buffered_id = &block_ids[start_index + j];
+
+            app_db.save_block_metrics(run_model.id, buffered_id, m)?;
+        }
+    }
+
     let duration = start.elapsed();
 
     app_db.finish_benchmark_run(run_model.id, Utc::now().naive_utc())?;
@@ -453,7 +477,7 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     // Give the OS a moment to sync metadata
     std::thread::sleep(Duration::from_millis(100));
 
-    let (growth, written) = bench_context.calculate_storage_delta()?;
+    let (growth, written) = bench_context.generate_delta_report()?;
 
     println!("Storage Delta:");
     println!(

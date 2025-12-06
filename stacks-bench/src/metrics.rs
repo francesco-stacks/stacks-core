@@ -31,19 +31,25 @@ impl CostModel {
     /// Compute a cost model from block metrics.
     /// Tries Linear Regression first, falls back to Min-Anchor, then Single Block.
     pub fn compute(metrics: &[BlockMetrics]) -> Self {
-        // Filter out warmup blocks if we have enough data
-        let data = if metrics.len() > 3 {
-            &metrics[1..]
+        // If we have enough data (e.g. > 5 blocks), skip the first few to avoid cold-cache skew.
+        // We skip the first 2 blocks or 10%, whichever is larger, but cap it at 5.
+        let skip_count = if metrics.len() >= 10 {
+            let pct = metrics.len() / 10; // 10%
+            pct.clamp(2, 5)
+        } else if metrics.len() > 3 {
+            1
         } else {
-            metrics
+            0
         };
+
+        let data = &metrics[skip_count..];
 
         if data.is_empty() {
             return CostModel::default();
         }
 
-        // 1. Try Linear Regression (requires N >= 2)
-        if data.len() >= 2 {
+        // 1. Try Linear Regression (requires N >= 3 for stability after warmup)
+        if data.len() >= 3 {
             if let Some(model) = Self::compute_regression(data) {
                 return model;
             }
@@ -146,6 +152,7 @@ pub struct BlockMetrics {
     pub total_clarity_cost: ExecutionCost,
     pub transactions: Vec<TransactionMetrics>,
     pub commit_overhead_baseline: Duration,
+    pub total_storage_delta: i64,
 }
 
 impl BlockMetrics {
@@ -204,6 +211,7 @@ impl Default for BlockMetrics {
             total_clarity_cost: ExecutionCost::ZERO,
             transactions: Vec::new(),
             commit_overhead_baseline: Duration::ZERO,
+            total_storage_delta: 0,
         }
     }
 }

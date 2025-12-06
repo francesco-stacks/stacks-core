@@ -8,7 +8,8 @@
 //! **Note:** This crate is not intended to be used directly. You should use the re-exported
 //! macro from the main `stacks-profiler` crate.
 
-use darling::{FromMeta, ast::NestedMeta}; // Import NestedMeta
+use darling::FromMeta;
+use darling::ast::NestedMeta;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::punctuated::Punctuated;
@@ -22,52 +23,15 @@ struct ProfileArgs {
 }
 
 /// Instruments a function to be tracked by the global `Profiler`.
-///
-/// This macro wraps the function body in a new block that:
-/// 1. Starts a profiling span immediately upon entry.
-/// 2. Creates a RAII guard to ensure the span is closed when the function returns (or panics).
-///
-/// # Arguments
-///
-/// * `name` (optional): Overrides the span name. If omitted, the function name is used.
-///
-/// # Examples
-///
-/// ## Basic Usage
-/// Uses the function name ("process_data") as the span name.
-/// ```ignore
-/// #[profile]
-/// fn process_data() {
-///     // ... work ...
-/// }
-/// ```
-///
-/// ## Custom Name
-/// Useful for grouping overloaded functions or providing more context.
-/// ```ignore
-/// #[profile(name = "Data Processing - Phase 1")]
-/// fn process_data() {
-///     // ... work ...
-/// }
-/// ```
-///
-/// # Async Safety Warning
-/// The underlying profiler uses **Thread Local Storage**.
-/// * **Safe:** Synchronous functions.
-/// * **Safe:** `async` functions running on a single-threaded runtime.
-/// * **Unsafe:** `async` functions running on a multi-threaded work-stealing runtime (like Tokio's default).
-///   If the task moves between threads, the start/end measurements will happen on different
-///   thread stacks, leading to panic or corrupted data.
 #[proc_macro_attribute]
 pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
-    // 1. Parse the attributes as a list of Meta items (e.g. name="foo", key=value)
+    // Parse the attributes as a list of Meta items (e.g. name="foo", key=value)
     let attr_args = parse_macro_input!(args with Punctuated::<Meta, Comma>::parse_terminated);
 
-    // 2. Convert syn::Meta to darling::ast::NestedMeta
-    // Darling expects NestedMeta (which can be a Meta or a Literal), so we wrap our Metas.
+    // Convert syn::Meta to darling::ast::NestedMeta
     let args_vec: Vec<NestedMeta> = attr_args.into_iter().map(NestedMeta::Meta).collect();
 
-    // 3. Process with Darling
+    // Process with Darling
     let args = match ProfileArgs::from_list(&args_vec) {
         Ok(v) => v,
         Err(e) => {
@@ -75,23 +39,81 @@ pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
-    // 4. Parse the function body
+    // Parse the function body
     let input_fn = parse_macro_input!(input as ItemFn);
 
     let vis = &input_fn.vis;
     let sig = &input_fn.sig;
     let block = &input_fn.block;
 
-    // 5. Determine the span name
-    let span_name = match args.name {
-        Some(n) => n,
-        None => sig.ident.to_string(),
+    // Logic to extract and clean context (runs once per function via OnceLock)
+    // We use the "type_name hack" to extract the full path.
+    let context_extraction = quote! {
+        let type_name = std::any::type_name::<__StacksProfilerScope>();
+        // type_name: "path::to::Type::func::__StacksProfilerScope"
+
+        // Strip suffix "::__StacksProfilerScope" (23 chars)
+        let full_path = &type_name[..type_name.len() - 23];
+
+        // Split into context (module/type) and name (function)
+        let (mut context, auto_name) = match full_path.rfind("::") {
+            Some(idx) => (&full_path[..idx], &full_path[idx+2..]),
+            None => ("", full_path),
+        };
+
+        // Handle Trait Impls: <Type as Trait> -> Type
+        if context.starts_with('<') {
+            if let Some(idx) = context.find(" as ") {
+                context = &context[1..idx];
+            }
+        }
+
+        // Handle Generics: Type<T> -> Type
+        let last_colon = context.rfind("::").map(|i| i + 2).unwrap_or(0);
+        if let Some(idx) = context[last_colon..].find('<') {
+            context = &context[..last_colon + idx];
+        }
     };
 
-    // 6. Generate the new function body
+    // Generate the span setup statement.
+    // FIX: We define `struct __StacksProfilerScope` *before* the `get_or_init` call.
+    let setup_block = match args.name {
+        Some(custom_name) => {
+            quote! {
+                {
+                    // Defined here so it belongs to the function scope, not the closure scope
+                    struct __StacksProfilerScope;
+
+                    static __PROFILER_SPAN_ID: std::sync::OnceLock<stacks_profiler::SpanId> = std::sync::OnceLock::new();
+                    __PROFILER_SPAN_ID.get_or_init(|| {
+                        #context_extraction
+                        stacks_profiler::Profiler::new_span_id(#custom_name)
+                            .with_context(context)
+                    })
+                }
+            }
+        }
+        None => {
+            quote! {
+                {
+                    // Defined here so it belongs to the function scope, not the closure scope
+                    struct __StacksProfilerScope;
+
+                    static __PROFILER_SPAN_ID: std::sync::OnceLock<stacks_profiler::SpanId> = std::sync::OnceLock::new();
+                    __PROFILER_SPAN_ID.get_or_init(|| {
+                        #context_extraction
+                        stacks_profiler::Profiler::new_span_id(auto_name)
+                            .with_context(context)
+                    })
+                }
+            }
+        }
+    };
+
     let output = quote! {
         #vis #sig {
-            let _guard = stacks_profiler::Profiler::begin_span(#span_name);
+            let __profiler_span_id = #setup_block;
+            let __profiler_guard = stacks_profiler::Profiler::begin_span(__profiler_span_id, None);
             #block
         }
     };
