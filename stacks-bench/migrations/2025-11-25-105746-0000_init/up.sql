@@ -170,6 +170,7 @@ CREATE TABLE stacks_tx (
 );
 
 CREATE INDEX idx_tx_tx_hash_hex ON stacks_tx(tx_hash_hex);
+CREATE INDEX idx_tx_block ON stacks_tx(stacks_block_id);
 CREATE INDEX idx_tx_caller_principal ON stacks_tx(caller_principal_id);
 CREATE INDEX idx_tx_contract ON stacks_tx(contract_id);
 
