@@ -199,6 +199,7 @@ table! {
         benchmark_run_id -> Integer,
         parent_id -> Nullable<Integer>,
         profiler_span_id -> Integer,
+        tag -> Nullable<Text>,
         profiler_location_id -> Integer,
         child_index -> Integer,
         depth -> Integer,

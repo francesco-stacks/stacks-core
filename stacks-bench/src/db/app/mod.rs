@@ -806,6 +806,7 @@ impl AppDb {
                             schema::profiler_record::benchmark_run_id.eq(run_id),
                             schema::profiler_record::parent_id.eq(parent_id),
                             schema::profiler_record::profiler_span_id.eq(span_id),
+                            schema::profiler_record::tag.eq(&node.tag().map(|t| t.to_string())),
                             schema::profiler_record::profiler_location_id.eq(loc_id),
                             schema::profiler_record::child_index.eq(child_index),
                             schema::profiler_record::depth.eq(depth),

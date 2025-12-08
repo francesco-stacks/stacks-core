@@ -260,6 +260,7 @@ pub struct ProfilerRecord {
     pub benchmark_run_id: i32,
     pub parent_id: Option<i32>,
     pub profiler_span_id: i32,
+    pub tag: Option<String>,
     pub profiler_location_id: i32,
     pub child_index: i32,
     pub depth: i32,

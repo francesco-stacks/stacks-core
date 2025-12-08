@@ -30,6 +30,7 @@ pub fn replay_block(
     mode: ReplayMode,
     block_summary: &BlockSummary,
 ) -> Result<BlockMetrics> {
+    let block_height = block_summary.height;
     match context.resolve_block_era(block_summary.epoch) {
         BlockEra::Nakamoto => {
             let (naka_block, _size) = context
@@ -44,10 +45,11 @@ pub fn replay_block(
                     Err(anyhow!("Nakamoto Miner replay not implemented"))
                 }
                 ReplayMode::Follower => {
-                    let mut metrics =
-                        stacks_profiler::measure!("Block Replay (Nakamoto Follower)", {
-                            re_execute_nakamoto_follower(context, &naka_block)
-                        })?;
+                    let mut metrics = stacks_profiler::measure!(
+                        "Block Replay (Nakamoto Follower)",
+                        block_height,
+                        { re_execute_nakamoto_follower(context, &naka_block) }
+                    )?;
                     // Calculate storage impact of this block
                     metrics.total_storage_delta = context.update_storage_delta()?;
                     Ok(metrics)
@@ -221,16 +223,16 @@ fn with_executed_nakamoto_block<F>(
 where
     F: FnOnce(&mut NakamotoBlockBuilder, ClarityTx, u32) -> Result<()>,
 {
-    let start_total = Instant::now();
-    let parent_block_id = block.header.parent_block_id.clone();
-
     // ========================================================================
     // 1. Setup Phase
     // ========================================================================
-    // We use manual begin_span/drop here because the DB handles created
+    // We use manual span!()/drop() here because the DB handles created
     // in this phase are self-referential (tenure_tx borrows burn_dbconn).
     // A block-scoped macro cannot return both the owner and the borrower safely.
     let setup_guard = stacks_profiler::span!("Setup");
+
+    let start_total = Instant::now();
+    let parent_block_id = block.header.parent_block_id.clone();
 
     let parent_header =
         NakamotoChainState::get_block_header(context.chainstate().db(), &parent_block_id)?
@@ -286,7 +288,7 @@ where
             let tx_len = tx.tx_len();
             let start_tx = Instant::now();
 
-            let result = stacks_profiler::measure!("Transaction", {
+            let result = stacks_profiler::measure!("Transaction", i, {
                 builder.try_mine_tx_with_len(
                     &mut tenure_tx,
                     tx,

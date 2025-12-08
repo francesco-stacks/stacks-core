@@ -185,6 +185,10 @@ impl ProfileStats {
         self.id.line
     }
 
+    pub fn tag(&self) -> Option<&Tag> {
+        self.tag.as_ref()
+    }
+
     pub fn count(&self) -> usize {
         self.count
     }

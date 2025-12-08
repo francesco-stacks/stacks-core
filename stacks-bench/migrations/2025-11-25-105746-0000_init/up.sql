@@ -86,9 +86,8 @@ CREATE TABLE contract (
     FOREIGN KEY (issuer_principal_id) REFERENCES principal(id),
     UNIQUE(issuer_principal_id, name)
 );
-
-CREATE INDEX idx_contract_principal ON contract(issuer_principal_id);
-CREATE INDEX idx_contract_name ON contract(name);
+CREATE INDEX idx_contract_name 
+  ON contract(name);
 
 -- ==========================================
 -- Staging table for Stacks contracts during bulk import.
@@ -111,8 +110,10 @@ CREATE TABLE burn_block (
     CHECK(length(block_hash) = 32)
 );
 
-CREATE INDEX idx_burn_block_height ON burn_block(height);
-CREATE INDEX idx_burn_block_block_hash_hex ON burn_block(block_hash_hex);
+CREATE INDEX idx_burn_block_height 
+  ON burn_block(height);
+CREATE INDEX idx_burn_block_block_hash_hex 
+  ON burn_block(block_hash_hex);
 
 -- ==========================================
 -- Dimension for Stacks blocks. Not linked to any specific chainstate as they
@@ -133,9 +134,12 @@ CREATE TABLE stacks_block (
   CHECK(length(index_hash) = 32)
 );
 
-CREATE INDEX idx_stacks_block_height ON stacks_block(height);
-CREATE INDEX idx_stacks_block_index_hash_hex ON stacks_block(index_hash_hex);
-CREATE INDEX idx_stacks_block_block_hash_hex ON stacks_block(block_hash_hex);
+CREATE INDEX idx_stacks_block_height 
+  ON stacks_block(height);
+CREATE INDEX idx_stacks_block_index_hash_hex 
+  ON stacks_block(index_hash_hex);
+CREATE INDEX idx_stacks_block_block_hash_hex 
+  ON stacks_block(block_hash_hex);
 
 -- ==========================================
 -- Staging table for Stacks blocks during bulk import.
@@ -169,10 +173,13 @@ CREATE TABLE stacks_tx (
   CHECK(length(tx_hash) = 32)
 );
 
-CREATE INDEX idx_tx_tx_hash_hex ON stacks_tx(tx_hash_hex);
-CREATE INDEX idx_tx_block ON stacks_tx(stacks_block_id);
-CREATE INDEX idx_tx_caller_principal ON stacks_tx(caller_principal_id);
-CREATE INDEX idx_tx_contract ON stacks_tx(contract_id);
+CREATE INDEX idx_tx_tx_hash_hex 
+  ON stacks_tx(tx_hash_hex);
+CREATE INDEX idx_tx_caller_principal 
+  ON stacks_tx(caller_principal_id);
+CREATE INDEX idx_tx_contract 
+  ON stacks_tx(contract_id)
+  WHERE contract_id IS NOT NULL;
 
 -- ==========================================
 -- Staging table for Stacks transactions during bulk import.
@@ -198,7 +205,7 @@ CREATE TABLE benchmark_run (
   end_time TIMESTAMP,
   args_json TEXT NOT NULL,
   FOREIGN KEY (chainstate_id) REFERENCES chainstate(id),
-  CHECK(length(git_commit_hash) = 20)
+  CHECK(length(git_commit_hash) IN (20, 32)) -- SHA1 or SHA256
 );
 
 -- ==========================================
@@ -231,7 +238,11 @@ CREATE TABLE stacks_block_stats (
   UNIQUE (benchmark_run_id, stacks_block_id)
 );
 
-CREATE INDEX idx_stacks_block_stats_block ON stacks_block_stats (stacks_block_id);
+CREATE INDEX idx_stacks_block_stats_block 
+  ON stacks_block_stats (stacks_block_id);
+-- For block stats p95 / histograms
+CREATE INDEX idx_block_stats_run_runtime
+  ON stacks_block_stats(benchmark_run_id, clarity_runtime);
 
 -- ==========================================
 -- Fact table for benchmark statistics per Stacks transaction.
@@ -257,7 +268,9 @@ CREATE TABLE stacks_tx_stats (
   UNIQUE (benchmark_run_id, stacks_tx_id)
 );
 
-CREATE INDEX idx_stacks_tx_stats_tx ON stacks_tx_stats (stacks_tx_id);
+  -- For TX stats p95 / histograms
+CREATE INDEX idx_tx_stats_run_runtime
+  ON stacks_tx_stats(benchmark_run_id, clarity_runtime);
 
 -- ==========================================
 -- Dimension table for profiler locations (file + line).
@@ -289,6 +302,7 @@ CREATE TABLE profiler_record (
   -- Hierarchy
   parent_id INTEGER,
   profiler_span_id INTEGER NOT NULL,
+  tag TEXT,
   profiler_location_id INTEGER NOT NULL,
   child_index INTEGER NOT NULL, -- Preserves execution order for flamegraphs
   depth INTEGER NOT NULL,       -- Optimization for UI rendering
@@ -315,14 +329,36 @@ CREATE TABLE profiler_record (
   FOREIGN KEY (stacks_tx_id) REFERENCES stacks_tx(id)
 );
 
-CREATE INDEX idx_prof_run_block 
-  ON profiler_record(benchmark_run_id, stacks_block_id)
+-- FLAMEGRAPH TRAVERSAL
+-- Finds children of a node, pre-sorted by execution order. Critical for 
+-- performant UI rendering.
+CREATE INDEX idx_prof_parent_ordered
+  ON profiler_record(parent_id, child_index);
+
+-- HOT PATH / AGGREGATION
+-- "Show me stats for span X in run Y".
+CREATE INDEX idx_prof_run_span
+  ON profiler_record(benchmark_run_id, profiler_span_id);
+
+-- BLOCK CONTEXT
+-- Finds everything in a block (and optionally specific txs within that block).
+-- Also acts as the FK index for benchmark_run_id (satisfies ON DELETE CASCADE).
+CREATE INDEX idx_prof_run_block
+  ON profiler_record(benchmark_run_id, stacks_block_id, stacks_tx_id)
   WHERE stacks_block_id IS NOT NULL;
-CREATE INDEX idx_prof_run_tx 
+
+-- TX CONTEXT (Lookup by TX only) 
+-- Necessary because you can't efficiently search the index above for a TX 
+-- without also knowing the Block ID.
+CREATE INDEX idx_prof_run_tx
   ON profiler_record(benchmark_run_id, stacks_tx_id)
   WHERE stacks_tx_id IS NOT NULL;
-CREATE INDEX idx_prof_parent ON profiler_record(parent_id);
-CREATE INDEX idx_prof_profiler_span ON profiler_record(profiler_span_id);
+
+-- TAG LOOKUP
+CREATE INDEX idx_prof_run_tag
+  ON profiler_record(benchmark_run_id, tag)
+  WHERE tag IS NOT NULL;
+
 
 -- ==========================================
 -- Cache table for chain tip lookups to speed up ancestor queries (e.g. when
