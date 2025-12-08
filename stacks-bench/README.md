@@ -62,3 +62,75 @@ WRITE: bw=179MiB/s
 - This test is the **official storage sanity-check** for `stacks-bench`
 - Ensures reliable and comparable benchmark results
 - Recommended environment: internal NVMe _or_ high-quality USB4/TB3 NVMe
+
+## Benchmark Data Storage
+
+`stacks-bench` stores its benchmarking data in an SQLite database, which by default is written
+to `./.stacks-bench/appdata/stacks-bench.db`, relative to the `stacks-bench` binary's working directory.
+
+## Analyzing Benchmark Data
+
+To help users better understand their benchmarking/profiling data, a small [Metabase](https://www.metabase.com/) instance is supplied with some pre-configured questions/dashboards.
+
+Running `stacks-bench metabase` will have `stacks-bench` setup/configure a PostgreSQL database for Metabase as well as Metabase itself using Docker. You can then access Metabase at <http://localhost:3000/>.
+
+### Backing up the Metabase database
+
+```bash
+docker exec stacks-bench-postgres \
+  pg_dump -U metabase -F c metabase \
+  > metabase_backup_$(date +"%Y%m%d%H%M").dump
+```
+
+### Restoring the Metabase database
+
+First, connect to the database:
+
+```bash
+psql -h localhost -p 5432 -U USERNAME -d PASSWORD
+```
+
+Create a metabase user and database to use as a restore target:
+
+```sql
+CREATE USER metabase WITH PASSWORD 'metabase';
+CREATE DATABASE metabase OWNER metabase;
+\q
+```
+
+Restore the Metabase backup into the newly created database:
+
+```bash
+pg_restore \
+  -h localhost \
+  -p 5432 \
+  -U metabase \
+  -d metabase \
+  --clean --if-exists \
+  BACKUP_FILE.dump
+```
+
+### Cleaning the Metabase database
+
+```sql
+-- Clear logs and execution history
+TRUNCATE TABLE query_execution;
+TRUNCATE TABLE task_history;
+TRUNCATE TABLE view_log;
+TRUNCATE TABLE login_history;
+
+-- Clear cache (forces Metabase to fetch fresh data)
+TRUNCATE TABLE query_cache;
+TRUNCATE TABLE metabase_fieldvalues; -- Clears cached filter dropdown values
+
+-- Clear user sessions (Forces all users to log in again)
+TRUNCATE TABLE core_session;
+
+-- Clear activity stream (removes "user X created dashboard Y" history)
+TRUNCATE TABLE activity;
+
+-- (Optional) Clear edit history
+-- Only run this if you want to remove the "Undo" history for questions/dashboards.
+-- If you want to keep the version history of how the dashboard was built, skip this.
+TRUNCATE TABLE revision;
+```
