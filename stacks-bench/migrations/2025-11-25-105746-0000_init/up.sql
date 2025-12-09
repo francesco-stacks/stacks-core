@@ -122,7 +122,6 @@ CREATE INDEX idx_burn_block_block_hash_hex
 CREATE TABLE stacks_block (
   id INTEGER PRIMARY KEY NOT NULL,
   index_hash BLOB NOT NULL UNIQUE,
-  index_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(index_hash))) STORED,
   block_hash BLOB NOT NULL,
   block_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(block_hash))) STORED,
   height INTEGER NOT NULL,
@@ -136,8 +135,6 @@ CREATE TABLE stacks_block (
 
 CREATE INDEX idx_stacks_block_height 
   ON stacks_block(height);
-CREATE INDEX idx_stacks_block_index_hash_hex 
-  ON stacks_block(index_hash_hex);
 CREATE INDEX idx_stacks_block_block_hash_hex 
   ON stacks_block(block_hash_hex);
 

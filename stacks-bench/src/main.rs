@@ -172,7 +172,8 @@ pub struct BenchArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     block_count: Option<u32>,
 
-    /// A specific transaction id (hex) to benchmark. May not be used with `start-at`, `end-at`, or `count`.
+    /// A specific transaction id (hex) to benchmark. May not be used with
+    /// `start-at`, `end-at`, or `count`.
     #[arg(long, conflicts_with_all = &["start_at", "end_at", "count"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     txid: Option<TxIdArg>,
@@ -180,6 +181,11 @@ pub struct BenchArgs {
     /// Number of blocks to use for calibration of the commit cost model.
     #[arg(long, value_name = "CALIBRATION_BLOCKS", default_value_t = 20)]
     calibration: usize,
+
+    /// Number of blocks to process as warmup before starting measurements.
+    /// These blocks will be executed but not included in the benchmark results.
+    #[arg(long, default_value_t = 0)]
+    warmup: usize,
 }
 
 impl IndexerArgs for BenchArgs {
@@ -416,6 +422,7 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     // Allow buffer to grow if we can't find variance. Empty blocks are small, so 500 is memory-safe.
     let max_calibration_buffer = 500;
     let mut calibrated = false;
+    let mut is_warmup = false;
     // Tracker for hydration time
     let mut total_hydration_duration = Duration::ZERO;
     let mut total_clarity_db_checkpoint_duration = Duration::ZERO;
@@ -424,10 +431,24 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
 
     let start = Instant::now();
     for (i, block_id) in block_ids.iter().enumerate() {
+        is_warmup = i < args.warmup;
         Profiler::clear();
 
         // Load metadata from App DB
         let summary = app_db.get_block(block_id, epochs.as_slice())?;
+
+        if is_warmup {
+            if i == 0 {
+                println!("Warming up for {} blocks...", args.warmup);
+            }
+            if i % 10 == 0 {
+                eprint!("(Warmup {}) ", summary.height);
+            }
+        } else if i == args.warmup || i % 5_000 == 0 || i == selected_block_count - 1 {
+            eprint!("{}", summary.height);
+        } else if i % 250 == 0 {
+            eprint!(".");
+        }
 
         if i == 0 || i % 5_000 == 0 || i == selected_block_count - 1 {
             eprint!("{}", summary.height);
@@ -515,35 +536,40 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
                             m.apply_heuristic();
                         }
 
-                        accumulator.add(m); // Accumulate
+                        if !is_warmup {
+                            // Accumulate
+                            accumulator.add(m);
 
-                        // Use the buffered block ID to save metrics
-                        let buffered_id = &block_ids[i - buffer_len + j + 1];
-                        app_db.save_block_metrics(run_model.id, buffered_id, m)?;
+                            // Use the buffered block ID to save metrics
+                            let buffered_id = &block_ids[i - buffer_len + j + 1];
+                            app_db.save_block_metrics(run_model.id, buffered_id, m)?;
+                        }
                     }
                     metrics_buffer.clear();
                 }
                 // Else: continue collecting blocks to find variance
             }
         } else {
-            if cost_model.time_per_byte > f64::EPSILON {
-                metrics.apply_cost_model(&cost_model);
-            } else {
-                metrics.apply_heuristic();
-            }
+            if !is_warmup {
+                if cost_model.time_per_byte > f64::EPSILON {
+                    metrics.apply_cost_model(&cost_model);
+                } else {
+                    metrics.apply_heuristic();
+                }
 
-            accumulator.add(&metrics); // Accumulate
-            app_db.save_block_metrics(run_model.id, &block.id, &metrics)?;
+                accumulator.add(&metrics); // Accumulate
+                app_db.save_block_metrics(run_model.id, &block.id, &metrics)?;
+            }
         }
     }
 
     // Flush any remaining profiler data after the loop
-    if !profiler_buffer.is_empty() {
+    if !profiler_buffer.is_empty() && !is_warmup {
         app_db.save_profiler_data_batch(run_model.id, &mut profiler_buffer)?;
     }
 
     // Flush any remaining metrics in the calibration buffer
-    if !metrics_buffer.is_empty() {
+    if !metrics_buffer.is_empty() && !is_warmup {
         let buffer_len = metrics_buffer.len(); // Capture length before mutable borrow
         println!();
         println!(

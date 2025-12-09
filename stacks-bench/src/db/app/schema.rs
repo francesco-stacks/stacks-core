@@ -88,7 +88,6 @@ table! {
     stacks_block (id) {
         id -> BigInt,
         index_hash -> Binary,
-        index_hash_hex -> Text,
         block_hash -> Binary,
         block_hash_hex -> Text,
         height -> BigInt,

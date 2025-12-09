@@ -135,7 +135,6 @@ pub struct BurnBlock {
 pub struct StacksBlock {
     pub id: i64,
     pub index_hash: Vec<u8>,
-    pub index_hash_hex: String,
     pub block_hash: Vec<u8>,
     pub block_hash_hex: String,
     pub height: i64,
