@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use diesel::backend::Backend;
 use diesel::deserialize::{self, FromSql, FromSqlRow};
 use diesel::prelude::*;
@@ -46,7 +46,7 @@ impl Epoch {
     pub fn to_stacks_epoch_id(&self) -> Result<StacksEpochId> {
         self.epoch_id()
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid StacksEpochId: {}", self.epoch_id))
+            .map_err(|e| anyhow!("Invalid StacksEpochId '{}': {e}", self.epoch_id))
     }
 
     pub fn network_epoch_id(&self) -> u32 {
@@ -85,4 +85,26 @@ impl ResolveEpochFromHeight for [Epoch] {
         }
         None
     }
+}
+
+#[derive(Queryable, Selectable, Debug, Clone)]
+#[diesel(table_name = schema::snapshots)]
+pub struct Snapshot {
+    pub sortition_id: String,
+    pub block_height: i64,
+    pub burn_header_hash: String,
+    pub parent_sortition_id: String,
+    pub canonical_stacks_tip_hash: String,
+    pub canonical_stacks_tip_consensus_hash: String,
+    pub canonical_stacks_tip_height: i64,
+    pub pox_valid: i32,
+}
+
+#[derive(Queryable, Selectable, Debug, Clone)]
+#[diesel(table_name = schema::stacks_chain_tips)]
+pub struct StacksChainTip {
+    pub sortition_id: String,
+    pub consensus_hash: String,
+    pub block_hash: String,
+    pub block_height: i64,
 }

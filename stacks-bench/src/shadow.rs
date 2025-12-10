@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use tempfile::TempDir;
@@ -56,7 +56,7 @@ impl ShadowDir {
 
     /// Calculates the storage delta between a base directory and a shadow directory.
     /// Returns a detailed report.
-    pub fn calculate_storage_delta(&self) -> std::io::Result<ShadowDirDeltaReport> {
+    pub fn calculate_storage_delta(&self) -> Result<ShadowDirDeltaReport> {
         let base_root = &self.source;
         let shadow_root = &self.root;
         let mut net_growth: i64 = 0;
@@ -136,7 +136,7 @@ impl ShadowDir {
                     // Calculate relative path to find base file
                     let relative_path = path
                         .strip_prefix(shadow_root)
-                        .map_err(std::io::Error::other)?
+                        .context("Failed to determine relative path")?
                         .to_path_buf();
                     let base_path = base_root.join(&relative_path);
 
@@ -276,7 +276,7 @@ impl ShadowDirBuilder {
         fs::create_dir_all(&root).with_context(|| format!("mkdir {}", root.display()))?;
 
         for dent in walker {
-            let dent = dent.map_err(|e| anyhow!("Walk error: {e}"))?;
+            let dent = dent.context("Walk error")?;
             let path = dent.path();
             if path == source {
                 continue;
@@ -288,12 +288,12 @@ impl ShadowDirBuilder {
             } else {
                 fs::metadata(path)
                     .map(|m| m.file_type())
-                    .map_err(|e| anyhow!("stat {}: {e}", path.display()))?
+                    .with_context(|| format!("stat {}", path.display()))?
             };
 
             let rel = path
                 .strip_prefix(&source)
-                .map_err(|e| anyhow!("strip_prefix {}: {e}", path.display()))?;
+                .with_context(|| format!("strip_prefix {}", path.display()))?;
             let out = root.join(rel);
 
             if ft.is_dir() {

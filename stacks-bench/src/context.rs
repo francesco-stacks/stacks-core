@@ -3,19 +3,20 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use blockstack_lib::burnchains::Burnchain;
-use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
-use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
-use blockstack_lib::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksChainState};
+use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use blockstack_lib::chainstate::stacks::index::marf::MARFOpenOpts;
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 
+use crate::db::DbOpenForRead;
+use crate::db::node::ChainStateDb;
+use crate::db::node::sortition::SortitionDb;
 use crate::paths::{BurnChainDir, ChainStateDir};
 use crate::shadow::{ShadowDir, ShadowDirBuilder, ShadowDirDeltaReport};
 use crate::{
-    BlockEra, BlockSummary, BlockTransactions, ChainCache, Network, ResolveEpochFromHeight,
-    StacksBlockRef, StacksEpoch,
+    BlockEra, ChainCache, Network, ResolveEpochFromHeight, StacksBlockHeader, StacksBlockRef,
+    StacksEpoch,
 };
 
 const BURNCHAIN_NAME: &str = "bitcoin";
@@ -109,6 +110,7 @@ pub struct BenchContext {
     epochs: Vec<StacksEpoch>,
     /// Tracks the cumulative storage growth to calculate per-block deltas
     last_storage_delta: i64,
+    chainstate_dir: ChainStateDir,
 }
 
 impl BenchContext {
@@ -118,6 +120,10 @@ impl BenchContext {
 
     pub fn chainstate_mut(&mut self) -> &mut StacksChainState {
         &mut self.chainstate
+    }
+
+    pub fn chainstate_dir(&self) -> &ChainStateDir {
+        &self.chainstate_dir
     }
 
     pub fn burnchain(&self) -> &Burnchain {
@@ -175,7 +181,7 @@ impl BenchContext {
         Ok(delta)
     }
 
-    pub fn initialize<Cache: ChainCache>(
+    pub async fn initialize<Cache: ChainCache>(
         opts: BenchContextOpts,
         mut cache: Option<&mut Cache>,
     ) -> Result<Self> {
@@ -190,65 +196,58 @@ impl BenchContext {
             .watch("chainstate/vm/index.sqlite")
             .copy()?;
         let setup_duration = start.elapsed();
-        println!(
-            "Created shadow directory at {:?} in {:.2?}",
-            &shadow_dir, setup_duration
-        );
+        println!("Created shadow directory at {shadow_dir:?} in {setup_duration:.2?}");
 
-        let burnchain_path = BurnChainDir::from_node_root(&shadow_dir);
-        let chainstate_path = ChainStateDir::from_node_root(&shadow_dir);
+        let burnchain_dir = BurnChainDir::from_node_root(&shadow_dir);
+        let chainstate_dir = ChainStateDir::from_node_root(&shadow_dir);
 
         let chain_id = opts.chain_id;
         let is_mainnet = opts.network.is_mainnet();
         let network_name = opts.network.to_string();
 
-        let burnchain = Burnchain::new(burnchain_path.as_str()?, BURNCHAIN_NAME, &network_name)?;
-        let (sortition_db, _burnchain_db) = burnchain.open_db(false)?;
+        let burnchain = Burnchain::new(burnchain_dir.as_str()?, BURNCHAIN_NAME, &network_name)?;
 
         let marf_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
 
         let (chainstate, _) = StacksChainState::open(
             is_mainnet,
             chain_id,
-            chainstate_path.as_str()?,
+            chainstate_dir.as_str()?,
             Some(marf_opts),
         )?;
 
+        let mut chainstate_db = ChainStateDb::open_for_read(chainstate_dir.index_db_path())?;
+        let mut sortition_db = SortitionDb::open_for_read(burnchain_dir.sortition_db_path())?;
+
         // 1. Get Node Tip (Global Default)
-        println!("Getting canonical stacks tip block id directly from sortdb");
-        let node_tip_id = sortition_db.get_canonical_stacks_tip_block_id();
-        let node_tip_header = NakamotoChainState::get_block_header(chainstate.db(), &node_tip_id)?
-            .ok_or(anyhow!("Failed to get tip block header"))?;
-        let node_tip_height = node_tip_header.stacks_block_height;
+        println!("Getting canonical stacks tip from sortition db");
+        let (node_tip_id, node_tip_height) = sortition_db.get_canonical_stacks_tip()?;
 
         // 2. Determine Anchor Tip
         // This is the block we will walk backwards FROM.
         let (anchor_id, anchor_height) = match &opts.tip {
             Some(StacksBlockRef::Id(id)) => {
-                let header = NakamotoChainState::get_block_header(chainstate.db(), id)?
-                    .ok_or_else(|| anyhow!("Tip block {} not found", id))?;
-                (id.clone(), header.stacks_block_height)
+                let header: StacksBlockHeader = chainstate_db
+                    .get_block_header(id)?
+                    .ok_or_else(|| anyhow!("Tip block {id} not found"))?
+                    .try_into()?;
+                (id.clone(), header.height)
             }
             Some(StacksBlockRef::Height(h)) => {
                 let h = *h;
                 if h > node_tip_height {
-                    bail!(
-                        "Requested tip height {} is beyond node tip {}",
-                        h,
-                        node_tip_height
-                    );
+                    bail!("Requested tip height {h} is beyond node tip {node_tip_height}");
                 }
                 // Walk back from node tip to find the canonical block at height h
                 let mut curr = node_tip_id.clone();
                 let mut curr_h = node_tip_height;
                 while curr_h > h {
-                    let header = NakamotoChainState::get_block_header(chainstate.db(), &curr)?
-                        .ok_or_else(|| anyhow!("Missing header for {}", curr))?;
-                    curr = match header.anchored_header {
-                        StacksBlockHeaderTypes::Epoch2(_) => chainstate.get_parent(&curr)?,
-                        StacksBlockHeaderTypes::Nakamoto(n) => n.parent_block_id,
-                    };
-                    curr_h -= 1;
+                    let header: StacksBlockHeader = chainstate_db
+                        .get_block_header(&curr)?
+                        .ok_or_else(|| anyhow!("Missing header for {curr}"))?
+                        .try_into()?;
+                    curr = header.parent_id;
+                    curr_h = header.height.saturating_sub(1);
                 }
                 (curr, h)
             }
@@ -256,22 +255,23 @@ impl BenchContext {
         };
 
         // Resolve start height
-        // We resolve this before `end_height` so we can support `block_count`
         let start_height = match &opts.start_at {
-            Some(block_ref) => {
-                let h = block_ref.resolve_block_height(&chainstate)?;
-                if h == 0 {
-                    bail!(
-                        "Start height cannot be 0 (genesis block). Please start at height 1 or greater."
-                    );
-                }
-                h
+            Some(StacksBlockRef::Height(h)) => *h,
+            Some(StacksBlockRef::Id(id)) => {
+                let header: StacksBlockHeader = chainstate_db
+                    .get_block_header(id)?
+                    .ok_or_else(|| anyhow!("Start block {id} not found"))?
+                    .try_into()?;
+                header.height
             }
             None => 1,
         };
 
+        if start_height == 0 {
+            bail!("Start height cannot be 0 (genesis block). Please start at height 1 or greater.");
+        }
+
         // Determine effective end block
-        // We walk back from the ANCHOR tip, not necessarily the node tip.
         let target_end_ref = if let Some(count) = opts.block_count {
             if count == 0 {
                 bail!("Block count must be greater than 0");
@@ -283,41 +283,36 @@ impl BenchContext {
 
         let (end_id, end_height) = match target_end_ref {
             Some(StacksBlockRef::Id(id)) => {
-                let header = NakamotoChainState::get_block_header(chainstate.db(), &id)?
-                    .ok_or_else(|| anyhow!("Block {} not found", id))?;
-                (id.clone(), header.stacks_block_height)
+                let header: StacksBlockHeader = chainstate_db
+                    .get_block_header(&id)?
+                    .ok_or_else(|| anyhow!("Block {id} not found"))?
+                    .try_into()?;
+                (id.clone(), header.height)
             }
             Some(StacksBlockRef::Height(h)) => {
                 let h = h;
                 if h > anchor_height {
-                    bail!(
-                        "Requested end height {} is beyond anchor tip {}",
-                        h,
-                        anchor_height
-                    );
+                    bail!("Requested end height {h} is beyond anchor tip {anchor_height}");
                 }
 
                 if h == anchor_height {
                     (anchor_id.clone(), anchor_height)
                 } else {
                     println!(
-                        "Resolving canonical block at height {} (walking back from {})...",
-                        h, anchor_height
+                        "Resolving canonical block at height {h} (walking back from {anchor_height})"
                     );
+
                     let mut curr = anchor_id.clone();
                     let mut curr_h = anchor_height;
 
-                    // Check cache to jump closer if we know an ancestor (this saves quite a bit of
-                    // walking time when targeting older blocks)
+                    // Check cache to jump closer if we know an ancestor
                     if let Some(c) = &mut cache {
                         if let Ok(Some((cached_id, cached_h))) =
-                            c.find_closest_ancestor(&anchor_id, h)
+                            c.find_closest_ancestor(&anchor_id, h).await
                         {
-                            // Ensure the cached block is actually useful (between current and target)
                             if cached_h < curr_h && cached_h >= h {
                                 println!(
-                                    "  [Cache Hit] Jumping from height {} to {} ({})",
-                                    curr_h, cached_h, cached_id
+                                    "  [Cache Hit] Jumping from height {curr_h} to {cached_h} ({cached_id})"
                                 );
                                 curr = cached_id;
                                 curr_h = cached_h;
@@ -325,27 +320,35 @@ impl BenchContext {
                         }
                     }
 
+                    let mut last_cache_height = curr_h;
+
                     while curr_h > h {
-                        let header = NakamotoChainState::get_block_header(chainstate.db(), &curr)?
-                            .ok_or_else(|| anyhow!("Missing header for {}", curr))?;
+                        // Fetch header for the current block
+                        let header: StacksBlockHeader = chainstate_db
+                            .get_block_header(&curr)?
+                            .ok_or_else(|| anyhow!("Missing header for {curr}"))?
+                            .try_into()?;
 
-                        curr = match header.anchored_header {
-                            StacksBlockHeaderTypes::Epoch2(_) => chainstate.get_parent(&curr)?,
-                            StacksBlockHeaderTypes::Nakamoto(n) => n.parent_block_id,
-                        };
-                        curr_h -= 1;
+                        // Move to the parent block
+                        curr = header.parent_id;
 
-                        // Populate cache periodically (every 1,000 blocks)
-                        if curr_h % 1_000 == 0 {
+                        // Update height (parent is always current - 1)
+                        curr_h = header.height.saturating_sub(1);
+
+                        // Populate cache periodically
+                        if last_cache_height - curr_h >= 10_000 {
                             if let Some(c) = &mut cache {
-                                let _ = c.cache_ancestor(&anchor_id, curr_h, &curr);
+                                let _ = c.cache_ancestor(&anchor_id, curr_h, &curr).await;
+                                eprint!("."); // Progress/activity indicator
                             }
+                            last_cache_height = curr_h;
                         }
                     }
+                    println!();
 
                     // Cache the final result too
                     if let Some(c) = &mut cache {
-                        let _ = c.cache_ancestor(&anchor_id, curr_h, &curr);
+                        let _ = c.cache_ancestor(&anchor_id, curr_h, &curr).await;
                     }
 
                     (curr, h)
@@ -369,6 +372,7 @@ impl BenchContext {
             tip_id: end_id,         // tip_id is now the benchmark tip ID
             epochs: opts.epochs,
             last_storage_delta: 0,
+            chainstate_dir,
         })
     }
 
@@ -385,135 +389,62 @@ impl BenchContext {
         &self,
         start_height: u32,
         end_height: u32,
-    ) -> impl Iterator<Item = Result<BlockSummary>> + '_ {
+    ) -> impl Iterator<Item = Result<StacksBlockHeader>> + '_ {
         let start_height = start_height as u64;
         let end_height = end_height as u64;
 
         let mut current_id = self.tip_id.clone();
-        // We'll lazily initialize the sortition DB to avoid keeping it open if not needed immediately,
-        // but for an iterator we need it.
-        let sortition_db = self
-            .burnchain
-            .open_sortition_db(false)
-            .expect("Failed to open sortition DB");
+
+        // Open a local handle to the ChainStateDb.
+        // We expect this to succeed since the node is running/initialized.
+        // Note: We use expect() here because we can't easily return a Result from the iterator setup,
+        // and a failure here implies a critical environment issue.
+        let mut chainstate_db = ChainStateDb::open_for_read(self.chainstate_dir.index_db_path())
+            .expect("Failed to open chainstate DB for reading");
 
         std::iter::from_fn(move || {
             loop {
-                // 1. Get Header
-                // Note: NakamotoChainState::get_block_header returns Result<Option<Header>>
-                let header_res =
-                    NakamotoChainState::get_block_header(self.chainstate.db(), &current_id);
+                // 1. Get Header via the unified query
+                let header_res = chainstate_db.get_block_header(&current_id);
+
                 let header = match header_res {
                     Ok(Some(h)) => h,
-                    Ok(None) => return Some(Err(anyhow!("Missing header for {}", current_id))),
-                    Err(e) => return Some(Err(anyhow!("DB error: {}", e))),
+                    Ok(None) => return Some(Err(anyhow!("Missing header for {current_id}"))),
+                    Err(e) => return Some(Err(anyhow!("DB error: {e}"))),
                 };
 
-                let current_height = header.stacks_block_height;
+                // 2. Convert to StacksBlockHeader
+                // This uses the TryInto impl in models.rs which populates:
+                // id, hash, parent_id, height, burn_block_hash, burn_block_height
+                let stacks_header: StacksBlockHeader = match header.try_into() {
+                    Ok(h) => h,
+                    Err(e) => return Some(Err(anyhow!("Conversion error: {e}"))),
+                };
+
+                let current_height = stacks_header.height;
 
                 if current_height < start_height {
                     return None;
                 }
 
-                // 2. Resolve BlockSummary
-                let (summary, consensus_hash) = match &header.anchored_header {
-                    StacksBlockHeaderTypes::Epoch2(header) => {
-                        let parent_res = self.chainstate.get_parent(&current_id);
-                        let parent = match parent_res {
-                            Ok(p) => p,
-                            Err(e) => return Some(Err(anyhow!("Failed to get parent: {}", e))),
-                        };
-
-                        let hashes_res = self.chainstate.get_block_header_hashes(&current_id);
-                        let (consensus_hash, _) = match hashes_res {
-                            Ok(Some(h)) => h,
-                            Ok(None) => {
-                                return Some(Err(anyhow!("Missing hashes for {}", current_id)));
-                            }
-                            Err(e) => return Some(Err(anyhow!("DB error: {}", e))),
-                        };
-
-                        let epoch = match self.epochs.resolve_stacks_epoch(current_height) {
-                            Some(e) => e,
-                            None => {
-                                return Some(Err(anyhow!(
-                                    "Unknown epoch for height {}",
-                                    current_height
-                                )));
-                            }
-                        };
-
-                        (
-                            BlockSummary::new(
-                                current_id.clone(),
-                                header.block_hash(),
-                                parent,
-                                current_height,
-                                epoch,
-                            ),
-                            consensus_hash,
-                        )
-                    }
-                    StacksBlockHeaderTypes::Nakamoto(h) => {
-                        let epoch = match self.epochs.resolve_stacks_epoch(current_height) {
-                            Some(e) => e,
-                            None => {
-                                return Some(Err(anyhow!(
-                                    "Unknown epoch for height {}",
-                                    current_height
-                                )));
-                            }
-                        };
-                        (
-                            BlockSummary::new(
-                                h.block_id(),
-                                h.block_hash(),
-                                h.parent_block_id.clone(),
-                                h.chain_length,
-                                epoch,
-                            ),
-                            h.consensus_hash.clone(),
-                        )
-                    }
-                };
-
                 // Prepare next ID
-                let parent_id = summary.parent_id.clone();
+                let parent_id = stacks_header.parent_id.clone();
                 let should_yield = current_height <= end_height;
 
                 current_id = parent_id;
 
                 if should_yield {
-                    let snapshot_res = SortitionDB::get_block_snapshot_consensus(
-                        sortition_db.conn(),
-                        &consensus_hash,
-                    );
-                    let snapshot = match snapshot_res {
-                        Ok(Some(s)) => s,
-                        Ok(None) => {
-                            return Some(Err(anyhow!(
-                                "Consensus hash {} not found in SortitionDB",
-                                consensus_hash
-                            )));
-                        }
-                        Err(e) => return Some(Err(anyhow!("SortitionDB error: {}", e))),
-                    };
-
-                    let summary = summary
-                        .with_burn_info(snapshot.block_height as u32, snapshot.burn_header_hash);
-
-                    let txs_res =
-                        BlockTransactions::load(&self.chainstate, summary.epoch, &summary);
-                    let txs = match txs_res {
-                        Ok(t) => t,
-                        Err(e) => return Some(Err(anyhow!("Failed to load txs: {}", e))),
-                    };
-
-                    return Some(Ok(summary.with_transactions(txs)));
+                    return Some(Ok(stacks_header));
                 }
 
                 // If not yielding (because we are above end_height), loop continues to walk back
             }
         })
+    }
+}
+
+impl ResolveEpochFromHeight for BenchContext {
+    fn resolve_stacks_epoch(&self, height: u64) -> Option<StacksEpochId> {
+        self.epochs.as_slice().resolve_stacks_epoch(height)
     }
 }

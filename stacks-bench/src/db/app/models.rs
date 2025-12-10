@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::NaiveDateTime;
 use diesel::prelude::*;
 use stacks_common::types::StacksEpochId;
+use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, StacksBlockId};
 
 use super::schema::{
     _staged_stacks_block, _staged_stacks_tx, benchmark_run, burn_block, chainstate, epoch, network,
@@ -60,7 +61,7 @@ impl Epoch {
     pub fn try_get_stacks_epoch_id(&self) -> Result<StacksEpochId> {
         (self.stacks_epoch_id as u32)
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid StacksEpochId: {}", self.stacks_epoch_id))
+            .map_err(|e| anyhow!("Invalid StacksEpochId '{}': {e}", self.stacks_epoch_id))
     }
 }
 
@@ -140,6 +141,42 @@ pub struct StacksBlock {
     pub height: i64,
     pub parent_stacks_block_id: Option<i64>,
     pub burn_block_id: i64,
+}
+
+impl TryFrom<(StacksBlock, BurnBlock, Option<Vec<u8>>)> for crate::StacksBlockHeader {
+    type Error = anyhow::Error;
+
+    fn try_from(
+        (s_block, b_block, parent_hash_bytes): (StacksBlock, BurnBlock, Option<Vec<u8>>),
+    ) -> Result<Self, Self::Error> {
+        let id = StacksBlockId::from_vec(&s_block.index_hash)
+            .ok_or_else(|| anyhow!("Invalid index hash in DB"))?;
+
+        let block_hash = BlockHeaderHash::from_vec(&s_block.block_hash)
+            .ok_or_else(|| anyhow!("Invalid block hash in DB"))?;
+
+        let parent_id = if s_block.height == 0 {
+            StacksBlockId::from_vec(&[255u8; 32]) // Genesis parent is all-0xff
+                .ok_or_else(|| anyhow!("Invalid genesis parent index hash"))?
+        } else {
+            let parent_hash_bytes =
+                parent_hash_bytes.ok_or_else(|| anyhow!("Missing parent index hash in DB"))?;
+            StacksBlockId::from_vec(&parent_hash_bytes)
+                .ok_or_else(|| anyhow!("Invalid parent index hash in DB"))?
+        };
+
+        let burn_hash = BurnchainHeaderHash::from_vec(&b_block.block_hash)
+            .ok_or_else(|| anyhow!("Invalid burn hash in DB"))?;
+
+        Ok(crate::StacksBlockHeader {
+            id,
+            hash: block_hash,
+            height: s_block.height.try_into()?,
+            parent_id,
+            burn_block_height: b_block.height.try_into()?,
+            burn_block_hash: burn_hash,
+        })
+    }
 }
 
 #[derive(Insertable, Debug, Clone)]

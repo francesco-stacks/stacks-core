@@ -28,6 +28,8 @@ pub enum CostErrors {
     ExecutionTimeExpired,
 }
 
+impl std::error::Error for CostErrors {}
+
 impl fmt::Display for CostErrors {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {

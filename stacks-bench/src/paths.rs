@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::db::app::AppDb;
 
+#[derive(Debug, Clone)]
 pub struct AppDataDir(PathBuf);
 
 impl AsRef<Path> for AppDataDir {
@@ -95,6 +96,7 @@ impl AppDataDir {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct BurnChainDir(PathBuf);
 
 impl BurnChainDir {
@@ -130,12 +132,15 @@ impl AsRef<Path> for BurnChainDir {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ChainStateDir(PathBuf);
 
 impl ChainStateDir {
     pub const CHAINSTATE_DIR_NAME: &'static str = "chainstate";
     pub const INDEX_DB_RELATIVE_FILE_PATH: &'static str = "vm/index.sqlite";
     pub const CLARITY_DB_RELATIVE_FILE_PATH: &'static str = "vm/clarity/marf.sqlite";
+    pub const BLOCKS_DIR_RELATIVE_PATH: &str = "blocks";
+    pub const NAKA_DB_RELATIVE_FILE_PATH: &str = "blocks/nakamoto.sqlite";
 
     pub fn new<P: Into<PathBuf>>(path: P) -> Self {
         ChainStateDir(path.into())
@@ -161,6 +166,14 @@ impl ChainStateDir {
 
     pub fn clarity_db_path(&self) -> PathBuf {
         self.path().join(Self::CLARITY_DB_RELATIVE_FILE_PATH)
+    }
+
+    pub fn blocks_dir(&self) -> PathBuf {
+        self.path().join(Self::BLOCKS_DIR_RELATIVE_PATH)
+    }
+
+    pub fn naka_db_path(&self) -> PathBuf {
+        self.path().join(Self::NAKA_DB_RELATIVE_FILE_PATH)
     }
 }
 

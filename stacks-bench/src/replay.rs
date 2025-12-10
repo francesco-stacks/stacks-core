@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
 use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
 use blockstack_lib::chainstate::nakamoto::miner::{MinerTenureInfoCause, NakamotoBlockBuilder};
@@ -16,7 +16,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 
 use crate::context::BenchContext;
 use crate::metrics::{BlockMetrics, TransactionMetrics};
-use crate::{BlockEra, BlockSummary};
+use crate::{BlockEra, ResolveEpochFromHeight, StacksBlockHeader};
 
 pub enum ReplayMode {
     Miner,
@@ -28,15 +28,19 @@ pub enum ReplayMode {
 pub fn replay_block(
     context: &mut BenchContext,
     mode: ReplayMode,
-    block_summary: &BlockSummary,
+    block_header: &StacksBlockHeader,
 ) -> Result<BlockMetrics> {
-    let block_height = block_summary.height;
-    match context.resolve_block_era(block_summary.epoch) {
+    let block_height = block_header.height;
+    let epoch = context
+        .resolve_stacks_epoch(block_height)
+        .ok_or_else(|| anyhow!("Failed to resolve epoch for height {}", block_height))?;
+
+    match context.resolve_block_era(epoch) {
         BlockEra::Nakamoto => {
             let (naka_block, _size) = context
                 .chainstate()
                 .nakamoto_blocks_db()
-                .get_nakamoto_block(&block_summary.id)?
+                .get_nakamoto_block(&block_header.id)?
                 .ok_or_else(|| anyhow!("Nakamoto block not found"))?;
 
             match mode {
@@ -66,7 +70,7 @@ pub fn replay_block(
             // Returning empty metrics for now to satisfy signature
             let (consensus_hash, header_hash) = context
                 .chainstate()
-                .get_block_header_hashes(&block_summary.id)?
+                .get_block_header_hashes(&block_header.id)?
                 .ok_or_else(|| anyhow!("Hashes not found"))?;
             let bytes =
                 StacksChainState::load_block_bytes(&blocks_path, &consensus_hash, &header_hash)?
@@ -163,7 +167,7 @@ fn re_execute_prenakamoto(
         sortition_burn,
         false,
     )
-    .map_err(|e| anyhow!("append_block failed: {:?}", e))?;
+    .with_context(|| format!("append_block failed"))?;
 
     // Commit the updated chainstate.
     chainstate_tx.commit()?;
@@ -306,7 +310,7 @@ where
                     cost = success_data.receipt.execution_cost.clone();
                     total_clarity_cost
                         .add(&cost)
-                        .map_err(|e| anyhow!("Execution cost addition failure: {:?}", e))?;
+                        .context(format!("Execution cost addition failure"))?;
                 }
                 TransactionResult::ProcessingError(ref error_data) => {
                     eprintln!("  Tx #{i} (0x{}) failed: {:?}", tx.txid(), error_data.error);

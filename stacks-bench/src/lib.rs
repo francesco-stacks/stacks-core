@@ -1,8 +1,11 @@
 use std::fmt::Display;
-use std::ops::{Bound, Deref, RangeBounds};
+use std::io::Cursor;
+use std::ops::Deref;
+use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
+use blockstack_lib::chainstate::nakamoto::NakamotoBlock;
 use blockstack_lib::chainstate::stacks::StacksTransaction;
 use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use clarity::codec::StacksMessageCodec;
@@ -11,6 +14,9 @@ use clarity::types::StacksEpochId;
 use clarity::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash};
 use serde::{Deserialize, Serialize};
 use stacks_common::types::chainstate::StacksBlockId;
+
+use crate::db::ReadOnly;
+use crate::db::node::NakamotoDb;
 
 pub mod context;
 pub mod db;
@@ -26,10 +32,10 @@ pub trait ChainCache {
     /// Finds the closest known ancestor of `tip` that has a height >= `target_height`.
     /// Returns `Some((block_id, height))` if found.
     fn find_closest_ancestor(
-        &mut self,
+        &self,
         tip: &StacksBlockId,
         target_height: u64,
-    ) -> Result<Option<(StacksBlockId, u64)>>;
+    ) -> impl Future<Output = Result<Option<(StacksBlockId, u64)>>>;
 
     /// Caches a known ancestor for a given tip.
     fn cache_ancestor(
@@ -37,7 +43,7 @@ pub trait ChainCache {
         tip: &StacksBlockId,
         height: u64,
         block: &StacksBlockId,
-    ) -> Result<()>;
+    ) -> impl Future<Output = Result<()>>;
 }
 
 #[derive(Debug, Clone)]
@@ -159,8 +165,7 @@ impl Network {
 
         if db_mainnet != expected_mainnet {
             return Err(format!(
-                "Network mismatch: CLI specified {}, but DB is configured for {}",
-                self,
+                "Network mismatch: CLI specified {self}, but DB is configured for {}",
                 if db_mainnet {
                     "mainnet"
                 } else {
@@ -171,8 +176,8 @@ impl Network {
 
         if db_chain_id != expected_chain_id {
             return Err(format!(
-                "Chain ID mismatch: CLI expects {} (0x{:x}), but DB has {} (0x{:x})",
-                expected_chain_id, expected_chain_id, db_chain_id, db_chain_id
+                "Chain ID mismatch: CLI expects {expected_chain_id} (0x{expected_chain_id:x}), \
+                but DB has {db_chain_id} (0x{db_chain_id:x})",
             ));
         }
 
@@ -198,7 +203,7 @@ impl FromStr for Network {
             "mainnet" => Ok(Self::Mainnet),
             "testnet" => Ok(Self::Testnet),
             "regtest" => Ok(Self::Regtest),
-            _ => Err(anyhow!("invalid network: {}", s)),
+            _ => Err(anyhow!("invalid network: {s}")),
         }
     }
 }
@@ -210,201 +215,13 @@ pub enum BlockEra {
 }
 
 #[derive(Debug, Clone)]
-pub struct BlockSummary {
+pub struct StacksBlockHeader {
     pub id: StacksBlockId,
-    pub block_hash: BlockHeaderHash,
+    pub hash: BlockHeaderHash,
     pub height: u64,
     pub parent_id: StacksBlockId,
-    pub burn_block_height: Option<u32>,
-    pub burn_block_hash: Option<BurnchainHeaderHash>,
-    pub epoch: StacksEpochId,
-    txs: Option<BlockTransactions>,
-}
-
-// impl From<&NakamotoBlockHeader> for BlockSummary {
-//     fn from(naka_header: &NakamotoBlockHeader) -> Self {
-//         BlockSummary {
-//             id: naka_header.block_id(),
-//             height: naka_header.chain_length as u32,
-//             parent_id: naka_header.parent_block_id.clone(),
-//             burn_block_height: None,
-//             burn_block_hash: None,
-//             txs: None,
-//         }
-//     }
-// }
-
-// impl From<NakamotoBlock> for BlockSummary {
-//     fn from(naka_block: NakamotoBlock) -> Self {
-//         BlockSummary {
-//             id: naka_block.block_id(),
-//             height: naka_block.header.chain_length as u32,
-//             parent_id: naka_block.header.parent_block_id,
-//             burn_block_height: None,
-//             burn_block_hash: None,
-//             txs: None,
-//         }
-//     }
-// }
-
-impl BlockSummary {
-    pub fn new(
-        id: StacksBlockId,
-        block_hash: BlockHeaderHash,
-        parent_id: StacksBlockId,
-        height: u64,
-        epoch: StacksEpochId,
-    ) -> Self {
-        BlockSummary {
-            id,
-            block_hash,
-            height,
-            parent_id,
-            burn_block_height: None,
-            burn_block_hash: None,
-            epoch,
-            txs: None,
-        }
-    }
-
-    pub fn with_transactions(mut self, txs: BlockTransactions) -> Self {
-        self.txs = Some(txs);
-        self
-    }
-
-    pub fn with_burn_info(mut self, height: u32, hash: BurnchainHeaderHash) -> Self {
-        self.burn_block_height = Some(height);
-        self.burn_block_hash = Some(hash);
-        self
-    }
-
-    pub fn transactions(&self) -> Option<&[StacksTransaction]> {
-        self.txs.as_ref().map(|t| t.as_slice())
-    }
-}
-
-pub struct BlockChain(Vec<BlockSummary>);
-
-impl AsRef<[BlockSummary]> for BlockChain {
-    fn as_ref(&self) -> &[BlockSummary] {
-        &self.0
-    }
-}
-
-impl Deref for BlockChain {
-    type Target = Vec<BlockSummary>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl BlockChain {
-    pub fn new_ascending<I: IntoIterator<Item = BlockSummary>>(blocks: I) -> Self {
-        let mut v: Vec<BlockSummary> = blocks.into_iter().collect();
-        v.sort_unstable_by_key(|b| b.height);
-
-        // Validate strictly increasing by height
-        if !v.windows(2).all(|w| w[0].height < w[1].height) {
-            panic!("BlockChain invariant violated: duplicate or unsorted heights");
-        }
-
-        Self(v)
-    }
-
-    /// Get block by its height, if one exists.
-    pub fn get_block_by_height(&self, height: u64) -> Option<&BlockSummary> {
-        self.0.iter().find(|b| b.height == height)
-    }
-
-    /// Get block by its [`StacksBlockId`], if one exists.
-    pub fn get_block_by_id(&self, id: &StacksBlockId) -> Option<&BlockSummary> {
-        self.0.iter().find(|b| &b.id == id)
-    }
-
-    /// Total transaction count across all blocks in the chain.
-    pub fn transaction_count(&self) -> usize {
-        self.0
-            .iter()
-            .flat_map(|b| b.txs.as_ref())
-            .map(|t| t.len())
-            .sum()
-    }
-
-    /// Clamp a height range (RangeBounds<u32>) to the canonical chain.
-    /// - Missing bounds snap to nearest valid height.
-    /// - If the clamped start > end, returns an empty chain.
-    ///
-    /// Returns an owned BlockChain (copies the selected window).
-    pub fn clamp_by_height_range<R: RangeBounds<u64>>(&self, range: R) -> Self {
-        let asc = &self.0;
-        if asc.is_empty() {
-            return Self(Vec::new());
-        }
-        match Self::clamp_indices_for_height_range(asc, range) {
-            Some((s, e)) => Self(asc[s..=e].to_vec()),
-            None => Self(Vec::new()),
-        }
-    }
-
-    /// Clamp by optional inclusive start/end heights (convenience).
-    /// Equivalent to clamp_by_height_range(start..=end), with None unbounded.
-    pub fn clamp_by_height(&self, start: Option<u64>, end: Option<u64>) -> Self {
-        let start_bound = start.map_or(Bound::Unbounded, Bound::Included);
-        let end_bound = end.map_or(Bound::Unbounded, Bound::Included);
-        self.clamp_by_height_range((start_bound, end_bound))
-    }
-
-    /// Borrowed slice view of a clamped height range (no allocation).
-    /// Returns an empty slice if out-of-range after clamping.
-    pub fn slice_by_height_range_clamped<R: RangeBounds<u64>>(&self, range: R) -> &[BlockSummary] {
-        let asc = &self.0;
-        if asc.is_empty() {
-            return &asc[0..0];
-        }
-        match Self::clamp_indices_for_height_range(asc, range) {
-            Some((s, e)) => &asc[s..=e],
-            None => &asc[0..0],
-        }
-    }
-
-    /// Internal: compute clamped [start,end] indices for a height range.
-    fn clamp_indices_for_height_range<R: RangeBounds<u64>>(
-        asc: &[BlockSummary],
-        range: R,
-    ) -> Option<(usize, usize)> {
-        // Start index (clamped up to the next present height)
-        let s_idx = match range.start_bound() {
-            Bound::Unbounded => 0,
-            Bound::Included(&h) => match asc.binary_search_by_key(&h, |b| b.height) {
-                Ok(i) => i,
-                Err(ip) => ip, // next higher
-            },
-            Bound::Excluded(&h) => match asc.binary_search_by_key(&h, |b| b.height) {
-                Ok(i) => i.saturating_add(1),
-                Err(ip) => ip, // next higher
-            },
-        };
-
-        // End index (clamped down to the previous present height)
-        let e_idx = match range.end_bound() {
-            Bound::Unbounded => asc.len() - 1,
-            Bound::Included(&h) => match asc.binary_search_by_key(&h, |b| b.height) {
-                Ok(i) => i,
-                Err(ip) => ip.saturating_sub(1), // previous lower
-            },
-            Bound::Excluded(&h) => match asc.binary_search_by_key(&h, |b| b.height) {
-                Ok(i) => i.saturating_sub(1),
-                Err(ip) => ip.saturating_sub(1), // previous lower
-            },
-        };
-
-        if s_idx <= e_idx && s_idx < asc.len() {
-            Some((s_idx, e_idx))
-        } else {
-            None
-        }
-    }
+    pub burn_block_height: u32,
+    pub burn_block_hash: BurnchainHeaderHash,
 }
 
 #[derive(Debug, Clone)]
@@ -418,6 +235,12 @@ impl Deref for BlockTransactions {
     }
 }
 
+impl Default for BlockTransactions {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
 impl AsRef<[StacksTransaction]> for BlockTransactions {
     fn as_ref(&self) -> &[StacksTransaction] {
         &self.0
@@ -425,42 +248,30 @@ impl AsRef<[StacksTransaction]> for BlockTransactions {
 }
 
 impl BlockTransactions {
-    pub fn load(
-        chainstate: &StacksChainState,
+    pub fn load<P: AsRef<Path>>(
+        naka_db: &mut NakamotoDb<ReadOnly>,
+        blocks_dir: P,
         epoch: StacksEpochId,
-        block: &BlockSummary,
+        block: &StacksBlockHeader,
     ) -> Result<Self> {
         let is_nakamoto = StacksEpochId::ALL_GTE_30.contains(&epoch);
+        let block_id = &block.id;
+
         if !is_nakamoto {
-            // Need consensus/header hashes to locate the on-disk bytes
-            let (consensus_hash, header_hash) = chainstate
-                .get_block_header_hashes(&block.id)
-                .map_err(|_| anyhow!("Failed to get header hashes for {}", block.id))?
-                .ok_or_else(|| anyhow!("Missing header hashes for {}", block.id))?;
-
-            // Read bytes and parse an anchored StacksBlock
-            let bytes = StacksChainState::load_block_bytes(
-                &chainstate.blocks_path,
-                &consensus_hash,
-                &header_hash,
-            )
-            .map_err(|e| anyhow!("load_block_bytes {}: {e}", block.id))?
-            .ok_or_else(|| anyhow!("Block bytes not found for {}", block.id))?;
-
-            // Deserialize to StacksBlock and take txs
-            let mut cursor = std::io::Cursor::new(bytes);
-            let stacks_block =
-                blockstack_lib::chainstate::stacks::StacksBlock::consensus_deserialize(&mut cursor)
-                    .map_err(|e| anyhow!("Failed to deserialize StacksBlock {}: {e}", block.id))?;
+            let stacks_block = load_block_from_disk(blocks_dir, block_id)
+                .with_context(|| format!("Failed to load StacksBlock {block_id} from disk"))?;
             Ok(Self(stacks_block.txs))
         } else {
-            // Get full block from the nakamoto blocks DB
-            let (naka_block, _size) = chainstate
-                .nakamoto_blocks_db()
-                .get_nakamoto_block(&block.id)
-                .map_err(|e| anyhow!("nakamoto get_nakamoto_block {}: {e}", block.id))?
-                .ok_or_else(|| anyhow!("Nakamoto block not found: {}", block.id))?;
-            Ok(Self(naka_block.txs))
+            let naka_block_bytes = naka_db
+                .get_nakamoto_block(block_id)
+                .with_context(|| format!("Failed to load Nakamoto block {block_id} from DB"))?
+                .ok_or_else(|| anyhow!("Nakamoto block not found: {block_id}"))?
+                .data;
+
+            let mut cursor = Cursor::new(naka_block_bytes);
+            NakamotoBlock::consensus_deserialize(&mut cursor)
+                .with_context(|| format!("Failed to deserialize Nakamoto block {block_id}"))
+                .map(|naka_block| Self(naka_block.txs))
         }
     }
 
@@ -469,193 +280,21 @@ impl BlockTransactions {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::ops::Bound;
+fn load_block_from_disk<P: AsRef<Path>>(
+    blocks_dir: P,
+    block_id: &StacksBlockId,
+) -> Result<blockstack_lib::chainstate::stacks::StacksBlock> {
+    let blocks_dir_str = blocks_dir.as_ref().to_string_lossy();
+    let block_path = StacksChainState::get_index_block_path(&blocks_dir_str, block_id)
+        .context("Failed to resolve block path")?;
+    println!("Loading block from disk: {block_path}");
 
-    use super::*;
-
-    /// Test helper to create a [`Block`] with the specified height.
-    fn mk_block(height: u64) -> BlockSummary {
-        let id = StacksBlockId::first_mined();
-        BlockSummary::new(
-            id.clone(),
-            [0; 32].into(),
-            id,
-            height,
-            StacksEpochId::Epoch10,
-        )
-    }
-
-    /// Test helper to create a [`BlockChain`] from a list of heights.
-    fn mk_chain(heights: &[u64]) -> BlockChain {
-        let blocks = heights.iter().copied().map(mk_block);
-        BlockChain::new_ascending(blocks)
-    }
-
-    #[test]
-    fn clamp_unbounded_returns_all() {
-        let chain = mk_chain(&[10, 20, 30, 40, 50]);
-        let selected = chain.clamp_by_height_range(..);
-        assert_eq!(
-            selected
-                .as_ref()
-                .iter()
-                .map(|b| b.height)
-                .collect::<Vec<_>>(),
-            vec![10, 20, 30, 40, 50]
-        );
-
-        let slice = chain.slice_by_height_range_clamped(..);
-        assert_eq!(
-            slice.iter().map(|b| b.height).collect::<Vec<_>>(),
-            vec![10, 20, 30, 40, 50]
-        );
-    }
-
-    #[test]
-    fn clamp_bounds_are_clamped_to_existing() {
-        let chain = mk_chain(&[100, 200, 300]);
-        // Below min and above max should clamp to [100, 300]
-        let selected = chain.clamp_by_height_range(0..=u64::MAX);
-        assert_eq!(
-            selected
-                .as_ref()
-                .iter()
-                .map(|b| b.height)
-                .collect::<Vec<_>>(),
-            vec![100, 200, 300]
-        );
-
-        // Start below min, end inside
-        let selected = chain.clamp_by_height_range(0..=200);
-        assert_eq!(
-            selected
-                .as_ref()
-                .iter()
-                .map(|b| b.height)
-                .collect::<Vec<_>>(),
-            vec![100, 200]
-        );
-
-        // Start inside, end above max
-        let selected = chain.clamp_by_height_range(200..=u64::MAX);
-        assert_eq!(
-            selected
-                .as_ref()
-                .iter()
-                .map(|b| b.height)
-                .collect::<Vec<_>>(),
-            vec![200, 300]
-        );
-    }
-
-    #[test]
-    fn clamp_inclusive_exclusive_semantics() {
-        let chain = mk_chain(&[10, 20, 30, 40]);
-
-        // Inclusive range picks exact heights
-        let inclusive = chain.clamp_by_height_range(20..=30);
-        assert_eq!(
-            inclusive
-                .as_ref()
-                .iter()
-                .map(|b| b.height)
-                .collect::<Vec<_>>(),
-            vec![20, 30]
-        );
-
-        // Exclusive end drops the end height
-        let excl_end = chain.clamp_by_height_range(20..30);
-        assert_eq!(
-            excl_end
-                .as_ref()
-                .iter()
-                .map(|b| b.height)
-                .collect::<Vec<_>>(),
-            vec![20]
-        );
-
-        // Fully exclusive using explicit bounds: (20, 40) -> picks 30 only
-        let excl_both = chain.clamp_by_height_range((Bound::Excluded(20), Bound::Excluded(40)));
-        assert_eq!(
-            excl_both
-                .as_ref()
-                .iter()
-                .map(|b| b.height)
-                .collect::<Vec<_>>(),
-            vec![30]
-        );
-
-        // Exclusively outside a single element yields empty
-        let empty = chain.clamp_by_height_range((Bound::Excluded(20), Bound::Excluded(30)));
-        assert!(empty.as_ref().is_empty());
-    }
-
-    #[test]
-    fn clamp_by_height_convenience_none_bounds() {
-        let chain = mk_chain(&[5, 10, 15, 20]);
-
-        // None..=15
-        let left_open = chain.clamp_by_height(None, Some(15));
-        assert_eq!(
-            left_open
-                .as_ref()
-                .iter()
-                .map(|b| b.height)
-                .collect::<Vec<_>>(),
-            vec![5, 10, 15]
-        );
-
-        // 10..=None
-        let right_open = chain.clamp_by_height(Some(10), None);
-        assert_eq!(
-            right_open
-                .as_ref()
-                .iter()
-                .map(|b| b.height)
-                .collect::<Vec<_>>(),
-            vec![10, 15, 20]
-        );
-
-        // None..=None -> all
-        let all = chain.clamp_by_height(None, None);
-        assert_eq!(
-            all.as_ref().iter().map(|b| b.height).collect::<Vec<_>>(),
-            vec![5, 10, 15, 20]
-        );
-    }
-
-    #[test]
-    fn slice_variant_returns_borrowed_window() {
-        let chain = mk_chain(&[1, 2, 3, 4, 5]);
-
-        // Borrowed slice for a middle window
-        let window = chain.slice_by_height_range_clamped(2..=4);
-        assert_eq!(
-            window.iter().map(|b| b.height).collect::<Vec<_>>(),
-            vec![2, 3, 4]
-        );
-
-        // Out-of-range clamps to empty slice
-        let empty = chain.slice_by_height_range_clamped(6..=9);
-        assert!(empty.is_empty());
-    }
-
-    #[test]
-    fn empty_chain_clamps_to_empty() {
-        let chain = mk_chain(&[]);
-        let owned = chain.clamp_by_height_range(..);
-        assert!(owned.as_ref().is_empty());
-
-        let slice = chain.slice_by_height_range_clamped(..);
-        assert!(slice.is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate or unsorted heights")]
-    fn constructing_with_duplicate_heights_panics() {
-        // new_ascending sorts first, then validates strictly increasing; duplicates should panic.
-        let _ = mk_chain(&[10, 20, 20, 30]);
-    }
+    let mut file = std::fs::File::open(&block_path)
+        .with_context(|| format!("Failed to open block file: {block_path}"))?;
+    let stacks_block =
+        blockstack_lib::chainstate::stacks::StacksBlock::consensus_deserialize(&mut file)
+            .with_context(|| {
+                format!("Failed to deserialize StacksBlock from file: {block_path}")
+            })?;
+    Ok(stacks_block)
 }

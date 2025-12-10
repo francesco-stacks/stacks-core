@@ -9,3 +9,25 @@ table! {
         network_epoch -> Integer
     }
 }
+
+table! {
+    snapshots (sortition_id) {
+        sortition_id -> Text,
+        block_height -> BigInt,
+        burn_header_hash -> Text,
+        parent_sortition_id -> Text,
+        canonical_stacks_tip_hash -> Text,
+        canonical_stacks_tip_consensus_hash -> Text,
+        canonical_stacks_tip_height -> BigInt,
+        pox_valid -> Integer,
+    }
+}
+
+table! {
+    stacks_chain_tips (sortition_id) {
+        sortition_id -> Text,
+        consensus_hash -> Text,
+        block_hash -> Text,
+        block_height -> BigInt,
+    }
+}

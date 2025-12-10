@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
 use diesel::prelude::*;
+use diesel::sql_types::{BigInt, Text};
+use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, StacksBlockId};
 
 use crate::Network;
 
@@ -50,5 +52,38 @@ impl DbConfig {
 
     pub fn chain_id(&self) -> u32 {
         self.chain_id as u32
+    }
+}
+
+#[derive(Queryable, QueryableByName, Debug, Clone)]
+pub struct BlockHeader {
+    #[diesel(sql_type = Text)]
+    pub index_block_hash: String,
+    #[diesel(sql_type = Text)]
+    pub block_hash: String,
+    #[diesel(sql_type = Text)]
+    pub parent_block_id: String,
+    #[diesel(sql_type = BigInt)]
+    pub block_height: i64,
+    #[diesel(sql_type = Text)]
+    pub consensus_hash: String,
+    #[diesel(sql_type = Text)]
+    pub burn_header_hash: String,
+    #[diesel(sql_type = BigInt)]
+    pub burn_header_height: i64,
+}
+
+impl TryInto<crate::StacksBlockHeader> for BlockHeader {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<crate::StacksBlockHeader> {
+        Ok(crate::StacksBlockHeader {
+            id: StacksBlockId::from_hex(&self.index_block_hash)?,
+            hash: BlockHeaderHash::from_hex(&self.block_hash)?,
+            parent_id: StacksBlockId::from_hex(&self.parent_block_id)?,
+            height: self.block_height.try_into()?,
+            burn_block_hash: BurnchainHeaderHash::from_hex(&self.burn_header_hash)?.into(),
+            burn_block_height: self.burn_header_height.try_into()?,
+        })
     }
 }

@@ -232,7 +232,7 @@ struct TxIdArg([u8; 32]);
 impl FromStr for TxIdArg {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = hex::decode(s).map_err(|e| anyhow!("invalid hex in txid: {}", e))?;
+        let bytes = hex::decode(s).with_context(|| format!("invalid hex in txid '{s}'"))?;
         if bytes.len() != 32 {
             return Err(anyhow!(
                 "invalid txid length: expected 32 bytes, got {} bytes",
@@ -282,7 +282,8 @@ fn get_git_hash() -> Option<Vec<u8>> {
         })
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // SAFETY: This is the first thing we do in the process, before any
     // potential threads are spawned or any FFI into C libraries that might read
     // the environment.
@@ -296,15 +297,17 @@ fn main() -> Result<()> {
     let app_data = AppDataDir::resolve_from_opt(cli.app_data_dir.as_ref())?;
 
     match cli.command {
-        Commands::Metabase { port, image_tag } => run_metabase(&app_data, port, image_tag),
-        Commands::Bench(args) => run_bench(&app_data, args),
+        Commands::Metabase { port, image_tag } => run_metabase(&app_data, port, image_tag).await,
+        Commands::Bench(args) => run_bench(&app_data, args).await,
         Commands::Chainstate(args) => match args.command {
-            ChainstateCommands::Index(index_args) => run_chainstate_index(&app_data, index_args),
+            ChainstateCommands::Index(index_args) => {
+                run_chainstate_index(&app_data, index_args).await
+            }
         },
     }
 }
 
-fn setup_bench_context<T: IndexerArgs>(
+async fn setup_bench_context<T: IndexerArgs>(
     app_db: &mut AppDb,
     args: &T,
 ) -> Result<(
@@ -360,40 +363,50 @@ fn setup_bench_context<T: IndexerArgs>(
         .with_maybe_block_count(args.block_count())
         .with_maybe_tip(args.tip().cloned());
 
-    let bench_context = BenchContext::initialize(context_opts, Some(app_db))?;
+    let bench_context = BenchContext::initialize(context_opts, Some(app_db)).await?;
 
     Ok((bench_context, network, chain_id, epochs))
 }
 
-fn run_chainstate_index(app_data: &AppDataDir, args: IndexArgs) -> Result<()> {
+async fn run_chainstate_index(app_data: &AppDataDir, args: IndexArgs) -> Result<()> {
     let app_db_path = app_data.app_db_path();
     let mut app_db = AppDb::open(&app_db_path)?;
 
-    let (mut bench_context, network, chain_id, epochs) = setup_bench_context(&mut app_db, &args)?;
+    let (bench_context, network, chain_id, epochs) =
+        setup_bench_context(&mut app_db, &args).await?;
 
-    let mut indexer = ChainstateIndexer::new(&mut app_db, &mut bench_context);
-    indexer.index_chainstate(network, chain_id, &epochs)?;
+    let mut indexer = ChainstateIndexer::new(&mut app_db, &bench_context);
+    indexer.index_chainstate(network, chain_id, &epochs).await?;
 
-    println!("Indexing complete.");
+    println!("Indexing complete");
+
+    println!("Cleaning up (this may take a few moments for large chainstates)...");
+    // Dropping the context will clean up the shadow dir
+    drop(bench_context);
+
+    println!("Done!");
     Ok(())
 }
 
-fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
+async fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     let app_db_path = app_data.app_db_path();
     let mut app_db = AppDb::open(&app_db_path)?;
 
-    let (mut bench_context, network, chain_id, epochs) = setup_bench_context(&mut app_db, &args)?;
+    let (mut bench_context, network, chain_id, epochs) =
+        setup_bench_context(&mut app_db, &args).await?;
 
-    let (chainstate_model, _) = app_db.get_or_create_chainstate(
-        network,
-        chain_id,
-        &bench_context.chain_tip().0,
-        bench_context.chain_tip().1,
-        &epochs,
-    )?;
+    let (chainstate_model, _) = app_db
+        .get_or_create_chainstate(
+            network,
+            chain_id,
+            &bench_context.chain_tip().0,
+            bench_context.chain_tip().1,
+            &epochs,
+        )
+        .await?;
 
-    let mut indexer = ChainstateIndexer::new(&mut app_db, &mut bench_context);
-    let block_ids = indexer.index_chainstate(network, chain_id, &epochs)?;
+    let mut indexer = ChainstateIndexer::new(&mut app_db, &bench_context);
+    let block_ids = indexer.index_chainstate(network, chain_id, &epochs).await?;
 
     let selected_block_count = block_ids.len();
 
@@ -401,13 +414,15 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
 
     let args_json = args.to_json()?;
     let git_commit_hash = get_git_hash().unwrap_or(vec![0u8; 20]); // Placeholder if git not available
-    let run_model = app_db.create_benchmark_run(
-        chainstate_model.id,
-        Utc::now().naive_utc(),
-        git_commit_hash,
-        Some(run_name),
-        args_json,
-    )?;
+    let run_model = app_db
+        .create_benchmark_run(
+            chainstate_model.id,
+            Utc::now().naive_utc(),
+            git_commit_hash,
+            Some(run_name),
+            args_json,
+        )
+        .await?;
 
     println!("Re-executing {selected_block_count} selected blocks...");
 
@@ -423,8 +438,6 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     let max_calibration_buffer = 500;
     let mut calibrated = false;
     let mut is_warmup = false;
-    // Tracker for hydration time
-    let mut total_hydration_duration = Duration::ZERO;
     let mut total_clarity_db_checkpoint_duration = Duration::ZERO;
 
     let mut accumulator = MetricsAccumulator::default();
@@ -435,37 +448,26 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
         Profiler::clear();
 
         // Load metadata from App DB
-        let summary = app_db.get_block(block_id, epochs.as_slice())?;
+        let block = app_db.get_block(block_id).await?;
 
         if is_warmup {
             if i == 0 {
                 println!("Warming up for {} blocks...", args.warmup);
             }
             if i % 10 == 0 {
-                eprint!("(Warmup {}) ", summary.height);
+                eprint!("(Warmup {}) ", block.height);
             }
         } else if i == args.warmup || i % 5_000 == 0 || i == selected_block_count - 1 {
-            eprint!("{}", summary.height);
+            eprint!("{}", block.height);
         } else if i % 250 == 0 {
             eprint!(".");
         }
 
         if i == 0 || i % 5_000 == 0 || i == selected_block_count - 1 {
-            eprint!("{}", summary.height);
+            eprint!("{}", block.height);
         } else if i % 250 == 0 {
             eprint!(".");
         }
-
-        // Hydrate transactions from Node DB (Heavy operation, done one-by-one)
-        let hydrate_start = Instant::now();
-        let txs = stacks_bench::BlockTransactions::load(
-            bench_context.chainstate(),
-            summary.epoch,
-            &summary,
-        )?;
-        total_hydration_duration += hydrate_start.elapsed();
-
-        let block = summary.with_transactions(txs);
 
         // Replay the block
         let mut metrics = stacks_profiler::measure!("Block Replay", {
@@ -488,7 +490,9 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
 
         // Flush buffer if full
         if profiler_buffer.len() >= PROFILER_BATCH_SIZE {
-            app_db.save_profiler_data_batch(run_model.id, &mut profiler_buffer)?;
+            app_db
+                .save_profiler_data_batch(run_model.id, &mut profiler_buffer)
+                .await?;
         }
 
         if !calibrated {
@@ -542,7 +546,9 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
 
                             // Use the buffered block ID to save metrics
                             let buffered_id = &block_ids[i - buffer_len + j + 1];
-                            app_db.save_block_metrics(run_model.id, buffered_id, m)?;
+                            app_db
+                                .save_block_metrics(run_model.id, buffered_id, m)
+                                .await?;
                         }
                     }
                     metrics_buffer.clear();
@@ -558,14 +564,18 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
                 }
 
                 accumulator.add(&metrics); // Accumulate
-                app_db.save_block_metrics(run_model.id, &block.id, &metrics)?;
+                app_db
+                    .save_block_metrics(run_model.id, &block.id, &metrics)
+                    .await?;
             }
         }
     }
 
     // Flush any remaining profiler data after the loop
     if !profiler_buffer.is_empty() && !is_warmup {
-        app_db.save_profiler_data_batch(run_model.id, &mut profiler_buffer)?;
+        app_db
+            .save_profiler_data_batch(run_model.id, &mut profiler_buffer)
+            .await?;
     }
 
     // Flush any remaining metrics in the calibration buffer
@@ -588,20 +598,23 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
             let start_index = selected_block_count - buffer_len;
             let buffered_id = &block_ids[start_index + j];
 
-            app_db.save_block_metrics(run_model.id, buffered_id, m)?;
+            app_db
+                .save_block_metrics(run_model.id, buffered_id, m)
+                .await?;
         }
     }
 
     let duration = start.elapsed();
 
-    app_db.finish_benchmark_run(run_model.id, Utc::now().naive_utc())?;
+    app_db
+        .finish_benchmark_run(run_model.id, Utc::now().naive_utc())
+        .await?;
 
     println!("Re-executed {selected_block_count} blocks in {duration:.2?}");
-    println!("  - Transaction Hydration: {total_hydration_duration:.2?}");
     println!("  - Clarity DB Checkpointing: {total_clarity_db_checkpoint_duration:.2?}");
     println!(
         "  - Benchmarking Overhead: {:.2?}",
-        duration - total_hydration_duration - total_clarity_db_checkpoint_duration
+        duration - total_clarity_db_checkpoint_duration
     );
 
     accumulator.print_summary(); // Print summary
@@ -648,8 +661,8 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
 
     println!();
     println!("Checkpointing/vacuuming database...");
-    app_db.checkpoint()?;
-    app_db.vacuum()?;
+    app_db.checkpoint().await?;
+    app_db.vacuum().await?;
 
     println!("Cleaning up (this may take a few moments for large chainstates)...");
     // Dropping the context will clean up the shadow dir
@@ -660,7 +673,7 @@ fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_metabase(app_data: &AppDataDir, port: u16, image_tag: String) -> Result<()> {
+async fn run_metabase(app_data: &AppDataDir, port: u16, image_tag: String) -> Result<()> {
     let db_path = app_data.app_db_path();
 
     // db_path is the full path to the database file.
@@ -700,9 +713,8 @@ fn run_metabase(app_data: &AppDataDir, port: u16, image_tag: String) -> Result<(
         println!("  - Status:      Initializing new configuration (Postgres)");
     }
 
-    // Create a runtime to execute the async Docker operations
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move { run_metabase_container(&app_data, port, image_tag).await })
+    // Setup and run Metabase container
+    run_metabase_container(&app_data, port, image_tag).await
 }
 
 async fn run_metabase_container(app_data: &AppDataDir, port: u16, image_tag: String) -> Result<()> {
