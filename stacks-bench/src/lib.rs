@@ -1,7 +1,6 @@
 use std::fmt::Display;
 use std::io::Cursor;
-use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -82,7 +81,9 @@ pub trait ResolveEpochFromHeight {
 impl ResolveEpochFromHeight for [StacksEpoch] {
     fn resolve_stacks_epoch(&self, height: u64) -> Option<StacksEpochId> {
         for epoch in self {
-            if height >= epoch.start_block_height && height <= epoch.end_block_height {
+            // Use half-open interval [start, end) to handle overlapping boundaries
+            // where the end of one epoch is the start (activation) of the next.
+            if height >= epoch.start_block_height && height < epoch.end_block_height {
                 return Some(epoch.epoch_id);
             }
         }
@@ -224,77 +225,115 @@ pub struct StacksBlockHeader {
     pub burn_block_hash: BurnchainHeaderHash,
 }
 
-#[derive(Debug, Clone)]
-pub struct BlockTransactions(Vec<StacksTransaction>);
-
-impl Deref for BlockTransactions {
-    type Target = Vec<StacksTransaction>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+pub enum BlockSource<'a, P: AsRef<Path>> {
+    Disk(P),
+    NakamotoDb(&'a mut NakamotoDb<ReadOnly>),
 }
 
-impl Default for BlockTransactions {
-    fn default() -> Self {
-        Self(Vec::new())
-    }
+pub struct StacksBlockLoader<'a> {
+    blocks_dir: PathBuf,
+    naka_db: &'a mut NakamotoDb<ReadOnly>,
+    naka_db_cutoff_height: u64,
 }
 
-impl AsRef<[StacksTransaction]> for BlockTransactions {
-    fn as_ref(&self) -> &[StacksTransaction] {
-        &self.0
-    }
-}
-
-impl BlockTransactions {
-    pub fn load<P: AsRef<Path>>(
-        naka_db: &mut NakamotoDb<ReadOnly>,
+impl<'a> StacksBlockLoader<'a> {
+    pub fn new<P: AsRef<Path>>(
         blocks_dir: P,
-        epoch: StacksEpochId,
-        block: &StacksBlockHeader,
-    ) -> Result<Self> {
-        let is_nakamoto = StacksEpochId::ALL_GTE_30.contains(&epoch);
-        let block_id = &block.id;
-
-        if !is_nakamoto {
-            let stacks_block = load_block_from_disk(blocks_dir, block_id)
-                .with_context(|| format!("Failed to load StacksBlock {block_id} from disk"))?;
-            Ok(Self(stacks_block.txs))
-        } else {
-            let naka_block_bytes = naka_db
-                .get_nakamoto_block(block_id)
-                .with_context(|| format!("Failed to load Nakamoto block {block_id} from DB"))?
-                .ok_or_else(|| anyhow!("Nakamoto block not found: {block_id}"))?
-                .data;
-
-            let mut cursor = Cursor::new(naka_block_bytes);
-            NakamotoBlock::consensus_deserialize(&mut cursor)
-                .with_context(|| format!("Failed to deserialize Nakamoto block {block_id}"))
-                .map(|naka_block| Self(naka_block.txs))
+        naka_db: &'a mut NakamotoDb<ReadOnly>,
+        naka_db_cutoff_height: u64,
+    ) -> Self {
+        Self {
+            blocks_dir: blocks_dir.as_ref().to_path_buf(),
+            naka_db,
+            naka_db_cutoff_height,
         }
     }
 
-    pub fn as_slice(&self) -> &[StacksTransaction] {
-        &self.0
+    pub fn get_block_source(&mut self, block_height: u64) -> BlockSource<'_, impl AsRef<Path>> {
+        if block_height >= self.naka_db_cutoff_height {
+            return BlockSource::NakamotoDb(self.naka_db);
+        }
+        BlockSource::Disk(self.blocks_dir.clone())
+    }
+
+    fn load_pre_nakamoto_block(
+        &self,
+        block_id: &StacksBlockId,
+    ) -> Result<blockstack_lib::chainstate::stacks::StacksBlock> {
+        let blocks_dir_str = self.blocks_dir.to_string_lossy();
+        let block_path = StacksChainState::get_index_block_path(&blocks_dir_str, block_id)
+            .context("Failed to resolve block path")?;
+
+        let mut file = std::fs::File::open(&block_path)
+            .with_context(|| format!("Failed to open block file: {block_path}"))?;
+        let stacks_block =
+            blockstack_lib::chainstate::stacks::StacksBlock::consensus_deserialize(&mut file)
+                .with_context(|| {
+                    format!("Failed to deserialize StacksBlock from file: {block_path}")
+                })?;
+        Ok(stacks_block)
+    }
+
+    fn load_nakamoto_block(
+        &mut self,
+        block_id: &StacksBlockId,
+    ) -> Result<blockstack_lib::chainstate::nakamoto::NakamotoBlock> {
+        let naka_block_bytes = self
+            .naka_db
+            .get_nakamoto_block(block_id)
+            .with_context(|| format!("Failed to load Nakamoto block {block_id} from DB"))?
+            .ok_or_else(|| anyhow!("Nakamoto block not found: {block_id}"))?
+            .data;
+
+        let mut cursor = Cursor::new(naka_block_bytes);
+        NakamotoBlock::consensus_deserialize(&mut cursor)
+            .with_context(|| format!("Failed to deserialize Nakamoto block {block_id}"))
+    }
+
+    pub fn load_block(&mut self, block: &StacksBlockHeader) -> Result<StacksBlock> {
+        let block_id = &block.id;
+
+        if block.height >= self.naka_db_cutoff_height {
+            let naka_block = self
+                .load_nakamoto_block(block_id)
+                .with_context(|| format!("Failed to load Nakamoto block {block_id}"))?;
+            Ok(StacksBlock::Nakamoto(naka_block))
+        } else {
+            let stacks_block = self
+                .load_pre_nakamoto_block(block_id)
+                .with_context(|| format!("Failed to load StacksBlock {block_id} from disk"))?;
+            Ok(StacksBlock::PreNakamoto(stacks_block))
+        }
     }
 }
 
-fn load_block_from_disk<P: AsRef<Path>>(
-    blocks_dir: P,
-    block_id: &StacksBlockId,
-) -> Result<blockstack_lib::chainstate::stacks::StacksBlock> {
-    let blocks_dir_str = blocks_dir.as_ref().to_string_lossy();
-    let block_path = StacksChainState::get_index_block_path(&blocks_dir_str, block_id)
-        .context("Failed to resolve block path")?;
-    println!("Loading block from disk: {block_path}");
+#[derive(Debug, Clone)]
+pub enum StacksBlock {
+    PreNakamoto(blockstack_lib::chainstate::stacks::StacksBlock),
+    Nakamoto(blockstack_lib::chainstate::nakamoto::NakamotoBlock),
+}
 
-    let mut file = std::fs::File::open(&block_path)
-        .with_context(|| format!("Failed to open block file: {block_path}"))?;
-    let stacks_block =
-        blockstack_lib::chainstate::stacks::StacksBlock::consensus_deserialize(&mut file)
-            .with_context(|| {
-                format!("Failed to deserialize StacksBlock from file: {block_path}")
-            })?;
-    Ok(stacks_block)
+impl AsRef<[StacksTransaction]> for StacksBlock {
+    fn as_ref(&self) -> &[StacksTransaction] {
+        match self {
+            StacksBlock::PreNakamoto(block) => &block.txs,
+            StacksBlock::Nakamoto(block) => &block.txs,
+        }
+    }
+}
+
+impl StacksBlock {
+    pub fn transactions(&self) -> &[StacksTransaction] {
+        match self {
+            StacksBlock::PreNakamoto(block) => &block.txs,
+            StacksBlock::Nakamoto(block) => &block.txs,
+        }
+    }
+
+    pub fn into_transactions_vec(self) -> Vec<StacksTransaction> {
+        match self {
+            StacksBlock::PreNakamoto(block) => block.txs,
+            StacksBlock::Nakamoto(block) => block.txs,
+        }
+    }
 }

@@ -1,36 +1,38 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use blockstack_lib::chainstate::stacks::StacksTransaction;
 use stacks_common::types::chainstate::StacksBlockId;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio::task;
 
 use crate::context::BenchContext;
 use crate::db::app::AppDb;
-use crate::db::node::NakamotoDb;
 use crate::db::node::sortition::models::Epoch;
-use crate::db::{DbOpen, ReadOnly};
-use crate::{BlockTransactions, Network, ResolveEpochFromHeight as _, StacksBlockHeader};
+use crate::{Network, StacksBlockHeader, StacksBlockLoader};
 
 #[derive(Debug, Default)]
 struct IndexerMetrics {
-    loaded_blocks: AtomicU64,
-    loaded_txs: AtomicU64,
+    loaded_blocks: AtomicUsize,
+    loaded_txs: AtomicUsize,
     last_loaded_height: AtomicU64,
-    flushed_blocks: AtomicU64,
+    flushed_blocks: AtomicUsize,
+    flushed_txs: AtomicUsize,
 }
 
 impl IndexerMetrics {
-    fn record_loaded_block(&self, height: u64, tx_count: u64) {
+    fn record_loaded_block(&self, height: u64, tx_count: usize) {
         self.loaded_blocks.fetch_add(1, Ordering::Relaxed);
         self.loaded_txs.fetch_add(tx_count, Ordering::Relaxed);
         self.last_loaded_height.store(height, Ordering::Relaxed);
     }
 
-    fn record_flushed_blocks(&self, count: u64) {
-        self.flushed_blocks.fetch_add(count, Ordering::Relaxed);
+    fn record_flush(&self, block_count: usize, tx_count: usize) {
+        self.flushed_blocks
+            .fetch_add(block_count, Ordering::Relaxed);
+        self.flushed_txs.fetch_add(tx_count, Ordering::Relaxed);
     }
 }
 
@@ -38,16 +40,22 @@ pub struct ChainstateIndexer<'a> {
     app_db: &'a mut AppDb,
     context: &'a BenchContext,
     batch_size: usize,
+    merge_threshold: usize,
+    channel_buffer_size: usize,
 }
 
 impl<'a> ChainstateIndexer<'a> {
-    pub const DEFAULT_BATCH_SIZE: usize = 250;
+    pub const DEFAULT_BATCH_SIZE: usize = 1_000;
+    pub const DEFAULT_MERGE_THRESHOLD: usize = 100_000;
+    pub const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 5_000;
 
     pub fn new(app_db: &'a mut AppDb, context: &'a BenchContext) -> Self {
         Self {
             app_db,
             context,
             batch_size: Self::DEFAULT_BATCH_SIZE,
+            merge_threshold: Self::DEFAULT_MERGE_THRESHOLD,
+            channel_buffer_size: Self::DEFAULT_CHANNEL_BUFFER_SIZE,
         }
     }
 
@@ -88,7 +96,7 @@ impl<'a> ChainstateIndexer<'a> {
             self.run_indexing_pipeline(start_height, end_height).await?;
 
             println!("Checkpointing database...");
-            self.app_db.checkpoint().await?;
+            self.app_db.checkpoint(true).await?;
             println!("Vacuuming database...");
             self.app_db.vacuum().await?;
 
@@ -111,141 +119,160 @@ impl<'a> ChainstateIndexer<'a> {
     async fn run_indexing_pipeline(&mut self, start_height: u64, end_height: u64) -> Result<()> {
         // Channel for passing loaded blocks to the writer
         let (tx_sender, tx_receiver) =
-            mpsc::channel::<Result<(StacksBlockHeader, BlockTransactions)>>(100);
+            mpsc::channel::<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>(100);
 
         // Split borrows to allow concurrent access
         let app_db = &mut *self.app_db;
         let context = &*self.context;
 
-        let metrics = Arc::new(IndexerMetrics {
-            loaded_blocks: AtomicU64::new(0),
-            loaded_txs: AtomicU64::new(0),
-            last_loaded_height: AtomicU64::new(0),
-            flushed_blocks: AtomicU64::new(0),
-        });
+        let metrics = Arc::new(IndexerMetrics::default());
 
         let loader_task = Self::run_loader(
             context,
             start_height,
             end_height,
+            self.channel_buffer_size,
             tx_sender,
             metrics.clone(),
         );
-        let writer_task = Self::run_writer(app_db, tx_receiver, self.batch_size, metrics.clone());
-        let reporter_task = Self::run_reporter(metrics.clone());
 
-        // Run tasks concurrently
-        // We use select! for the reporter so it stops when the others finish
-        tokio::select! {
-            res = async { tokio::try_join!(loader_task, writer_task) } => res.map(|_| ()),
-            _ = reporter_task => Ok(()),
-        }
-    }
+        let writer_task = Self::run_writer(
+            app_db,
+            tx_receiver,
+            self.batch_size,
+            self.merge_threshold,
+            metrics.clone(),
+        );
 
-    async fn run_reporter(metrics: Arc<IndexerMetrics>) -> Result<()> {
-        let start_time = Instant::now();
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        // Spawn the reporter task so it runs independently of the loader/writer loop.
+        // This prevents the reporter from stalling if the writer performs a long blocking operation (like a merge/checkpoint).
+        let reporter_handle = task::spawn(run_reporter(metrics.clone(), start_height, end_height));
 
-        loop {
-            interval.tick().await;
-            let elapsed = start_time.elapsed();
-            let loaded = metrics.loaded_blocks.load(Ordering::Relaxed);
-            let flushed = metrics.flushed_blocks.load(Ordering::Relaxed);
-            let txs = metrics.loaded_txs.load(Ordering::Relaxed);
-            let height = metrics.last_loaded_height.load(Ordering::Relaxed);
+        // Run loader and writer concurrently on the current task
+        let result = tokio::try_join!(loader_task, writer_task);
 
-            let rate = if elapsed.as_secs() > 0 {
-                flushed as f64 / elapsed.as_secs_f64()
-            } else {
-                0.0
-            };
+        // Abort the reporter once the work is done (or if it failed)
+        reporter_handle.abort();
 
-            println!(
-                "  Status: Loaded {loaded} blocks (last height: {height}), {txs} txs. \
-                Flushed {flushed} blocks. Rate: {rate:.1} blocks/sec"
-            );
-        }
+        result.map(|_| ())
     }
 
     async fn run_loader(
         context: &BenchContext,
         start_height: u64,
         end_height: u64,
-        tx_sender: mpsc::Sender<Result<(StacksBlockHeader, BlockTransactions)>>,
+        channel_buffer_size: usize,
+        tx_sender: mpsc::Sender<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>,
         metrics: Arc<IndexerMetrics>,
     ) -> Result<()> {
         println!("  Indexing loader started");
         let chainstate_dir = context.chainstate_dir();
+        let blocks_dir = chainstate_dir.blocks_dir();
+
+        let min_naka_height = context
+            .open_nakamoto_db_for_read()?
+            .get_min_block_height()?
+            .unwrap_or(u64::MAX);
+        println!("Nakamoto blocks DB first block height: {min_naka_height:?}");
 
         // Limit concurrent DB opens/reads
         let available_parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let semaphore = Arc::new(Semaphore::new(available_parallelism));
 
+        let worker_count = available_parallelism * 2;
+
+        // Create a synchronous channel to distribute work to the blocking
+        // workers. We use tokio::sync::mpsc for the channel so the sender can
+        // await.
+        let (work_tx, work_rx) = mpsc::channel::<StacksBlockHeader>(channel_buffer_size);
+
+        // Wrap the receiver in a mutex to share it among blocking workers. We
+        // use std::sync::Mutex because workers cannot .await a tokio Mutex.
+        let work_rx = Arc::new(std::sync::Mutex::new(work_rx));
+
+        let mut handles = Vec::new();
+
+        // Spawn persistent workers
+        for _ in 0..worker_count {
+            let rx = work_rx.clone();
+            let tx = tx_sender.clone();
+            let b_dir = blocks_dir.clone();
+            let metrics = metrics.clone();
+            // One read-only instance of the naka db per worker
+            let mut naka_db = context.open_nakamoto_db_for_read()?;
+
+            handles.push(task::spawn_blocking(move || -> Result<()> {
+                loop {
+                    // Fetch next job
+                    let header = {
+                        // Lock the shared receiver
+                        let mut locked_rx = rx.lock().unwrap();
+                        // Use blocking_recv() since we are in a blocking thread
+                        match locked_rx.blocking_recv() {
+                            Some(h) => h,
+                            None => break, // Channel closed, work finished
+                        }
+                    };
+
+                    let mut loader = StacksBlockLoader::new(&b_dir, &mut naka_db, min_naka_height);
+                    let load_res = loader.load_block(&header).with_context(|| {
+                        format!("Failed to load transactions for block {}", header.height)
+                    });
+
+                    match load_res {
+                        Ok(block) => {
+                            metrics.record_loaded_block(header.height, block.transactions().len());
+                            if tx
+                                .blocking_send(Ok((header, block.into_transactions_vec())))
+                                .is_err()
+                            {
+                                break; // Receiver dropped
+                            }
+                        }
+                        Err(e) => {
+                            // Send the error to the writer/main thread so it can abort gracefully
+                            let _ = tx.blocking_send(Err(e));
+                            break; // Worker exits after reporting error
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+
+        // Feed the workers from the main stream
         for block_res in context.canonical_block_stream(start_height as u32, end_height as u32) {
             // If the writer has stopped (e.g. due to error), stop spawning new tasks immediately.
             if tx_sender.is_closed() {
                 break;
             }
 
-            let header = match block_res {
-                Ok(b) => b,
+            match block_res {
+                Ok(header) => {
+                    // Use .await here to handle backpressure without blocking the runtime
+                    if work_tx.send(header).await.is_err() {
+                        break; // Workers died
+                    }
+                }
                 Err(e) => {
                     // Propagate error to writer and stop
                     let _ = tx_sender.send(Err(e)).await;
                     break;
                 }
-            };
-
-            let height = header.height;
-            let epoch = context
-                .resolve_stacks_epoch(header.height)
-                .ok_or_else(|| anyhow!("Failed to resolve epoch for height {}", header.height))?;
-
-            let permit = semaphore.clone().acquire_owned().await?;
-            let sender = tx_sender.clone();
-            let blocks_dir = chainstate_dir.blocks_dir();
-            let naka_db_path = chainstate_dir.naka_db_path();
-            let metrics = metrics.clone();
-
-            task::spawn(async move {
-                // Perform blocking IO in a blocking thread
-                let res = task::spawn_blocking(
-                    move || -> Result<(StacksBlockHeader, BlockTransactions)> {
-                        // Hold permit until done
-                        let _permit = permit;
-
-                        let mut naka_db = NakamotoDb::<ReadOnly>::open(naka_db_path)
-                            .context("Failed to open Nakamoto DB")?;
-
-                        let txs =
-                            BlockTransactions::load(&mut naka_db, &blocks_dir, epoch, &header)
-                                .with_context(|| {
-                                    format!(
-                                        "Failed to load transactions for block {}",
-                                        header.height
-                                    )
-                                })?;
-
-                        metrics.record_loaded_block(height as u64, txs.len() as u64);
-
-                        Ok((header, txs))
-                    },
-                )
-                .await;
-
-                // Handle join error and inner result
-                let result = match res {
-                    Ok(inner) => inner,
-                    Err(e) => Err(anyhow!("Task join error: {e}")),
-                };
-
-                // Silently fail if receiver is closed (writer stopped)
-                let _ = sender.send(result).await;
-            });
+            }
         }
 
+        // Close the work channel to signal workers to exit
+        drop(work_tx);
+
+        // Wait for all workers to finish cleanly
+        for handle in handles {
+            match handle.await {
+                Ok(res) => res?,
+                Err(e) => return Err(anyhow!("Worker task panicked: {}", e)),
+            }
+        }
         println!("Indexing loader finished");
 
         Ok(())
@@ -253,25 +280,50 @@ impl<'a> ChainstateIndexer<'a> {
 
     async fn run_writer(
         app_db: &mut AppDb,
-        mut tx_receiver: mpsc::Receiver<Result<(StacksBlockHeader, BlockTransactions)>>,
+        mut tx_receiver: mpsc::Receiver<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>,
         batch_size: usize,
+        merge_threshold: usize,
         metrics: Arc<IndexerMetrics>,
     ) -> Result<()> {
         println!("  Indexing writer started with a batch size of {batch_size}");
         let mut batch = Vec::with_capacity(batch_size);
+        let mut txs_since_last_merge = 0;
 
         while let Some(res) = tx_receiver.recv().await {
-            let (block, txs) = res?;
-            batch.push((block, txs));
+            let (header, transactions) = res?;
+            batch.push((header, transactions));
 
+            // We still batch writes by block count to keep memory usage predictable
             if batch.len() >= batch_size {
-                let count = batch.len() as u64;
-                let headers: Vec<_> = batch.iter().map(|(b, _)| b.clone()).collect();
+                let block_count = batch.len();
+                let headers: Vec<_> = batch.iter().map(|(h, _)| h.clone()).collect();
+
+                // Calculate total txs in this batch for the merge threshold
+                let tx_count: usize = batch.iter().map(|(_, txs)| txs.len()).sum();
+                txs_since_last_merge += tx_count;
 
                 app_db.stage_blocks(headers).await?;
                 app_db.stage_transactions(batch.drain(..)).await?;
 
-                metrics.record_flushed_blocks(count);
+                metrics.record_flush(block_count, tx_count);
+
+                // Check if we should merge staging data based on TRANSACTION count
+                if txs_since_last_merge >= merge_threshold {
+                    println!(
+                        "  Merge threshold reached ({txs_since_last_merge} txs). Merging staging data..."
+                    );
+                    let start = Instant::now();
+                    app_db.merge_staging().await?;
+
+                    // Checkpoint to keep WAL size manageable since auto-checkpoint is disabled
+                    app_db.checkpoint(false).await?;
+
+                    println!(
+                        "  Incremental merge & checkpoint complete in {:.2?}",
+                        start.elapsed()
+                    );
+                    txs_since_last_merge = 0;
+                }
             }
         }
 
@@ -282,11 +334,91 @@ impl<'a> ChainstateIndexer<'a> {
             app_db.stage_transactions(batch).await?;
         }
 
-        println!("  Last block received - merging staged data. This may take a few moments...");
+        println!("  Last block received - performing final staging data merge");
+        let start = Instant::now();
         app_db.merge_staging().await?;
-        println!("  Merge complete!");
+        println!("  Final merge complete in {:.2?}", start.elapsed());
 
         println!("Indexing writer finished");
         Ok(())
     }
+}
+
+async fn run_reporter(
+    metrics: Arc<IndexerMetrics>,
+    start_height: u64,
+    end_height: u64,
+) -> Result<()> {
+    let total_blocks = (end_height.saturating_sub(start_height) + 1) as usize;
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+    let mut last_flushed_blocks = 0;
+    let mut last_loaded_blocks = 0;
+    let mut last_loaded_txs = 0;
+    let mut last_flushed_txs = 0;
+    let mut last_time = Instant::now();
+
+    loop {
+        interval.tick().await;
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_time).as_secs_f64();
+
+        let current_loaded_blocks = metrics.loaded_blocks.load(Ordering::Relaxed);
+        let current_flushed_blocks = metrics.flushed_blocks.load(Ordering::Relaxed);
+        let current_loaded_txs = metrics.loaded_txs.load(Ordering::Relaxed);
+        let current_flushed_txs = metrics.flushed_txs.load(Ordering::Relaxed);
+        let current_height = metrics.last_loaded_height.load(Ordering::Relaxed);
+
+        let delta_loaded_blocks = current_loaded_blocks.saturating_sub(last_loaded_blocks);
+        let delta_flushed_blocks = current_flushed_blocks.saturating_sub(last_flushed_blocks);
+        let delta_loaded_txs = current_loaded_txs.saturating_sub(last_loaded_txs);
+        let delta_flushed_txs = current_flushed_txs.saturating_sub(last_flushed_txs);
+
+        let rate_loaded_blocks = if elapsed > 0.0 {
+            delta_loaded_blocks as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        let rate_flushed_blocks = if elapsed > 0.0 {
+            delta_flushed_blocks as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        let rate_loaded_txs = if elapsed > 0.0 {
+            delta_loaded_txs as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        let rate_flushed_txs = if elapsed > 0.0 {
+            delta_flushed_txs as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        let progress = if total_blocks > 0 {
+            (current_flushed_blocks as f64 / total_blocks as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        println!(
+            "  Status: {progress:>5.1}% | Height: {current_height:<7} | \
+            Blocks: +{delta_loaded_blocks:<4} ({rate_loaded_blocks:>5.1}/s) -> +{delta_flushed_blocks:<4} ({rate_flushed_blocks:>5.1}/s) | \
+            Txs: +{delta_loaded_txs:<5} ({rate_loaded_txs:>6.1}/s) -> +{delta_flushed_txs:<5} ({rate_flushed_txs:>6.1}/s)"
+        );
+
+        last_loaded_blocks = current_loaded_blocks;
+        last_flushed_blocks = current_flushed_blocks;
+        last_loaded_txs = current_loaded_txs;
+        last_flushed_txs = current_flushed_txs;
+        last_time = now;
+
+        if current_flushed_blocks >= total_blocks {
+            break;
+        }
+    }
+    Ok(())
 }

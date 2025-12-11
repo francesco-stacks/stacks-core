@@ -405,8 +405,9 @@ async fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
         )
         .await?;
 
-    let mut indexer = ChainstateIndexer::new(&mut app_db, &bench_context);
-    let block_ids = indexer.index_chainstate(network, chain_id, &epochs).await?;
+    let block_ids = ChainstateIndexer::new(&mut app_db, &bench_context)
+        .index_chainstate(network, chain_id, &epochs)
+        .await?;
 
     let selected_block_count = block_ids.len();
 
@@ -423,6 +424,9 @@ async fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
             args_json,
         )
         .await?;
+
+    // Open the heavy databases before the loop
+    let (mut chainstate, burnchain) = bench_context.open_stacks_chainstate()?;
 
     println!("Re-executing {selected_block_count} selected blocks...");
 
@@ -457,13 +461,7 @@ async fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
             if i % 10 == 0 {
                 eprint!("(Warmup {}) ", block.height);
             }
-        } else if i == args.warmup || i % 5_000 == 0 || i == selected_block_count - 1 {
-            eprint!("{}", block.height);
-        } else if i % 250 == 0 {
-            eprint!(".");
-        }
-
-        if i == 0 || i % 5_000 == 0 || i == selected_block_count - 1 {
+        } else if i == args.warmup || i % 2_500 == 0 || i == selected_block_count - 1 {
             eprint!("{}", block.height);
         } else if i % 250 == 0 {
             eprint!(".");
@@ -471,13 +469,19 @@ async fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
 
         // Replay the block
         let mut metrics = stacks_profiler::measure!("Block Replay", {
-            stacks_bench::replay::replay_block(&mut bench_context, ReplayMode::Follower, &block)?
+            stacks_bench::replay::replay_block(
+                &mut bench_context,
+                &mut chainstate,
+                &burnchain,
+                ReplayMode::Follower,
+                &block,
+            )?
         });
 
         let profiler_results = Profiler::take_results();
 
         let checkpoint_start = Instant::now();
-        bench_context.chainstate().checkpoint_clarity_state()?;
+        chainstate.checkpoint_clarity_state()?;
         total_clarity_db_checkpoint_duration += checkpoint_start.elapsed();
 
         // We clone the transaction metrics because 'metrics' is needed below for calibration/stats.
@@ -660,8 +664,8 @@ async fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     println!("========================================");
 
     println!();
-    println!("Checkpointing/vacuuming database...");
-    app_db.checkpoint().await?;
+    println!("Checkpointing & vacuuming database...");
+    app_db.checkpoint(true).await?;
     app_db.vacuum().await?;
 
     println!("Cleaning up (this may take a few moments for large chainstates)...");

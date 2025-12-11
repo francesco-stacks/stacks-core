@@ -55,4 +55,16 @@ impl<Mode> NakamotoDb<Mode> {
             .optional()
             .with_context(|| format!("Failed to query nakamoto_staging_blocks for id {id}"))
     }
+
+    pub fn get_min_block_height(&mut self) -> Result<Option<u64>> {
+        use diesel::dsl::min;
+
+        use self::schema::nakamoto_staging_blocks::dsl::*;
+
+        nakamoto_staging_blocks
+            .select(min(height))
+            .first::<Option<i32>>(&mut self.conn)
+            .map(|opt| opt.map(|h| h as u64))
+            .context("Failed to get min block height from nakamoto db")
+    }
 }

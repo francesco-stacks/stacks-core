@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use blockstack_lib::chainstate::stacks::TransactionPayload;
+use blockstack_lib::chainstate::stacks::{StacksTransaction, TransactionPayload};
 use chrono::NaiveDateTime;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -13,7 +13,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 use tokio::sync::Mutex;
 
 use crate::metrics::BlockMetrics;
-use crate::{BlockTransactions, ChainCache, Network, StacksBlockHeader};
+use crate::{ChainCache, Network, StacksBlockHeader};
 
 pub mod models;
 pub mod schema;
@@ -61,6 +61,10 @@ impl AppDb {
         diesel::sql_query("PRAGMA cache_size = -262144;").execute(&mut conn)?;
         // Use max mmap size (will be limited by OS)
         diesel::sql_query("PRAGMA mmap_size = 30000000000;").execute(&mut conn)?;
+        // Disable WAL autocheckpoint entirely.
+        // We are doing heavy bulk writes and will explicitly checkpoint at the end.
+        // This prevents SQLite from doing automatic checkpoints that can slow down writes.
+        diesel::sql_query("PRAGMA wal_autocheckpoint = 0;").execute(&mut conn)?;
 
         let pending_migrations = conn
             .pending_migrations(MIGRATIONS)
@@ -93,10 +97,16 @@ impl AppDb {
         })
     }
 
-    pub async fn checkpoint(&mut self) -> Result<()> {
-        diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut *self.conn.lock().await)
-            .context("Failed to perform WAL checkpoint")?;
+    pub async fn checkpoint(&mut self, truncate: bool) -> Result<()> {
+        if truncate {
+            diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .execute(&mut *self.conn.lock().await)
+                .context("Failed to perform WAL checkpoint with TRUNCATE")?;
+        } else {
+            diesel::sql_query("PRAGMA wal_checkpoint(FULL)")
+                .execute(&mut *self.conn.lock().await)
+                .context("Failed to perform WAL checkpoint with FULL")?;
+        }
         Ok(())
     }
 
@@ -479,7 +489,7 @@ impl AppDb {
 
     pub async fn stage_transactions<I>(&mut self, blocks_with_txs: I) -> Result<()>
     where
-        I: IntoIterator<Item = (StacksBlockHeader, BlockTransactions)>,
+        I: IntoIterator<Item = (StacksBlockHeader, Vec<StacksTransaction>)>,
     {
         use self::models::{StagedContract, StagedPrincipal, StagedStacksTx, StagedStacksTxType};
         use self::schema::{_staged_principal, _staged_stacks_tx, _staged_stacks_tx_type};
@@ -548,7 +558,7 @@ impl AppDb {
                 let mut tx_buffer = Vec::new();
 
                 loop {
-                    let chunk: Vec<(StacksBlockHeader, crate::BlockTransactions)> =
+                    let chunk: Vec<(StacksBlockHeader, Vec<StacksTransaction>)> =
                         block_iter.by_ref().take(CHUNK_SIZE).collect();
                     if chunk.is_empty() {
                         break;

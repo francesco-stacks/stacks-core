@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use diesel::{Connection, SqliteConnection};
+use diesel::prelude::*;
 
 pub mod app;
 pub mod node;
@@ -78,8 +78,13 @@ impl DbOpen<ReadOnly> for SqliteDbHandle<ReadOnly> {
 
         let conn_str = format!("file:{}?mode=ro", path_str);
 
-        let conn = SqliteConnection::establish(&conn_str)
+        let mut conn = SqliteConnection::establish(&conn_str)
             .with_context(|| format!("Failed to open SQLite DB (ReadOnly) at {:?}", path))?;
+
+        // Set busy timeout to 10s to handle concurrent access/locking
+        diesel::sql_query("PRAGMA busy_timeout = 1000")
+            .execute(&mut conn)
+            .context("Failed to set busy_timeout")?;
 
         Ok(SqliteDbHandle {
             _path: path,
@@ -95,8 +100,13 @@ impl DbOpen<ReadWrite> for SqliteDbHandle<ReadWrite> {
             .to_str()
             .ok_or_else(|| anyhow!("Invalid database path: {:?}", path))?;
 
-        let conn = SqliteConnection::establish(path_str)
+        let mut conn = SqliteConnection::establish(path_str)
             .with_context(|| format!("Failed to open SQLite DB (ReadWrite) at {:?}", path))?;
+
+        // Set busy timeout to 10s to handle concurrent access/locking
+        diesel::sql_query("PRAGMA busy_timeout = 10000")
+            .execute(&mut conn)
+            .context("Failed to set busy_timeout")?;
 
         Ok(SqliteDbHandle {
             _path: path,

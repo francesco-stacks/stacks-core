@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -9,9 +10,9 @@ use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 
-use crate::db::DbOpenForRead;
-use crate::db::node::ChainStateDb;
 use crate::db::node::sortition::SortitionDb;
+use crate::db::node::{ChainStateDb, NakamotoDb};
+use crate::db::{DbOpenForRead, ReadOnly};
 use crate::paths::{BurnChainDir, ChainStateDir};
 use crate::shadow::{ShadowDir, ShadowDirBuilder, ShadowDirDeltaReport};
 use crate::{
@@ -101,37 +102,21 @@ impl BenchContextOpts {
 pub struct BenchContext {
     is_mainnet: bool,
     shadow_dir: ShadowDir,
-    chainstate: StacksChainState,
-    burnchain: Burnchain,
     start_height: u64,
     end_height: u64,
     tip_height: u64,
     tip_id: StacksBlockId,
-    epochs: Vec<StacksEpoch>,
+    epochs: Arc<Vec<StacksEpoch>>,
+    network: Network,
+    chain_id: u32,
     /// Tracks the cumulative storage growth to calculate per-block deltas
     last_storage_delta: i64,
     chainstate_dir: ChainStateDir,
 }
 
 impl BenchContext {
-    pub fn chainstate(&self) -> &StacksChainState {
-        &self.chainstate
-    }
-
-    pub fn chainstate_mut(&mut self) -> &mut StacksChainState {
-        &mut self.chainstate
-    }
-
     pub fn chainstate_dir(&self) -> &ChainStateDir {
         &self.chainstate_dir
-    }
-
-    pub fn burnchain(&self) -> &Burnchain {
-        &self.burnchain
-    }
-
-    pub fn burnchain_mut(&mut self) -> &mut Burnchain {
-        &mut self.burnchain
     }
 
     pub fn is_mainnet(&self) -> bool {
@@ -147,6 +132,11 @@ impl BenchContext {
         (self.tip_id.clone(), self.tip_height)
     }
 
+    /// The Stacks epochs applicable for this context.
+    pub fn epochs_arc(&self) -> Arc<Vec<StacksEpoch>> {
+        self.epochs.clone()
+    }
+
     pub fn resolve_block_era(&self, epoch: StacksEpochId) -> BlockEra {
         if epoch >= StacksEpochId::Epoch30 {
             BlockEra::Nakamoto
@@ -160,15 +150,31 @@ impl BenchContext {
         Ok((self.start_height, self.end_height))
     }
 
-    pub fn with_databases_mut<F, R>(&mut self, func: F) -> Result<R>
-    where
-        F: FnOnce(&mut StacksChainState, &mut Burnchain) -> Result<R>,
-    {
-        func(&mut self.chainstate, &mut self.burnchain)
+    /// Opens the heavy `StacksChainState` and `Burnchain` databases on demand.
+    /// Use this only when you need to execute blocks or access deep chain state.
+    pub fn open_stacks_chainstate(&self) -> Result<(StacksChainState, Burnchain)> {
+        let burnchain_dir = BurnChainDir::from_node_root(&self.shadow_dir);
+        let chainstate_dir = ChainStateDir::from_node_root(&self.shadow_dir);
+        let network_name = self.network.to_string();
+
+        let burnchain = Burnchain::new(burnchain_dir.as_str()?, BURNCHAIN_NAME, &network_name)?;
+
+        let marf_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+
+        let (chainstate, _) = StacksChainState::open(
+            self.is_mainnet,
+            self.chain_id,
+            chainstate_dir.as_str()?,
+            Some(marf_opts),
+        )?;
+
+        Ok((chainstate, burnchain))
     }
 
-    pub fn get_databases_mut(&mut self) -> (&mut StacksChainState, &mut Burnchain) {
-        (&mut self.chainstate, &mut self.burnchain)
+    pub fn open_nakamoto_db_for_read(&self) -> Result<NakamotoDb<ReadOnly>> {
+        let nakamoto_db_path = self.chainstate_dir.nakamoto_db_path();
+        NakamotoDb::<ReadOnly>::open_for_read(nakamoto_db_path)
+            .with_context(|| "Failed to open nakamoto DB for read")
     }
 
     /// Calculates the storage delta since the last call to this function.
@@ -203,18 +209,6 @@ impl BenchContext {
 
         let chain_id = opts.chain_id;
         let is_mainnet = opts.network.is_mainnet();
-        let network_name = opts.network.to_string();
-
-        let burnchain = Burnchain::new(burnchain_dir.as_str()?, BURNCHAIN_NAME, &network_name)?;
-
-        let marf_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-
-        let (chainstate, _) = StacksChainState::open(
-            is_mainnet,
-            chain_id,
-            chainstate_dir.as_str()?,
-            Some(marf_opts),
-        )?;
 
         let mut chainstate_db = ChainStateDb::open_for_read(chainstate_dir.index_db_path())?;
         let mut sortition_db = SortitionDb::open_for_read(burnchain_dir.sortition_db_path())?;
@@ -241,6 +235,22 @@ impl BenchContext {
                 // Walk back from node tip to find the canonical block at height h
                 let mut curr = node_tip_id.clone();
                 let mut curr_h = node_tip_height;
+
+                // Check cache to jump closer if we know an ancestor
+                if let Some(c) = &mut cache {
+                    if let Ok(Some((cached_id, cached_h))) =
+                        c.find_closest_ancestor(&node_tip_id, h).await
+                    {
+                        if cached_h < curr_h && cached_h >= h {
+                            println!(
+                                "  [Cache Hit] Jumping from height {curr_h} to {cached_h} ({cached_id})"
+                            );
+                            curr = cached_id;
+                            curr_h = cached_h;
+                        }
+                    }
+                }
+
                 while curr_h > h {
                     let header: StacksBlockHeader = chainstate_db
                         .get_block_header(&curr)?
@@ -248,6 +258,13 @@ impl BenchContext {
                         .try_into()?;
                     curr = header.parent_id;
                     curr_h = header.height.saturating_sub(1);
+
+                    // Populate cache periodically
+                    if curr_h % 10_000 == 0 {
+                        if let Some(c) = &mut cache {
+                            let _ = c.cache_ancestor(&node_tip_id, curr_h, &curr).await;
+                        }
+                    }
                 }
                 (curr, h)
             }
@@ -320,8 +337,6 @@ impl BenchContext {
                         }
                     }
 
-                    let mut last_cache_height = curr_h;
-
                     while curr_h > h {
                         // Fetch header for the current block
                         let header: StacksBlockHeader = chainstate_db
@@ -336,12 +351,11 @@ impl BenchContext {
                         curr_h = header.height.saturating_sub(1);
 
                         // Populate cache periodically
-                        if last_cache_height - curr_h >= 10_000 {
+                        if curr_h % 10_000 == 0 {
                             if let Some(c) = &mut cache {
                                 let _ = c.cache_ancestor(&anchor_id, curr_h, &curr).await;
                                 eprint!("."); // Progress/activity indicator
                             }
-                            last_cache_height = curr_h;
                         }
                     }
                     println!();
@@ -364,13 +378,13 @@ impl BenchContext {
         Ok(Self {
             is_mainnet,
             shadow_dir,
-            chainstate,
-            burnchain,
             start_height,
             end_height: end_height, // end_height is the benchmark tip height
             tip_height: end_height, // tip_height is now the benchmark tip height
             tip_id: end_id,         // tip_id is now the benchmark tip ID
-            epochs: opts.epochs,
+            epochs: Arc::new(opts.epochs),
+            chain_id,
+            network: opts.network,
             last_storage_delta: 0,
             chainstate_dir,
         })

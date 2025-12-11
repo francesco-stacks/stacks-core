@@ -77,7 +77,9 @@ impl ResolveEpochFromHeight for [Epoch] {
     fn resolve_stacks_epoch(&self, height: u64) -> Option<StacksEpochId> {
         let height_i64: i64 = height.try_into().ok()?;
         for epoch in self {
-            if height_i64 >= epoch.start_block_height && height_i64 <= epoch.end_block_height {
+            // Use half-open interval [start, end) to handle overlapping boundaries
+            // where the end of one epoch is the start (activation) of the next.
+            if height_i64 >= epoch.start_block_height && height_i64 < epoch.end_block_height {
                 let epoch_id_u32: u32 = epoch.epoch_id.try_into().ok()?;
                 let stacks_epoch_id: StacksEpochId = epoch_id_u32.try_into().ok()?;
                 return Some(stacks_epoch_id);

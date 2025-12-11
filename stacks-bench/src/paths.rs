@@ -172,7 +172,7 @@ impl ChainStateDir {
         self.path().join(Self::BLOCKS_DIR_RELATIVE_PATH)
     }
 
-    pub fn naka_db_path(&self) -> PathBuf {
+    pub fn nakamoto_db_path(&self) -> PathBuf {
         self.path().join(Self::NAKA_DB_RELATIVE_FILE_PATH)
     }
 }
