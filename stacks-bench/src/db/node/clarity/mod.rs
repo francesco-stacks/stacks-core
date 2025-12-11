@@ -1,29 +1,17 @@
+use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use diesel::RunQueryDsl;
-use diesel::sql_types::Integer;
+use diesel_async::RunQueryDsl;
+use models::*;
 
 use crate::db::{DbOpen, ReadWrite, SqliteDbHandle};
 
 pub mod models;
 pub mod schema;
 
-// Define a struct to map the PRAGMA result
-#[derive(diesel::QueryableByName, Debug)]
-pub struct CheckpointResult {
-    #[diesel(sql_type = Integer)]
-    #[diesel(column_name = "busy")]
-    pub busy: i32,
-    #[diesel(sql_type = Integer)]
-    #[diesel(column_name = "log")]
-    pub log: i32,
-    #[diesel(sql_type = Integer)]
-    #[diesel(column_name = "checkpointed")]
-    pub checkpointed: i32,
-}
-
+#[derive(Clone)]
 pub struct ClarityDb<Mode> {
     handle: SqliteDbHandle<Mode>,
 }
@@ -48,20 +36,21 @@ impl<Mode> DbOpen<Mode> for ClarityDb<Mode>
 where
     SqliteDbHandle<Mode>: DbOpen<Mode>,
 {
-    fn open(path: PathBuf) -> Result<Self> {
+    async fn open<P: AsRef<Path> + Debug + Send>(path: P) -> Result<Self> {
         Ok(Self {
-            handle: SqliteDbHandle::<Mode>::open(path)?,
+            handle: SqliteDbHandle::<Mode>::open(path).await?,
         })
     }
 }
 
 impl ClarityDb<ReadWrite> {
-    pub fn checkpoint(&mut self) -> Result<()> {
+    pub async fn checkpoint(&mut self) -> Result<()> {
         let results: Vec<CheckpointResult> = diesel::sql_query("PRAGMA wal_checkpoint(FULL)")
-            .load(&mut self.conn)
+            .load(&mut self.handle.get_conn().await?)
+            .await
             .context("Failed to perform WAL checkpoint")?;
 
-        if let Some(res) = results.first() {
+        if let Some(res) = results.get(0) {
             // Print status regardless of busy state to debug
             eprintln!(
                 "Checkpoint Status: busy={}, log={}, checkpointed={}",
@@ -71,9 +60,10 @@ impl ClarityDb<ReadWrite> {
         Ok(())
     }
 
-    pub fn vacuum(&mut self) -> Result<()> {
+    pub async fn vacuum(&mut self) -> Result<()> {
         diesel::sql_query("VACUUM")
-            .execute(&mut self.conn)
+            .execute(&mut self.handle.get_conn().await?)
+            .await
             .context("Failed to vacuum the database")?;
         Ok(())
     }

@@ -1,36 +1,51 @@
+use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use diesel::prelude::*;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::bb8::{Pool, PooledConnection};
+use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
+use diesel_async::{AsyncConnection, RunQueryDsl};
 
 pub mod app;
 pub mod node;
 
+type AsyncSqliteConnection = SyncConnectionWrapper<SqliteConnection>;
+type SqlitePool = Pool<AsyncSqliteConnection>;
+
 /// Marker type for read-only database access
+#[derive(Debug, Clone, Copy)]
 pub struct ReadOnly;
 /// Marker type for read-write database access
+#[derive(Debug, Clone, Copy)]
 pub struct ReadWrite;
 
 /// Trait for opening a database in a specific mode (read-only, read-write).
 pub trait DbOpen<Mode>: Sized {
-    fn open(path: PathBuf) -> Result<Self>;
+    fn open<P: AsRef<Path> + Debug + Send>(path: P) -> impl Future<Output = Result<Self>> + Send;
 }
 
 pub trait DbOpenForRead: Sized {
-    fn open_for_read(path: PathBuf) -> Result<Self>;
+    fn open_for_read<P: AsRef<Path> + Debug + Send>(
+        path: P,
+    ) -> impl Future<Output = Result<Self>> + Send;
 }
 
 pub trait DbOpenForWrite: Sized {
-    fn open_for_write(path: PathBuf) -> Result<Self>;
+    fn open_for_write<P: AsRef<Path> + Debug + Send>(
+        path: P,
+    ) -> impl Future<Output = Result<Self>> + Send;
 }
 
 impl<T> DbOpenForRead for T
 where
     T: DbOpen<ReadOnly>,
 {
-    fn open_for_read(path: PathBuf) -> Result<T> {
-        T::open(path)
+    async fn open_for_read<P: AsRef<Path> + Debug + Send>(path: P) -> Result<T> {
+        T::open(path).await
     }
 }
 
@@ -38,80 +53,91 @@ impl<T> DbOpenForWrite for T
 where
     T: DbOpen<ReadWrite>,
 {
-    fn open_for_write(path: PathBuf) -> Result<T> {
-        T::open(path)
+    async fn open_for_write<P: AsRef<Path> + Debug + Send>(path: P) -> Result<T> {
+        T::open(path).await
     }
-}
-
-/// Trait for accessing a handle's underlying connection.
-pub trait DbConn<Mode> {
-    type DbConnection: Connection;
-
-    fn conn(&self) -> &Self::DbConnection;
-    fn conn_mut(&mut self) -> &mut Self::DbConnection;
 }
 
 /// A generic handle to a SQLite database connection.
+#[derive(Clone)]
 pub struct SqliteDbHandle<Mode> {
-    _path: PathBuf,
-    conn: SqliteConnection,
+    pool: SqlitePool,
     _mode: PhantomData<Mode>,
 }
 
-impl<Mode> DbConn<Mode> for SqliteDbHandle<Mode> {
-    type DbConnection = SqliteConnection;
-
-    fn conn(&self) -> &Self::DbConnection {
-        &self.conn
-    }
-
-    fn conn_mut(&mut self) -> &mut Self::DbConnection {
-        &mut self.conn
+impl<Mode> SqliteDbHandle<Mode> {
+    pub async fn get_conn(&self) -> Result<PooledConnection<'_, AsyncSqliteConnection>> {
+        self.pool
+            .get()
+            .await
+            .context("Failed to get connection from SqliteDbHandle pool")
     }
 }
 
 impl DbOpen<ReadOnly> for SqliteDbHandle<ReadOnly> {
-    fn open(path: PathBuf) -> Result<Self> {
+    async fn open<P: AsRef<Path> + Debug + Send>(path: P) -> Result<Self> {
         let path_str = path
+            .as_ref()
             .to_str()
             .ok_or_else(|| anyhow!("Invalid database path: {:?}", path))?;
 
         let conn_str = format!("file:{}?mode=ro", path_str);
 
-        let mut conn = SqliteConnection::establish(&conn_str)
-            .with_context(|| format!("Failed to open SQLite DB (ReadOnly) at {:?}", path))?;
-
-        // Set busy timeout to 10s to handle concurrent access/locking
-        diesel::sql_query("PRAGMA busy_timeout = 1000")
-            .execute(&mut conn)
-            .context("Failed to set busy_timeout")?;
+        let pool = build_pool(conn_str, 16).await?;
 
         Ok(SqliteDbHandle {
-            _path: path,
-            conn,
+            pool,
             _mode: PhantomData,
         })
     }
 }
 
 impl DbOpen<ReadWrite> for SqliteDbHandle<ReadWrite> {
-    fn open(path: PathBuf) -> Result<Self> {
+    async fn open<P: AsRef<Path> + Debug + Send>(path: P) -> Result<Self> {
         let path_str = path
+            .as_ref()
             .to_str()
             .ok_or_else(|| anyhow!("Invalid database path: {:?}", path))?;
 
-        let mut conn = SqliteConnection::establish(path_str)
-            .with_context(|| format!("Failed to open SQLite DB (ReadWrite) at {:?}", path))?;
-
-        // Set busy timeout to 10s to handle concurrent access/locking
-        diesel::sql_query("PRAGMA busy_timeout = 10000")
-            .execute(&mut conn)
-            .context("Failed to set busy_timeout")?;
+        let pool = build_pool(path_str, 16).await?;
 
         Ok(SqliteDbHandle {
-            _path: path,
-            conn,
+            pool,
             _mode: PhantomData,
         })
     }
+}
+
+async fn build_pool<U: Into<String>>(url: U, size: u32) -> Result<Pool<AsyncSqliteConnection>> {
+    let mut manager_config = diesel_async::pooled_connection::ManagerConfig::default();
+    manager_config.custom_setup = Box::new(|url| {
+        Box::pin(async move {
+            let mut conn = AsyncSqliteConnection::establish(url).await?;
+
+            diesel::sql_query("PRAGMA busy_timeout = 10000")
+                .execute(&mut conn)
+                .await
+                .inspect_err(|e| {
+                    eprintln!(
+                        "Failed to set PRAGMA busy_timeout=10000 on SqliteDbHandle<ReadWrite>: {}",
+                        e
+                    )
+                })
+                .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
+            Ok(conn)
+        })
+    });
+
+    let manager = AsyncDieselConnectionManager::<AsyncSqliteConnection>::new_with_config(
+        url.into(),
+        manager_config,
+    );
+
+    Pool::builder()
+        .max_size(size)
+        .min_idle(8)
+        .connection_timeout(Duration::from_secs(1))
+        .build(manager)
+        .await
+        .context("Failed to build SQLite pool (ReadWrite)")
 }

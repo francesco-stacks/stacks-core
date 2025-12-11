@@ -38,3 +38,4 @@ sha2.workspace = true
 bollard.workspace = true
 tokio.workspace = true
 futures.workspace = true
+diesel-async.workspace = true

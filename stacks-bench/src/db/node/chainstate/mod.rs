@@ -1,15 +1,19 @@
+use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use clarity::types::chainstate::StacksBlockId;
 use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 
+use crate::blocks::BlockHeaderProvider;
 use crate::db::{DbOpen, SqliteDbHandle};
 
 pub mod models;
 pub mod schema;
 
+#[derive(Clone)]
 pub struct ChainStateDb<Mode> {
     handle: SqliteDbHandle<Mode>,
 }
@@ -34,28 +38,31 @@ impl<Mode> DbOpen<Mode> for ChainStateDb<Mode>
 where
     SqliteDbHandle<Mode>: DbOpen<Mode>,
 {
-    fn open(path: PathBuf) -> Result<Self> {
+    async fn open<P: AsRef<Path> + Debug + Send>(path: P) -> Result<Self> {
         Ok(Self {
-            handle: SqliteDbHandle::<Mode>::open(path)?,
+            handle: SqliteDbHandle::<Mode>::open(path).await?,
         })
     }
 }
 
 impl<Mode> ChainStateDb<Mode> {
-    pub fn read_db_config(&mut self) -> Result<models::DbConfig> {
+    pub async fn read_db_config(&self) -> Result<models::DbConfig> {
         use schema::db_config::dsl::db_config;
+        let mut conn = self.handle.get_conn().await?;
         db_config
-            .first::<models::DbConfig>(&mut self.conn)
+            .first::<models::DbConfig>(&mut conn)
+            .await
             .with_context(|| "Failed to query chainstate 'db_config' table")
     }
 
     /// Tries to find a block header in either `nakamoto_block_headers` or `block_headers`.
-    pub fn get_block_header(
-        &mut self,
+    pub async fn get_block_header(
+        &self,
         block_id: &StacksBlockId,
     ) -> Result<Option<models::BlockHeader>> {
         use self::schema::{block_headers, nakamoto_block_headers};
         let index_hash_hex = block_id.to_hex();
+        let mut conn = self.handle.get_conn().await?;
 
         let q1 = nakamoto_block_headers::table
             .select((
@@ -84,10 +91,21 @@ impl<Mode> ChainStateDb<Mode> {
         // UNION ALL with LIMIT 1 is efficient: SQLite checks the first query,
         // and if it finds a match, it stops immediately without checking the second.
         q1.union_all(q2)
-            .first::<models::BlockHeader>(&mut self.conn)
+            .first::<models::BlockHeader>(&mut conn)
+            .await
             .optional()
             .with_context(|| {
                 format!("Failed to query block header for block with index hash '{index_hash_hex}'")
             })
+    }
+}
+
+impl<Mode: Send> BlockHeaderProvider for ChainStateDb<Mode> {
+    async fn get_header(&mut self, id: &StacksBlockId) -> Result<Option<crate::StacksBlockHeader>> {
+        let header = self.get_block_header(id).await?;
+        match header {
+            Some(h) => Ok(Some(h.try_into()?)),
+            None => Ok(None),
+        }
     }
 }

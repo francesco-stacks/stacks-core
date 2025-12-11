@@ -1,16 +1,19 @@
+use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 
-use crate::db::{DbConn, DbOpen, SqliteDbHandle};
+use crate::db::{DbOpen, SqliteDbHandle};
 
 pub mod models;
 pub mod schema;
 
+#[derive(Clone)]
 pub struct SortitionDb<Mode> {
     handle: SqliteDbHandle<Mode>,
 }
@@ -33,26 +36,29 @@ impl<Mode> DbOpen<Mode> for SortitionDb<Mode>
 where
     SqliteDbHandle<Mode>: DbOpen<Mode>,
 {
-    fn open(path: PathBuf) -> Result<Self> {
+    async fn open<P: AsRef<Path> + Debug + Send>(path: P) -> Result<Self> {
         Ok(Self {
-            handle: SqliteDbHandle::open(path)?,
+            handle: SqliteDbHandle::open(path).await?,
         })
     }
 }
 
 impl<Mode> SortitionDb<Mode> {
-    pub fn get_epochs(&mut self) -> Result<Vec<models::Epoch>> {
+    pub async fn get_epochs(&mut self) -> Result<Vec<models::Epoch>> {
         use schema::epochs::dsl::*;
 
         epochs
-            .load::<models::Epoch>(self.conn_mut())
+            .load::<models::Epoch>(&mut self.handle.get_conn().await?)
+            .await
             .context(format!("Failed to load epochs from sortition db"))
     }
 
-    pub fn get_canonical_stacks_tip(&mut self) -> Result<(StacksBlockId, u64)> {
+    pub async fn get_canonical_stacks_tip(&mut self) -> Result<(StacksBlockId, u64)> {
         use schema::epochs::dsl as ep;
         use schema::snapshots::dsl as sn;
         use schema::stacks_chain_tips::dsl as sct;
+
+        let mut conn = self.handle.get_conn().await?;
 
         // 1. Get canonical burn chain tip
         // Logic: The canonical tip is the highest block with pox_valid=1.
@@ -60,7 +66,8 @@ impl<Mode> SortitionDb<Mode> {
         let tip_snapshot: models::Snapshot = sn::snapshots
             .filter(sn::pox_valid.eq(1))
             .order((sn::block_height.desc(), sn::burn_header_hash.asc()))
-            .first(self.conn_mut())
+            .first(&mut conn)
+            .await
             .context("Failed to get canonical burn chain tip")?;
 
         // 2. Get epoch for this height to determine how to find the Stacks tip
@@ -68,7 +75,8 @@ impl<Mode> SortitionDb<Mode> {
             .select(ep::epoch_id)
             .filter(ep::start_block_height.le(tip_snapshot.block_height))
             .filter(ep::end_block_height.ge(tip_snapshot.block_height))
-            .first(self.conn_mut())
+            .first(&mut conn)
+            .await
             .context("Failed to get epoch for tip height")?;
 
         let epoch_id: StacksEpochId = (epoch_id_val as u32).try_into().map_err(|e| {
@@ -85,7 +93,8 @@ impl<Mode> SortitionDb<Mode> {
                 let chain_tip_opt: Option<models::StacksChainTip> = sct::stacks_chain_tips
                     .filter(sct::sortition_id.eq(&current_snapshot.sortition_id))
                     .order(sct::block_height.desc())
-                    .first(self.conn_mut())
+                    .first(&mut conn)
+                    .await
                     .optional()?;
 
                 if let Some(tip) = chain_tip_opt {
@@ -101,7 +110,8 @@ impl<Mode> SortitionDb<Mode> {
                 // Move to parent sortition
                 let parent_opt: Option<models::Snapshot> = sn::snapshots
                     .filter(sn::sortition_id.eq(&current_snapshot.parent_sortition_id))
-                    .first(self.conn_mut())
+                    .first(&mut conn)
+                    .await
                     .optional()?;
 
                 match parent_opt {

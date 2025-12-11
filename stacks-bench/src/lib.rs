@@ -17,6 +17,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 use crate::db::ReadOnly;
 use crate::db::node::NakamotoDb;
 
+pub mod blocks;
 pub mod context;
 pub mod db;
 pub mod indexer;
@@ -25,25 +26,6 @@ pub mod paths;
 pub mod profiler;
 pub mod replay;
 pub mod shadow;
-
-/// Trait for caching and retrieving block ancestors to speed up chain walking.
-pub trait ChainCache {
-    /// Finds the closest known ancestor of `tip` that has a height >= `target_height`.
-    /// Returns `Some((block_id, height))` if found.
-    fn find_closest_ancestor(
-        &self,
-        tip: &StacksBlockId,
-        target_height: u64,
-    ) -> impl Future<Output = Result<Option<(StacksBlockId, u64)>>>;
-
-    /// Caches a known ancestor for a given tip.
-    fn cache_ancestor(
-        &mut self,
-        tip: &StacksBlockId,
-        height: u64,
-        block: &StacksBlockId,
-    ) -> impl Future<Output = Result<()>>;
-}
 
 #[derive(Debug, Clone)]
 pub struct StacksEpoch {
@@ -256,7 +238,7 @@ impl<'a> StacksBlockLoader<'a> {
         BlockSource::Disk(self.blocks_dir.clone())
     }
 
-    fn load_pre_nakamoto_block(
+    async fn load_pre_nakamoto_block(
         &self,
         block_id: &StacksBlockId,
     ) -> Result<blockstack_lib::chainstate::stacks::StacksBlock> {
@@ -264,23 +246,32 @@ impl<'a> StacksBlockLoader<'a> {
         let block_path = StacksChainState::get_index_block_path(&blocks_dir_str, block_id)
             .context("Failed to resolve block path")?;
 
-        let mut file = std::fs::File::open(&block_path)
-            .with_context(|| format!("Failed to open block file: {block_path}"))?;
-        let stacks_block =
+        let stacks_block = tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut file = std::fs::File::open(&block_path)
+                .with_context(|| format!("Failed to open block file: {:?}", block_path))?;
+
             blockstack_lib::chainstate::stacks::StacksBlock::consensus_deserialize(&mut file)
                 .with_context(|| {
-                    format!("Failed to deserialize StacksBlock from file: {block_path}")
-                })?;
+                    format!(
+                        "Failed to deserialize StacksBlock from file: {:?}",
+                        block_path
+                    )
+                })
+        })
+        .await
+        .context("Failed to join blocking task")??;
+
         Ok(stacks_block)
     }
 
-    fn load_nakamoto_block(
+    async fn load_nakamoto_block(
         &mut self,
         block_id: &StacksBlockId,
     ) -> Result<blockstack_lib::chainstate::nakamoto::NakamotoBlock> {
         let naka_block_bytes = self
             .naka_db
             .get_nakamoto_block(block_id)
+            .await
             .with_context(|| format!("Failed to load Nakamoto block {block_id} from DB"))?
             .ok_or_else(|| anyhow!("Nakamoto block not found: {block_id}"))?
             .data;
@@ -290,17 +281,19 @@ impl<'a> StacksBlockLoader<'a> {
             .with_context(|| format!("Failed to deserialize Nakamoto block {block_id}"))
     }
 
-    pub fn load_block(&mut self, block: &StacksBlockHeader) -> Result<StacksBlock> {
+    pub async fn load_block(&mut self, block: &StacksBlockHeader) -> Result<StacksBlock> {
         let block_id = &block.id;
 
         if block.height >= self.naka_db_cutoff_height {
             let naka_block = self
                 .load_nakamoto_block(block_id)
+                .await
                 .with_context(|| format!("Failed to load Nakamoto block {block_id}"))?;
             Ok(StacksBlock::Nakamoto(naka_block))
         } else {
             let stacks_block = self
                 .load_pre_nakamoto_block(block_id)
+                .await
                 .with_context(|| format!("Failed to load StacksBlock {block_id} from disk"))?;
             Ok(StacksBlock::PreNakamoto(stacks_block))
         }

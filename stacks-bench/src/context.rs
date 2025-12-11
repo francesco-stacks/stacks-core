@@ -7,17 +7,19 @@ use blockstack_lib::burnchains::Burnchain;
 use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use blockstack_lib::chainstate::stacks::index::marf::MARFOpenOpts;
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
+use futures::{Stream, StreamExt};
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 
+use crate::blocks::BackwardsBlockStream;
+use crate::db::app::AppDb;
 use crate::db::node::sortition::SortitionDb;
 use crate::db::node::{ChainStateDb, NakamotoDb};
 use crate::db::{DbOpenForRead, ReadOnly};
 use crate::paths::{BurnChainDir, ChainStateDir};
 use crate::shadow::{ShadowDir, ShadowDirBuilder, ShadowDirDeltaReport};
 use crate::{
-    BlockEra, ChainCache, Network, ResolveEpochFromHeight, StacksBlockHeader, StacksBlockRef,
-    StacksEpoch,
+    BlockEra, Network, ResolveEpochFromHeight, StacksBlockHeader, StacksBlockRef, StacksEpoch,
 };
 
 const BURNCHAIN_NAME: &str = "bitcoin";
@@ -64,42 +66,29 @@ impl BenchContextOpts {
         })
     }
 
-    pub fn with_start_block(mut self, start: StacksBlockRef) -> Self {
-        self.start_at = Some(start);
+    pub fn with_start_block<T: Into<Option<StacksBlockRef>>>(mut self, start: T) -> Self {
+        self.start_at = start.into();
         self
     }
 
-    pub fn with_maybe_start_block(mut self, start: Option<StacksBlockRef>) -> Self {
-        if let Some(s) = start {
-            self.start_at = Some(s);
-        }
+    pub fn with_end_block<T: Into<Option<StacksBlockRef>>>(mut self, end: T) -> Self {
+        self.end_at = end.into();
         self
     }
 
-    pub fn with_end_block(mut self, end: StacksBlockRef) -> Self {
-        self.end_at = Some(end);
+    pub fn with_maybe_tip<T: Into<Option<StacksBlockRef>>>(mut self, tip: T) -> Self {
+        self.tip = tip.into();
         self
     }
 
-    pub fn with_maybe_end_block(mut self, end: Option<StacksBlockRef>) -> Self {
-        if let Some(e) = end {
-            self.end_at = Some(e);
-        }
-        self
-    }
-
-    pub fn with_maybe_tip(mut self, tip: Option<StacksBlockRef>) -> Self {
-        self.tip = tip;
-        self
-    }
-
-    pub fn with_maybe_block_count(mut self, count: Option<u32>) -> Self {
-        self.block_count = count;
+    pub fn with_block_count<T: Into<Option<u32>>>(mut self, count: T) -> Self {
+        self.block_count = count.into();
         self
     }
 }
 
 pub struct BenchContext {
+    app_db: AppDb,
     is_mainnet: bool,
     shadow_dir: ShadowDir,
     start_height: u64,
@@ -112,6 +101,7 @@ pub struct BenchContext {
     /// Tracks the cumulative storage growth to calculate per-block deltas
     last_storage_delta: i64,
     chainstate_dir: ChainStateDir,
+    burnchain_dir: BurnChainDir,
 }
 
 impl BenchContext {
@@ -171,10 +161,31 @@ impl BenchContext {
         Ok((chainstate, burnchain))
     }
 
-    pub fn open_nakamoto_db_for_read(&self) -> Result<NakamotoDb<ReadOnly>> {
+    /// Opens the Nakamoto blocks database in read-only mode using our internal,
+    /// lightweight [`NakamotoDb`].
+    pub async fn open_nakamoto_db_for_read(&self) -> Result<NakamotoDb<ReadOnly>> {
         let nakamoto_db_path = self.chainstate_dir.nakamoto_db_path();
         NakamotoDb::<ReadOnly>::open_for_read(nakamoto_db_path)
+            .await
             .with_context(|| "Failed to open nakamoto DB for read")
+    }
+
+    /// Opens the Stacks chainstate index database in read-only mode using our
+    /// internal, lightweight [`ChainStateDb`].
+    pub async fn open_chainstate_db_for_read(&self) -> Result<ChainStateDb<ReadOnly>> {
+        let index_db_path = self.chainstate_dir.index_db_path();
+        ChainStateDb::<ReadOnly>::open_for_read(index_db_path)
+            .await
+            .with_context(|| "Failed to open chainstate index DB for read")
+    }
+
+    /// Opens the sortition database in read-only mode using our internal,
+    /// lightweight [`SortitionDb`].
+    pub async fn open_sortition_db_for_read(&self) -> Result<SortitionDb<ReadOnly>> {
+        let sortition_db_path = self.burnchain_dir.sortition_db_path();
+        SortitionDb::<ReadOnly>::open_for_read(sortition_db_path)
+            .await
+            .with_context(|| "Failed to open sortition DB for read")
     }
 
     /// Calculates the storage delta since the last call to this function.
@@ -187,10 +198,7 @@ impl BenchContext {
         Ok(delta)
     }
 
-    pub async fn initialize<Cache: ChainCache>(
-        opts: BenchContextOpts,
-        mut cache: Option<&mut Cache>,
-    ) -> Result<Self> {
+    pub async fn initialize(mut app_db: AppDb, opts: BenchContextOpts) -> Result<Self> {
         println!("Creating shadow directory (this may take a few moments)...");
         let start = Instant::now();
         let shadow_dir = ShadowDirBuilder::new(&opts.source_dir)
@@ -210,19 +218,21 @@ impl BenchContext {
         let chain_id = opts.chain_id;
         let is_mainnet = opts.network.is_mainnet();
 
-        let mut chainstate_db = ChainStateDb::open_for_read(chainstate_dir.index_db_path())?;
-        let mut sortition_db = SortitionDb::open_for_read(burnchain_dir.sortition_db_path())?;
+        let mut chainstate_db = ChainStateDb::open_for_read(chainstate_dir.index_db_path()).await?;
+        let mut sortition_db =
+            SortitionDb::open_for_read(burnchain_dir.sortition_db_path()).await?;
 
         // 1. Get Node Tip (Global Default)
         println!("Getting canonical stacks tip from sortition db");
-        let (node_tip_id, node_tip_height) = sortition_db.get_canonical_stacks_tip()?;
+        let (node_tip_id, node_tip_height) = sortition_db.get_canonical_stacks_tip().await?;
 
         // 2. Determine Anchor Tip
         // This is the block we will walk backwards FROM.
         let (anchor_id, anchor_height) = match &opts.tip {
             Some(StacksBlockRef::Id(id)) => {
                 let header: StacksBlockHeader = chainstate_db
-                    .get_block_header(id)?
+                    .get_block_header(id)
+                    .await?
                     .ok_or_else(|| anyhow!("Tip block {id} not found"))?
                     .try_into()?;
                 (id.clone(), header.height)
@@ -233,40 +243,11 @@ impl BenchContext {
                     bail!("Requested tip height {h} is beyond node tip {node_tip_height}");
                 }
                 // Walk back from node tip to find the canonical block at height h
-                let mut curr = node_tip_id.clone();
-                let mut curr_h = node_tip_height;
-
-                // Check cache to jump closer if we know an ancestor
-                if let Some(c) = &mut cache {
-                    if let Ok(Some((cached_id, cached_h))) =
-                        c.find_closest_ancestor(&node_tip_id, h).await
-                    {
-                        if cached_h < curr_h && cached_h >= h {
-                            println!(
-                                "  [Cache Hit] Jumping from height {curr_h} to {cached_h} ({cached_id})"
-                            );
-                            curr = cached_id;
-                            curr_h = cached_h;
-                        }
-                    }
-                }
-
-                while curr_h > h {
-                    let header: StacksBlockHeader = chainstate_db
-                        .get_block_header(&curr)?
-                        .ok_or_else(|| anyhow!("Missing header for {curr}"))?
-                        .try_into()?;
-                    curr = header.parent_id;
-                    curr_h = header.height.saturating_sub(1);
-
-                    // Populate cache periodically
-                    if curr_h % 10_000 == 0 {
-                        if let Some(c) = &mut cache {
-                            let _ = c.cache_ancestor(&node_tip_id, curr_h, &curr).await;
-                        }
-                    }
-                }
-                (curr, h)
+                let mut stream = BackwardsBlockStream::new(chainstate_db, node_tip_id.clone())
+                    .with_cache(&mut app_db);
+                let header = stream.seek_to_height(h, &node_tip_id).await?;
+                chainstate_db = stream.into_inner();
+                (header.id, header.height)
             }
             None => (node_tip_id, node_tip_height),
         };
@@ -276,7 +257,8 @@ impl BenchContext {
             Some(StacksBlockRef::Height(h)) => *h,
             Some(StacksBlockRef::Id(id)) => {
                 let header: StacksBlockHeader = chainstate_db
-                    .get_block_header(id)?
+                    .get_block_header(id)
+                    .await?
                     .ok_or_else(|| anyhow!("Start block {id} not found"))?
                     .try_into()?;
                 header.height
@@ -301,7 +283,8 @@ impl BenchContext {
         let (end_id, end_height) = match target_end_ref {
             Some(StacksBlockRef::Id(id)) => {
                 let header: StacksBlockHeader = chainstate_db
-                    .get_block_header(&id)?
+                    .get_block_header(&id)
+                    .await?
                     .ok_or_else(|| anyhow!("Block {id} not found"))?
                     .try_into()?;
                 (id.clone(), header.height)
@@ -319,53 +302,10 @@ impl BenchContext {
                         "Resolving canonical block at height {h} (walking back from {anchor_height})"
                     );
 
-                    let mut curr = anchor_id.clone();
-                    let mut curr_h = anchor_height;
-
-                    // Check cache to jump closer if we know an ancestor
-                    if let Some(c) = &mut cache {
-                        if let Ok(Some((cached_id, cached_h))) =
-                            c.find_closest_ancestor(&anchor_id, h).await
-                        {
-                            if cached_h < curr_h && cached_h >= h {
-                                println!(
-                                    "  [Cache Hit] Jumping from height {curr_h} to {cached_h} ({cached_id})"
-                                );
-                                curr = cached_id;
-                                curr_h = cached_h;
-                            }
-                        }
-                    }
-
-                    while curr_h > h {
-                        // Fetch header for the current block
-                        let header: StacksBlockHeader = chainstate_db
-                            .get_block_header(&curr)?
-                            .ok_or_else(|| anyhow!("Missing header for {curr}"))?
-                            .try_into()?;
-
-                        // Move to the parent block
-                        curr = header.parent_id;
-
-                        // Update height (parent is always current - 1)
-                        curr_h = header.height.saturating_sub(1);
-
-                        // Populate cache periodically
-                        if curr_h % 10_000 == 0 {
-                            if let Some(c) = &mut cache {
-                                let _ = c.cache_ancestor(&anchor_id, curr_h, &curr).await;
-                                eprint!("."); // Progress/activity indicator
-                            }
-                        }
-                    }
-                    println!();
-
-                    // Cache the final result too
-                    if let Some(c) = &mut cache {
-                        let _ = c.cache_ancestor(&anchor_id, curr_h, &curr).await;
-                    }
-
-                    (curr, h)
+                    let mut stream = BackwardsBlockStream::new(chainstate_db, anchor_id.clone())
+                        .with_cache(&mut app_db);
+                    let header = stream.seek_to_height(h, &anchor_id).await?;
+                    (header.id, header.height)
                 }
             }
             None => (anchor_id.clone(), anchor_height),
@@ -387,6 +327,8 @@ impl BenchContext {
             network: opts.network,
             last_storage_delta: 0,
             chainstate_dir,
+            burnchain_dir,
+            app_db,
         })
     }
 
@@ -399,61 +341,51 @@ impl BenchContext {
     /// Returns an iterator over canonical blocks in the range [start_height, end_height].
     /// The iterator yields blocks in descending order (from end_height down to start_height).
     /// This is efficient because it follows parent links from the tip.
-    pub fn canonical_block_stream(
-        &self,
+    pub async fn canonical_block_stream(
+        &mut self,
         start_height: u32,
         end_height: u32,
-    ) -> impl Iterator<Item = Result<StacksBlockHeader>> + '_ {
+    ) -> impl Stream<Item = Result<StacksBlockHeader>> + '_ {
         let start_height = start_height as u64;
         let end_height = end_height as u64;
 
-        let mut current_id = self.tip_id.clone();
+        let current_id = self.tip_id.clone();
 
         // Open a local handle to the ChainStateDb.
         // We expect this to succeed since the node is running/initialized.
-        // Note: We use expect() here because we can't easily return a Result from the iterator setup,
-        // and a failure here implies a critical environment issue.
-        let mut chainstate_db = ChainStateDb::open_for_read(self.chainstate_dir.index_db_path())
-            .expect("Failed to open chainstate DB for reading");
+        let chainstate_db_res =
+            ChainStateDb::open_for_read(self.chainstate_dir.index_db_path()).await;
 
-        std::iter::from_fn(move || {
-            loop {
-                // 1. Get Header via the unified query
-                let header_res = chainstate_db.get_block_header(&current_id);
-
-                let header = match header_res {
-                    Ok(Some(h)) => h,
-                    Ok(None) => return Some(Err(anyhow!("Missing header for {current_id}"))),
-                    Err(e) => return Some(Err(anyhow!("DB error: {e}"))),
-                };
-
-                // 2. Convert to StacksBlockHeader
-                // This uses the TryInto impl in models.rs which populates:
-                // id, hash, parent_id, height, burn_block_hash, burn_block_height
-                let stacks_header: StacksBlockHeader = match header.try_into() {
-                    Ok(h) => h,
-                    Err(e) => return Some(Err(anyhow!("Conversion error: {e}"))),
-                };
-
-                let current_height = stacks_header.height;
-
-                if current_height < start_height {
-                    return None;
-                }
-
-                // Prepare next ID
-                let parent_id = stacks_header.parent_id.clone();
-                let should_yield = current_height <= end_height;
-
-                current_id = parent_id;
-
-                if should_yield {
-                    return Some(Ok(stacks_header));
-                }
-
-                // If not yielding (because we are above end_height), loop continues to walk back
+        match chainstate_db_res {
+            Ok(chainstate_db) => {
+                let stream = BackwardsBlockStream::new(chainstate_db, current_id)
+                    .with_cache(&mut self.app_db);
+                futures::stream::unfold(stream, move |mut bs| async move {
+                    loop {
+                        match bs.next_block().await {
+                            Ok(Some(header)) => {
+                                if header.height < start_height {
+                                    return None;
+                                }
+                                if header.height <= end_height {
+                                    return Some((Ok(header), bs));
+                                }
+                                // If not yielding (because we are above end_height), loop continues to walk back
+                            }
+                            Ok(None) => return Some((Err(anyhow!("Missing header")), bs)),
+                            Err(e) => return Some((Err(e), bs)),
+                        }
+                    }
+                })
+                .boxed()
             }
-        })
+            Err(e) => {
+                futures::stream::once(
+                    async move { Err(anyhow!("Failed to open chainstate DB: {e}")) },
+                )
+                .boxed()
+            }
+        }
     }
 }
 

@@ -83,6 +83,7 @@ impl ResolveEpochFromHeight for [Epoch] {
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
 #[diesel(table_name = stacks_tx_type)]
+#[diesel(treat_none_as_null = true)]
 pub struct StacksTxType {
     pub id: i32,
     pub name: String,
@@ -90,12 +91,14 @@ pub struct StacksTxType {
 
 #[derive(Insertable, Debug, Clone)]
 #[diesel(table_name = _staged_stacks_tx_type)]
+#[diesel(treat_none_as_null = true)]
 pub struct StagedStacksTxType {
     pub name: String,
 }
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
 #[diesel(table_name = principal)]
+#[diesel(treat_none_as_null = true)]
 pub struct Principal {
     pub id: i32,
     pub address: String,
@@ -103,6 +106,7 @@ pub struct Principal {
 
 #[derive(Insertable, Debug, Clone)]
 #[diesel(table_name = _staged_principal)]
+#[diesel(treat_none_as_null = true)]
 pub struct StagedPrincipal {
     pub address: String,
 }
@@ -110,6 +114,7 @@ pub struct StagedPrincipal {
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(Principal, foreign_key = issuer_principal_id))]
 #[diesel(table_name = contract)]
+#[diesel(treat_none_as_null = true)]
 pub struct Contract {
     pub id: i32,
     pub issuer_principal_id: i32,
@@ -118,6 +123,7 @@ pub struct Contract {
 
 #[derive(Insertable, Debug, Clone)]
 #[diesel(table_name = _staged_contract)]
+#[diesel(treat_none_as_null = true)]
 pub struct StagedContract {
     pub issuer_address: String,
     pub name: String,
@@ -135,6 +141,7 @@ pub struct BurnBlock {
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(BurnBlock))]
 #[diesel(table_name = stacks_block)]
+#[diesel(treat_none_as_null = true)]
 pub struct StacksBlock {
     pub id: i64,
     pub index_hash: Vec<u8>,
@@ -183,6 +190,7 @@ impl TryFrom<(StacksBlock, BurnBlock, Option<Vec<u8>>)> for crate::StacksBlockHe
 
 #[derive(Insertable, Debug, Clone)]
 #[diesel(table_name = _staged_stacks_block)]
+#[diesel(treat_none_as_null = true)]
 pub struct StagedStacksBlock {
     pub index_hash: Vec<u8>,
     pub block_hash: Vec<u8>,
@@ -195,6 +203,7 @@ pub struct StagedStacksBlock {
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(StacksBlock))]
 #[diesel(table_name = stacks_tx)]
+#[diesel(treat_none_as_null = true)]
 pub struct StacksTx {
     pub id: i64,
     pub stacks_block_id: i64,
@@ -207,6 +216,7 @@ pub struct StacksTx {
 
 #[derive(Insertable, Debug, Clone)]
 #[diesel(table_name = _staged_stacks_tx)]
+#[diesel(treat_none_as_null = true)]
 pub struct StagedStacksTx {
     pub block_index_hash: Vec<u8>,
     pub tx_hash: Vec<u8>,
@@ -221,6 +231,7 @@ pub struct StagedStacksTx {
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(Chainstate))]
 #[diesel(table_name = benchmark_run)]
+#[diesel(treat_none_as_null = true)]
 pub struct BenchmarkRun {
     pub id: i32,
     pub run_name: Option<String>,
@@ -279,6 +290,7 @@ pub struct ProfilerLocation {
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
 #[diesel(table_name = profiler_span)]
+#[diesel(treat_none_as_null = true)]
 pub struct ProfilerSpan {
     pub id: i32,
     pub context: Option<String>,
@@ -293,6 +305,7 @@ pub struct ProfilerSpan {
 #[diesel(belongs_to(StacksTx))]
 #[diesel(belongs_to(ProfilerRecord, foreign_key = parent_id))]
 #[diesel(table_name = profiler_record)]
+#[diesel(treat_none_as_null = true)]
 pub struct ProfilerRecord {
     pub id: i32,
     pub benchmark_run_id: i32,

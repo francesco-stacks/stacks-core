@@ -319,8 +319,8 @@ async fn setup_bench_context<T: IndexerArgs>(
     let chainstate_path = ChainStateDir::from_node_root(args.source_dir());
     let burnchain_path = BurnChainDir::from_node_root(args.source_dir());
 
-    let mut chainstate_db = ChainStateDb::open_for_read(chainstate_path.index_db_path())?;
-    let db_config = chainstate_db.read_db_config()?;
+    let chainstate_db = ChainStateDb::open_for_read(chainstate_path.index_db_path()).await?;
+    let db_config = chainstate_db.read_db_config().await?;
 
     let network = if let Some(n) = args.network() {
         db_config.assert_matches_network(n)?;
@@ -335,8 +335,8 @@ async fn setup_bench_context<T: IndexerArgs>(
 
     let chain_id = db_config.chain_id();
 
-    let mut sortition_db = SortitionDb::open_for_read(burnchain_path.sortition_db_path())?;
-    let epochs = sortition_db.get_epochs()?;
+    let mut sortition_db = SortitionDb::open_for_read(burnchain_path.sortition_db_path()).await?;
+    let epochs = sortition_db.get_epochs().await?;
     let epochs_str = epochs
         .iter()
         .map(|e| {
@@ -358,24 +358,24 @@ async fn setup_bench_context<T: IndexerArgs>(
     );
 
     let context_opts = BenchContextOpts::new(args.source_dir().into(), network, chain_id, &epochs)?
-        .with_maybe_start_block(args.start_at().cloned())
-        .with_maybe_end_block(args.end_at().cloned())
-        .with_maybe_block_count(args.block_count())
+        .with_start_block(args.start_at().cloned())
+        .with_end_block(args.end_at().cloned())
+        .with_block_count(args.block_count())
         .with_maybe_tip(args.tip().cloned());
 
-    let bench_context = BenchContext::initialize(context_opts, Some(app_db)).await?;
+    let bench_context = BenchContext::initialize(app_db.clone(), context_opts).await?;
 
     Ok((bench_context, network, chain_id, epochs))
 }
 
 async fn run_chainstate_index(app_data: &AppDataDir, args: IndexArgs) -> Result<()> {
     let app_db_path = app_data.app_db_path();
-    let mut app_db = AppDb::open(&app_db_path)?;
+    let mut app_db = AppDb::open(&app_db_path).await?;
 
-    let (bench_context, network, chain_id, epochs) =
+    let (mut bench_context, network, chain_id, epochs) =
         setup_bench_context(&mut app_db, &args).await?;
 
-    let mut indexer = ChainstateIndexer::new(&mut app_db, &bench_context);
+    let mut indexer = ChainstateIndexer::new(&mut app_db, &mut bench_context);
     indexer.index_chainstate(network, chain_id, &epochs).await?;
 
     println!("Indexing complete");
@@ -390,7 +390,7 @@ async fn run_chainstate_index(app_data: &AppDataDir, args: IndexArgs) -> Result<
 
 async fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
     let app_db_path = app_data.app_db_path();
-    let mut app_db = AppDb::open(&app_db_path)?;
+    let mut app_db = AppDb::open(&app_db_path).await?;
 
     let (mut bench_context, network, chain_id, epochs) =
         setup_bench_context(&mut app_db, &args).await?;
@@ -405,7 +405,7 @@ async fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
         )
         .await?;
 
-    let block_ids = ChainstateIndexer::new(&mut app_db, &bench_context)
+    let block_ids = ChainstateIndexer::new(&mut app_db, &mut bench_context)
         .index_chainstate(network, chain_id, &epochs)
         .await?;
 
@@ -499,7 +499,7 @@ async fn run_bench(app_data: &AppDataDir, args: BenchArgs) -> Result<()> {
                 .await?;
         }
 
-        if !calibrated {
+        if !calibrated && !is_warmup {
             metrics_buffer.push(metrics);
 
             let buffer_len = metrics_buffer.len();

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use blockstack_lib::chainstate::stacks::StacksTransaction;
+use futures::StreamExt;
 use stacks_common::types::chainstate::StacksBlockId;
 use tokio::sync::mpsc;
 use tokio::task;
@@ -38,7 +39,7 @@ impl IndexerMetrics {
 
 pub struct ChainstateIndexer<'a> {
     app_db: &'a mut AppDb,
-    context: &'a BenchContext,
+    context: &'a mut BenchContext,
     batch_size: usize,
     merge_threshold: usize,
     channel_buffer_size: usize,
@@ -49,7 +50,7 @@ impl<'a> ChainstateIndexer<'a> {
     pub const DEFAULT_MERGE_THRESHOLD: usize = 100_000;
     pub const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 5_000;
 
-    pub fn new(app_db: &'a mut AppDb, context: &'a BenchContext) -> Self {
+    pub fn new(app_db: &'a mut AppDb, context: &'a mut BenchContext) -> Self {
         Self {
             app_db,
             context,
@@ -121,14 +122,10 @@ impl<'a> ChainstateIndexer<'a> {
         let (tx_sender, tx_receiver) =
             mpsc::channel::<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>(100);
 
-        // Split borrows to allow concurrent access
-        let app_db = &mut *self.app_db;
-        let context = &*self.context;
-
         let metrics = Arc::new(IndexerMetrics::default());
 
         let loader_task = Self::run_loader(
-            context,
+            &mut self.context,
             start_height,
             end_height,
             self.channel_buffer_size,
@@ -137,7 +134,7 @@ impl<'a> ChainstateIndexer<'a> {
         );
 
         let writer_task = Self::run_writer(
-            app_db,
+            &mut self.app_db,
             tx_receiver,
             self.batch_size,
             self.merge_threshold,
@@ -158,7 +155,7 @@ impl<'a> ChainstateIndexer<'a> {
     }
 
     async fn run_loader(
-        context: &BenchContext,
+        context: &mut BenchContext,
         start_height: u64,
         end_height: u64,
         channel_buffer_size: usize,
@@ -169,9 +166,10 @@ impl<'a> ChainstateIndexer<'a> {
         let chainstate_dir = context.chainstate_dir();
         let blocks_dir = chainstate_dir.blocks_dir();
 
-        let min_naka_height = context
-            .open_nakamoto_db_for_read()?
-            .get_min_block_height()?
+        let nakamoto_db = context.open_nakamoto_db_for_read().await?;
+        let min_naka_height = nakamoto_db
+            .get_min_block_height()
+            .await?
             .unwrap_or(u64::MAX);
         println!("Nakamoto blocks DB first block height: {min_naka_height:?}");
 
@@ -182,14 +180,11 @@ impl<'a> ChainstateIndexer<'a> {
 
         let worker_count = available_parallelism * 2;
 
-        // Create a synchronous channel to distribute work to the blocking
-        // workers. We use tokio::sync::mpsc for the channel so the sender can
-        // await.
+        // Create a channel to distribute work to the workers.
         let (work_tx, work_rx) = mpsc::channel::<StacksBlockHeader>(channel_buffer_size);
 
-        // Wrap the receiver in a mutex to share it among blocking workers. We
-        // use std::sync::Mutex because workers cannot .await a tokio Mutex.
-        let work_rx = Arc::new(std::sync::Mutex::new(work_rx));
+        // Wrap the receiver in a tokio Mutex to share it among async workers.
+        let work_rx = Arc::new(tokio::sync::Mutex::new(work_rx));
 
         let mut handles = Vec::new();
 
@@ -200,23 +195,22 @@ impl<'a> ChainstateIndexer<'a> {
             let b_dir = blocks_dir.clone();
             let metrics = metrics.clone();
             // One read-only instance of the naka db per worker
-            let mut naka_db = context.open_nakamoto_db_for_read()?;
+            let mut naka_db = nakamoto_db.clone();
 
-            handles.push(task::spawn_blocking(move || -> Result<()> {
+            handles.push(tokio::spawn(async move {
                 loop {
                     // Fetch next job
                     let header = {
                         // Lock the shared receiver
-                        let mut locked_rx = rx.lock().unwrap();
-                        // Use blocking_recv() since we are in a blocking thread
-                        match locked_rx.blocking_recv() {
+                        let mut locked_rx = rx.lock().await;
+                        match locked_rx.recv().await {
                             Some(h) => h,
                             None => break, // Channel closed, work finished
                         }
                     };
 
                     let mut loader = StacksBlockLoader::new(&b_dir, &mut naka_db, min_naka_height);
-                    let load_res = loader.load_block(&header).with_context(|| {
+                    let load_res = loader.load_block(&header).await.with_context(|| {
                         format!("Failed to load transactions for block {}", header.height)
                     });
 
@@ -224,7 +218,8 @@ impl<'a> ChainstateIndexer<'a> {
                         Ok(block) => {
                             metrics.record_loaded_block(header.height, block.transactions().len());
                             if tx
-                                .blocking_send(Ok((header, block.into_transactions_vec())))
+                                .send(Ok((header, block.into_transactions_vec())))
+                                .await
                                 .is_err()
                             {
                                 break; // Receiver dropped
@@ -232,17 +227,20 @@ impl<'a> ChainstateIndexer<'a> {
                         }
                         Err(e) => {
                             // Send the error to the writer/main thread so it can abort gracefully
-                            let _ = tx.blocking_send(Err(e));
+                            let _ = tx.send(Err(e)).await;
                             break; // Worker exits after reporting error
                         }
                     }
                 }
-                Ok(())
+                Ok::<(), anyhow::Error>(())
             }));
         }
 
         // Feed the workers from the main stream
-        for block_res in context.canonical_block_stream(start_height as u32, end_height as u32) {
+        let mut stream = context
+            .canonical_block_stream(start_height as u32, end_height as u32)
+            .await;
+        while let Some(block_res) = stream.next().await {
             // If the writer has stopped (e.g. due to error), stop spawning new tasks immediately.
             if tx_sender.is_closed() {
                 break;
