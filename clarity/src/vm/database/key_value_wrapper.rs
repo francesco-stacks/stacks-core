@@ -240,6 +240,7 @@ impl<'a> RollbackWrapper<'a> {
     // Rollback the child's edits.
     //   this clears all edits from the child's edit queue,
     //     and removes any of those edits from the lookup map.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn rollback(&mut self) -> Result<(), InterpreterError> {
         let mut last_item = self.stack.pop().ok_or_else(|| {
             InterpreterError::Expect("ERROR: Clarity VM attempted to commit past the stack.".into())
@@ -263,6 +264,7 @@ impl<'a> RollbackWrapper<'a> {
         self.stack.len()
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn commit(&mut self) -> Result<(), InterpreterError> {
         let mut last_item = self.stack.pop().ok_or_else(|| {
             InterpreterError::Expect("ERROR: Clarity VM attempted to commit past the stack.".into())
@@ -320,6 +322,7 @@ fn inner_put_data<T>(
 }
 
 impl RollbackWrapper<'_> {
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn put_data(&mut self, key: &str, value: &str) -> InterpreterResult<()> {
         let current = self.stack.last_mut().ok_or_else(|| {
             InterpreterError::Expect(
@@ -357,6 +360,7 @@ impl RollbackWrapper<'_> {
 
     /// this function will only return commitment proofs for values _already_ materialized
     ///  in the underlying store. otherwise it returns None.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_data_with_proof<T>(&mut self, key: &str) -> InterpreterResult<Option<(T, Vec<u8>)>>
     where
         T: ClarityDeserializable<T>,
@@ -369,6 +373,7 @@ impl RollbackWrapper<'_> {
 
     /// this function will only return commitment proofs for values _already_ materialized
     ///  in the underlying store. otherwise it returns None.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_data_with_proof_by_hash<T>(
         &mut self,
         hash: &TrieHash,
@@ -382,6 +387,7 @@ impl RollbackWrapper<'_> {
             .transpose()
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_data<T>(&mut self, key: &str) -> InterpreterResult<Option<T>>
     where
         T: ClarityDeserializable<T>,
@@ -412,6 +418,7 @@ impl RollbackWrapper<'_> {
     ///
     /// This should never be called from within the Clarity VM, or via block-processing.  It's only
     /// meant to be used by the RPC system.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_data_by_hash<T>(&mut self, hash: &TrieHash) -> InterpreterResult<Option<T>>
     where
         T: ClarityDeserializable<T>,
@@ -439,6 +446,7 @@ impl RollbackWrapper<'_> {
 
     /// Get a Clarity value from the underlying Clarity KV store.
     /// Returns Some if found, with the Clarity Value and the serialized byte length of the value.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_value(
         &mut self,
         key: &str,
@@ -475,6 +483,7 @@ impl RollbackWrapper<'_> {
         self.store.get_block_at_height(block_height)
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_contract_hash(
         &mut self,
         contract: &QualifiedContractIdentifier,
@@ -488,6 +497,7 @@ impl RollbackWrapper<'_> {
         Ok(Some(cc.hash))
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn prepare_for_contract_metadata(
         &mut self,
         contract: &QualifiedContractIdentifier,
@@ -498,6 +508,7 @@ impl RollbackWrapper<'_> {
         self.put_data(&key, &value)
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn insert_metadata(
         &mut self,
         contract: &QualifiedContractIdentifier,
@@ -523,6 +534,7 @@ impl RollbackWrapper<'_> {
 
     // Throws a NoSuchContract error if contract doesn't exist,
     //   returns None if there is no such metadata field.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_metadata(
         &mut self,
         contract: &QualifiedContractIdentifier,
@@ -553,6 +565,7 @@ impl RollbackWrapper<'_> {
 
     // Throws a NoSuchContract error if contract doesn't exist,
     //   returns None if there is no such metadata field.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_metadata_manual(
         &mut self,
         at_height: u32,
@@ -582,6 +595,7 @@ impl RollbackWrapper<'_> {
         }
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn has_entry(&mut self, key: &str) -> InterpreterResult<bool> {
         self.stack.last().ok_or_else(|| {
             InterpreterError::Expect(
@@ -595,6 +609,7 @@ impl RollbackWrapper<'_> {
         }
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn has_metadata_entry(
         &mut self,
         contract: &QualifiedContractIdentifier,

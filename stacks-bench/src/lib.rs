@@ -23,7 +23,6 @@ pub mod db;
 pub mod indexer;
 pub mod metrics;
 pub mod paths;
-pub mod profiler;
 pub mod replay;
 pub mod shadow;
 

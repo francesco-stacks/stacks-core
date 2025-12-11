@@ -59,6 +59,7 @@ sha2 = { version = "0.10.9", default-features = false }
 bollard = { version = "0.19.4", default-features = false, features = ["http", "pipe"] }
 tokio = { version = "1.48.0", default-features = false, features = ["signal", "macros", "rt-multi-thread", "rt"] }
 futures = { version = "0.3.31", default-features = false }
+criterion = { version = "0.8.1", default-features = false, features = ["html_reports"] }
 
 
 # Use a bit more than default optimization for

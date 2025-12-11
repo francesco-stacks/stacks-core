@@ -550,7 +550,6 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
         self.marf.sqlite_conn()
     }
 
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn get_cc_special_cases_handler(&self) -> Option<SpecialCaseHandler> {
         Some(&handle_contract_call_special_cases)
     }
@@ -632,7 +631,6 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
             .map(|x| StacksBlockId(x.to_bytes()))
     }
 
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn get_open_chain_tip(&mut self) -> StacksBlockId {
         StacksBlockId(
             self.marf
@@ -643,7 +641,6 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
         )
     }
 
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn get_open_chain_tip_height(&mut self) -> u32 {
         self.marf
             .get_open_chain_tip_height()

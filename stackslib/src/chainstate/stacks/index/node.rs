@@ -609,11 +609,13 @@ impl fmt::Debug for TrieLeaf {
 }
 
 impl StacksMessageCodec for TrieLeaf {
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         self.path.consensus_serialize(fd)?;
         self.data.consensus_serialize(fd)
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<TrieLeaf, codec_error> {
         let path = read_next(fd)?;
         let data = read_next(fd)?;
@@ -824,6 +826,7 @@ impl TrieNode for TrieNode4 {
         None
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode4, Error> {
         let mut ptrs_slice = [TriePtr::default(); 4];
         ptrs_from_bytes(TrieNodeID::Node4 as u8, r, &mut ptrs_slice)?;
@@ -893,6 +896,7 @@ impl TrieNode for TrieNode16 {
         None
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode16, Error> {
         let mut ptrs_slice = [TriePtr::default(); 16];
         ptrs_from_bytes(TrieNodeID::Node16 as u8, r, &mut ptrs_slice)?;
@@ -967,6 +971,7 @@ impl TrieNode for TrieNode48 {
         Some(*ptr)
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
         w.write_all(&[self.id()])?;
         write_ptrs_to_bytes(self.ptrs(), w)?;
@@ -983,6 +988,7 @@ impl TrieNode for TrieNode48 {
     }
 
     #[allow(clippy::indexing_slicing)]
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode48, Error> {
         let mut ptrs_slice = [TriePtr::default(); 48];
         ptrs_from_bytes(TrieNodeID::Node48 as u8, r, &mut ptrs_slice)?;
@@ -1099,6 +1105,7 @@ impl TrieNode for TrieNode256 {
         Some(*ptr)
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode256, Error> {
         let mut ptrs_slice = [TriePtr::default(); 256];
         ptrs_from_bytes(TrieNodeID::Node256 as u8, r, &mut ptrs_slice)?;
@@ -1158,6 +1165,7 @@ impl TrieNode for TrieLeaf {
         None
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
         w.write_all(&[self.id()])?;
         write_path_to_bytes(&self.path, w)?;
@@ -1169,6 +1177,7 @@ impl TrieNode for TrieLeaf {
         1 + get_path_byte_len(&self.path) + self.data.len()
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn from_bytes<R: Read>(r: &mut R) -> Result<TrieLeaf, Error> {
         let mut idbuf = [0u8; 1];
         let l_idbuf = r.read(&mut idbuf).map_err(Error::IOError)?;

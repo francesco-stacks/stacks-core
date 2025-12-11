@@ -76,7 +76,7 @@ impl BenchContextOpts {
         self
     }
 
-    pub fn with_maybe_tip<T: Into<Option<StacksBlockRef>>>(mut self, tip: T) -> Self {
+    pub fn with_tip<T: Into<Option<StacksBlockRef>>>(mut self, tip: T) -> Self {
         self.tip = tip.into();
         self
     }
