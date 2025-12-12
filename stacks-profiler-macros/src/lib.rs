@@ -17,9 +17,15 @@ use syn::token::Comma;
 use syn::{ItemFn, Meta, parse_macro_input};
 
 #[derive(Debug, FromMeta)]
-struct ProfileArgs {
+struct ProfileArgs<Name, SampleRate>
+where
+    Name: Into<Option<String>> + Default,
+    SampleRate: Into<Option<usize>> + Default,
+{
     #[darling(default)]
-    name: Option<String>,
+    name: Name,
+    #[darling(default)]
+    sample_rate: SampleRate,
 }
 
 /// Instruments a function to be tracked by the global `Profiler`.
@@ -76,7 +82,6 @@ pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     // Generate the span setup statement.
-    // FIX: We define `struct __StacksProfilerScope` *before* the `get_or_init` call.
     let setup_block = match args.name {
         Some(custom_name) => {
             quote! {
@@ -110,10 +115,56 @@ pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
+    // Generate the guard creation logic, choosing the most efficient sampling method
+    // based on the provided sampling rate (if any).
+    let guard_creation = if let Some(rate) = args.sample_rate {
+        // If the rate is <= 1 then we treat it as 100% = always sample.
+        if rate <= 1 {
+            quote! {
+                let __profiler_guard = Some(stacks_profiler::Profiler::begin_span(__profiler_span_id, None));
+            }
+        // If the rate is a power of two, we can use a bitmask for faster modulo (fastest).
+        } else if rate.is_power_of_two() {
+            let mask = rate - 1;
+            quote! {
+                static __PROFILER_SAMPLE_COUNTER: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+
+                let __n = __PROFILER_SAMPLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let __should_sample = (__n & #mask) == 0;
+
+                let __profiler_guard = if __should_sample {
+                    Some(stacks_profiler::Profiler::begin_span(__profiler_span_id, None))
+                } else {
+                    None
+                };
+            }
+        // Otherwise, use regular modulo (slightly slower).
+        } else {
+            quote! {
+                static __PROFILER_SAMPLE_COUNTER: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+
+                let __n = __PROFILER_SAMPLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let __should_sample = (__n % #rate) == 0;
+
+                let __profiler_guard = if __should_sample {
+                    Some(stacks_profiler::Profiler::begin_span(__profiler_span_id, None))
+                } else {
+                    None
+                };
+            }
+        }
+    } else {
+        quote! {
+            let __profiler_guard = Some(stacks_profiler::Profiler::begin_span(__profiler_span_id, None));
+        }
+    };
+
     let output = quote! {
         #vis #sig {
             let __profiler_span_id = #setup_block;
-            let __profiler_guard = stacks_profiler::Profiler::begin_span(__profiler_span_id, None);
+            #guard_creation
             #block
         }
     };

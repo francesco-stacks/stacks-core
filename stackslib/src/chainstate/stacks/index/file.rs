@@ -499,7 +499,7 @@ impl Write for TrieFile {
 
 /// Boilerplate Read implementation for TrieFileDisk.  Plumbs through to the inner fd.
 impl Read for TrieFileDisk {
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile(sample_rate = 1000))]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.fd.read(buf)
     }

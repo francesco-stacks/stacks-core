@@ -1,7 +1,7 @@
 use std::time::Duration;
 use std::{panic, thread};
 
-use stacks_profiler::{Profiler, profile};
+use stacks_profiler::{Profiler, profile, span};
 
 /// Helper to ensure we start with a clean state in tests
 fn clear_profiler() {
@@ -169,4 +169,33 @@ fn test_zero_time_safety() {
         "Count should reflect the loop iterations"
     );
     assert_eq!(results[0].id.name, "Fast");
+}
+
+#[test]
+fn test_sampling_rate_accuracy() {
+    Profiler::clear();
+
+    let iterations = 100_000;
+    let rate = 10;
+
+    // Run loop
+    for _ in 0..iterations {
+        // This macro expansion site has its own unique static counter
+        let _guard = span!("test_sampling", rate: 10);
+    }
+
+    // Get stats
+    let stats = Profiler::take_results();
+
+    // Find our span
+    let root = stats
+        .iter()
+        .find(|s| s.id.name == "test_sampling")
+        .expect("Span not found");
+
+    // We expect exactly iterations / rate because the counter is deterministic
+    // and starts at 0 for this specific macro expansion site.
+    let expected = iterations / rate;
+    let actual = root.count;
+    assert_eq!(actual, expected, "Sampling count mismatch");
 }

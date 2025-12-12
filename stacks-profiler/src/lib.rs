@@ -10,21 +10,7 @@ use std::time::{Duration, Instant};
 // Re-export the profiling procedural macro
 pub use stacks_profiler_macros::profile;
 
-struct Style;
-
-#[allow(unused)]
-impl Style {
-    const RESET: &str = "\x1b[0m";
-    const BOLD: &str = "\x1b[1m";
-    const GRAY: &str = "\x1b[90m";
-    const RED: &str = "\x1b[31m";
-    const DIM: &str = "\x1b[2m";
-    const GREEN: &str = "\x1b[32m";
-    const YELLOW: &str = "\x1b[33m";
-    const CYAN: &str = "\x1b[36m";
-    const BLUE: &str = "\x1b[34m";
-    const WHITE: &str = "\x1b[37m";
-}
+pub mod print;
 
 // ==============================================================
 // Platform Specific CPU Timer
@@ -62,47 +48,36 @@ pub enum Tag {
     Str(&'static str),
 }
 
-impl std::fmt::Display for Tag {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Tag::U64(v) => write!(f, "{}", v),
-            Tag::I64(v) => write!(f, "{}", v),
-            Tag::Usize(v) => write!(f, "{}", v),
-            Tag::Str(v) => write!(f, "{}", v),
-        }
-    }
-}
-
 impl From<u64> for Tag {
-    #[inline]
+    #[inline(always)]
     fn from(v: u64) -> Self {
         Tag::U64(v)
     }
 }
 
 impl From<i64> for Tag {
-    #[inline]
+    #[inline(always)]
     fn from(v: i64) -> Self {
         Tag::I64(v)
     }
 }
 
 impl From<u32> for Tag {
-    #[inline]
+    #[inline(always)]
     fn from(v: u32) -> Self {
         Tag::U64(v as u64)
     }
 }
 
 impl From<i32> for Tag {
-    #[inline]
+    #[inline(always)]
     fn from(v: i32) -> Self {
         Tag::I64(v as i64)
     }
 }
 
 impl From<usize> for Tag {
-    #[inline]
+    #[inline(always)]
     fn from(v: usize) -> Self {
         Tag::Usize(v)
     }
@@ -277,117 +252,16 @@ impl ProfileStats {
         None
     }
 
-    // ========================================================================
-    // Printing Logic
-    // ========================================================================
-
-    /// Recursively prints the profiling tree to stdout.
+    /// Recursively prints the profiling tree to stdout using the default PrettyPrinter.
     pub fn print_tree(&self) {
-        // 1. Root Header
-        self.print_node_header("", "", true);
-
-        // 2. Recurse (No footer needed for root in standard tree view)
-        self.print_children_recursive("");
+        crate::print::print_tree(self, &crate::print::PrettyPrinter);
     }
 
-    /// Internal helper to iterate children
-    fn print_children_recursive(&self, prefix: &str) {
-        let len = self.children.len();
-        for (i, child) in self.children.iter().enumerate() {
-            let is_last = i == len - 1;
-
-            // 1. Determine Connector
-            // Last sibling gets "└── ", others get "├── "
-            let connector = if is_last { "└── " } else { "├── " };
-
-            // 2. Print Header
-            child.print_node_header(prefix, connector, false);
-
-            // 3. Determine Prefix for Grandchildren
-            // If this was the last sibling, the vertical spine stops here ("    ").
-            // Otherwise, it continues ("│   ").
-            let child_prefix_segment = if is_last { "    " } else { "│   " };
-            // We build the prefix as Plain Text to avoid color artifacting
-            let child_prefix = format!("{}{}", prefix, child_prefix_segment);
-
-            // 4. Recurse
-            child.print_children_recursive(&child_prefix);
-
-            // 5. No Footer. The "└── " from step 1 visually closed this block.
-        }
-    }
-
-    /// Prints the "Header" line: Connector + Name + File + Metrics
-    fn print_node_header(&self, prefix: &str, connector: &str, is_root: bool) {
-        let reset = Style::RESET;
-        let gray = Style::GRAY;
-        let bold = Style::BOLD;
-        let cyan = Style::CYAN;
-        let dim = Style::DIM;
-        let white = Style::WHITE;
-
-        let name_icon = if is_root { "" } else { "▶" };
-        let name = self.id.name;
-        let file = self.id.file;
-        let line = self.id.line;
-
-        // Format Tag
-        let tag_display = if let Some(t) = self.tag {
-            match t {
-                Tag::U64(v) => format!(" {cyan}#{v}{reset}"),
-                Tag::I64(v) => format!(" {cyan}#{v}{reset}"),
-                Tag::Usize(v) => format!(" {cyan}#{v}{reset}"),
-                Tag::Str(v) => format!(" {cyan}[{v}]{reset}"),
-            }
-        } else {
-            String::new()
-        };
-
-        let metrics = self.format_metrics();
-
-        let source_loc = format!("{reset}{dim}{gray}@ {file}:{line}{reset}");
-
-        if is_root {
-            print!("{bold}{white}{name}{tag_display} {metrics} {source_loc}");
-        } else {
-            print!(
-                "{gray}{prefix}{connector}{reset}{gray}{name_icon}{reset} {bold}{white}{name}{tag_display} {metrics} {source_loc}"
-            );
-        }
-        println!();
-    }
-
-    /// Generates the formatted metrics string
-    fn format_metrics(&self) -> String {
-        let reset = Style::RESET;
-        let gray = Style::GRAY;
-        let red = Style::RED;
-        let cyan = Style::CYAN;
-        let dim = Style::DIM;
-        //let metrics_icon = ""; //∫
-
-        // Use u64 fields
-        let wall_ms = self.wall_time_ns as f64 / 1_000_000.0;
-        let cpu_ms = self.cpu_time_ns as f64 / 1_000_000.0;
-        let wait_ns = self.wait_time_ns();
-        let wait_ms = wait_ns as f64 / 1_000_000.0;
-
-        let wait_color = if wait_ns > self.cpu_time_ns {
-            red
-        } else {
-            gray
-        };
-        let count = self.count;
-
-        format!(
-            "{reset}{dim}[total: {cyan}{wall_ms:.3}ms {reset}{dim}| busy: {cyan}{cpu_ms:.3}ms{reset} {dim}| wait: {reset}{wait_color}{wait_ms:.3}ms{reset}{dim}]{reset} {gray}(x{count}){reset}"
-        )
+    /// Prints the tree using a custom formatter.
+    pub fn print_with<F: crate::print::TreeFormatter>(&self, formatter: &F) {
+        crate::print::print_tree(self, formatter);
     }
 }
-
-// -----------------------------------------------------------------------------
-// OPTIMIZED INTERNAL STATE
-// -----------------------------------------------------------------------------
 
 struct ActiveSpan {
     /// Zero-copy reference to the static ID.
@@ -421,7 +295,7 @@ thread_local! {
 pub struct Profiler;
 
 impl Profiler {
-    #[inline]
+    #[inline(always)]
     #[track_caller]
     pub fn new_span_id(name: &'static str) -> SpanId {
         let loc = Location::caller();
@@ -431,7 +305,7 @@ impl Profiler {
     /// Starts a new profiling span.
     ///
     /// Requires a `&'static SpanId`. Use the `profile_scope!` macro to generate these safely.
-    #[inline]
+    #[inline(always)]
     pub fn begin_span(id: &'static SpanId, tag: Option<Tag>) -> ProfileGuard {
         let start_wall = Instant::now();
         let start_cpu_ns = platform::thread_cpu_nanos();
@@ -540,50 +414,52 @@ impl Drop for ProfileGuard {
 
 #[macro_export]
 macro_rules! measure {
-    // Tagged & Block: measure!("Name", tag_expr, { ... })
+    // Name, Tag, Rate, Block
+    ($name:literal, $tag:expr, rate: $rate:literal, $block:block) => {
+        {
+            let _guard = $crate::span!($name, $tag, rate: $rate);
+            $block
+        }
+    };
+
+    // Name, Rate, Block
+    ($name:literal, rate: $rate:literal, $block:block) => {
+        {
+            let _guard = $crate::span!($name, rate: $rate);
+            $block
+        }
+    };
+
+    // Name, Tag, Block
     ($name:literal, $tag:expr, $block:block) => {
         {
-            static __PROFILER_SPAN_ID: std::sync::OnceLock<$crate::SpanId> = std::sync::OnceLock::new();
-            let __profiler_span_id_ref = __PROFILER_SPAN_ID.get_or_init(|| {
-                $crate::Profiler::new_span_id($name).with_context(module_path!())
-            });
-            let __tag = Into::into($tag);
-            let _guard = $crate::Profiler::begin_span(__profiler_span_id_ref, Some(__tag));
+            let _guard = $crate::span!($name, $tag);
             $block
         }
     };
 
-    // Named Block (No Tag): measure!("Name", { ... })
+    // Name, Block
     ($name:literal, $block:block) => {
         {
-            static __PROFILER_SPAN_ID: std::sync::OnceLock<$crate::SpanId> = std::sync::OnceLock::new();
-            let __profiler_span_id_ref = __PROFILER_SPAN_ID.get_or_init(|| {
-                $crate::Profiler::new_span_id($name).with_context(module_path!())
-            });
-            let _guard = $crate::Profiler::begin_span(__profiler_span_id_ref, None);
+            let _guard = $crate::span!($name);
             $block
         }
     };
 
-    // Trap
+    // Trap (Name, Rate)
+    ($name:literal, rate: $rate:literal) => {
+        let _guard = $crate::span!($name, rate: $rate);
+    };
+
+    // Trap (Name)
     ($name:literal) => {
-        let _guard = {
-            static __PROFILER_SPAN_ID: std::sync::OnceLock<$crate::SpanId> = std::sync::OnceLock::new();
-            let id = __PROFILER_SPAN_ID.get_or_init(|| {
-                $crate::Profiler::new_span_id($name).with_context(module_path!())
-            });
-            $crate::Profiler::begin_span(id, None)
-        };
+        let _guard = $crate::span!($name);
     };
 
     // Anonymous Block
     ($($t:tt)*) => {
         {
-            static __PROFILER_SPAN_ID: std::sync::OnceLock<$crate::SpanId> = std::sync::OnceLock::new();
-            let __profiler_span_id_ref = __PROFILER_SPAN_ID.get_or_init(|| {
-                $crate::Profiler::new_span_id("scope").with_context(module_path!())
-            });
-            let _guard = $crate::Profiler::begin_span(__profiler_span_id_ref, None);
+            let _guard = $crate::span!("scope");
             $($t)*
         }
     };
@@ -591,26 +467,83 @@ macro_rules! measure {
 
 #[macro_export]
 macro_rules! span {
-    // Tagged Guard: span!("Name", tag_expr)
-    ($name:literal, $tag:expr) => {{
+    // Internal helpers
+
+    (@get_id $name:literal) => {{
         static __PROFILER_SPAN_ID: std::sync::OnceLock<$crate::SpanId> = std::sync::OnceLock::new();
-        let id = __PROFILER_SPAN_ID
-            .get_or_init(|| $crate::Profiler::new_span_id($name).with_context(module_path!()));
-        let tag = Into::into($tag);
-        $crate::Profiler::begin_span(id, Some(tag))
+        __PROFILER_SPAN_ID.get_or_init(|| $crate::Profiler::new_span_id($name).with_context(module_path!()))
     }};
 
-    // Standard Guard: span!("Name")
+    (@begin $id:expr, $tag_opt:expr) => {{
+        Some($crate::Profiler::begin_span($id, $tag_opt))
+    }};
+
+    (@should_sample $counter:ident, $rate:literal) => {{
+        const __RATE: usize = $rate;
+        if __RATE <= 1 {
+            true
+        } else {
+            let __n = $counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // Fast-path for power-of-two rates: n % rate == 0 <=> (n & (rate-1)) == 0
+            if __RATE.is_power_of_two() {
+                (__n & (__RATE - 1)) == 0
+            } else {
+                (__n % __RATE) == 0
+            }
+        }
+    }};
+
+    (@sampled $counter:ident, $rate:literal, $sampled_block:block) => {{
+        if $crate::span!(@should_sample $counter, $rate) {
+            $sampled_block
+        } else {
+            None
+        }
+    }};
+
+    // Public forms
+
+    // Name, Tag, Rate
+    ($name:literal, $tag:expr, rate: $rate:literal) => {{
+        static __PROFILER_SAMPLE_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+
+        $crate::span!(@sampled __PROFILER_SAMPLE_COUNTER, $rate, {
+            let __id = $crate::span!(@get_id $name);
+            // Only convert the tag when we actually sample.
+            let __tag: $crate::Tag = ::core::convert::Into::into($tag);
+            $crate::span!(@begin __id, Some(__tag))
+        })
+    }};
+
+    // Name, Rate
+    ($name:literal, rate: $rate:literal) => {{
+        static __PROFILER_SAMPLE_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+
+        $crate::span!(@sampled __PROFILER_SAMPLE_COUNTER, $rate, {
+            let __id = $crate::span!(@get_id $name);
+            $crate::span!(@begin __id, None)
+        })
+    }};
+
+    // Name, Tag
+    ($name:literal, $tag:expr) => {{
+        let __id = $crate::span!(@get_id $name);
+        let __tag: $crate::Tag = ::core::convert::Into::into($tag);
+        $crate::span!(@begin __id, Some(__tag))
+    }};
+
+    // Name
     ($name:literal) => {{
-        static __PROFILER_SPAN_ID: std::sync::OnceLock<$crate::SpanId> = std::sync::OnceLock::new();
-        let id = __PROFILER_SPAN_ID
-            .get_or_init(|| $crate::Profiler::new_span_id($name).with_context(module_path!()));
-        $crate::Profiler::begin_span(id, None)
+        let __id = $crate::span!(@get_id $name);
+        $crate::span!(@begin __id, None)
     }};
 }
 
 /// Trait for analyzing and flattening profiling trees.
-pub trait ProfileAnalyzer {
+pub trait Flatten {
     /// Flattens the hierarchy into a list, aggregating stats by SpanId.
     ///
     /// This transforms a Tree View into a Flat/Bottom-Up View.
@@ -621,7 +554,7 @@ pub trait ProfileAnalyzer {
     fn flatten(&self) -> Vec<ProfileStats>;
 }
 
-impl ProfileAnalyzer for Vec<ProfileStats> {
+impl Flatten for Vec<ProfileStats> {
     fn flatten(&self) -> Vec<ProfileStats> {
         let mut map: HashMap<SpanId, ProfileStats> = HashMap::new();
 
@@ -654,7 +587,7 @@ impl ProfileAnalyzer for Vec<ProfileStats> {
     }
 }
 
-impl ProfileAnalyzer for ProfileStats {
+impl Flatten for ProfileStats {
     fn flatten(&self) -> Vec<ProfileStats> {
         // Treat this single node as a root of a tree and flatten it.
         vec![self.clone()].flatten()

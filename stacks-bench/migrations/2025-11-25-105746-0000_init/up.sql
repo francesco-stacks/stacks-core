@@ -157,7 +157,7 @@ CREATE TABLE _staged_stacks_block (
 CREATE TABLE stacks_tx (
   id INTEGER PRIMARY KEY NOT NULL,
   stacks_block_id INTEGER NOT NULL,
-  tx_hash BLOB NOT NULL UNIQUE,
+  tx_hash BLOB NOT NULL,
   tx_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(tx_hash))) STORED,
   stacks_tx_type_id INTEGER NOT NULL,
   caller_principal_id INTEGER NOT NULL,

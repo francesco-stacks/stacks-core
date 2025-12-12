@@ -1,6 +1,6 @@
 use std::hint::black_box;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
 use stacks_profiler::{Profiler, measure, span};
 
 fn bench_overhead(c: &mut Criterion) {
@@ -39,7 +39,7 @@ fn bench_overhead(c: &mut Criterion) {
         Profiler::clear();
     });
 
-    // 3. Tagged Span Overhead
+    // Tagged Span Overhead
     // Adds the cost of constructing and storing the Tag enum.
     group.bench_function("span_tagged_u64", |b| {
         let id = Box::leak(Box::new(Profiler::new_span_id("bench_tag")));
@@ -57,7 +57,7 @@ fn bench_overhead(c: &mut Criterion) {
         Profiler::clear();
     });
 
-    // 4. Macro Overhead
+    // Macro Overhead
     // Measures the full cost including the OnceLock check inside the macro.
     group.bench_function("macro_span", |b| {
         b.iter(|| {
@@ -67,7 +67,7 @@ fn bench_overhead(c: &mut Criterion) {
         Profiler::clear();
     });
 
-    // 5. Nested Overhead (Depth 3)
+    // Nested Overhead (Depth 3)
     // This tests pushing to stack, popping, and merging into PARENT (not root).
     group.bench_function("nested_depth_3", |b| {
         b.iter(|| {
@@ -82,7 +82,7 @@ fn bench_overhead(c: &mut Criterion) {
         Profiler::clear();
     });
 
-    // 6. Sibling Merge Overhead
+    // Sibling Merge Overhead
     // This tests the "Hot Loop" scenario where we merge into the same sibling repeatedly.
     // This validates the `if last.id == stats.id` optimization in `merge_into_list`.
     group.bench_function("sibling_merge_loop", |b| {
@@ -96,12 +96,65 @@ fn bench_overhead(c: &mut Criterion) {
         Profiler::clear();
     });
 
+    // Sampled Span (10% sampling)
+    // Should be significantly faster than untagged
+    group.bench_function("span_sampled_10", |b| {
+        b.iter(|| {
+            let _guard = span!("sampled_10", rate: 10);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    // Sampled Span (1% sampling)
+    // Should be nearly as fast as baseline
+    group.bench_function("span_sampled_100", |b| {
+        b.iter(|| {
+            let _guard = span!("sampled_100", rate: 100);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    group.finish();
+}
+
+fn bench_10m_sampled_spans(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Profiler 10M sampled spans");
+
+    // Use flat sampling: explicitly tell Criterion to run exactly 10 samples. This overrides the
+    // auto-tuning logic that tries to fit 100 samples into a time window. This works well here
+    // since we're manually running a large number of iterations internally for each sample.
+    group.sample_size(10).sampling_mode(SamplingMode::Flat);
+
+    group.bench_function("10M_calls_sampled_10", |b| {
+        b.iter(|| {
+            let _outer_guard = span!("outer_loop");
+            for _ in 0..10_000_000u32 {
+                let _guard = span!("sampled_10", rate: 10);
+                black_box(());
+            }
+            Profiler::clear();
+        });
+    });
+
+    group.bench_function("10M_calls_sampled_100", |b| {
+        b.iter(|| {
+            let _outer_guard = span!("outer_loop");
+            for _ in 0..10_000_000u32 {
+                let _guard = span!("sampled_100", rate: 100);
+                black_box(());
+            }
+            Profiler::clear();
+        });
+    });
+
     group.finish();
 }
 
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_overhead
+    targets = bench_overhead, bench_10m_sampled_spans
 }
 criterion_main!(benches);
