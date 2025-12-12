@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
 use crate::{ProfileStats, SpanId, Tag};
@@ -12,7 +12,8 @@ struct Node {
 
     wall_time_ns: u64,
     cpu_time_ns: u64,
-    count: usize,
+    total_count: usize,
+    timed_count: usize,
 
     children: Vec<NodeId>,
     last_child: Option<NodeId>,
@@ -27,20 +28,24 @@ impl Node {
 }
 
 #[derive(Debug)]
+enum ActiveKind {
+    Timed {
+        start_wall: Instant,
+        start_cpu_ns: u64,
+    },
+    CountOnly,
+}
+
+#[derive(Debug)]
 struct ActiveFrame {
     node: NodeId,
-    start_wall: Instant,
-    start_cpu_ns: u64,
+    kind: ActiveKind,
 }
 
 #[derive(Debug)]
 struct ThreadState {
     stack: Vec<ActiveFrame>,
-
-    // Arena storage
     nodes: Vec<Node>,
-
-    // Roots are “children” of an implicit virtual root.
     roots: Vec<NodeId>,
     roots_last_child: Option<NodeId>,
 }
@@ -55,7 +60,7 @@ impl ThreadState {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn alloc_node(&mut self, id: &'static SpanId, tag: Option<Tag>) -> NodeId {
         let idx = self.nodes.len();
         self.nodes.push(Node {
@@ -63,7 +68,8 @@ impl ThreadState {
             tag,
             wall_time_ns: 0,
             cpu_time_ns: 0,
-            count: 0,
+            total_count: 0,
+            timed_count: 0,
             children: Vec::new(),
             last_child: None,
         });
@@ -82,14 +88,12 @@ impl ThreadState {
 
     #[inline]
     fn find_or_create_root(&mut self, id: &'static SpanId, tag: Option<Tag>) -> NodeId {
-        // last_child fast-path
         if let Some(last) = self.roots_last_child {
             if self.node(last).key_eq(id, tag) {
                 return last;
             }
         }
 
-        // scan roots
         for &child in &self.roots {
             if self.node(child).key_eq(id, tag) {
                 self.roots_last_child = Some(child);
@@ -97,7 +101,6 @@ impl ThreadState {
             }
         }
 
-        // create
         let child = self.alloc_node(id, tag);
         self.roots.push(child);
         self.roots_last_child = Some(child);
@@ -111,15 +114,12 @@ impl ThreadState {
         id: &'static SpanId,
         tag: Option<Tag>,
     ) -> NodeId {
-        // last_child fast-path
         if let Some(last) = self.node(parent).last_child {
             if self.node(last).key_eq(id, tag) {
                 return last;
             }
         }
 
-        // scan children
-        // (copy children ids to avoid borrow conflicts with later mutation)
         let children: &[NodeId] = &self.node(parent).children;
         for &child in children {
             if self.node(child).key_eq(id, tag) {
@@ -128,7 +128,6 @@ impl ThreadState {
             }
         }
 
-        // create
         let child = self.alloc_node(id, tag);
         let p = self.node_mut(parent);
         p.children.push(child);
@@ -136,12 +135,12 @@ impl ThreadState {
         child
     }
 
-    #[inline]
+    #[inline(always)]
     fn current_parent(&self) -> Option<NodeId> {
         self.stack.last().map(|f| f.node)
     }
 
-    #[inline]
+    #[inline(always)]
     fn resolve_node(&mut self, id: &'static SpanId, tag: Option<Tag>) -> NodeId {
         match self.current_parent() {
             None => self.find_or_create_root(id, tag),
@@ -163,13 +162,12 @@ impl ThreadState {
             wall_time_ns: node.wall_time_ns,
             cpu_time_ns: node.cpu_time_ns,
             children,
-            count: node.count,
+            total_count: node.total_count,
+            timed_count: node.timed_count,
         }
     }
 
     fn take_results_and_reset(&mut self) -> Vec<ProfileStats> {
-        // If someone calls take_results with active frames, the tree will be incomplete.
-        // Keep it permissive in release; enforce in debug for sanity.
         debug_assert!(
             self.stack.is_empty(),
             "take_results called while spans are still active"
@@ -180,7 +178,6 @@ impl ThreadState {
             out.push(self.materialize_node(root));
         }
 
-        // Reset state but keep allocations for reuse.
         self.stack.clear();
         self.nodes.clear();
         self.roots.clear();
@@ -201,8 +198,28 @@ thread_local! {
     static STATE: RefCell<ThreadState> = RefCell::new(ThreadState::new());
 }
 
+// Suppression is separate from STATE so `span!` can check cheaply without RefCell borrows.
+thread_local! {
+    static SUPPRESS_DEPTH: Cell<u32> = Cell::new(0);
+}
+
 #[inline(always)]
-pub fn begin_span(id: &'static SpanId, tag: Option<Tag>) {
+pub fn is_suppressed() -> bool {
+    SUPPRESS_DEPTH.with(|d| d.get() != 0)
+}
+
+#[inline(always)]
+pub fn begin_suppression() {
+    SUPPRESS_DEPTH.with(|d| d.set(d.get().wrapping_add(1)));
+}
+
+#[inline(always)]
+pub fn end_suppression() {
+    SUPPRESS_DEPTH.with(|d| d.set(d.get().wrapping_sub(1)));
+}
+
+#[inline(always)]
+pub fn begin_span_timed(id: &'static SpanId, tag: Option<Tag>) {
     let start_wall = Instant::now();
     let start_cpu_ns = crate::platform::thread_cpu_nanos();
 
@@ -211,30 +228,57 @@ pub fn begin_span(id: &'static SpanId, tag: Option<Tag>) {
         let node = st.resolve_node(id, tag);
         st.stack.push(ActiveFrame {
             node,
-            start_wall,
-            start_cpu_ns,
+            kind: ActiveKind::Timed {
+                start_wall,
+                start_cpu_ns,
+            },
+        });
+    });
+}
+
+#[inline(always)]
+pub fn begin_span_count_only(id: &'static SpanId, tag: Option<Tag>) {
+    STATE.with(|cell| {
+        let mut st = cell.borrow_mut();
+        let node = st.resolve_node(id, tag);
+        st.stack.push(ActiveFrame {
+            node,
+            kind: ActiveKind::CountOnly,
         });
     });
 }
 
 #[inline]
 pub fn end_span() {
-    let end_wall = Instant::now();
-    let end_cpu_ns = crate::platform::thread_cpu_nanos();
-
+    // Pop first, then decide whether we need clocks.
     STATE.with(|cell| {
         let mut st = cell.borrow_mut();
         let Some(frame) = st.stack.pop() else {
             return;
         };
 
-        let wall_ns = end_wall.duration_since(frame.start_wall).as_nanos() as u64;
-        let cpu_ns = end_cpu_ns.saturating_sub(frame.start_cpu_ns);
-
         let node = st.node_mut(frame.node);
-        node.wall_time_ns += wall_ns;
-        node.cpu_time_ns += cpu_ns;
-        node.count += 1;
+
+        match frame.kind {
+            ActiveKind::Timed {
+                start_wall,
+                start_cpu_ns,
+            } => {
+                let end_wall = Instant::now();
+                let end_cpu_ns = crate::platform::thread_cpu_nanos();
+
+                let wall_ns = end_wall.duration_since(start_wall).as_nanos() as u64;
+                let cpu_ns = end_cpu_ns.saturating_sub(start_cpu_ns);
+
+                node.wall_time_ns += wall_ns;
+                node.cpu_time_ns += cpu_ns;
+                node.total_count += 1;
+                node.timed_count += 1;
+            }
+            ActiveKind::CountOnly => {
+                node.total_count += 1;
+            }
+        }
     });
 }
 
@@ -246,4 +290,5 @@ pub fn take_results() -> Vec<ProfileStats> {
 #[inline]
 pub fn clear() {
     STATE.with(|cell| cell.borrow_mut().clear())
+    // NOTE: do not touch SUPPRESS_DEPTH here; suppression is scoped by guards.
 }

@@ -116,6 +116,71 @@ fn bench_overhead(c: &mut Criterion) {
         Profiler::clear();
     });
 
+    // Suppressed unsampled parent:
+    // - If not sampled, we enter suppression and *nested spans become no-ops*.
+    group.bench_function("span_sampled_100_suppress_parent", |b| {
+        b.iter(|| {
+            let _guard = span!("sampled_100_suppress_parent", rate: 100, suppress);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    // Count-only unsampled parent:
+    // - If not sampled, we still push a lightweight frame to preserve hierarchy,
+    //   increment per-context count, but do not read clocks.
+    group.bench_function("span_sampled_100_count_only_parent", |b| {
+        b.iter(|| {
+            let _guard = span!("sampled_100_count_only_parent", rate: 100, count_only);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    // Demonstrates the hierarchy issue explicitly:
+    // Suppression means children don't attach to the wrong parent (they are dropped).
+    group.bench_function("nested_parent_unsampled_suppress_children", |b| {
+        b.iter(|| {
+            measure!("root", {
+                let _p = span!("parent", rate: 100, suppress);
+                // Child work that would otherwise attach to root if parent is unsampled.
+                let _c = span!("child");
+                black_box(());
+            });
+        });
+        Profiler::clear();
+    });
+
+    // Count-only means children still attach under the parent, preserving tree context.
+    group.bench_function("nested_parent_unsampled_count_only_children", |b| {
+        b.iter(|| {
+            measure!("root", {
+                let _p = span!("parent", rate: 100, count_only);
+                let _c = span!("child");
+                black_box(());
+            });
+        });
+        Profiler::clear();
+    });
+
+    // Optional: tagged variants (root fanout is often tag-driven)
+    group.bench_function("span_sampled_100_suppress_tagged_u64", |b| {
+        b.iter(|| {
+            let _guard = span!("sampled_100_suppress_tagged_u64", 12345u64, rate: 100, suppress);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    group.bench_function("span_sampled_100_count_only_tagged_u64", |b| {
+        b.iter(|| {
+            let _guard =
+                span!("sampled_100_count_only_tagged_u64", 12345u64, rate: 100, count_only);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
     group.finish();
 }
 
@@ -143,6 +208,28 @@ fn bench_10m_sampled_spans(c: &mut Criterion) {
             let _outer_guard = span!("outer_loop");
             for _ in 0..10_000_000u32 {
                 let _guard = span!("sampled_100", rate: 100);
+                black_box(());
+            }
+            Profiler::clear();
+        });
+    });
+
+    group.bench_function("10M_calls_sampled_100_suppress_parent", |b| {
+        b.iter(|| {
+            let _outer_guard = span!("outer_loop");
+            for _ in 0..10_000_000u32 {
+                let _guard = span!("sampled_100_suppress_parent", rate: 100, suppress);
+                black_box(());
+            }
+            Profiler::clear();
+        });
+    });
+
+    group.bench_function("10M_calls_sampled_100_count_only_parent", |b| {
+        b.iter(|| {
+            let _outer_guard = span!("outer_loop");
+            for _ in 0..10_000_000u32 {
+                let _guard = span!("sampled_100_count_only_parent", rate: 100, count_only);
                 black_box(());
             }
             Profiler::clear();

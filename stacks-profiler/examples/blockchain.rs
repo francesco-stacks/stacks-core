@@ -1,8 +1,7 @@
 use std::thread;
 use std::time::Duration;
 
-use stacks_profiler::util::Flatten;
-use stacks_profiler::{ProfileStats, Profiler};
+use stacks_profiler::Profiler;
 
 // ============================================================================
 // 1. Simulation Types
@@ -113,31 +112,5 @@ fn main() {
     println!("\n=== Raw Profiler Trace ===\n");
     for r in &results {
         r.print_tree();
-    }
-
-    println!("\n=== Global Flat Profile ===\n");
-    // "How much time did we spend in 'Execute Logic' across the ENTIRE program?"
-    let global_flat = results.flatten();
-    print_stats("Execute Logic", &global_flat);
-
-    println!("\n=== Scoped Flat Profile ===\n");
-    // Correct approach: Find 'Block 2' inside the GLOBAL flat list first.
-    // The global flat list contains 'Block 2' with all its children aggregated inside it.
-    if let Some(block_2) = global_flat.iter().find(|s| s.name() == "Block 2") {
-        // Now we flatten just Block 2 to see the breakdown of ITS execution
-        let block_2_flat = block_2.flatten();
-        print_stats("Execute Logic", &block_2_flat);
-    } else {
-        println!("Could not find 'Block 2' in the trace.");
-    }
-}
-
-fn print_stats(target_name: &str, flat_list: &[ProfileStats]) {
-    if let Some(stat) = flat_list.iter().find(|s| s.id.name == target_name) {
-        println!("Stats for '{}':", target_name);
-        println!("  Total Count: {}", stat.count);
-        println!("  Total Wall:  {:?}ns", stat.wall_time_ns);
-        // The children of this flat node represent the aggregated breakdown
-        // of what 'Execute Logic' called, across all its invocations.
     }
 }

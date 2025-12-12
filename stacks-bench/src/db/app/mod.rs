@@ -992,7 +992,7 @@ impl<'a> ProfilerInsertContext<'a> {
                     schema::profiler_record::cpu_time_us.eq(cpu_time_us),
                     schema::profiler_record::self_wall_time_us.eq(self_wall_time_us),
                     schema::profiler_record::self_cpu_time_us.eq(self_cpu_time_us),
-                    schema::profiler_record::call_count.eq(node.count as i32),
+                    schema::profiler_record::call_count.eq(node.total_count as i32),
                 ))
                 .returning(schema::profiler_record::id)
                 .get_result(conn)

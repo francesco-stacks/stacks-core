@@ -1,16 +1,19 @@
+use std::hint::black_box;
 use std::time::Duration;
 use std::{panic, thread};
 
 use stacks_profiler::{Profiler, profile, span};
 
-/// Helper to ensure we start with a clean state in tests
-fn clear_profiler() {
-    let _ = Profiler::take_results();
+fn find_child<'a>(
+    node: &'a stacks_profiler::ProfileStats,
+    name: &'static str,
+) -> Option<&'a stacks_profiler::ProfileStats> {
+    node.children.iter().find(|c| c.name() == name)
 }
 
 #[test]
 fn test_basic_nesting() {
-    clear_profiler();
+    Profiler::clear();
 
     stacks_profiler::measure!("Root", {
         thread::sleep(Duration::from_millis(1));
@@ -32,7 +35,7 @@ fn test_basic_nesting() {
 
 #[test]
 fn test_macro_variations() {
-    clear_profiler();
+    Profiler::clear();
 
     // 1. Statement style (wrapped in block to force drop)
     {
@@ -57,7 +60,7 @@ fn test_macro_variations() {
 
 #[test]
 fn test_multi_threading_isolation() {
-    clear_profiler();
+    Profiler::clear();
 
     // Spawn a thread that does profiling
     let t = thread::spawn(|| {
@@ -93,7 +96,7 @@ fn test_multi_threading_isolation() {
 
 #[test]
 fn test_panic_safety() {
-    clear_profiler();
+    Profiler::clear();
 
     let result = panic::catch_unwind(|| {
         let _span = stacks_profiler::span!("WillPanic");
@@ -120,7 +123,7 @@ fn test_panic_safety() {
 
 #[test]
 fn test_recursion() {
-    clear_profiler();
+    Profiler::clear();
 
     #[profile(name = "Recursive")]
     fn recursive_func(depth: usize) {
@@ -149,7 +152,7 @@ fn test_recursion() {
 
 #[test]
 fn test_zero_time_safety() {
-    clear_profiler();
+    Profiler::clear();
 
     // Ensure very fast operations don't cause underflow/crashes
     for _ in 0..1000 {
@@ -165,7 +168,7 @@ fn test_zero_time_safety() {
         "Should aggregate 1000 identical calls into 1 entry"
     );
     assert_eq!(
-        results[0].count, 1000,
+        results[0].total_count, 1000,
         "Count should reflect the loop iterations"
     );
     assert_eq!(results[0].id.name, "Fast");
@@ -196,6 +199,100 @@ fn test_sampling_rate_accuracy() {
     // We expect exactly iterations / rate because the counter is deterministic
     // and starts at 0 for this specific macro expansion site.
     let expected = iterations / rate;
-    let actual = root.count;
+    let actual = root.total_count;
     assert_eq!(actual, expected, "Sampling count mismatch");
+}
+
+#[test]
+fn test_suppression_prevents_wrong_parent_attachment() {
+    Profiler::clear();
+
+    // With rate=2, the first callsite execution samples (n=0), the second does not (n=1).
+    // In suppress mode, the unsampled parent becomes a suppression guard, and nested spans
+    // must become no-ops (so they do NOT attach to the wrong parent).
+    stacks_profiler::measure!("RootSuppress", {
+        for _ in 0..2 {
+            let _parent = span!("ParentSuppress", rate: 2, suppress);
+            let _child = span!("ChildSuppress");
+            black_box(());
+        }
+    });
+
+    let results = Profiler::take_results();
+    assert_eq!(results.len(), 1, "Should have exactly one root");
+    let root = &results[0];
+    assert_eq!(root.name(), "RootSuppress");
+
+    // Parent span should only be recorded on the sampled iteration (so count == 1).
+    let parent =
+        find_child(root, "ParentSuppress").expect("Expected ParentSuppress under RootSuppress");
+    assert_eq!(
+        parent.count(),
+        1,
+        "Suppress mode should NOT create a parent span entry on unsampled iterations"
+    );
+
+    // Child should only exist under the sampled parent (count == 1).
+    let child =
+        find_child(parent, "ChildSuppress").expect("Expected ChildSuppress under ParentSuppress");
+    assert_eq!(
+        child.count(),
+        1,
+        "Child should only be recorded on sampled iterations"
+    );
+
+    // Critically: Child must NOT attach to root when parent is unsampled.
+    assert!(
+        find_child(root, "ChildSuppress").is_none(),
+        "Child must not attach to Root when Parent is unsampled (suppression should drop it)"
+    );
+}
+
+#[test]
+fn test_count_only_preserves_hierarchy_and_counts() {
+    Profiler::clear();
+
+    stacks_profiler::measure!("RootCountOnly", {
+        for _ in 0..2 {
+            let _parent = span!("ParentCountOnly", rate: 2, count_only);
+            let _child = span!("ChildCountOnly");
+            black_box(());
+        }
+    });
+
+    let results = Profiler::take_results();
+    assert_eq!(results.len(), 1, "Should have exactly one root");
+    let root = &results[0];
+    assert_eq!(root.name(), "RootCountOnly");
+
+    let parents: Vec<_> = root
+        .children
+        .iter()
+        .filter(|c| c.name() == "ParentCountOnly")
+        .collect();
+    assert_eq!(
+        parents.len(),
+        1,
+        "Expected exactly one ParentCountOnly node (duplicate SpanIds indicates macro hoisting bug)"
+    );
+    let parent = parents[0];
+
+    assert_eq!(
+        parent.count(),
+        2,
+        "Count-only mode should increment count even when not timing"
+    );
+
+    let child = find_child(parent, "ChildCountOnly")
+        .expect("Expected ChildCountOnly under ParentCountOnly");
+    assert_eq!(
+        child.count(),
+        2,
+        "Child should attach under Parent for both iterations"
+    );
+
+    assert!(
+        find_child(root, "ChildCountOnly").is_none(),
+        "Child must not attach to Root when Parent is count-only"
+    );
 }

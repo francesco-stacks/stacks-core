@@ -144,7 +144,7 @@ pub async fn setup_bench_context<T: IndexerArgs>(
                     .map(|id| {
                         let id_display = id.to_string().replace(".", "_");
                         format!(
-                            "{id_display}[{}..{}]",
+                            "Epoch{id_display}[{}..{}]",
                             e.start_block_height(),
                             e.end_block_height()
                         )
