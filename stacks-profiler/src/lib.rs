@@ -2,38 +2,18 @@
 //!
 //! A high-performance, allocation-optimized profiler using Thread Local Storage.
 
-use std::cell::RefCell;
 use std::panic::Location;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // Re-export the profiling procedural macro
 pub use stacks_profiler_macros::profile;
 
+mod macros;
+mod platform;
+mod runtime;
+
 pub mod print;
 pub mod util;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-mod platform {
-    #[inline(always)]
-    pub fn thread_cpu_nanos() -> u64 {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        unsafe {
-            libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
-        }
-        (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-mod platform {
-    #[inline(always)]
-    pub fn thread_cpu_nanos() -> u64 {
-        0
-    }
-}
 
 /// A lightweight tag for distinguishing spans with the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -259,31 +239,6 @@ impl ProfileStats {
     }
 }
 
-struct ActiveSpan {
-    /// Zero-copy reference to the static ID.
-    id: &'static SpanId,
-    tag: Option<Tag>,
-    start_wall: Instant,
-    start_cpu_ns: u64,
-    /// We use `Option` so we can take() it out without moving the struct.
-    children: Option<Vec<ProfileStats>>,
-}
-
-struct ThreadState {
-    active_stack: Vec<ActiveSpan>,
-    completed_roots: Vec<ProfileStats>,
-    /// Pool of reusable vectors to prevent allocator churn.
-    vec_pool: Vec<Vec<ProfileStats>>,
-}
-
-thread_local! {
-    static STATE: RefCell<ThreadState> = RefCell::new(ThreadState {
-        active_stack: Vec::with_capacity(32),
-        completed_roots: Vec::with_capacity(4),
-        vec_pool: Vec::with_capacity(16),
-    });
-}
-
 // -----------------------------------------------------------------------------
 // PROFILER API
 // -----------------------------------------------------------------------------
@@ -303,95 +258,24 @@ impl Profiler {
     /// Requires a `&'static SpanId`. Use the `profile_scope!` macro to generate these safely.
     #[inline(always)]
     pub fn begin_span(id: &'static SpanId, tag: Option<Tag>) -> ProfileGuard {
-        let start_wall = Instant::now();
-        let start_cpu_ns = platform::thread_cpu_nanos();
-
-        STATE.with(|cell| {
-            let mut state = cell.borrow_mut();
-
-            state.active_stack.push(ActiveSpan {
-                id,
-                tag,
-                start_wall,
-                start_cpu_ns,
-                children: None,
-            });
-        });
-
+        runtime::begin_span(id, tag);
         ProfileGuard
     }
 
     #[inline]
     #[doc(hidden)]
     pub fn end_span() {
-        let end_wall = Instant::now();
-        let end_cpu_ns = platform::thread_cpu_nanos();
-
-        STATE.with(|cell| {
-            let mut state = cell.borrow_mut();
-
-            // Split borrow
-            let ThreadState {
-                active_stack,
-                completed_roots,
-                vec_pool,
-            } = &mut *state;
-
-            if let Some(mut active) = active_stack.pop() {
-                let wall_ns = end_wall.duration_since(active.start_wall).as_nanos() as u64;
-                let cpu_ns = end_cpu_ns.saturating_sub(active.start_cpu_ns);
-
-                // Recover children or grab a recycled vector
-                let children = active
-                    .children
-                    .take()
-                    .unwrap_or_else(|| vec_pool.pop().unwrap_or_default());
-
-                let stats = ProfileStats {
-                    id: active.id,
-                    tag: active.tag,
-                    wall_time_ns: wall_ns,
-                    cpu_time_ns: cpu_ns,
-                    children,
-                    count: 1,
-                };
-
-                let recycled_vec = if let Some(parent) = active_stack.last_mut() {
-                    // Lazy allocation for parent's children list
-                    let list = parent
-                        .children
-                        .get_or_insert_with(|| vec_pool.pop().unwrap_or_default());
-
-                    // Merge and potentially get back a recycled vector
-                    ProfileStats::merge_into_list(list, stats)
-                } else {
-                    ProfileStats::merge_into_list(completed_roots, stats)
-                };
-
-                // If we got a vector back from merging, put it in the pool
-                if let Some(vec) = recycled_vec {
-                    if vec_pool.len() < 1024 {
-                        // Sanity cap
-                        vec_pool.push(vec);
-                    }
-                }
-            }
-        });
+        runtime::end_span();
     }
 
     #[inline]
     pub fn take_results() -> Vec<ProfileStats> {
-        STATE.with(|cell| std::mem::take(&mut cell.borrow_mut().completed_roots))
+        runtime::take_results()
     }
 
     #[inline]
     pub fn clear() {
-        STATE.with(|cell| {
-            let mut state = cell.borrow_mut();
-            state.completed_roots.clear();
-            state.active_stack.clear();
-            // We can keep the vec_pool as is, or clear it if we want to release memory
-        });
+        runtime::clear();
     }
 }
 
@@ -402,138 +286,4 @@ impl Drop for ProfileGuard {
     fn drop(&mut self) {
         Profiler::end_span();
     }
-}
-
-// ========================================================================
-// Macros
-// ========================================================================
-
-#[macro_export]
-macro_rules! measure {
-    // Name, Tag, Rate, Block
-    ($name:literal, $tag:expr, rate: $rate:literal, $block:block) => {
-        {
-            let _guard = $crate::span!($name, $tag, rate: $rate);
-            $block
-        }
-    };
-
-    // Name, Rate, Block
-    ($name:literal, rate: $rate:literal, $block:block) => {
-        {
-            let _guard = $crate::span!($name, rate: $rate);
-            $block
-        }
-    };
-
-    // Name, Tag, Block
-    ($name:literal, $tag:expr, $block:block) => {
-        {
-            let _guard = $crate::span!($name, $tag);
-            $block
-        }
-    };
-
-    // Name, Block
-    ($name:literal, $block:block) => {
-        {
-            let _guard = $crate::span!($name);
-            $block
-        }
-    };
-
-    // Trap (Name, Rate)
-    ($name:literal, rate: $rate:literal) => {
-        let _guard = $crate::span!($name, rate: $rate);
-    };
-
-    // Trap (Name)
-    ($name:literal) => {
-        let _guard = $crate::span!($name);
-    };
-
-    // Anonymous Block
-    ($($t:tt)*) => {
-        {
-            let _guard = $crate::span!("scope");
-            $($t)*
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! span {
-    // Internal helpers
-
-    (@get_id $name:literal) => {{
-        static __PROFILER_SPAN_ID: std::sync::OnceLock<$crate::SpanId> = std::sync::OnceLock::new();
-        __PROFILER_SPAN_ID.get_or_init(|| $crate::Profiler::new_span_id($name).with_context(module_path!()))
-    }};
-
-    (@begin $id:expr, $tag_opt:expr) => {{
-        Some($crate::Profiler::begin_span($id, $tag_opt))
-    }};
-
-    (@should_sample $counter:ident, $rate:literal) => {{
-        const __RATE: usize = $rate;
-        if __RATE <= 1 {
-            true
-        } else {
-            let __n = $counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            // Fast-path for power-of-two rates: n % rate == 0 <=> (n & (rate-1)) == 0
-            if __RATE.is_power_of_two() {
-                (__n & (__RATE - 1)) == 0
-            } else {
-                (__n % __RATE) == 0
-            }
-        }
-    }};
-
-    (@sampled $counter:ident, $rate:literal, $sampled_block:block) => {{
-        if $crate::span!(@should_sample $counter, $rate) {
-            $sampled_block
-        } else {
-            None
-        }
-    }};
-
-    // Public forms
-
-    // Name, Tag, Rate
-    ($name:literal, $tag:expr, rate: $rate:literal) => {{
-        static __PROFILER_SAMPLE_COUNTER: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-
-        $crate::span!(@sampled __PROFILER_SAMPLE_COUNTER, $rate, {
-            let __id = $crate::span!(@get_id $name);
-            // Only convert the tag when we actually sample.
-            let __tag: $crate::Tag = ::core::convert::Into::into($tag);
-            $crate::span!(@begin __id, Some(__tag))
-        })
-    }};
-
-    // Name, Rate
-    ($name:literal, rate: $rate:literal) => {{
-        static __PROFILER_SAMPLE_COUNTER: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-
-        $crate::span!(@sampled __PROFILER_SAMPLE_COUNTER, $rate, {
-            let __id = $crate::span!(@get_id $name);
-            $crate::span!(@begin __id, None)
-        })
-    }};
-
-    // Name, Tag
-    ($name:literal, $tag:expr) => {{
-        let __id = $crate::span!(@get_id $name);
-        let __tag: $crate::Tag = ::core::convert::Into::into($tag);
-        $crate::span!(@begin __id, Some(__tag))
-    }};
-
-    // Name
-    ($name:literal) => {{
-        let __id = $crate::span!(@get_id $name);
-        $crate::span!(@begin __id, None)
-    }};
 }
