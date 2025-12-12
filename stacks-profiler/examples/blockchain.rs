@@ -1,7 +1,8 @@
 use std::thread;
 use std::time::Duration;
 
-use stacks_profiler::{Flatten, ProfileStats, Profiler};
+use stacks_profiler::util::Flatten;
+use stacks_profiler::{ProfileStats, Profiler};
 
 // ============================================================================
 // 1. Simulation Types
