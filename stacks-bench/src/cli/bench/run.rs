@@ -98,13 +98,7 @@ impl RunArgs {
             setup_bench_context(&mut app_db, self).await?;
 
         let (chainstate_model, _) = app_db
-            .get_or_create_chainstate(
-                network,
-                chain_id,
-                &bench_context.chain_tip().0,
-                bench_context.chain_tip().1,
-                &epochs,
-            )
+            .get_or_create_chainstate(network, chain_id, bench_context.chain_tip(), &epochs)
             .await?;
 
         let block_ids = ChainstateIndexer::new(&mut app_db, &mut bench_context)

@@ -11,7 +11,7 @@ use futures::{Stream, StreamExt};
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 
-use crate::blocks::BackwardsBlockStream;
+use crate::blocks::{BackwardsBlockStream, BlockRef};
 use crate::db::app::AppDb;
 use crate::db::node::sortition::SortitionDb;
 use crate::db::node::{ChainStateDb, NakamotoDb};
@@ -91,10 +91,9 @@ pub struct BenchContext {
     app_db: AppDb,
     is_mainnet: bool,
     shadow_dir: ShadowDir,
-    start_height: u64,
-    end_height: u64,
-    tip_height: u64,
-    tip_id: StacksBlockId,
+    start_block: BlockRef,
+    end_block: BlockRef,
+    chain_tip: BlockRef,
     epochs: Arc<Vec<StacksEpoch>>,
     network: Network,
     chain_id: u32,
@@ -118,8 +117,8 @@ impl BenchContext {
     }
 
     /// Returns the Stacks chain tip as a `(StacksBlockId, u64)`] tuple.
-    pub fn chain_tip(&self) -> (StacksBlockId, u64) {
-        (self.tip_id.clone(), self.tip_height)
+    pub fn chain_tip(&self) -> &BlockRef {
+        &self.chain_tip
     }
 
     /// The Stacks epochs applicable for this context.
@@ -137,7 +136,15 @@ impl BenchContext {
 
     /// Returns the target block range as `(start_height, end_height)`.
     pub fn block_height_range(&self) -> Result<(u64, u64)> {
-        Ok((self.start_height, self.end_height))
+        Ok((self.start_block.height, self.end_block.height))
+    }
+
+    pub fn start_block(&self) -> &BlockRef {
+        &self.start_block
+    }
+
+    pub fn end_block(&self) -> &BlockRef {
+        &self.end_block
     }
 
     /// Opens the heavy `StacksChainState` and `Burnchain` databases on demand.
@@ -224,21 +231,25 @@ impl BenchContext {
 
         // 1. Get Node Tip (Global Default)
         println!("Getting canonical stacks tip from sortition db");
-        let (node_tip_id, node_tip_height) = sortition_db.get_canonical_stacks_tip().await?;
 
         // 2. Determine Anchor Tip
         // This is the block we will walk backwards FROM.
-        let (anchor_id, anchor_height) = match &opts.tip {
+        let anchor_block = match &opts.tip {
             Some(StacksBlockRef::Id(id)) => {
                 let header: StacksBlockHeader = chainstate_db
                     .get_block_header(id)
                     .await?
                     .ok_or_else(|| anyhow!("Tip block {id} not found"))?
                     .try_into()?;
-                (id.clone(), header.height)
+                BlockRef {
+                    id: header.id,
+                    height: header.height,
+                }
             }
             Some(StacksBlockRef::Height(h)) => {
                 let h = *h;
+                let (node_tip_id, node_tip_height) =
+                    sortition_db.get_canonical_stacks_tip().await?;
                 if h > node_tip_height {
                     bail!("Requested tip height {h} is beyond node tip {node_tip_height}");
                 }
@@ -247,81 +258,142 @@ impl BenchContext {
                     .with_cache(&mut app_db);
                 let header = stream.seek_to_height(h, &node_tip_id).await?;
                 chainstate_db = stream.into_inner();
-                (header.id, header.height)
+                BlockRef {
+                    id: header.id,
+                    height: header.height,
+                }
             }
-            None => (node_tip_id, node_tip_height),
+            None => {
+                let (node_tip_id, node_tip_height) =
+                    sortition_db.get_canonical_stacks_tip().await?;
+                BlockRef {
+                    id: node_tip_id,
+                    height: node_tip_height,
+                }
+            }
         };
 
-        // Resolve start height
-        let start_height = match &opts.start_at {
-            Some(StacksBlockRef::Height(h)) => *h,
+        // Resolve start block (must end up as a BlockRef {id,height})
+        let start_block: BlockRef = match &opts.start_at {
             Some(StacksBlockRef::Id(id)) => {
                 let header: StacksBlockHeader = chainstate_db
                     .get_block_header(id)
                     .await?
                     .ok_or_else(|| anyhow!("Start block {id} not found"))?
                     .try_into()?;
-                header.height
+                BlockRef {
+                    id: header.id,
+                    height: header.height,
+                }
             }
-            None => 1,
+            Some(StacksBlockRef::Height(h)) => BlockRef {
+                // We'll resolve the id after we compute end_block (see below)
+                // For now, store just the height (id placeholder will be overwritten).
+                // NOTE: we must overwrite id before returning from initialize().
+                id: StacksBlockId([0u8; 32]),
+                height: *h,
+            },
+            None => BlockRef {
+                id: StacksBlockId([0u8; 32]),
+                height: 1,
+            },
         };
 
-        if start_height == 0 {
+        if start_block.height == 0 {
             bail!("Start height cannot be 0 (genesis block). Please start at height 1 or greater.");
         }
 
-        // Determine effective end block
+        // Determine effective end reference (height/id)
         let target_end_ref = if let Some(count) = opts.block_count {
             if count == 0 {
                 bail!("Block count must be greater than 0");
             }
-            Some(StacksBlockRef::Height(start_height + count as u64 - 1))
+            Some(StacksBlockRef::Height(
+                start_block.height + count as u64 - 1,
+            ))
         } else {
             opts.end_at.clone()
         };
 
-        let (end_id, end_height) = match target_end_ref {
+        // Resolve end_block as a full BlockRef {id,height}, anchored off anchor_block.id
+        let end_block: BlockRef = match target_end_ref {
             Some(StacksBlockRef::Id(id)) => {
                 let header: StacksBlockHeader = chainstate_db
                     .get_block_header(&id)
                     .await?
                     .ok_or_else(|| anyhow!("Block {id} not found"))?
                     .try_into()?;
-                (id.clone(), header.height)
+                BlockRef {
+                    id: header.id,
+                    height: header.height,
+                }
             }
             Some(StacksBlockRef::Height(h)) => {
-                let h = h;
-                if h > anchor_height {
-                    bail!("Requested end height {h} is beyond anchor tip {anchor_height}");
+                if h > anchor_block.height {
+                    bail!(
+                        "Requested end height {h} is beyond anchor tip {}",
+                        anchor_block.height
+                    );
                 }
 
-                if h == anchor_height {
-                    (anchor_id.clone(), anchor_height)
+                if h == anchor_block.height {
+                    anchor_block.clone()
                 } else {
                     println!(
-                        "Resolving canonical block at height {h} (walking back from {anchor_height})"
+                        "Resolving canonical block at height {h} (walking back from {})",
+                        anchor_block.height
                     );
 
-                    let mut stream = BackwardsBlockStream::new(chainstate_db, anchor_id.clone())
-                        .with_cache(&mut app_db);
-                    let header = stream.seek_to_height(h, &anchor_id).await?;
-                    (header.id, header.height)
+                    let mut stream =
+                        BackwardsBlockStream::new(chainstate_db, anchor_block.id.clone())
+                            .with_cache(&mut app_db);
+                    let header = stream.seek_to_height(h, &anchor_block.id).await?;
+                    chainstate_db = stream.into_inner();
+
+                    BlockRef {
+                        id: header.id,
+                        height: header.height,
+                    }
                 }
             }
-            None => (anchor_id.clone(), anchor_height),
+            None => anchor_block.clone(),
         };
 
-        if start_height > end_height {
-            bail!("start height ({start_height}) > end height ({end_height})");
+        if start_block.height > end_block.height {
+            bail!(
+                "start height ({}) > end height ({})",
+                start_block.height,
+                end_block.height
+            );
         }
+
+        // If start was given by height (or defaulted), resolve its canonical id by walking back from end_block.id.
+        // This ensures start_block is consistent with the chosen end_block.
+        let start_block: BlockRef = match &opts.start_at {
+            Some(StacksBlockRef::Id(_)) => start_block,
+            _ => {
+                if start_block.height == end_block.height {
+                    end_block.clone()
+                } else {
+                    let header = BackwardsBlockStream::new(chainstate_db, end_block.id.clone())
+                        .with_cache(&mut app_db)
+                        .seek_to_height(start_block.height, &end_block.id)
+                        .await?;
+
+                    BlockRef {
+                        id: header.id,
+                        height: header.height,
+                    }
+                }
+            }
+        };
 
         Ok(Self {
             is_mainnet,
             shadow_dir,
-            start_height,
-            end_height: end_height, // end_height is the benchmark tip height
-            tip_height: end_height, // tip_height is now the benchmark tip height
-            tip_id: end_id,         // tip_id is now the benchmark tip ID
+            start_block,
+            end_block,
+            chain_tip: anchor_block,
             epochs: Arc::new(opts.epochs),
             chain_id,
             network: opts.network,
@@ -349,7 +421,7 @@ impl BenchContext {
         let start_height = start_height as u64;
         let end_height = end_height as u64;
 
-        let current_id = self.tip_id.clone();
+        let current_id = self.end_block.id.clone();
 
         // Open a local handle to the ChainStateDb.
         // We expect this to succeed since the node is running/initialized.

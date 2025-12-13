@@ -240,7 +240,6 @@ impl<'a> RollbackWrapper<'a> {
     // Rollback the child's edits.
     //   this clears all edits from the child's edit queue,
     //     and removes any of those edits from the lookup map.
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn rollback(&mut self) -> Result<(), InterpreterError> {
         let mut last_item = self.stack.pop().ok_or_else(|| {
             InterpreterError::Expect("ERROR: Clarity VM attempted to commit past the stack.".into())
@@ -322,7 +321,6 @@ fn inner_put_data<T>(
 }
 
 impl RollbackWrapper<'_> {
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn put_data(&mut self, key: &str, value: &str) -> InterpreterResult<()> {
         let current = self.stack.last_mut().ok_or_else(|| {
             InterpreterError::Expect(

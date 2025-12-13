@@ -42,12 +42,6 @@ table! {
 }
 
 table! {
-    _staged_stacks_tx_type (name) {
-        name -> Text,
-    }
-}
-
-table! {
     principal (id) {
         id -> Integer,
         address -> Text,
@@ -123,7 +117,7 @@ table! {
     _staged_stacks_tx (block_index_hash, tx_hash) {
         block_index_hash -> Binary,
         tx_hash -> Binary,
-        tx_type -> Text,
+        stacks_tx_type_id -> Integer,
         caller_address -> Text,
         contract_issuer_address -> Nullable<Text>,
         contract_name -> Nullable<Text>,
@@ -209,6 +203,7 @@ table! {
         self_wall_time_us -> BigInt,
         self_cpu_time_us -> BigInt,
         call_count -> Integer,
+        sample_count -> Integer,
     }
 }
 
@@ -253,7 +248,6 @@ allow_tables_to_appear_in_same_query!(
     stacks_tx_stats,
     _staged_stacks_block,
     _staged_stacks_tx,
-    _staged_stacks_tx_type,
     _staged_principal,
     _staged_contract,
     profiler_location,

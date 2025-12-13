@@ -1,7 +1,21 @@
+use std::fmt::Display;
+
 use anyhow::{Result, anyhow, bail};
 use stacks_common::types::chainstate::StacksBlockId;
 
 use crate::StacksBlockHeader;
+
+#[derive(Clone, Debug)]
+pub struct BlockRef {
+    pub id: StacksBlockId,
+    pub height: u64,
+}
+
+impl Display for BlockRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.id, self.height)
+    }
+}
 
 /// Trait for caching and retrieving block ancestors to speed up chain walking.
 pub trait ChainCache {

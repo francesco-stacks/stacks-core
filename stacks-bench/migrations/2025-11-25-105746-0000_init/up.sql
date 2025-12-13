@@ -57,10 +57,6 @@ CREATE TABLE stacks_tx_type (
     name TEXT NOT NULL UNIQUE
 );
 
-CREATE TABLE _staged_stacks_tx_type (
-    name TEXT NOT NULL
-);
-
 -- ==========================================
 -- Dimension for Stacks principals which have been seen.
 -- ==========================================
@@ -184,7 +180,7 @@ CREATE INDEX idx_tx_contract
 CREATE TABLE _staged_stacks_tx (
     block_index_hash BLOB NOT NULL,
     tx_hash BLOB NOT NULL,
-    tx_type TEXT NOT NULL,
+    stacks_tx_type_id INTEGER NOT NULL,
     caller_address TEXT NOT NULL,
     contract_issuer_address TEXT,
     contract_name TEXT
@@ -316,6 +312,7 @@ CREATE TABLE profiler_record (
   -- Exclusive CPU time (cpu_time - sum(children.cpu_time))
   self_cpu_time_us INTEGER NOT NULL,
   call_count INTEGER NOT NULL,
+  sample_count INTEGER NOT NULL,
 
   -- Constraints
   FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id) ON DELETE CASCADE,

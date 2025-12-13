@@ -25,8 +25,9 @@ use syn::punctuated::Punctuated;
 use syn::token::Comma;
 use syn::{ItemFn, Meta, parse_macro_input};
 
+/// Defines behavior for unsampled calls when `sample_rate` is set.
 #[derive(Debug, Default, Clone, Copy, FromMeta)]
-enum SampleMode {
+enum UnsampledBehavior {
     /// Unsampled calls return `None` (default).
     #[default]
     #[darling(rename = "none")]
@@ -54,7 +55,7 @@ where
     /// Controls what happens on *unsampled* calls when `sample_rate` is set.
     /// One of: "none" | "suppress" | "count_only".
     #[darling(default)]
-    sample_mode: SampleMode,
+    unsampled: UnsampledBehavior,
 }
 
 /// Instruments a function by automatically creating a `stacks_profiler` span for its body.
@@ -210,7 +211,7 @@ pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
-    let mode = args.sample_mode;
+    let mode = args.unsampled;
     let guard_creation = if let Some(rate) = args.sample_rate {
         if rate <= 1 {
             quote! {
@@ -226,11 +227,11 @@ pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
 
             // Unsampled behavior selection
             let unsampled = match mode {
-                SampleMode::None => quote! { None },
-                SampleMode::Suppress => {
+                UnsampledBehavior::None => quote! { None },
+                UnsampledBehavior::Suppress => {
                     quote! { Some(stacks_profiler::Profiler::begin_suppression()) }
                 }
-                SampleMode::CountOnly => {
+                UnsampledBehavior::CountOnly => {
                     quote! { Some(stacks_profiler::Profiler::begin_span_count_only(__profiler_span_id, None)) }
                 }
             };
@@ -253,11 +254,11 @@ pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
             }
         } else {
             let unsampled = match mode {
-                SampleMode::None => quote! { None },
-                SampleMode::Suppress => {
+                UnsampledBehavior::None => quote! { None },
+                UnsampledBehavior::Suppress => {
                     quote! { Some(stacks_profiler::Profiler::begin_suppression()) }
                 }
-                SampleMode::CountOnly => {
+                UnsampledBehavior::CountOnly => {
                     quote! { Some(stacks_profiler::Profiler::begin_span_count_only(__profiler_span_id, None)) }
                 }
             };

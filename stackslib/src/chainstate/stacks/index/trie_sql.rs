@@ -205,7 +205,7 @@ pub fn get_unconfirmed_block_identifier<T: MarfTrieId>(
     .map_err(|e| e.into())
 }
 
-#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
+#[cfg_attr(feature = "profiler", stacks_profiler::profile(sample_rate = 128))]
 pub fn get_block_hash<T: MarfTrieId>(conn: &Connection, local_id: u32) -> Result<T, Error> {
     let result = conn
         .query_row(

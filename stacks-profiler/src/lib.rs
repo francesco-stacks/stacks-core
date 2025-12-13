@@ -115,8 +115,8 @@ pub struct ProfileStats {
     pub wall_time_ns: u64,
     pub cpu_time_ns: u64,
     pub children: Vec<ProfileStats>,
-    pub total_count: usize,
-    pub timed_count: usize,
+    pub entered_count: usize,
+    pub sampled_count: usize,
 }
 
 impl ProfileStats {
@@ -141,7 +141,7 @@ impl ProfileStats {
     }
 
     pub fn count(&self) -> usize {
-        self.total_count
+        self.entered_count
     }
 
     /// Calculates the time the thread was suspended.
@@ -253,8 +253,10 @@ impl Profiler {
 }
 
 enum GuardKind {
-    Span,        // timed or count-only; runtime knows which
-    Suppression, // only affects suppression depth
+    /// Timed or count-only; should call `end_span()` on `drop()`.
+    Span,
+    /// Only affects suppression depth; should call `end_suppression()` on `drop()`.
+    Suppression,
 }
 
 pub struct ProfileGuard {

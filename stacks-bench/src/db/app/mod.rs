@@ -25,11 +25,12 @@ use stacks_common::types::chainstate::StacksBlockId;
 use tokio::sync::RwLock;
 
 use crate::StacksBlockHeader;
-use crate::blocks::{BlockHeaderProvider, ChainCache};
+use crate::blocks::{BlockHeaderProvider, BlockRef, ChainCache};
 use crate::metrics::BlockMetrics;
 
 pub mod models;
 pub mod schema;
+mod util;
 
 use super::{AsyncSqliteConnection, SqlitePool};
 
@@ -232,8 +233,7 @@ impl AppDb {
         &mut self,
         network: crate::Network,
         chain_id: u32,
-        tip_block_id: &StacksBlockId,
-        tip_height: u64,
+        chain_tip: &BlockRef,
         source_epochs: &[crate::db::node::sortition::models::Epoch],
     ) -> Result<(Chainstate, Vec<Epoch>)> {
         let network_id = Self::resolve_network_id(network);
@@ -242,7 +242,7 @@ impl AppDb {
         // chain_id is u32, so .into() is safe.
         let chain_id_val: i64 = chain_id.into();
         // tip_height is u64, so .try_into() is needed.
-        let tip_height_val: i64 = tip_height.try_into()?;
+        let tip_height_val: i64 = chain_tip.height.try_into()?;
 
         // 1. Compute the configuration hash
         let epochs_hash = Self::compute_epochs_hash(source_epochs);
@@ -255,7 +255,7 @@ impl AppDb {
                 let existing = chainstate::table
                     .filter(chainstate::network_id.eq(network_id))
                     .filter(chainstate::chain_id.eq(chain_id_val))
-                    .filter(chainstate::tip_index_hash.eq(tip_block_id.as_bytes()))
+                    .filter(chainstate::tip_index_hash.eq(chain_tip.id.as_bytes()))
                     .filter(chainstate::epochs_hash.eq(&epochs_hash))
                     .first::<Chainstate>(conn)
                     .await
@@ -276,7 +276,7 @@ impl AppDb {
                         .values((
                             chainstate::network_id.eq(network_id),
                             chainstate::chain_id.eq(chain_id_val),
-                            chainstate::tip_index_hash.eq(tip_block_id.0.to_vec()),
+                            chainstate::tip_index_hash.eq(chain_tip.id.0.to_vec()),
                             chainstate::tip_height.eq(tip_height_val),
                             chainstate::epochs_hash.eq(epochs_hash),
                         ))
@@ -469,8 +469,8 @@ impl AppDb {
     pub async fn get_chain_block_ids(
         &mut self,
         tip_index_hash: &StacksBlockId,
-        start_height: u32,
-        end_height: u32,
+        start_height: u64,
+        end_height: u64,
     ) -> Result<Vec<StacksBlockId>> {
         use diesel::sql_query;
         use diesel::sql_types::{BigInt, Binary};
@@ -480,16 +480,16 @@ impl AppDb {
             WITH RECURSIVE chain(index_hash, height, parent_stacks_block_id) AS (
                 SELECT index_hash, height, parent_stacks_block_id
                 FROM stacks_block
-                WHERE index_hash = ?
+                WHERE index_hash = ?1
                 UNION ALL
                 SELECT p.index_hash, p.height, p.parent_stacks_block_id
                 FROM stacks_block p
                 INNER JOIN chain c ON c.parent_stacks_block_id = p.id
-                WHERE c.height > ?
+                WHERE c.height > ?2
             )
             SELECT index_hash
             FROM chain
-            WHERE height <= ? AND height >= ?
+            WHERE height <= ?3 AND height >= ?2
             ORDER BY height ASC
         "#;
 
@@ -503,7 +503,6 @@ impl AppDb {
             .bind::<Binary, _>(tip_index_hash.as_bytes())
             .bind::<BigInt, _>(start_height as i64)
             .bind::<BigInt, _>(end_height as i64)
-            .bind::<BigInt, _>(start_height as i64)
             .load(&mut self.get_conn().await?)
             .await
             .context("Failed to query chain block IDs")?;
@@ -594,7 +593,7 @@ impl AppDb {
     {
         struct StagingBuffer {
             txs: Vec<StagedStacksTx>,
-            tx_types: HashSet<String>,
+            tx_types: HashSet<StacksTxType>,
             principals: HashSet<String>,
             contracts: HashSet<(String, String)>,
         }
@@ -613,9 +612,10 @@ impl AppDb {
                 for tx in txs {
                     let block_index_hash = block.id.as_bytes().to_vec();
                     let tx_hash = tx.txid().as_bytes().to_vec();
-                    let tx_type = tx.payload.name().to_string();
+                    let tx_type = util::resolve_tx_type(&tx.payload);
+                    let stacks_tx_type_id = tx_type.id;
 
-                    self.tx_types.insert(tx_type.clone());
+                    self.tx_types.insert(tx_type);
 
                     let caller_address = tx.origin_address().to_string();
                     self.principals.insert(caller_address.clone());
@@ -646,7 +646,7 @@ impl AppDb {
                     self.txs.push(StagedStacksTx {
                         block_index_hash,
                         tx_hash,
-                        tx_type,
+                        stacks_tx_type_id,
                         caller_address,
                         contract_issuer_address,
                         contract_name,
@@ -655,9 +655,12 @@ impl AppDb {
             }
 
             async fn flush(&mut self, conn: &mut AsyncSqliteConnection) -> Result<()> {
-                for name in self.tx_types.drain() {
-                    diesel::insert_into(_staged_stacks_tx_type::table)
-                        .values(StagedStacksTxType { name })
+                for tx_type in self.tx_types.drain() {
+                    diesel::insert_into(stacks_tx_type::table)
+                        .values(&tx_type)
+                        .on_conflict(stacks_tx_type::id)
+                        .do_update()
+                        .set(stacks_tx_type::name.eq(&tx_type.name))
                         .execute(conn)
                         .await?;
                 }
@@ -729,9 +732,6 @@ impl AppDb {
                         .execute(conn)
                         .await?;
                     diesel::delete(_staged_stacks_tx::table)
-                        .execute(conn)
-                        .await?;
-                    diesel::delete(_staged_stacks_tx_type::table)
                         .execute(conn)
                         .await?;
                     diesel::delete(_staged_principal::table)
@@ -992,7 +992,8 @@ impl<'a> ProfilerInsertContext<'a> {
                     schema::profiler_record::cpu_time_us.eq(cpu_time_us),
                     schema::profiler_record::self_wall_time_us.eq(self_wall_time_us),
                     schema::profiler_record::self_cpu_time_us.eq(self_cpu_time_us),
-                    schema::profiler_record::call_count.eq(node.total_count as i32),
+                    schema::profiler_record::call_count.eq(node.entered_count as i32),
+                    schema::profiler_record::sample_count.eq(node.sampled_count as i32),
                 ))
                 .returning(schema::profiler_record::id)
                 .get_result(conn)

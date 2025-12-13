@@ -1,13 +1,3 @@
--- Merge transaction Types
-INSERT INTO
-    stacks_tx_type (name)
-SELECT DISTINCT
-    name
-FROM _staged_stacks_tx_type
-WHERE
-    true
-ON CONFLICT (name) DO NOTHING;
-
 -- Merge principals
 INSERT INTO
     principal (address)
@@ -78,12 +68,16 @@ INSERT INTO
         caller_principal_id,
         contract_id
     )
-SELECT b.id, st.tx_hash, tt.id, p_caller.id, c.id
+SELECT 
+    b.id, 
+    st.tx_hash, 
+    st.stacks_tx_type_id, 
+    p_caller.id, 
+    c.id
 FROM
     _staged_stacks_tx st
     JOIN stacks_block b ON st.block_index_hash = b.index_hash
-    JOIN stacks_tx_type tt ON st.tx_type = tt.name -- Resolve Caller
-    LEFT JOIN principal p_caller ON st.caller_address = p_caller.address -- Resolve Contract (requires joining principal first to get the owner ID)
+    LEFT JOIN principal p_caller ON st.caller_address = p_caller.address
     LEFT JOIN principal p_contract_issuer ON st.contract_issuer_address = p_contract_issuer.address
     LEFT JOIN contract c ON c.issuer_principal_id = p_contract_issuer.id AND c.name = st.contract_name
 WHERE

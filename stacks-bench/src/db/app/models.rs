@@ -11,8 +11,7 @@ use super::schema::{
 };
 use crate::ResolveEpochFromHeight;
 use crate::db::app::schema::{
-    _staged_contract, _staged_principal, _staged_stacks_tx_type, chain_tip_cache, contract,
-    principal, stacks_tx_type,
+    _staged_contract, _staged_principal, chain_tip_cache, contract, principal, stacks_tx_type,
 };
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
@@ -81,18 +80,11 @@ impl ResolveEpochFromHeight for [Epoch] {
     }
 }
 
-#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone, PartialEq, Eq, Hash)]
 #[diesel(table_name = stacks_tx_type)]
 #[diesel(treat_none_as_null = true)]
 pub struct StacksTxType {
     pub id: i32,
-    pub name: String,
-}
-
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = _staged_stacks_tx_type)]
-#[diesel(treat_none_as_null = true)]
-pub struct StagedStacksTxType {
     pub name: String,
 }
 
@@ -220,7 +212,7 @@ pub struct StacksTx {
 pub struct StagedStacksTx {
     pub block_index_hash: Vec<u8>,
     pub tx_hash: Vec<u8>,
-    pub tx_type: String,
+    pub stacks_tx_type_id: i32,
     pub caller_address: String,
     pub contract_issuer_address: Option<String>,
     pub contract_name: Option<String>,
@@ -322,6 +314,7 @@ pub struct ProfilerRecord {
     pub self_wall_time_us: i64,
     pub self_cpu_time_us: i64,
     pub call_count: i32,
+    pub sample_count: i32,
 }
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]

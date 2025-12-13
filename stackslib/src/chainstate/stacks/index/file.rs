@@ -371,7 +371,6 @@ impl TrieFile {
 
     /// Obtain a TrieNodeType and its associated TrieHash for a node, given its block ID and
     /// pointer
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn read_node_type(
         &mut self,
         db: &Connection,
@@ -384,7 +383,6 @@ impl TrieFile {
     }
 
     /// Obtain a TrieNodeType, given its block ID and pointer
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn read_node_type_nohash(
         &mut self,
         db: &Connection,
@@ -458,12 +456,10 @@ impl TrieFile {
 
 /// Boilerplate Write implementation for TrieFileDisk.  Plumbs through to the inner fd.
 impl Write for TrieFileDisk {
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.fd.write(buf)
     }
 
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn flush(&mut self) -> io::Result<()> {
         self.fd.flush()
     }
@@ -499,10 +495,6 @@ impl Write for TrieFile {
 
 /// Boilerplate Read implementation for TrieFileDisk.  Plumbs through to the inner fd.
 impl Read for TrieFileDisk {
-    #[cfg_attr(
-        feature = "profiler",
-        stacks_profiler::profile(sample_rate = 1024, sample_mode = "count_only")
-    )]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.fd.read(buf)
     }
@@ -527,7 +519,6 @@ impl Read for TrieFile {
 
 /// Boilerplate Seek implementation for TrieFileDisk.  Plumbs through to the inner fd
 impl Seek for TrieFileDisk {
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.fd.seek(pos)
     }

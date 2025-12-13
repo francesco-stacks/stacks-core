@@ -70,47 +70,78 @@ impl<'a> ChainstateIndexer<'a> {
         chain_id: u32,
         epochs: &[Epoch],
     ) -> Result<Vec<StacksBlockId>> {
-        let (tip_id, tip_height) = self.context.chain_tip();
+        let chain_tip = self.context.chain_tip().clone();
         let (start_height, end_height) = self.context.block_height_range()?;
+        let end_block_id = self.context.end_block().id.clone();
 
-        println!("Targeting block range: {start_height} to {end_height} (Tip: {tip_height})");
+        // Index one extra block so the first replayed block can resolve its parent in AppDb::get_block().
+        let index_start_height = if start_height > 0 {
+            start_height - 1
+        } else {
+            start_height
+        };
+
+        println!("Targeting block range: {start_height} to {end_height} (Tip: {chain_tip})");
 
         let (_chainstate_model, _) = self
             .app_db
-            .get_or_create_chainstate(network, chain_id, &tip_id, tip_height, epochs)
+            .get_or_create_chainstate(network, chain_id, &chain_tip, epochs)
             .await?;
 
-        // Get canonical block IDs from App DB
-        let mut block_ids = self
+        let expected_indexed_count = (end_height - index_start_height + 1) as usize;
+
+        // Query the indexed segment (may include start-1).
+        let mut indexed_ids = self
             .app_db
-            .get_chain_block_ids(&tip_id, start_height as u32, end_height as u32)
+            .get_chain_block_ids(&end_block_id, index_start_height, end_height)
             .await?;
 
-        let expected_count = (end_height - start_height + 1) as usize;
-
-        if block_ids.len() != expected_count {
+        if indexed_ids.len() != expected_indexed_count {
             println!(
-                "App DB index incomplete (found {}, expected {expected_count}). Indexing from Node DB...",
-                block_ids.len(),
+                "App DB index incomplete (found {}, expected {expected_indexed_count}). Indexing from Node DB...",
+                indexed_ids.len(),
             );
 
-            self.run_indexing_pipeline(start_height, end_height).await?;
+            self.run_indexing_pipeline(index_start_height, end_height)
+                .await?;
 
             println!("Checkpointing database...");
             self.app_db.checkpoint(true).await?;
             println!("Vacuuming database...");
             self.app_db.vacuum().await?;
 
-            // Reload IDs
-            block_ids = self
+            // Reload indexed IDs after indexing/merge.
+            indexed_ids = self
                 .app_db
-                .get_chain_block_ids(&tip_id, start_height as u32, end_height as u32)
+                .get_chain_block_ids(&end_block_id, index_start_height, end_height)
                 .await?;
         }
 
-        if block_ids.is_empty() {
+        if indexed_ids.is_empty() {
             return Err(anyhow!(
-                "No blocks found in range {start_height} to {end_height}"
+                "No blocks found in indexed range {index_start_height} to {end_height}"
+            ));
+        }
+
+        if indexed_ids.len() != expected_indexed_count {
+            return Err(anyhow!(
+                "Index still incomplete after indexing (found {}, expected {expected_indexed_count})",
+                indexed_ids.len(),
+            ));
+        }
+
+        // Return only the requested range [start_height..=end_height].
+        let block_ids: Vec<StacksBlockId> = if start_height > 0 {
+            indexed_ids.into_iter().skip(1).collect()
+        } else {
+            indexed_ids
+        };
+
+        let expected_count = (end_height - start_height + 1) as usize;
+        if block_ids.len() != expected_count {
+            return Err(anyhow!(
+                "Unexpected block id count (found {}, expected {expected_count})",
+                block_ids.len(),
             ));
         }
 

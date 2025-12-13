@@ -87,7 +87,7 @@ impl TreeFormatter for PrettyPrinter {
         let cpu_ms = stats.cpu_time_ns as f64 / 1_000_000.0;
         let wait_ns = stats.wait_time_ns();
         let wait_ms = wait_ns as f64 / 1_000_000.0;
-        let count = stats.total_count;
+        let count = stats.entered_count;
 
         let wait_color = if wait_ns > stats.cpu_time_ns {
             red

@@ -168,7 +168,7 @@ fn test_zero_time_safety() {
         "Should aggregate 1000 identical calls into 1 entry"
     );
     assert_eq!(
-        results[0].total_count, 1000,
+        results[0].entered_count, 1000,
         "Count should reflect the loop iterations"
     );
     assert_eq!(results[0].id.name, "Fast");
@@ -199,7 +199,7 @@ fn test_sampling_rate_accuracy() {
     // We expect exactly iterations / rate because the counter is deterministic
     // and starts at 0 for this specific macro expansion site.
     let expected = iterations / rate;
-    let actual = root.total_count;
+    let actual = root.entered_count;
     assert_eq!(actual, expected, "Sampling count mismatch");
 }
 

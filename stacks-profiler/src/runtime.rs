@@ -12,8 +12,8 @@ struct Node {
 
     wall_time_ns: u64,
     cpu_time_ns: u64,
-    total_count: usize,
-    timed_count: usize,
+    entered_count: usize,
+    sampled_count: usize,
 
     children: Vec<NodeId>,
     last_child: Option<NodeId>,
@@ -68,8 +68,8 @@ impl ThreadState {
             tag,
             wall_time_ns: 0,
             cpu_time_ns: 0,
-            total_count: 0,
-            timed_count: 0,
+            entered_count: 0,
+            sampled_count: 0,
             children: Vec::new(),
             last_child: None,
         });
@@ -162,8 +162,8 @@ impl ThreadState {
             wall_time_ns: node.wall_time_ns,
             cpu_time_ns: node.cpu_time_ns,
             children,
-            total_count: node.total_count,
-            timed_count: node.timed_count,
+            entered_count: node.entered_count,
+            sampled_count: node.sampled_count,
         }
     }
 
@@ -272,11 +272,11 @@ pub fn end_span() {
 
                 node.wall_time_ns += wall_ns;
                 node.cpu_time_ns += cpu_ns;
-                node.total_count += 1;
-                node.timed_count += 1;
+                node.entered_count += 1;
+                node.sampled_count += 1;
             }
             ActiveKind::CountOnly => {
-                node.total_count += 1;
+                node.entered_count += 1;
             }
         }
     });
