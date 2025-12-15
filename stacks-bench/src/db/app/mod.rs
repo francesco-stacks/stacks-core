@@ -594,8 +594,6 @@ impl AppDb {
         struct StagingBuffer {
             txs: Vec<StagedStacksTx>,
             tx_types: HashSet<StacksTxType>,
-            principals: HashSet<String>,
-            contracts: HashSet<(String, String)>,
         }
 
         impl StagingBuffer {
@@ -603,44 +601,47 @@ impl AppDb {
                 Self {
                     txs: Vec::new(),
                     tx_types: HashSet::new(),
-                    principals: HashSet::new(),
-                    contracts: HashSet::new(),
                 }
             }
 
-            fn process_txs(&mut self, block: &StacksBlockHeader, txs: &[StacksTransaction]) {
+            fn process_txs(
+                &mut self,
+                block: &StacksBlockHeader,
+                txs: &[StacksTransaction],
+            ) -> Result<()> {
                 for tx in txs {
                     let block_index_hash = block.id.as_bytes().to_vec();
                     let tx_hash = tx.txid().as_bytes().to_vec();
+
                     let tx_type = util::resolve_tx_type(&tx.payload);
                     let stacks_tx_type_id = tx_type.id;
-
                     self.tx_types.insert(tx_type);
 
                     let caller_address = tx.origin_address().to_string();
-                    self.principals.insert(caller_address.clone());
 
                     let mut contract_issuer_address = None;
                     let mut contract_name = None;
+                    let mut contract_fn_name: Option<String> = None;
+                    let mut contract_call_args_json: Option<String> = None;
 
                     if let TransactionPayload::SmartContract(sc, _) = &tx.payload {
+                        // Deploy: issuer is caller; contract name is in payload
                         contract_issuer_address = Some(caller_address.clone());
-                        let c_name = sc.name.to_string();
-                        contract_name = Some(c_name.clone());
-                        self.contracts.insert((caller_address.clone(), c_name));
+                        contract_name = Some(sc.name.to_string());
                     }
 
                     if let TransactionPayload::ContractCall(cc) = &tx.payload {
-                        let issuer_address =
-                            cc.contract_identifier().issuer.to_address().to_string();
-                        let name = cc.contract_name.to_string();
+                        // Call: issuer + contract name + fn name + args
+                        contract_issuer_address =
+                            Some(cc.contract_identifier().issuer.to_address().to_string());
+                        contract_name = Some(cc.contract_name.to_string());
+                        contract_fn_name = Some(cc.function_name.to_string());
 
-                        self.principals.insert(issuer_address.clone());
-                        self.contracts
-                            .insert((issuer_address.clone(), name.clone()));
-
-                        contract_issuer_address = Some(issuer_address);
-                        contract_name = Some(name);
+                        // Store args as JSON array of Clarity string representations
+                        // (keeps it stable and queryable even without a full Clarity->JSON mapping)
+                        let args_json = serde_json::to_string(&cc.function_args)
+                            .with_context(|| format!("Failed to serialize contract-call arguments to JSON string for tx '{}'", tx.txid().to_hex()))?;
+                        contract_call_args_json = Some(args_json);
                     }
 
                     self.txs.push(StagedStacksTx {
@@ -650,8 +651,11 @@ impl AppDb {
                         caller_address,
                         contract_issuer_address,
                         contract_name,
+                        contract_fn_name,
+                        contract_call_args_json,
                     });
                 }
+                Ok(())
             }
 
             async fn flush(&mut self, conn: &mut AsyncSqliteConnection) -> Result<()> {
@@ -661,23 +665,6 @@ impl AppDb {
                         .on_conflict(stacks_tx_type::id)
                         .do_update()
                         .set(stacks_tx_type::name.eq(&tx_type.name))
-                        .execute(conn)
-                        .await?;
-                }
-
-                for address in self.principals.drain() {
-                    diesel::insert_into(_staged_principal::table)
-                        .values(StagedPrincipal { address })
-                        .execute(conn)
-                        .await?;
-                }
-
-                for (issuer_address, name) in self.contracts.drain() {
-                    diesel::insert_into(schema::_staged_contract::table)
-                        .values(StagedContract {
-                            issuer_address,
-                            name,
-                        })
                         .execute(conn)
                         .await?;
                 }
@@ -709,7 +696,7 @@ impl AppDb {
                         }
 
                         for (block, txs) in chunk {
-                            buffer.process_txs(&block, &txs);
+                            buffer.process_txs(&block, &txs)?;
                         }
 
                         buffer.flush(conn).await?;
@@ -732,12 +719,6 @@ impl AppDb {
                         .execute(conn)
                         .await?;
                     diesel::delete(_staged_stacks_tx::table)
-                        .execute(conn)
-                        .await?;
-                    diesel::delete(_staged_principal::table)
-                        .execute(conn)
-                        .await?;
-                    diesel::delete(_staged_contract::table)
                         .execute(conn)
                         .await?;
 

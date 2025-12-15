@@ -10,9 +10,7 @@ use super::schema::{
     stacks_tx_stats,
 };
 use crate::ResolveEpochFromHeight;
-use crate::db::app::schema::{
-    _staged_contract, _staged_principal, chain_tip_cache, contract, principal, stacks_tx_type,
-};
+use crate::db::app::schema::{chain_tip_cache, contract, contract_fn, principal, stacks_tx_type};
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
 #[diesel(table_name = network)]
@@ -96,13 +94,6 @@ pub struct Principal {
     pub address: String,
 }
 
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = _staged_principal)]
-#[diesel(treat_none_as_null = true)]
-pub struct StagedPrincipal {
-    pub address: String,
-}
-
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(Principal, foreign_key = issuer_principal_id))]
 #[diesel(table_name = contract)]
@@ -113,11 +104,13 @@ pub struct Contract {
     pub name: String,
 }
 
-#[derive(Insertable, Debug, Clone)]
-#[diesel(table_name = _staged_contract)]
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[diesel(belongs_to(Contract, foreign_key = contract_id))]
+#[diesel(table_name = contract_fn)]
 #[diesel(treat_none_as_null = true)]
-pub struct StagedContract {
-    pub issuer_address: String,
+pub struct ContractFn {
+    pub id: i32,
+    pub contract_id: i32,
     pub name: String,
 }
 
@@ -204,6 +197,8 @@ pub struct StacksTx {
     pub stacks_tx_type_id: i32,
     pub caller_principal_id: i32,
     pub contract_id: Option<i32>,
+    pub contract_fn_id: Option<i32>,
+    pub contract_call_args_json: Option<String>,
 }
 
 #[derive(Insertable, Debug, Clone)]
@@ -216,6 +211,8 @@ pub struct StagedStacksTx {
     pub caller_address: String,
     pub contract_issuer_address: Option<String>,
     pub contract_name: Option<String>,
+    pub contract_fn_name: Option<String>,
+    pub contract_call_args_json: Option<String>,
 }
 
 // Keep Queryable as Value (Diesel can deserialize Text -> Value automatically if feature is on,

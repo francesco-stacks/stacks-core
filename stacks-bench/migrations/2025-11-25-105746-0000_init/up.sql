@@ -66,13 +66,6 @@ CREATE TABLE principal (
 );
 
 -- ==========================================
--- Staging table for Stacks principals during bulk import.
--- ==========================================
-CREATE TABLE _staged_principal (
-    address TEXT NOT NULL
-);
-
--- ==========================================
 -- Dimension for Stacks contracts which have been seen.
 -- ==========================================
 CREATE TABLE contract (
@@ -82,15 +75,19 @@ CREATE TABLE contract (
     FOREIGN KEY (issuer_principal_id) REFERENCES principal(id),
     UNIQUE(issuer_principal_id, name)
 );
+
 CREATE INDEX idx_contract_name 
   ON contract(name);
 
 -- ==========================================
--- Staging table for Stacks contracts during bulk import.
+-- Dimension for Stacks contract functions which have been seen.
 -- ==========================================
-CREATE TABLE _staged_contract (
-    issuer_address TEXT NOT NULL,
-    name TEXT NOT NULL
+CREATE TABLE contract_fn (
+  id INTEGER PRIMARY KEY NOT NULL,
+  contract_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  FOREIGN KEY (contract_id) REFERENCES contract(id),
+  UNIQUE(contract_id, name)
 );
 
 -- ==========================================
@@ -158,6 +155,9 @@ CREATE TABLE stacks_tx (
   stacks_tx_type_id INTEGER NOT NULL,
   caller_principal_id INTEGER NOT NULL,
   contract_id INTEGER,
+  contract_fn_id INTEGER,
+  contract_call_args_json TEXT,
+  FOREIGN KEY (contract_fn_id) REFERENCES contract_fn(id),
   FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
   FOREIGN KEY (stacks_tx_type_id) REFERENCES stacks_tx_type(id),
   FOREIGN KEY (caller_principal_id) REFERENCES principal(id),
@@ -171,8 +171,12 @@ CREATE INDEX idx_tx_tx_hash_hex
 CREATE INDEX idx_tx_caller_principal 
   ON stacks_tx(caller_principal_id);
 CREATE INDEX idx_tx_contract 
-  ON stacks_tx(contract_id)
+  ON stacks_tx(contract_id, contract_fn_id)
   WHERE contract_id IS NOT NULL;
+
+CREATE INDEX idx_tx_contract_fn
+  ON stacks_tx(contract_fn_id)
+  WHERE contract_fn_id IS NOT NULL;
 
 -- ==========================================
 -- Staging table for Stacks transactions during bulk import.
@@ -183,7 +187,9 @@ CREATE TABLE _staged_stacks_tx (
     stacks_tx_type_id INTEGER NOT NULL,
     caller_address TEXT NOT NULL,
     contract_issuer_address TEXT,
-    contract_name TEXT
+    contract_name TEXT,
+    contract_fn_name TEXT,
+    contract_call_args_json TEXT
 );
 
 -- ==========================================

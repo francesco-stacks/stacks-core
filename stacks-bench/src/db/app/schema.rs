@@ -49,12 +49,6 @@ table! {
 }
 
 table! {
-    _staged_principal (address) {
-        address -> Text,
-    }
-}
-
-table! {
     contract (id) {
         id -> Integer,
         issuer_principal_id -> Integer,
@@ -63,8 +57,9 @@ table! {
 }
 
 table! {
-    _staged_contract (issuer_address, name) {
-        issuer_address -> Text,
+    contract_fn (id) {
+        id -> Integer,
+        contract_id -> Integer,
         name -> Text,
     }
 }
@@ -110,6 +105,8 @@ table! {
         stacks_tx_type_id -> Integer,
         caller_principal_id -> Integer,
         contract_id -> Nullable<Integer>,
+        contract_fn_id -> Nullable<Integer>,
+        contract_call_args_json -> Nullable<Text>,
     }
 }
 
@@ -121,6 +118,8 @@ table! {
         caller_address -> Text,
         contract_issuer_address -> Nullable<Text>,
         contract_name -> Nullable<Text>,
+        contract_fn_name -> Nullable<Text>,
+        contract_call_args_json -> Nullable<Text>,
     }
 }
 
@@ -223,6 +222,8 @@ joinable!(stacks_tx -> stacks_block (stacks_block_id));
 joinable!(stacks_tx -> stacks_tx_type (stacks_tx_type_id));
 joinable!(stacks_tx -> principal (caller_principal_id));
 joinable!(stacks_tx -> contract (contract_id));
+joinable!(stacks_tx -> contract_fn (contract_fn_id));
+joinable!(contract_fn -> contract (contract_id));
 joinable!(stacks_block_stats -> benchmark_run (benchmark_run_id));
 joinable!(stacks_block_stats -> stacks_block (stacks_block_id));
 joinable!(stacks_tx_stats -> benchmark_run (benchmark_run_id));
@@ -240,6 +241,7 @@ allow_tables_to_appear_in_same_query!(
     stacks_tx_type,
     principal,
     contract,
+    contract_fn,
     burn_block,
     stacks_block,
     stacks_tx,
@@ -248,8 +250,6 @@ allow_tables_to_appear_in_same_query!(
     stacks_tx_stats,
     _staged_stacks_block,
     _staged_stacks_tx,
-    _staged_principal,
-    _staged_contract,
     profiler_location,
     profiler_span,
     profiler_record,
