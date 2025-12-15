@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use stacks_bench::filter::TxFilter;
 use stacks_bench::indexer::ChainstateIndexer;
 use stacks_bench::metrics::{CostModel, MetricsAccumulator, ModelSource};
 use stacks_bench::replay::ReplayMode;
@@ -27,7 +28,7 @@ pub struct RunArgs {
 
     /// The Stacks block (height or hex block id) to end at, inclusive. Cannot
     /// be used with the `txid` or `count` flags.
-    #[arg(long, conflicts_with_all = &["txid", "block_count"])]
+    #[arg(long, conflicts_with_all = ["txid", "block_count"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     end_at: Option<StacksBlockRef>,
 
@@ -45,13 +46,13 @@ pub struct RunArgs {
     network: Option<Network>,
 
     /// The number of blocks to process, starting from `start-at`.
-    #[arg(long = "count", short = 'c', conflicts_with_all = &["end_at", "txid"], requires = "start_at")]
+    #[arg(long = "count", short = 'c', conflicts_with_all = ["end_at", "txid"], requires = "start_at")]
     #[serde(skip_serializing_if = "Option::is_none")]
     block_count: Option<u32>,
 
     /// A specific transaction id (hex) to benchmark. May not be used with
     /// `start-at`, `end-at`, or `count`.
-    #[arg(long, conflicts_with_all = &["start_at", "end_at", "count"])]
+    #[arg(long, conflicts_with_all = ["start_at", "end_at", "count", "filter"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     txid: Option<TxIdArg>,
 
@@ -63,6 +64,15 @@ pub struct RunArgs {
     /// These blocks will be executed but not included in the benchmark results.
     #[arg(long, default_value_t = 0)]
     warmup: usize,
+
+    #[arg(long, short = 'f', conflicts_with_all = ["txid"])]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<FilterArg>,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, Serialize, Deserialize)]
+pub enum FilterArg {
+    ContractCall,
 }
 
 impl IndexerArgs for RunArgs {
@@ -110,7 +120,7 @@ impl RunArgs {
         let run_name = format!("{}", Utc::now().format("%Y%m%d-%H%M%S"));
 
         let args_json = self.to_json()?;
-        let git_commit_hash = get_git_hash().unwrap_or(vec![0u8; 20]); // Placeholder if git not available
+        let git_commit_hash = get_git_hash().unwrap_or(vec![0u8; 20]);
         let run_model = app_db
             .create_benchmark_run(
                 chainstate_model.id,
@@ -164,12 +174,17 @@ impl RunArgs {
             }
 
             // Replay the block
+            let mode = match self.filter.as_ref() {
+                Some(FilterArg::ContractCall) => ReplayMode::SegmentedFiltered(TxFilter::ContractCall),
+                None => ReplayMode::Follower,
+            };
+
             let mut metrics = stacks_profiler::measure!("Block Replay", {
                 stacks_bench::replay::replay_block(
                     &mut bench_context,
                     &mut chainstate,
                     &burnchain,
-                    ReplayMode::Follower,
+                    mode,
                     &block,
                 )?
             });

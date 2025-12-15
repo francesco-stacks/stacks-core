@@ -929,7 +929,6 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
         self.cost_track.unwrap()
     }
 
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn precommit_to_block(self, final_bhh: StacksBlockId) -> PreCommitClarityBlock<'a> {
         self.cost_track
             .expect("Clarity block connection lost cost tracker before commitment");

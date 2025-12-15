@@ -20,6 +20,7 @@ use crate::db::node::NakamotoDb;
 pub mod blocks;
 pub mod context;
 pub mod db;
+pub mod filter;
 pub mod indexer;
 pub mod metrics;
 pub mod paths;

@@ -3235,7 +3235,7 @@ impl NakamotoChainState {
     /// already-existing block commit and snapshot
     ///
     /// `header` should be a pointer to the header in `tip_info`.
-    pub(crate) fn insert_stacks_block_header(
+    pub fn insert_stacks_block_header(
         chainstate_tx: &Connection,
         tip_info: &StacksHeaderInfo,
         header: &NakamotoBlockHeader,
@@ -3354,7 +3354,7 @@ impl NakamotoChainState {
 
     /// Append a Stacks block to an existing Stacks block, and grant the miner the block reward.
     /// Return the new Stacks header info.
-    fn advance_tip(
+    pub fn advance_tip(
         headers_tx: &mut StacksDBTx,
         parent_tip: &StacksBlockHeaderTypes,
         parent_consensus_hash: &ConsensusHash,
