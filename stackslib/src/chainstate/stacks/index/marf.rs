@@ -278,6 +278,7 @@ impl<T: MarfTrieId> MarfConnection<T> for MARF<T> {
 ///   aborted
 ///
 impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn commit(mut self) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
@@ -310,6 +311,7 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
     ///   to commit the mined block, but write it to the mined_block table,
     ///   rather than out to the marf_data table (this prevents the
     ///   miner's block from getting stepped on after the sortition).
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn commit_mined(mut self, bhh: &T) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);

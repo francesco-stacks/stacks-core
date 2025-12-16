@@ -1796,6 +1796,7 @@ impl NakamotoChainState {
     /// This is either:
     ///    (1)  set by the tenure change tx if one exists
     ///    (2)  the same as parent block id
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_block_burn_view(
         sort_db: &SortitionDB,
         next_ready_block: &NakamotoBlock,
@@ -3354,6 +3355,7 @@ impl NakamotoChainState {
 
     /// Append a Stacks block to an existing Stacks block, and grant the miner the block reward.
     /// Return the new Stacks header info.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn advance_tip(
         headers_tx: &mut StacksDBTx,
         parent_tip: &StacksBlockHeaderTypes,

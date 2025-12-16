@@ -741,6 +741,7 @@ impl Trie {
 
     /// Perform the reads, lookups, etc. for computing the ancestor byte vector.
     /// This method _does not_ restore the previously open block on failure, the caller will do that.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn inner_get_trie_ancestor_hashes_bytes<T: MarfTrieId>(
         storage: &mut TrieStorageConnection<T>,
     ) -> Result<Vec<TrieHash>, Error> {

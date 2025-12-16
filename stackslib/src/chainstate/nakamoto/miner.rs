@@ -613,6 +613,7 @@ impl NakamotoBlockBuilder {
     }
 
     /// Finish building the Nakamoto block
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn mine_nakamoto_block(
         &mut self,
         clarity_tx: &mut ClarityTx,

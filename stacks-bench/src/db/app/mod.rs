@@ -380,91 +380,6 @@ impl AppDb {
         id_opt.ok_or_else(|| anyhow!("Stacks block not found in DB"))
     }
 
-    /// Saves execution metrics for a block and its transactions.
-    /// Assumes the block and transactions have already been indexed.
-    pub async fn save_block_metrics(
-        &mut self,
-        run_id: i32,
-        block_id: &StacksBlockId,
-        metrics: &BlockMetrics,
-    ) -> Result<()> {
-        let conn = &mut self.get_conn().await?;
-
-        // Get block ID
-        let block_id = self.get_stacks_block_id(block_id).await?;
-
-        // Insert block stats
-        diesel::insert_into(stacks_block_stats::table)
-            .values((
-                stacks_block_stats::benchmark_run_id.eq(run_id),
-                stacks_block_stats::stacks_block_id.eq(block_id),
-                stacks_block_stats::total_duration_us.eq(metrics.total_duration.as_micros() as i32),
-                stacks_block_stats::setup_duration_us.eq(metrics.setup_duration.as_micros() as i32),
-                stacks_block_stats::execution_duration_us
-                    .eq(metrics.execution_duration.as_micros() as i32),
-                stacks_block_stats::commit_duration_us
-                    .eq(metrics.commit_duration.as_micros() as i32),
-                stacks_block_stats::commit_overhead_baseline_us
-                    .eq(metrics.commit_overhead_baseline.as_micros() as i32),
-                stacks_block_stats::clarity_write_length
-                    .eq(metrics.total_clarity_cost.write_length as i32),
-                stacks_block_stats::clarity_write_count
-                    .eq(metrics.total_clarity_cost.write_count as i32),
-                stacks_block_stats::clarity_read_length
-                    .eq(metrics.total_clarity_cost.read_length as i32),
-                stacks_block_stats::clarity_read_count
-                    .eq(metrics.total_clarity_cost.read_count as i32),
-                stacks_block_stats::clarity_runtime.eq(metrics.total_clarity_cost.runtime as i32),
-                stacks_block_stats::total_storage_delta.eq(metrics.total_storage_delta),
-            ))
-            .execute(conn)
-            .await
-            .context("Failed to insert stacks block stats")?;
-
-        // Insert tx stats
-        // Fetch all tx IDs for this block in one query to avoid N lookups
-        let tx_map: HashMap<Vec<u8>, i64> = stacks_tx::table
-            .select((stacks_tx::tx_hash, stacks_tx::id))
-            .filter(stacks_tx::stacks_block_id.eq(block_id))
-            .load::<(Vec<u8>, i64)>(conn)
-            .await?
-            .into_iter()
-            .collect();
-
-        let mut tx_stats_batch = Vec::with_capacity(metrics.transactions.len());
-        for tx_metric in &metrics.transactions {
-            let tx_hash_bytes = hex::decode(&tx_metric.txid)
-                .with_context(|| format!("Invalid hex in txid '{}'", &tx_metric.txid))?;
-
-            if let Some(&tx_id) = tx_map.get(&tx_hash_bytes) {
-                tx_stats_batch.push((
-                    stacks_tx_stats::benchmark_run_id.eq(run_id),
-                    stacks_tx_stats::stacks_tx_id.eq(tx_id),
-                    stacks_tx_stats::duration_us.eq(tx_metric.duration.as_micros() as i32),
-                    stacks_tx_stats::estimated_commit_impact_us
-                        .eq(tx_metric.estimated_commit_impact.as_micros() as i32),
-                    stacks_tx_stats::clarity_write_length.eq(tx_metric.cost.write_length as i32),
-                    stacks_tx_stats::clarity_write_count.eq(tx_metric.cost.write_count as i32),
-                    stacks_tx_stats::clarity_read_length.eq(tx_metric.cost.read_length as i32),
-                    stacks_tx_stats::clarity_read_count.eq(tx_metric.cost.read_count as i32),
-                    stacks_tx_stats::clarity_runtime.eq(tx_metric.cost.runtime as i32),
-                ));
-            }
-        }
-
-        if !tx_stats_batch.is_empty() {
-            for stats in tx_stats_batch {
-                diesel::insert_into(stacks_tx_stats::table)
-                    .values(stats)
-                    .execute(conn)
-                    .await
-                    .context("Failed to insert stacks tx stats")?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Retrieves the ordered list of block IDs for the canonical chain segment.
     pub async fn get_chain_block_ids(
         &mut self,
@@ -748,76 +663,6 @@ impl AppDb {
         hasher.finalize().to_vec()
     }
 
-    pub async fn save_profiler_data_batch(
-        &mut self,
-        run_id: i32,
-        batch: &mut Vec<(
-            StacksBlockId,
-            Vec<stacks_profiler::ProfileStats>,
-            Vec<crate::metrics::TransactionMetrics>,
-        )>,
-    ) -> Result<()> {
-        // Take ownership of the batch data to process it
-        let batch_data = std::mem::take(batch);
-
-        // Clone caches before borrowing self for the connection
-        let span_cache = self.profiler_span_cache.clone();
-        let loc_cache = self.profiler_loc_cache.clone();
-
-        let conn = &mut self.get_conn().await?;
-
-        conn.transaction::<(), anyhow::Error, _>(|dbtx| {
-            Box::pin(async move {
-                for (block_id, results, tx_metrics) in batch_data {
-                    // 1. Resolve Block ID (DB Primary Key)
-                    let block_pk: i64 = stacks_block::table
-                        .select(stacks_block::id)
-                        .filter(stacks_block::index_hash.eq(block_id.as_bytes()))
-                        .first(dbtx)
-                        .await?;
-
-                    // 2. Resolve Tx IDs (DB Primary Keys) for mapping
-                    let tx_hashes: Vec<Vec<u8>> = tx_metrics
-                        .iter()
-                        .map(|tx| hex::decode(&tx.txid))
-                        .collect::<Result<Vec<_>, _>>()?;
-
-                    let tx_lookup: HashMap<Vec<u8>, i64> = stacks_tx::table
-                        .select((stacks_tx::tx_hash, stacks_tx::id))
-                        .filter(stacks_tx::tx_hash.eq_any(&tx_hashes))
-                        .load(dbtx)
-                        .await?
-                        .into_iter()
-                        .collect();
-
-                    // Map the metrics order to the resolved IDs
-                    let tx_db_ids: Vec<Option<i64>> = tx_hashes
-                        .iter()
-                        .map(|h| tx_lookup.get(h).cloned())
-                        .collect();
-
-                    let ctx = ProfilerInsertContext {
-                        run_id,
-                        block_pk,
-                        tx_db_ids: &tx_db_ids,
-                        span_cache: span_cache.clone(),
-                        loc_cache: loc_cache.clone(),
-                    };
-
-                    // Start insertion for this block
-                    let mut tx_ordinal: usize = 0;
-                    for (i, root) in results.iter().enumerate() {
-                        tx_ordinal = ctx
-                            .insert_node(dbtx, root, None, i as i32, 0, None, tx_ordinal)
-                            .await?;
-                    }
-                }
-                Ok(())
-            })
-        })
-        .await
-    }
-
     async fn resolve_profiler_location(
         conn: &mut AsyncSqliteConnection,
         cache: Arc<RwLock<HashMap<(String, i32), i32>>>,
@@ -894,17 +739,139 @@ impl AppDb {
         cache.write().await.insert((context, name), id);
         Ok(id)
     }
+
+    pub async fn save_block_metrics<I>(&mut self, run_id: i32, blocks: I) -> Result<()>
+    where
+        I: IntoIterator<Item = BlockMetrics> + Send,
+        I::IntoIter: Send,
+    {
+        let span_cache = self.profiler_span_cache.clone();
+        let loc_cache = self.profiler_loc_cache.clone();
+
+        let conn = &mut self.get_conn().await?;
+
+        conn.transaction::<(), anyhow::Error, _>(|dbtx| {
+            Box::pin(async {
+                for metrics in blocks.into_iter() {
+                    // Resolve Stacks block PK
+                    let block_pk: i64 = stacks_block::table
+                        .select(stacks_block::id)
+                        .filter(stacks_block::index_hash.eq(metrics.id.as_bytes()))
+                        .first(dbtx)
+                        .await?;
+
+                    // Insert block stats
+                    diesel::insert_into(stacks_block_stats::table)
+                        .values((
+                            stacks_block_stats::benchmark_run_id.eq(run_id),
+                            stacks_block_stats::stacks_block_id.eq(block_pk),
+                            stacks_block_stats::total_duration_us
+                                .eq(metrics.total_duration.as_micros() as i32),
+                            stacks_block_stats::setup_duration_us
+                                .eq(metrics.setup_duration.as_micros() as i32),
+                            stacks_block_stats::execution_duration_us
+                                .eq(metrics.execution_duration.as_micros() as i32),
+                            stacks_block_stats::commit_duration_us
+                                .eq(metrics.commit_duration.as_micros() as i32),
+                            stacks_block_stats::commit_overhead_baseline_us
+                                .eq(metrics.commit_overhead_baseline.as_micros() as i32),
+                            stacks_block_stats::clarity_write_length
+                                .eq(metrics.total_clarity_cost.write_length as i32),
+                            stacks_block_stats::clarity_write_count
+                                .eq(metrics.total_clarity_cost.write_count as i32),
+                            stacks_block_stats::clarity_read_length
+                                .eq(metrics.total_clarity_cost.read_length as i32),
+                            stacks_block_stats::clarity_read_count
+                                .eq(metrics.total_clarity_cost.read_count as i32),
+                            stacks_block_stats::clarity_runtime
+                                .eq(metrics.total_clarity_cost.runtime as i32),
+                            stacks_block_stats::total_storage_delta.eq(metrics.total_storage_delta),
+                        ))
+                        .execute(dbtx)
+                        .await
+                        .context("Failed to insert stacks block stats")?;
+
+                    // Load tx_id map for this block
+                    let tx_map: HashMap<Vec<u8>, i64> = stacks_tx::table
+                        .select((stacks_tx::tx_hash, stacks_tx::id))
+                        .filter(stacks_tx::stacks_block_id.eq(block_pk))
+                        .load::<(Vec<u8>, i64)>(dbtx)
+                        .await?
+                        .into_iter()
+                        .collect();
+
+                    // Insert tx stats + remember tx PKs for profiler attachment
+                    let mut tx_pks: Vec<Option<i64>> =
+                        Vec::with_capacity(metrics.transactions.len());
+                    for tx_metric in &metrics.transactions {
+                        let tx_hash = tx_metric.txid.as_bytes().to_vec();
+                        let tx_pk = tx_map.get(&tx_hash).copied();
+                        tx_pks.push(tx_pk);
+
+                        if let Some(tx_pk) = tx_pk {
+                            diesel::insert_into(stacks_tx_stats::table)
+                                .values((
+                                    stacks_tx_stats::benchmark_run_id.eq(run_id),
+                                    stacks_tx_stats::stacks_tx_id.eq(tx_pk),
+                                    stacks_tx_stats::duration_us
+                                        .eq(tx_metric.duration.as_micros() as i32),
+                                    stacks_tx_stats::estimated_commit_impact_us
+                                        .eq(tx_metric.estimated_commit_impact.as_micros() as i32),
+                                    stacks_tx_stats::clarity_write_length
+                                        .eq(tx_metric.cost.write_length as i32),
+                                    stacks_tx_stats::clarity_write_count
+                                        .eq(tx_metric.cost.write_count as i32),
+                                    stacks_tx_stats::clarity_read_length
+                                        .eq(tx_metric.cost.read_length as i32),
+                                    stacks_tx_stats::clarity_read_count
+                                        .eq(tx_metric.cost.read_count as i32),
+                                    stacks_tx_stats::clarity_runtime
+                                        .eq(tx_metric.cost.runtime as i32),
+                                ))
+                                .execute(dbtx)
+                                .await
+                                .context("Failed to insert stacks tx stats")?;
+                        }
+                    }
+
+                    // Insert profiler records (block roots + tx roots)
+                    let ctx = ProfilerInsertContext {
+                        run_id,
+                        block_pk,
+                        span_cache: span_cache.clone(),
+                        loc_cache: loc_cache.clone(),
+                    };
+
+                    for (i, root) in metrics.profiler_roots.iter().enumerate() {
+                        ctx.insert_node(dbtx, root, None, i as i32, 0, None).await?;
+                    }
+
+                    for (tx_idx, tx_metric) in metrics.transactions.iter().enumerate() {
+                        let Some(tx_pk) = tx_pks.get(tx_idx).and_then(|x| *x) else {
+                            continue;
+                        };
+                        for (i, root) in tx_metric.profiler_roots.iter().enumerate() {
+                            ctx.insert_node(dbtx, root, None, i as i32, 0, Some(tx_pk))
+                                .await?;
+                        }
+                    }
+                }
+
+                Ok(())
+            })
+        })
+        .await
+    }
 }
 
-struct ProfilerInsertContext<'a> {
+struct ProfilerInsertContext {
     run_id: i32,
     block_pk: i64,
-    tx_db_ids: &'a [Option<i64>],
     span_cache: Arc<RwLock<HashMap<(Option<&'static str>, &'static str), i32>>>,
     loc_cache: Arc<RwLock<HashMap<(String, i32), i32>>>,
 }
 
-impl<'a> ProfilerInsertContext<'a> {
+impl ProfilerInsertContext {
     fn insert_node<'b>(
         &'b self,
         conn: &'b mut AsyncSqliteConnection,
@@ -912,11 +879,9 @@ impl<'a> ProfilerInsertContext<'a> {
         parent_id: Option<i32>,
         child_index: i32,
         depth: i32,
-        active_tx_id: Option<i64>,
-        tx_ordinal: usize,
-    ) -> BoxFuture<'b, Result<usize>> {
+        stacks_tx_id: Option<i64>,
+    ) -> BoxFuture<'b, Result<()>> {
         async move {
-            // A. Resolve/Insert Location (With Caching)
             let loc_id = AppDb::resolve_profiler_location(
                 conn,
                 self.loc_cache.clone(),
@@ -925,7 +890,6 @@ impl<'a> ProfilerInsertContext<'a> {
             )
             .await?;
 
-            // B. Resolve/Insert Span Name (With Caching)
             let span_id = AppDb::resolve_profiler_span(
                 conn,
                 self.span_cache.clone(),
@@ -934,23 +898,6 @@ impl<'a> ProfilerInsertContext<'a> {
             )
             .await?;
 
-            // C. Determine Context (Block vs Tx)
-            let mut current_tx_id = active_tx_id;
-            let mut next_tx_ordinal = tx_ordinal;
-
-            if node.name() == "Transaction" {
-                // Do NOT inherit the previous tx id across transactions
-                current_tx_id = None;
-
-                if let Some(tid) = self.tx_db_ids.get(next_tx_ordinal).and_then(|x| *x) {
-                    current_tx_id = Some(tid);
-                }
-
-                // Advance global transaction ordinal (even if lookup failed)
-                next_tx_ordinal += 1;
-            }
-
-            // Calculate metrics
             let wall_time_us = node.wall_time_micros() as i64;
             let children_wall_time_us: i64 = node
                 .children
@@ -967,7 +914,6 @@ impl<'a> ProfilerInsertContext<'a> {
                 .sum();
             let self_cpu_time_us = cpu_time_us.saturating_sub(children_cpu_time_us);
 
-            // Insert record
             let record_id: i32 = diesel::insert_into(schema::profiler_record::table)
                 .values((
                     schema::profiler_record::benchmark_run_id.eq(self.run_id),
@@ -978,7 +924,7 @@ impl<'a> ProfilerInsertContext<'a> {
                     schema::profiler_record::child_index.eq(child_index),
                     schema::profiler_record::depth.eq(depth),
                     schema::profiler_record::stacks_block_id.eq(Some(self.block_pk)),
-                    schema::profiler_record::stacks_tx_id.eq(current_tx_id),
+                    schema::profiler_record::stacks_tx_id.eq(stacks_tx_id),
                     schema::profiler_record::wall_time_us.eq(wall_time_us),
                     schema::profiler_record::cpu_time_us.eq(cpu_time_us),
                     schema::profiler_record::self_wall_time_us.eq(self_wall_time_us),
@@ -990,22 +936,19 @@ impl<'a> ProfilerInsertContext<'a> {
                 .get_result(conn)
                 .await?;
 
-            // Recurse (carry the updated tx ordinal through DFS order)
             for (idx, child) in node.children.iter().enumerate() {
-                next_tx_ordinal = self
-                    .insert_node(
-                        conn,
-                        child,
-                        Some(record_id),
-                        idx as i32,
-                        depth + 1,
-                        current_tx_id,
-                        next_tx_ordinal,
-                    )
-                    .await?;
+                self.insert_node(
+                    conn,
+                    child,
+                    Some(record_id),
+                    idx as i32,
+                    depth + 1,
+                    stacks_tx_id,
+                )
+                .await?;
             }
 
-            Ok(next_tx_ordinal)
+            Ok(())
         }
         .boxed()
     }

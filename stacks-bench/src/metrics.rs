@@ -1,6 +1,9 @@
 use std::time::Duration;
 
+use blockstack_lib::burnchains::Txid;
 use clarity::vm::costs::ExecutionCost;
+use stacks_common::types::chainstate::StacksBlockId;
+use stacks_profiler::ProfileStats;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSource {
@@ -143,8 +146,18 @@ impl CostModel {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BlockProcessingBaseline {
+    pub avg_setup_duration: Duration,
+    pub avg_finalize_duration: Duration,
+    pub avg_clarity_state_commit_duration: Duration,
+    pub avg_advance_tip_duration: Duration,
+    pub avg_index_commit_duration: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct BlockMetrics {
+    pub id: StacksBlockId,
     pub total_duration: Duration,
     pub setup_duration: Duration,
     pub execution_duration: Duration,
@@ -153,9 +166,26 @@ pub struct BlockMetrics {
     pub transactions: Vec<TransactionMetrics>,
     pub commit_overhead_baseline: Duration,
     pub total_storage_delta: i64,
+    /// Block-associated profiler roots
+    pub profiler_roots: Vec<ProfileStats>,
 }
 
 impl BlockMetrics {
+    pub fn new_default(id: StacksBlockId) -> Self {
+        Self {
+            id,
+            total_duration: Duration::ZERO,
+            setup_duration: Duration::ZERO,
+            execution_duration: Duration::ZERO,
+            commit_duration: Duration::ZERO,
+            total_clarity_cost: ExecutionCost::ZERO,
+            transactions: vec![],
+            commit_overhead_baseline: Duration::ZERO,
+            total_storage_delta: 0,
+            profiler_roots: vec![],
+        }
+    }
+
     /// Apply a predictive cost model to attribute commit times.
     pub fn apply_cost_model(&mut self, model: &CostModel) {
         let total_write_len = self.total_clarity_cost.write_length;
@@ -201,27 +231,14 @@ impl BlockMetrics {
     }
 }
 
-impl Default for BlockMetrics {
-    fn default() -> Self {
-        Self {
-            total_duration: Duration::ZERO,
-            setup_duration: Duration::ZERO,
-            execution_duration: Duration::ZERO,
-            commit_duration: Duration::ZERO,
-            total_clarity_cost: ExecutionCost::ZERO,
-            transactions: Vec::new(),
-            commit_overhead_baseline: Duration::ZERO,
-            total_storage_delta: 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct TransactionMetrics {
-    pub txid: String,
+    pub txid: Txid,
     pub duration: Duration,
     pub cost: ExecutionCost,
     pub estimated_commit_impact: Duration,
+    /// Tx-associated profiler roots
+    pub profiler_roots: Vec<ProfileStats>,
 }
 
 #[derive(Default)]

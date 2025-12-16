@@ -134,13 +134,83 @@ impl RunArgs {
         // Open the heavy databases before the loop
         let (mut chainstate, burnchain) = bench_context.open_stacks_chainstate()?;
 
+        println!("Calculating block processing overhead baseline");
+        if self.warmup > 0 {
+            println!("  Warming up for {} blocks...", self.warmup);
+            stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
+                &mut chainstate,
+                &burnchain,
+                &bench_context.end_block().id,
+                self.warmup as u32,
+            )?;
+        }
+
+        println!("  Measuring baseline over 500 blocks...");
+        let block_processing_baselines1 =
+            stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
+                &mut chainstate,
+                &burnchain,
+                &bench_context.end_block().id,
+                500,
+            )?;
+        println!(" ===Block Processing Overhead Baselines (#1) =========================");
+        println!(
+            "  - Avg Setup Duration:                 {:.2?}",
+            block_processing_baselines1.avg_setup_duration
+        );
+        println!(
+            "  - Avg Finalize Duration:              {:.2?}",
+            block_processing_baselines1.avg_finalize_duration
+        );
+        println!(
+            "  - Avg Clarity State Commit Duration:  {:.2?}",
+            block_processing_baselines1.avg_clarity_state_commit_duration
+        );
+        println!(
+            "  - Avg Advance Tip Duration:           {:.2?}",
+            block_processing_baselines1.avg_advance_tip_duration
+        );
+        println!(
+            "  - Avg Index Commit Duration:          {:.2?}",
+            block_processing_baselines1.avg_index_commit_duration
+        );
+        let block_processing_baselines2 =
+            stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
+                &mut chainstate,
+                &burnchain,
+                &bench_context.end_block().id,
+                500,
+            )?;
+        println!(" ===Block Processing Overhead Baselines (#2) =========================");
+        println!(
+            "  - Avg Setup Duration:                 {:.2?}",
+            block_processing_baselines2.avg_setup_duration
+        );
+        println!(
+            "  - Avg Finalize Duration:              {:.2?}",
+            block_processing_baselines2.avg_finalize_duration
+        );
+        println!(
+            "  - Avg Clarity State Commit Duration:  {:.2?}",
+            block_processing_baselines2.avg_clarity_state_commit_duration
+        );
+        println!(
+            "  - Avg Advance Tip Duration:           {:.2?}",
+            block_processing_baselines2.avg_advance_tip_duration
+        );
+        println!(
+            "  - Avg Index Commit Duration:          {:.2?}",
+            block_processing_baselines2.avg_index_commit_duration
+        );
+        println!(" ================================================================\n");
+
+        bench_context.calculate_storage_delta()?; // Reset storage delta baseline
+
         println!("Re-executing {selected_block_count} selected blocks...");
 
+        const METRICS_FLUSH_THRESHOLD: usize = 1000;
         let mut metrics_buffer = Vec::new();
         let mut cost_model = CostModel::default();
-
-        const PROFILER_BATCH_SIZE: usize = 1_000;
-        let mut profiler_buffer = Vec::with_capacity(PROFILER_BATCH_SIZE);
 
         // Dynamic calibration window
         let min_calibration_count = self.calibration;
@@ -181,38 +251,30 @@ impl RunArgs {
                 None => ReplayMode::Follower,
             };
 
-            let mut metrics = stacks_profiler::measure!("Block Replay", {
-                stacks_bench::replay::replay_block(
-                    &mut bench_context,
-                    &mut chainstate,
-                    &burnchain,
-                    mode,
-                    &block,
-                )?
-            });
-
-            let profiler_results = Profiler::take_results();
+            let maybe_metrics = stacks_bench::replay::replay_block(
+                &mut bench_context,
+                &mut chainstate,
+                &burnchain,
+                mode,
+                &block,
+            )?;
 
             let checkpoint_start = Instant::now();
             chainstate.checkpoint_clarity_state()?;
             total_clarity_db_checkpoint_duration += checkpoint_start.elapsed();
 
-            // We clone the transaction metrics because 'metrics' is needed below for calibration/stats.
-            // The buffer takes ownership of the data.
-            profiler_buffer.push((
-                block.id.clone(),
-                profiler_results,
-                metrics.transactions.clone(),
-            ));
-
-            // Flush buffer if full
-            if profiler_buffer.len() >= PROFILER_BATCH_SIZE {
-                app_db
-                    .save_profiler_data_batch(run_model.id, &mut profiler_buffer)
-                    .await?;
+            if is_warmup {
+                continue;
             }
 
-            if !calibrated && !is_warmup {
+            let Some(mut metrics) = maybe_metrics else {
+                // No metrics collected (e.g. filtered out)
+                continue;
+            };
+
+            accumulator.add(&metrics); // Accumulate
+
+            if !calibrated {
                 metrics_buffer.push(metrics);
 
                 let buffer_len = metrics_buffer.len();
@@ -250,75 +312,57 @@ impl RunArgs {
                         println!("----------------------------------------\n");
 
                         // Flush buffer
-                        for (j, m) in metrics_buffer.iter_mut().enumerate() {
+                        for m in metrics_buffer.iter_mut() {
                             if cost_model.time_per_byte > f64::EPSILON {
                                 m.apply_cost_model(&cost_model);
                             } else {
                                 m.apply_heuristic();
                             }
-
-                            if !is_warmup {
-                                // Accumulate
-                                accumulator.add(m);
-
-                                // Use the buffered block ID to save metrics
-                                let buffered_id = &block_ids[i - buffer_len + j + 1];
-                                app_db
-                                    .save_block_metrics(run_model.id, buffered_id, m)
-                                    .await?;
-                            }
                         }
-                        metrics_buffer.clear();
+
+                        app_db
+                            .save_block_metrics(run_model.id, metrics_buffer.drain(..))
+                            .await?;
                     }
                     // Else: continue collecting blocks to find variance
                 }
             } else {
-                if !is_warmup {
-                    if cost_model.time_per_byte > f64::EPSILON {
-                        metrics.apply_cost_model(&cost_model);
-                    } else {
-                        metrics.apply_heuristic();
-                    }
+                if cost_model.time_per_byte > f64::EPSILON {
+                    metrics.apply_cost_model(&cost_model);
+                } else {
+                    metrics.apply_heuristic();
+                }
 
-                    accumulator.add(&metrics); // Accumulate
+                metrics_buffer.push(metrics);
+
+                if metrics_buffer.len() >= METRICS_FLUSH_THRESHOLD {
+                    // Flush buffer
                     app_db
-                        .save_block_metrics(run_model.id, &block.id, &metrics)
+                        .save_block_metrics(run_model.id, metrics_buffer.drain(..))
                         .await?;
                 }
             }
         }
 
-        // Flush any remaining profiler data after the loop
-        if !profiler_buffer.is_empty() && !is_warmup {
-            app_db
-                .save_profiler_data_batch(run_model.id, &mut profiler_buffer)
-                .await?;
-        }
-
         // Flush any remaining metrics in the calibration buffer
-        if !metrics_buffer.is_empty() && !is_warmup {
-            let buffer_len = metrics_buffer.len(); // Capture length before mutable borrow
-            println!();
+        if !metrics_buffer.is_empty() {
             println!(
-                "Flushing remaining {} blocks from calibration buffer...",
-                buffer_len
+                "\nFlushing remaining {} block metrics from buffer...",
+                metrics_buffer.len()
             );
 
-            for (j, m) in metrics_buffer.iter_mut().enumerate() {
-                // Apply heuristic since we didn't finish calibration
-                m.apply_heuristic();
-
-                accumulator.add(m);
-
-                // Calculate correct block ID index
-                // The buffer contains the LAST N blocks processed.
-                let start_index = selected_block_count - buffer_len;
-                let buffered_id = &block_ids[start_index + j];
-
-                app_db
-                    .save_block_metrics(run_model.id, buffered_id, m)
-                    .await?;
+            for m in metrics_buffer.iter_mut() {
+                if !calibrated {
+                    // Apply heuristic since we didn't finish calibration
+                    m.apply_heuristic();
+                }
             }
+
+            app_db
+                .save_block_metrics(run_model.id, metrics_buffer.drain(..))
+                .await?;
+        } else if is_warmup {
+            println!("\nNo blocks executed for benchmarking (all warmup).");
         }
 
         let duration = start.elapsed();

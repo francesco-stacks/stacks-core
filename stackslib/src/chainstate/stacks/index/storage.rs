@@ -682,6 +682,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
     /// If the given `storage_tx`'s hash calculation mode is set to
     /// `TrieHashCalculationMode::Deferred`, then this method will also store each non-leaf node's
     /// hash.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn calculate_node_hashes(
         &mut self,
         storage_tx: &mut TrieStorageTransaction<T>,
