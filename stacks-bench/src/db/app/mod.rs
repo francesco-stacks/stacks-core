@@ -805,8 +805,11 @@ impl AppDb {
                     };
 
                     // Start insertion for this block
+                    let mut tx_ordinal: usize = 0;
                     for (i, root) in results.iter().enumerate() {
-                        ctx.insert_node(dbtx, root, None, i as i32, 0, None).await?;
+                        tx_ordinal = ctx
+                            .insert_node(dbtx, root, None, i as i32, 0, None, tx_ordinal)
+                            .await?;
                     }
                 }
                 Ok(())
@@ -910,7 +913,8 @@ impl<'a> ProfilerInsertContext<'a> {
         child_index: i32,
         depth: i32,
         active_tx_id: Option<i64>,
-    ) -> BoxFuture<'b, Result<()>> {
+        tx_ordinal: usize,
+    ) -> BoxFuture<'b, Result<usize>> {
         async move {
             // A. Resolve/Insert Location (With Caching)
             let loc_id = AppDb::resolve_profiler_location(
@@ -932,10 +936,18 @@ impl<'a> ProfilerInsertContext<'a> {
 
             // C. Determine Context (Block vs Tx)
             let mut current_tx_id = active_tx_id;
+            let mut next_tx_ordinal = tx_ordinal;
+
             if node.name() == "Transaction" {
-                if let Some(tid) = self.tx_db_ids.get(child_index as usize).and_then(|x| *x) {
+                // Do NOT inherit the previous tx id across transactions
+                current_tx_id = None;
+
+                if let Some(tid) = self.tx_db_ids.get(next_tx_ordinal).and_then(|x| *x) {
                     current_tx_id = Some(tid);
                 }
+
+                // Advance global transaction ordinal (even if lookup failed)
+                next_tx_ordinal += 1;
             }
 
             // Calculate metrics
@@ -945,10 +957,8 @@ impl<'a> ProfilerInsertContext<'a> {
                 .iter()
                 .map(|c| c.wall_time_micros() as i64)
                 .sum();
-            // Use saturating_sub to handle potential clock skew or precision issues
             let self_wall_time_us = wall_time_us.saturating_sub(children_wall_time_us);
 
-            // CPU time
             let cpu_time_us = node.cpu_time_micros() as i64;
             let children_cpu_time_us: i64 = node
                 .children
@@ -980,19 +990,22 @@ impl<'a> ProfilerInsertContext<'a> {
                 .get_result(conn)
                 .await?;
 
-            // Recurse
+            // Recurse (carry the updated tx ordinal through DFS order)
             for (idx, child) in node.children.iter().enumerate() {
-                self.insert_node(
-                    conn,
-                    child,
-                    Some(record_id),
-                    idx as i32,
-                    depth + 1,
-                    current_tx_id,
-                )
-                .await?;
+                next_tx_ordinal = self
+                    .insert_node(
+                        conn,
+                        child,
+                        Some(record_id),
+                        idx as i32,
+                        depth + 1,
+                        current_tx_id,
+                        next_tx_ordinal,
+                    )
+                    .await?;
             }
-            Ok(())
+
+            Ok(next_tx_ordinal)
         }
         .boxed()
     }

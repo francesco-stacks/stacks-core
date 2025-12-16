@@ -1803,6 +1803,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     }
 
     /// Flush uncommitted state to disk.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn flush(&mut self) -> Result<(), Error> {
         if self.data.unconfirmed {
             self.inner_flush(FlushOptions::UnconfirmedTable)
@@ -1873,6 +1874,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     /// Extend the forest of Tries to include a new confirmed block.
     /// Fails if the block already exists, or if the storage is read-only, or open
     /// only for unconfirmed state.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn extend_to_block(&mut self, bhh: &T) -> Result<(), Error> {
         self.clear_cached_ancestor_hashes_bytes();
         if self.data.readonly {
@@ -1909,6 +1911,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     /// Extend the forest of Tries to include a new unconfirmed block.
     /// If the unconfirmed block (bhh) already exists, then load up its trie as the uncommitted_writes
     /// trie.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn extend_to_unconfirmed_block(&mut self, bhh: &T) -> Result<bool, Error> {
         self.clear_cached_ancestor_hashes_bytes();
         if !self.data.unconfirmed {

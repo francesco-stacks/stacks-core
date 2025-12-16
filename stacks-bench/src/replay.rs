@@ -41,7 +41,9 @@ struct TxSegment {
     attribute_commit_to_txs: bool,
 }
 
-fn build_segments_full(block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock) -> Vec<TxSegment> {
+fn build_segments_full(
+    block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
+) -> Vec<TxSegment> {
     if block.txs.is_empty() {
         return vec![];
     }
@@ -347,9 +349,18 @@ fn replay_nakamoto_by_segments(
         // Get the txs for this segment
         let segment_txs = &block.txs[seg.range.clone()];
 
+        let _setup_guard = if seg.record {
+            stacks_profiler::span!("Segment Setup", seg_ix)
+        } else {
+            None
+        };
+
         // Find whether this segment includes the tenure tx / coinbase tx
-        let segment_tenure_change_tx: Option<&blockstack_lib::chainstate::stacks::StacksTransaction> =
-            segment_txs.iter().find(|tx| tx.try_as_tenure_change().is_some());
+        let segment_tenure_change_tx: Option<
+            &blockstack_lib::chainstate::stacks::StacksTransaction,
+        > = segment_txs
+            .iter()
+            .find(|tx| tx.try_as_tenure_change().is_some());
 
         let segment_coinbase_tx: Option<&blockstack_lib::chainstate::stacks::StacksTransaction> =
             segment_txs.iter().find(|tx| tx.try_as_coinbase().is_some());
@@ -389,22 +400,36 @@ fn replay_nakamoto_by_segments(
 
         let burn_chain_height = miner_tenure_info.burn_tip_height;
 
-        let mut clarity_tx = builder.tenure_begin(
-            &burn_dbconn,
-            &mut miner_tenure_info,
-        )?;
+        let mut clarity_tx = builder.tenure_begin(&burn_dbconn, &mut miner_tenure_info)?;
 
+        drop(_setup_guard);
 
         // Execute each tx in this segment
         let mut segment_tx_metrics: Vec<(String, Duration, ExecutionCost)> = Vec::new();
 
         let starting_cost = clarity_tx.cost_so_far();
 
+        let _exec_guard = if seg.record {
+            stacks_profiler::span!("Segment Execution", seg_ix)
+        } else {
+            None
+        };
+
         for i in seg.range.clone() {
             let tx = &block.txs[i];
             let tx_len = tx.tx_len();
 
-            let start = if seg.record { Some(Instant::now()) } else { None };
+            let start = if seg.record {
+                Some(Instant::now())
+            } else {
+                None
+            };
+
+            let _tx_guard = if seg.record {
+                stacks_profiler::span!("Transaction", i)
+            } else {
+                None
+            };
 
             let res = builder.try_mine_tx_with_len(
                 &mut clarity_tx,
@@ -413,6 +438,8 @@ fn replay_nakamoto_by_segments(
                 &BlockLimitFunction::NO_LIMIT_HIT,
                 None,
             );
+
+            drop(_tx_guard);
 
             let dur = start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
 
@@ -434,13 +461,25 @@ fn replay_nakamoto_by_segments(
             }
         }
 
-        let total_tenure_cost = clarity_tx.cost_so_far();
-        let mut block_execution_cost = clarity_tx.cost_so_far();
-        block_execution_cost.sub(&starting_cost)?;
+        drop(_exec_guard);
 
         // Commit this segment (optionally measured)
         // Measure commit “the way mining does”: finalize (merkle+seal) + clarity commit + header/marf writes
-        let commit_start = if seg.record { Some(Instant::now()) } else { None };
+        let commit_start = if seg.record {
+            Some(Instant::now())
+        } else {
+            None
+        };
+
+        let _commit_guard = if seg.record {
+            stacks_profiler::span!("Segment Commit", seg_ix)
+        } else {
+            None
+        };
+
+        let total_tenure_cost = clarity_tx.cost_so_far();
+        let mut block_execution_cost = clarity_tx.cost_so_far();
+        block_execution_cost.sub(&starting_cost)?;
 
         // cheap per-segment size approximation (matches builder accounting)
         let segment_block_size = builder.get_bytes_so_far();
@@ -457,8 +496,16 @@ fn replay_nakamoto_by_segments(
         let burn_view =
             NakamotoChainState::get_block_burn_view(&sortdb, &mined_block, &cur_parent_info)?;
 
-        let sn = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), &mined_block.header.consensus_hash)?
-            .ok_or_else(|| anyhow!("Snapshot not found for {}", mined_block.header.consensus_hash))?;
+        let sn = SortitionDB::get_block_snapshot_consensus(
+            sortdb.conn(),
+            &mined_block.header.consensus_hash,
+        )?
+        .ok_or_else(|| {
+            anyhow!(
+                "Snapshot not found for {}",
+                mined_block.header.consensus_hash
+            )
+        })?;
 
         let new_tip_info = NakamotoChainState::advance_tip(
             &mut miner_tenure_info.chainstate_tx.tx,
@@ -475,7 +522,10 @@ fn replay_nakamoto_by_segments(
             &total_tenure_cost,
             segment_block_size, // <-- per-segment, not original block_size
             false,
-            vec![], vec![], vec![], vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
             false,
             0,
             0,
@@ -484,6 +534,8 @@ fn replay_nakamoto_by_segments(
 
         // and finally commit the whole thing once (or let outer scope do it)
         miner_tenure_info.chainstate_tx.commit()?;
+
+        drop(_commit_guard);
 
         // Advance parent for the next segment so burn_view inheritance works
         cur_parent_info = new_tip_info;
@@ -494,7 +546,10 @@ fn replay_nakamoto_by_segments(
         // Record totals + per-tx metrics if this segment is recorded
         if seg.record {
             // total segment durations
-            out.execution_duration += segment_tx_metrics.iter().map(|(_, d, _)| *d).sum::<Duration>();
+            out.execution_duration += segment_tx_metrics
+                .iter()
+                .map(|(_, d, _)| *d)
+                .sum::<Duration>();
             out.commit_duration += commit_dur;
 
             // total clarity cost

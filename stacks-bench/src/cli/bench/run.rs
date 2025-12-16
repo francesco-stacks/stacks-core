@@ -175,7 +175,9 @@ impl RunArgs {
 
             // Replay the block
             let mode = match self.filter.as_ref() {
-                Some(FilterArg::ContractCall) => ReplayMode::SegmentedFiltered(TxFilter::ContractCall),
+                Some(FilterArg::ContractCall) => {
+                    ReplayMode::SegmentedFiltered(TxFilter::ContractCall)
+                }
                 None => ReplayMode::Follower,
             };
 

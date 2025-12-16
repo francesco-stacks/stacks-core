@@ -616,6 +616,7 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
     /// Seal the in-RAM MARF state so that no subsequent writes will be permitted.
     /// Returns the new root hash of the MARF.
     /// Runtime-panics if the MARF was already sealed.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn seal(&mut self) -> Result<TrieHash, Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
