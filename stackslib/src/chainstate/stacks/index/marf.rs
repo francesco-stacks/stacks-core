@@ -834,6 +834,7 @@ impl<T: MarfTrieId> MARF<T> {
     /// Walk down this MARF at the given block hash, doing a copy-on-write for intermediate nodes in this block's Trie from any prior Tries.
     /// s must point to the last filled-in Trie -- i.e. block_hash points to the _new_ Trie that is
     /// being filled in.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn walk_cow(
         storage: &mut TrieStorageTransaction<T>,
         block_hash: &T,
@@ -939,6 +940,7 @@ impl<T: MarfTrieId> MARF<T> {
     /// Walk down this MARF at the given block hash, resolving backptrs to previous tries.
     /// Return the cursor and the last node visited.
     /// s will point to the block in which the leaf was found, or the last block visited.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn walk(
         storage: &mut TrieStorageConnection<T>,
         block_hash: &T,
@@ -1171,6 +1173,7 @@ impl<T: MarfTrieId> MARF<T> {
         Ok(MARF::from_storage(file_storage))
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_by_path(
         storage: &mut TrieStorageConnection<T>,
         block_hash: &T,
@@ -1196,6 +1199,7 @@ impl<T: MarfTrieId> MARF<T> {
 
     /// Load up a MARF value by key, given a handle to the storage connection and a tip to work off
     /// of.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_by_key(
         storage: &mut TrieStorageConnection<T>,
         block_hash: &T,
@@ -1223,6 +1227,7 @@ impl<T: MarfTrieId> MARF<T> {
 
     /// Load up a MARF value by TrieHash, given a handle to the storage connection and a tip to
     /// work off of.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_by_hash(
         storage: &mut TrieStorageConnection<T>,
         block_hash: &T,
@@ -1278,6 +1283,7 @@ impl<T: MarfTrieId> MARF<T> {
         MARF::get_block_height_miner_tip(storage, block_hash, current_block_hash)
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_block_at_height(
         storage: &mut TrieStorageConnection<T>,
         height: u32,
@@ -1400,6 +1406,7 @@ impl<T: MarfTrieId> MARF<T> {
         self.storage.connection().open_block(block_hash)
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_with_proof(
         &mut self,
         block_hash: &T,
@@ -1414,6 +1421,7 @@ impl<T: MarfTrieId> MARF<T> {
         Ok(Some((marf_value, proof)))
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_with_proof_from_hash(
         &mut self,
         block_hash: &T,
@@ -1434,6 +1442,7 @@ impl<T: MarfTrieId> MARF<T> {
 
     /// Insert a batch of key/value pairs.  More efficient than inserting them individually, since
     /// the trie root hash will only be calculated once (which is an O(log B) operation).
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn insert_batch(&mut self, keys: &[String], values: Vec<MARFValue>) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
@@ -1455,6 +1464,7 @@ impl<T: MarfTrieId> MARF<T> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn insert(&mut self, key: &str, value: MARFValue) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
@@ -1467,6 +1477,7 @@ impl<T: MarfTrieId> MARF<T> {
     /// Insert the given (key, value) pair into the MARF.  Inserting the same key twice silently
     /// overwrites the existing key.  Succeeds if there are no storage errors.
     /// Must be called after a call to .begin() (will fail otherwise)
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn insert_raw(&mut self, path: TrieHash, marf_leaf: TrieLeaf) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
@@ -1522,6 +1533,7 @@ impl<T: MarfTrieId> MARF<T> {
 
     /// Finish writing the next trie in the MARF.  This persists all changes.
     /// Works for both confirmed and unconfirmed tries
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn commit(&mut self) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
@@ -1538,6 +1550,7 @@ impl<T: MarfTrieId> MARF<T> {
     ///   to commit the mined block, but write it to the mined_block table,
     ///   rather than out to the marf_data table (this prevents the
     ///   miner's block from getting stepped on after the sortition).
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn commit_mined(&mut self, bhh: &T) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
@@ -1555,6 +1568,7 @@ impl<T: MarfTrieId> MARF<T> {
 
     /// Finish writing the next trie in the MARF, but change the hash of the current Trie's
     /// block hash to something other than what we opened it as.  This persists all changes.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn commit_to(&mut self, real_bhh: &T) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
