@@ -82,6 +82,7 @@ table! {
         height -> BigInt,
         parent_stacks_block_id -> Nullable<BigInt>,
         burn_block_id -> BigInt,
+        txs_indexed -> Bool,
     }
 }
 
@@ -93,6 +94,12 @@ table! {
         height -> BigInt,
         burn_block_hash -> Binary,
         burn_block_height -> BigInt,
+    }
+}
+
+table! {
+    _staged_indexed_stacks_block (block_index_hash) {
+        block_index_hash -> Binary,
     }
 }
 
@@ -249,6 +256,7 @@ allow_tables_to_appear_in_same_query!(
     stacks_block_stats,
     stacks_tx_stats,
     _staged_stacks_block,
+    _staged_indexed_stacks_block,
     _staged_stacks_tx,
     profiler_location,
     profiler_span,

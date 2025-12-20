@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use blockstack_lib::chainstate::stacks::{StacksTransaction, TransactionPayload};
 use chrono::NaiveDateTime;
+use diesel::sql_types::{BigInt, Binary};
 use diesel::{
     ExpressionMethods as _, JoinOnDsl as _, NullableExpressionMethods as _, OptionalExtension as _,
     QueryDsl as _, QueryableByName, SelectableHelper as _, SqliteConnection, sql_query,
@@ -24,9 +25,9 @@ use sha2::{Digest, Sha256};
 use stacks_common::types::chainstate::StacksBlockId;
 use tokio::sync::RwLock;
 
-use crate::StacksBlockHeader;
 use crate::blocks::{BlockHeaderProvider, BlockRef, ChainCache};
 use crate::metrics::BlockMetrics;
+use crate::{StacksBlockHeader, StacksEpoch};
 
 pub mod models;
 pub mod schema;
@@ -234,7 +235,7 @@ impl AppDb {
         network: crate::Network,
         chain_id: u32,
         chain_tip: &BlockRef,
-        source_epochs: &[crate::db::node::sortition::models::Epoch],
+        source_epochs: &[StacksEpoch],
     ) -> Result<(Chainstate, Vec<Epoch>)> {
         let network_id = Self::resolve_network_id(network);
 
@@ -290,19 +291,19 @@ impl AppDb {
                             .values((
                                 epoch::chainstate_id.eq(chainstate.id),
                                 epoch::stacks_epoch_id.eq(e.epoch_id() as i32),
-                                epoch::network_epoch_id.eq(e.network_epoch_id() as i32),
+                                epoch::network_epoch_id.eq(e.network_epoch_id as i32),
                                 epoch::start_height.eq(e.start_block_height() as i64),
                                 epoch::end_height.eq(e.end_block_height() as i64),
                                 epoch::write_length_budget
-                                    .eq(TryInto::<i64>::try_into(e.block_limits.write_length)?),
+                                    .eq(TryInto::<i64>::try_into(e.write_length_budget)?),
                                 epoch::write_count_budget
-                                    .eq(TryInto::<i64>::try_into(e.block_limits.write_count)?),
+                                    .eq(TryInto::<i64>::try_into(e.write_count_budget)?),
                                 epoch::read_length_budget
-                                    .eq(TryInto::<i64>::try_into(e.block_limits.read_length)?),
+                                    .eq(TryInto::<i64>::try_into(e.read_length_budget)?),
                                 epoch::read_count_budget
-                                    .eq(TryInto::<i64>::try_into(e.block_limits.read_count)?),
+                                    .eq(TryInto::<i64>::try_into(e.read_count_budget)?),
                                 epoch::runtime_budget
-                                    .eq(TryInto::<i64>::try_into(e.block_limits.runtime)?),
+                                    .eq(TryInto::<i64>::try_into(e.runtime_budget)?),
                             ))
                             .get_result::<Epoch>(conn)
                             .await?;
@@ -382,14 +383,11 @@ impl AppDb {
 
     /// Retrieves the ordered list of block IDs for the canonical chain segment.
     pub async fn get_chain_block_ids(
-        &mut self,
+        &self,
         tip_index_hash: &StacksBlockId,
         start_height: u64,
         end_height: u64,
     ) -> Result<Vec<StacksBlockId>> {
-        use diesel::sql_query;
-        use diesel::sql_types::{BigInt, Binary};
-
         // Recursive CTE to walk backwards from tip, then order ascending
         let query = r#"
             WITH RECURSIVE chain(index_hash, height, parent_stacks_block_id) AS (
@@ -433,9 +431,80 @@ impl AppDb {
         Ok(ids)
     }
 
+    /// Retrieves headers for a chain range, but ONLY if they are fully indexed (txs_indexed = true).
+    /// Used to determine if we need to run the indexer pipeline.
+    pub async fn get_indexed_chain_block_ids(
+        &self,
+        tip_index_hash: &StacksBlockId,
+        start_height: u64,
+        end_height: u64,
+    ) -> Result<Vec<StacksBlockId>> {
+        // Similar to get_chain_block_ids but filters for txs_indexed = true
+        let query = r#"
+            WITH RECURSIVE chain(index_hash, height, parent_stacks_block_id) AS (
+                SELECT index_hash, height, parent_stacks_block_id
+                FROM stacks_block
+                WHERE index_hash = ?1 AND txs_indexed = 1
+                UNION ALL
+                SELECT p.index_hash, p.height, p.parent_stacks_block_id
+                FROM stacks_block p
+                INNER JOIN chain c ON c.parent_stacks_block_id = p.id
+                WHERE c.height > ?2 AND p.txs_indexed = 1
+            )
+            SELECT index_hash
+            FROM chain
+            WHERE height <= ?3 AND height >= ?2
+            ORDER BY height ASC
+        "#;
+
+        #[derive(Debug, QueryableByName)]
+        struct RawId {
+            #[diesel(sql_type = Binary)]
+            index_hash: Vec<u8>,
+        }
+
+        let raw_ids: Vec<RawId> = sql_query(query)
+            .bind::<Binary, _>(tip_index_hash.as_bytes())
+            .bind::<BigInt, _>(start_height as i64)
+            .bind::<BigInt, _>(end_height as i64)
+            .load(&mut self.get_conn().await?)
+            .await
+            .context("Failed to query chain block IDs")?;
+
+        let ids = raw_ids
+            .into_iter()
+            .map(|r| {
+                StacksBlockId::from_vec(&r.index_hash)
+                    .ok_or_else(|| anyhow!("Invalid hash in DB: {:?}", r.index_hash))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(ids)
+    }
+
+    /// Retrieves headers for a chain range from AppDb, regardless of txs_indexed status.
+    /// Used by the loader to avoid walking the node DB again.
+    pub async fn get_chain_headers(
+        &self,
+        tip_index_hash: &StacksBlockId,
+        start_height: u64,
+        end_height: u64,
+    ) -> Result<Vec<StacksBlockHeader>> {
+        let ids = self
+            .get_chain_block_ids(tip_index_hash, start_height, end_height)
+            .await?;
+        let mut headers = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(h) = self.get_header(&id).await? {
+                headers.push(h);
+            }
+        }
+        Ok(headers)
+    }
+
     /// Fetches a single block header by index block hash ([`StacksBlockId`]),
     /// resolving parent and burn info.
-    pub async fn get_block(&mut self, id: &StacksBlockId) -> Result<StacksBlockHeader> {
+    pub async fn get_block(&self, id: &StacksBlockId) -> Result<StacksBlockHeader> {
         // Define an alias for the parent block table
         let parent_block = diesel::alias!(stacks_block as parent_block);
 
@@ -464,9 +533,9 @@ impl AppDb {
         (s_block, b_block, parent_hash_opt).try_into()
     }
 
-    pub async fn stage_blocks<I>(&mut self, blocks: I) -> Result<()>
+    pub async fn stage_blocks<'a, I>(&mut self, blocks: I) -> Result<()>
     where
-        I: IntoIterator<Item = StacksBlockHeader> + Send,
+        I: IntoIterator<Item = &'a StacksBlockHeader> + Send,
         I::IntoIter: Send,
     {
         self.get_conn()
@@ -622,6 +691,43 @@ impl AppDb {
             .await
     }
 
+    pub async fn stage_indexed_blocks<'a, I>(&mut self, headers: I) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a StacksBlockHeader> + Send,
+        I::IntoIter: Send,
+    {
+        use crate::db::app::schema::_staged_indexed_stacks_block;
+
+        // Collect once so we can iterate inside the async transaction closure safely.
+        let hashes: Vec<Vec<u8>> = headers
+            .into_iter()
+            .map(|h| h.id.as_bytes().to_vec())
+            .collect();
+
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
+        self.get_conn()
+            .await?
+            .transaction::<_, anyhow::Error, _>(|conn| {
+                Box::pin(async move {
+                    for block_index_hash in hashes {
+                        diesel::insert_into(_staged_indexed_stacks_block::table)
+                            .values(
+                                _staged_indexed_stacks_block::block_index_hash.eq(block_index_hash),
+                            )
+                            .on_conflict(_staged_indexed_stacks_block::block_index_hash)
+                            .do_nothing()
+                            .execute(conn)
+                            .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+    }
+
     pub async fn merge_staging(&mut self) -> Result<()> {
         self.get_conn()
             .await?
@@ -644,21 +750,21 @@ impl AppDb {
     }
 
     /// Computes a deterministic hash of the epoch configuration.
-    fn compute_epochs_hash(epochs: &[crate::db::node::sortition::models::Epoch]) -> Vec<u8> {
+    fn compute_epochs_hash(epochs: &[StacksEpoch]) -> Vec<u8> {
         let mut hasher = Sha256::new();
         // Sort by start height to ensure determinism
         let mut sorted = epochs.to_vec();
         sorted.sort_by_key(|e| e.start_block_height());
 
         for epoch in sorted {
-            hasher.update(epoch.epoch_id().to_le_bytes());
+            hasher.update(epoch.epoch_id_le_bytes());
             hasher.update(epoch.start_block_height().to_le_bytes());
             hasher.update(epoch.end_block_height().to_le_bytes());
-            hasher.update(epoch.block_limits.write_length.to_le_bytes());
-            hasher.update(epoch.block_limits.write_count.to_le_bytes());
-            hasher.update(epoch.block_limits.read_length.to_le_bytes());
-            hasher.update(epoch.block_limits.read_count.to_le_bytes());
-            hasher.update(epoch.block_limits.runtime.to_le_bytes());
+            hasher.update(epoch.write_length_budget.to_le_bytes());
+            hasher.update(epoch.write_count_budget.to_le_bytes());
+            hasher.update(epoch.read_length_budget.to_le_bytes());
+            hasher.update(epoch.read_count_budget.to_le_bytes());
+            hasher.update(epoch.runtime_budget.to_le_bytes());
         }
         hasher.finalize().to_vec()
     }
@@ -1001,7 +1107,7 @@ impl ChainCache for AppDb {
 }
 
 impl BlockHeaderProvider for AppDb {
-    async fn get_header(&mut self, id: &StacksBlockId) -> Result<Option<StacksBlockHeader>> {
+    async fn get_header(&self, id: &StacksBlockId) -> Result<Option<StacksBlockHeader>> {
         match self.get_block(id).await {
             Ok(h) => Ok(Some(h)),
             Err(_) => Ok(None),

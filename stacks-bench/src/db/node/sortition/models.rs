@@ -67,8 +67,14 @@ impl TryFrom<&Epoch> for crate::StacksEpoch {
     fn try_from(epoch: &Epoch) -> Result<Self> {
         Ok(Self {
             epoch_id: epoch.to_stacks_epoch_id()?,
+            network_epoch_id: epoch.network_epoch_id(),
             start_block_height: epoch.start_block_height(),
             end_block_height: epoch.end_block_height(),
+            write_count_budget: epoch.block_limits.write_count,
+            write_length_budget: epoch.block_limits.write_length,
+            read_count_budget: epoch.block_limits.read_count,
+            read_length_budget: epoch.block_limits.read_length,
+            runtime_budget: epoch.block_limits.runtime,
         })
     }
 }

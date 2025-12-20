@@ -2,12 +2,14 @@ use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clarity::types::chainstate::StacksBlockId;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use futures::Stream;
 
-use crate::blocks::BlockHeaderProvider;
+use crate::StacksBlockHeader;
+use crate::blocks::{BackwardsBlockStream, BlockHeaderProvider};
 use crate::db::{DbOpen, SqliteDbHandle};
 
 pub mod models;
@@ -45,7 +47,7 @@ where
     }
 }
 
-impl<Mode> ChainStateDb<Mode> {
+impl<Mode: Send + Sync + 'static> ChainStateDb<Mode> {
     pub async fn read_db_config(&self) -> Result<models::DbConfig> {
         use schema::db_config::dsl::db_config;
         let mut conn = self.handle.get_conn().await?;
@@ -98,10 +100,52 @@ impl<Mode> ChainStateDb<Mode> {
                 format!("Failed to query block header for block with index hash '{index_hash_hex}'")
             })
     }
+
+    /// Stream canonical headers by walking parent links from `tip_id`,
+    /// yielding headers whose height is in [start_height, end_height] (descending).
+    ///
+    /// Note: this still performs per-header lookups (via `get_header()`), but it avoids
+    /// the extra pre-walk done by BenchContext::initialize().
+    pub fn canonical_block_stream_from_tip(
+        &self,
+        tip_id: StacksBlockId,
+        start_height: u64,
+        end_height: u64,
+    ) -> impl Stream<Item = Result<StacksBlockHeader>> {
+        let stream = BackwardsBlockStream::new(self, tip_id);
+
+        Box::pin(futures::stream::unfold(stream, move |mut bs| async move {
+            loop {
+                match bs.next_block().await {
+                    Ok(Some(header)) => {
+                        if header.height < start_height {
+                            return None;
+                        }
+                        if header.height <= end_height {
+                            return Some((Ok(header), bs));
+                        }
+                        // above end_height: keep walking
+                    }
+                    Ok(None) => return Some((Err(anyhow!("Missing header")), bs)),
+                    Err(e) => return Some((Err(e), bs)),
+                }
+            }
+        }))
+    }
 }
 
-impl<Mode: Send> BlockHeaderProvider for ChainStateDb<Mode> {
-    async fn get_header(&mut self, id: &StacksBlockId) -> Result<Option<crate::StacksBlockHeader>> {
+impl<Mode: Send + Sync + 'static> BlockHeaderProvider for ChainStateDb<Mode> {
+    async fn get_header(&self, id: &StacksBlockId) -> Result<Option<crate::StacksBlockHeader>> {
+        let header = self.get_block_header(id).await?;
+        match header {
+            Some(h) => Ok(Some(h.try_into()?)),
+            None => Ok(None),
+        }
+    }
+}
+
+impl<Mode: Send + Sync + 'static> BlockHeaderProvider for &ChainStateDb<Mode> {
+    async fn get_header(&self, id: &StacksBlockId) -> Result<Option<crate::StacksBlockHeader>> {
         let header = self.get_block_header(id).await?;
         match header {
             Some(h) => Ok(Some(h.try_into()?)),

@@ -24,7 +24,7 @@ use crate::{
 
 const BURNCHAIN_NAME: &str = "bitcoin";
 
-pub struct BenchContextOpts {
+pub struct BenchEnvOpts {
     source_dir: PathBuf,
     network: Network,
     chain_id: u32,
@@ -37,22 +37,16 @@ pub struct BenchContextOpts {
     epochs: Vec<StacksEpoch>,
 }
 
-impl BenchContextOpts {
-    pub fn new<T, I>(
-        source_dir: PathBuf,
-        network: Network,
-        chain_id: u32,
-        epochs: I,
-    ) -> Result<Self>
+impl BenchEnvOpts {
+    pub fn new<I>(source_dir: PathBuf, network: Network, chain_id: u32, epochs: I) -> Result<Self>
     where
-        T: TryInto<StacksEpoch>,
-        T::Error: Into<anyhow::Error>,
-        I: IntoIterator<Item = T>,
+        I: IntoIterator<Item = StacksEpoch>,
     {
-        let epochs = epochs
-            .into_iter()
-            .map(|e| e.try_into().map_err(Into::into))
-            .collect::<Result<Vec<_>>>()?;
+        // let epochs = epochs
+        //     .into_iter()
+        //     .map(|e| e.try_into().map_err(Into::into))
+        //     .collect::<Result<Vec<_>>>()?;
+        let epochs: Vec<StacksEpoch> = epochs.into_iter().collect();
 
         Ok(Self {
             source_dir,
@@ -87,8 +81,76 @@ impl BenchContextOpts {
     }
 }
 
+pub struct BenchEnv {
+    pub is_mainnet: bool,
+    pub shadow_dir: ShadowDir,
+    pub chainstate_dir: ChainStateDir,
+    pub burnchain_dir: BurnChainDir,
+    pub epochs: Arc<Vec<StacksEpoch>>,
+    pub network: Network,
+    pub chain_id: u32,
+}
+
+impl BenchEnv {
+    pub async fn initialize(opts: BenchEnvOpts) -> Result<(Self, BlockRef)> {
+        println!("Creating shadow directory (this may take a few moments)...");
+        let start = Instant::now();
+        let shadow_dir = ShadowDirBuilder::new(&opts.source_dir)
+            .glob("burnchain/**")
+            .glob("chainstate/**")
+            .watch("chainstate/vm/clarity/marf.sqlite")
+            .watch("chainstate/vm/clarity/marf.sqlite.blobs")
+            .watch("chainstate/vm/clarity/marf.sqlite-wal")
+            .watch("chainstate/vm/index.sqlite")
+            .copy()?;
+        println!(
+            "Created shadow directory at {shadow_dir:?} in {:.2?}",
+            start.elapsed()
+        );
+
+        let burnchain_dir = BurnChainDir::from_node_root(&shadow_dir);
+        let chainstate_dir = ChainStateDir::from_node_root(&shadow_dir);
+
+        let is_mainnet = opts.network.is_mainnet();
+
+        // Canonical node tip (id + height) is obtained from sortition db without any Stacks header walking
+        let mut sortition_db =
+            SortitionDb::open_for_read(burnchain_dir.sortition_db_path()).await?;
+        let (node_tip_id, node_tip_height) = sortition_db.get_canonical_stacks_tip().await?;
+
+        let env = Self {
+            is_mainnet,
+            shadow_dir,
+            chainstate_dir,
+            burnchain_dir,
+            epochs: Arc::new(opts.epochs),
+            network: opts.network,
+            chain_id: opts.chain_id,
+        };
+
+        Ok((
+            env,
+            BlockRef {
+                id: node_tip_id,
+                height: node_tip_height,
+            },
+        ))
+    }
+
+    pub async fn open_chainstate_db_for_read(&self) -> Result<ChainStateDb<ReadOnly>> {
+        ChainStateDb::<ReadOnly>::open_for_read(self.chainstate_dir.index_db_path()).await
+    }
+
+    pub async fn open_nakamoto_db_for_read(&self) -> Result<NakamotoDb<ReadOnly>> {
+        NakamotoDb::<ReadOnly>::open_for_read(self.chainstate_dir.nakamoto_db_path()).await
+    }
+
+    pub async fn open_sortition_db_for_read(&self) -> Result<SortitionDb<ReadOnly>> {
+        SortitionDb::<ReadOnly>::open_for_read(self.burnchain_dir.sortition_db_path()).await
+    }
+}
+
 pub struct BenchContext {
-    app_db: AppDb,
     is_mainnet: bool,
     shadow_dir: ShadowDir,
     start_block: BlockRef,
@@ -104,6 +166,27 @@ pub struct BenchContext {
 }
 
 impl BenchContext {
+    pub fn from_env(
+        env: BenchEnv,
+        chain_tip: BlockRef,
+        start_block: BlockRef,
+        end_block: BlockRef,
+    ) -> Self {
+        Self {
+            is_mainnet: env.is_mainnet,
+            shadow_dir: env.shadow_dir,
+            chainstate_dir: env.chainstate_dir,
+            burnchain_dir: env.burnchain_dir,
+            epochs: env.epochs,
+            network: env.network,
+            chain_id: env.chain_id,
+            chain_tip,
+            start_block,
+            end_block,
+            last_storage_delta: 0,
+        }
+    }
+
     pub fn chainstate_dir(&self) -> &ChainStateDir {
         &self.chainstate_dir
     }
@@ -205,7 +288,7 @@ impl BenchContext {
         Ok(delta)
     }
 
-    pub async fn initialize(mut app_db: AppDb, opts: BenchContextOpts) -> Result<Self> {
+    pub async fn initialize(mut app_db: AppDb, opts: BenchEnvOpts) -> Result<Self> {
         println!("Creating shadow directory (this may take a few moments)...");
         let start = Instant::now();
         let shadow_dir = ShadowDirBuilder::new(&opts.source_dir)
@@ -400,7 +483,7 @@ impl BenchContext {
             last_storage_delta: 0,
             chainstate_dir,
             burnchain_dir,
-            app_db,
+            //app_db,
         })
     }
 
@@ -430,8 +513,7 @@ impl BenchContext {
 
         match chainstate_db_res {
             Ok(chainstate_db) => {
-                let stream = BackwardsBlockStream::new(chainstate_db, current_id)
-                    .with_cache(&mut self.app_db);
+                let stream = BackwardsBlockStream::new(chainstate_db, current_id);
                 futures::stream::unfold(stream, move |mut bs| async move {
                     loop {
                         match bs.next_block().await {

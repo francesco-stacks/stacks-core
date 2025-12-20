@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use stacks_bench::context::BenchContext;
 use stacks_bench::filter::TxFilter;
 use stacks_bench::indexer::ChainstateIndexer;
 use stacks_bench::metrics::{CostModel, MetricsAccumulator, ModelSource};
@@ -11,7 +12,9 @@ use stacks_bench::replay::ReplayMode;
 use stacks_bench::{Network, StacksBlockRef};
 use stacks_profiler::Profiler;
 
-use crate::cli::common::{CliContext, IndexerArgs, TxIdArg, get_git_hash, setup_bench_context};
+use crate::cli::common::{
+    CliContext, IndexerArgs, TxIdArg, get_git_hash, setup_bench_env_and_plan,
+};
 
 // TODO: Add a `--contract` arg to filter by qualified contract id
 #[derive(clap::Args, Debug, Serialize, Deserialize)]
@@ -104,16 +107,27 @@ impl RunArgs {
     pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
         let mut app_db = ctx.app_db();
 
-        let (mut bench_context, network, chain_id, epochs) =
-            setup_bench_context(&mut app_db, self).await?;
+        // Create env + compute height plan
+        let (env, plan) = setup_bench_env_and_plan(self).await?;
 
+        // Setup indexer and index chainstate range
+        let mut indexer = ChainstateIndexer::new(&mut app_db, &env);
+        let (resolved, block_ids) = indexer
+            .index_chainstate_range(env.network, env.chain_id, &env.epochs, plan)
+            .await?;
+
+        // Ensure chainstate row exists
         let (chainstate_model, _) = app_db
-            .get_or_create_chainstate(network, chain_id, bench_context.chain_tip(), &epochs)
+            .get_or_create_chainstate(env.network, env.chain_id, &resolved.anchor_tip, &env.epochs)
             .await?;
 
-        let block_ids = ChainstateIndexer::new(&mut app_db, &mut bench_context)
-            .index_chainstate(network, chain_id, &epochs)
-            .await?;
+        // Build BenchContext from resolved BlockRefs
+        let mut bench_context = BenchContext::from_env(
+            env,
+            resolved.anchor_tip.clone(),
+            resolved.start.clone(),
+            resolved.end.clone(),
+        );
 
         let selected_block_count = block_ids.len();
 

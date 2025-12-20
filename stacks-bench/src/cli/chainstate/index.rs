@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use stacks_bench::indexer::ChainstateIndexer;
 use stacks_bench::{Network, StacksBlockRef};
 
-use crate::cli::common::{CliContext, IndexerArgs, setup_bench_context};
+use crate::cli::common::{CliContext, IndexerArgs, setup_bench_env_and_plan};
 
 #[derive(clap::Args, Debug, Serialize, Deserialize)]
 pub struct IndexArgs {
@@ -65,19 +65,22 @@ impl IndexArgs {
     pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
         let mut app_db = ctx.app_db();
 
-        let (mut bench_context, network, chain_id, epochs) =
-            setup_bench_context(&mut app_db, self).await?;
+        let (env, plan) = setup_bench_env_and_plan(self).await?;
 
-        let mut indexer = ChainstateIndexer::new(&mut app_db, &mut bench_context);
-        indexer.index_chainstate(network, chain_id, &epochs).await?;
+        let mut indexer = ChainstateIndexer::new(&mut app_db, &env);
+        let (resolved, _block_ids) = indexer
+            .index_chainstate_range(env.network, env.chain_id, &env.epochs, plan)
+            .await?;
 
-        println!("Indexing complete");
+        println!(
+            "Indexing complete: start={} end={}",
+            resolved.start, resolved.end
+        );
 
-        println!("Cleaning up (this may take a few moments for large chainstates)...");
-        // Dropping the context will clean up the shadow dir
-        drop(bench_context);
+        // build context only if you actually need it for something else;
+        // otherwise, drop env to cleanup shadow dir
+        drop(env);
 
-        println!("Done!");
         Ok(())
     }
 }

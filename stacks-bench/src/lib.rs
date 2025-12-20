@@ -27,22 +27,23 @@ pub mod paths;
 pub mod replay;
 pub mod shadow;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct StacksEpoch {
     epoch_id: StacksEpochId,
+    network_epoch_id: u32,
     start_block_height: u64,
     end_block_height: u64,
+    write_length_budget: u64,
+    write_count_budget: u64,
+    read_length_budget: u64,
+    read_count_budget: u64,
+    runtime_budget: u64,
 }
 
 impl StacksEpoch {
-    pub fn new(epoch_id: StacksEpochId, start_block_height: u64, end_block_height: u64) -> Self {
-        Self {
-            epoch_id,
-            start_block_height,
-            end_block_height,
-        }
+    pub fn epoch_id_le_bytes(&self) -> [u8; 4] {
+        (self.epoch_id as u32).to_le_bytes()
     }
-
     pub fn epoch_id(&self) -> StacksEpochId {
         self.epoch_id
     }

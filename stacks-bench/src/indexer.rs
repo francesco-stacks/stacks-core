@@ -9,10 +9,22 @@ use stacks_common::types::chainstate::StacksBlockId;
 use tokio::sync::mpsc;
 use tokio::task;
 
-use crate::context::BenchContext;
+use crate::blocks::{BlockRef, ChainCache as _};
+use crate::context::BenchEnv;
 use crate::db::app::AppDb;
-use crate::db::node::sortition::models::Epoch;
-use crate::{Network, StacksBlockHeader, StacksBlockLoader};
+use crate::{Network, StacksBlockHeader, StacksBlockLoader, StacksEpoch};
+
+pub struct ChainIndexPlan {
+    pub anchor_tip: BlockRef,
+    pub start_height: u64,
+    pub end_height: u64,
+}
+
+pub struct ResolvedRange {
+    pub anchor_tip: BlockRef,
+    pub start: BlockRef,
+    pub end: BlockRef,
+}
 
 #[derive(Debug, Default)]
 struct IndexerMetrics {
@@ -39,7 +51,7 @@ impl IndexerMetrics {
 
 pub struct ChainstateIndexer<'a> {
     app_db: &'a mut AppDb,
-    context: &'a mut BenchContext,
+    env: &'a BenchEnv,
     batch_size: usize,
     merge_threshold: usize,
     channel_buffer_size: usize,
@@ -50,10 +62,10 @@ impl<'a> ChainstateIndexer<'a> {
     pub const DEFAULT_MERGE_THRESHOLD: usize = 100_000;
     pub const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 5_000;
 
-    pub fn new(app_db: &'a mut AppDb, context: &'a mut BenchContext) -> Self {
+    pub fn new(app_db: &'a mut AppDb, env: &'a BenchEnv) -> Self {
         Self {
             app_db,
-            context,
+            env,
             batch_size: Self::DEFAULT_BATCH_SIZE,
             merge_threshold: Self::DEFAULT_MERGE_THRESHOLD,
             channel_buffer_size: Self::DEFAULT_CHANNEL_BUFFER_SIZE,
@@ -64,91 +76,229 @@ impl<'a> ChainstateIndexer<'a> {
         self.batch_size = batch_size;
     }
 
-    pub async fn index_chainstate(
+    async fn try_get_cached_id_at_height(
+        &mut self,
+        anchor_tip_id: &StacksBlockId,
+        target_height: u64,
+    ) -> Result<Option<StacksBlockId>> {
+        match self
+            .app_db
+            .find_closest_ancestor(anchor_tip_id, target_height)
+            .await?
+        {
+            Some((id, h)) if h == target_height => Ok(Some(id)),
+            _ => Ok(None),
+        }
+    }
+
+    async fn build_resolved_from_ids(
+        &mut self,
+        anchor_tip: BlockRef,
+        start_id: StacksBlockId,
+        start_height: u64,
+        end_id: StacksBlockId,
+        end_height: u64,
+    ) -> Result<ResolvedRange> {
+        Ok(ResolvedRange {
+            anchor_tip,
+            start: BlockRef {
+                id: start_id,
+                height: start_height,
+            },
+            end: BlockRef {
+                id: end_id,
+                height: end_height,
+            },
+        })
+    }
+
+    async fn resolve_range_ids_via_node_walk(
+        &mut self,
+        anchor_tip: BlockRef,
+        start_height: u64,
+        end_height: u64,
+    ) -> Result<ResolvedRange> {
+        let chainstate_db = self.env.open_chainstate_db_for_read().await?;
+
+        let mut resolved_start: Option<StacksBlockHeader> = None;
+        let mut resolved_end: Option<StacksBlockHeader> = None;
+
+        let mut stream = chainstate_db.canonical_block_stream_from_tip(
+            anchor_tip.id.clone(),
+            start_height,
+            end_height,
+        );
+
+        while let Some(hdr) = stream.next().await {
+            let hdr = hdr?;
+            if hdr.height == end_height && resolved_end.is_none() {
+                resolved_end = Some(hdr.clone());
+            }
+            if hdr.height == start_height && resolved_start.is_none() {
+                resolved_start = Some(hdr.clone());
+            }
+            if resolved_start.is_some() && resolved_end.is_some() {
+                break;
+            }
+        }
+
+        let start_hdr = resolved_start.ok_or_else(|| anyhow!("Failed to resolve start height"))?;
+        let end_hdr = resolved_end.ok_or_else(|| anyhow!("Failed to resolve end height"))?;
+
+        Ok(ResolvedRange {
+            anchor_tip,
+            start: BlockRef {
+                id: start_hdr.id,
+                height: start_hdr.height,
+            },
+            end: BlockRef {
+                id: end_hdr.id,
+                height: end_hdr.height,
+            },
+        })
+    }
+
+    pub async fn index_chainstate_range(
         &mut self,
         network: Network,
         chain_id: u32,
-        epochs: &[Epoch],
-    ) -> Result<Vec<StacksBlockId>> {
-        let chain_tip = self.context.chain_tip().clone();
-        let (start_height, end_height) = self.context.block_height_range()?;
-        let end_block_id = self.context.end_block().id.clone();
-
-        // Index one extra block so the first replayed block can resolve its parent in AppDb::get_block().
-        let index_start_height = if start_height > 0 {
-            start_height - 1
+        epochs: &[StacksEpoch],
+        plan: ChainIndexPlan,
+    ) -> Result<(ResolvedRange, Vec<StacksBlockId>)> {
+        let index_start_height = if plan.start_height > 0 {
+            plan.start_height - 1
         } else {
-            start_height
+            plan.start_height
         };
 
-        println!("Targeting block range: {start_height} to {end_height} (Tip: {chain_tip})");
+        println!(
+            "Targeting block range: {} to {} (Anchor tip: {})",
+            plan.start_height, plan.end_height, plan.anchor_tip
+        );
 
         let (_chainstate_model, _) = self
             .app_db
-            .get_or_create_chainstate(network, chain_id, &chain_tip, epochs)
+            .get_or_create_chainstate(network, chain_id, &plan.anchor_tip, epochs)
             .await?;
 
-        let expected_indexed_count = (end_height - index_start_height + 1) as usize;
+        let expected_indexed_count = (plan.end_height - index_start_height + 1) as usize;
 
-        // Query the indexed segment (may include start-1).
-        let mut indexed_ids = self
-            .app_db
-            .get_chain_block_ids(&end_block_id, index_start_height, end_height)
+        // Try to resolve an in-range anchor (end_id) from the cache.
+        // This is the critical short-circuit that avoids “anchor tip not in AppDb” problems.
+        let cached_end_id = self
+            .try_get_cached_id_at_height(&plan.anchor_tip.id, plan.end_height)
             .await?;
 
-        if indexed_ids.len() != expected_indexed_count {
-            println!(
-                "App DB index incomplete (found {}, expected {expected_indexed_count}). Indexing from Node DB...",
-                indexed_ids.len(),
-            );
-
-            self.run_indexing_pipeline(index_start_height, end_height)
-                .await?;
-
-            println!("Checkpointing database...");
-            self.app_db.checkpoint(true).await?;
-            println!("Vacuuming database...");
-            self.app_db.vacuum().await?;
-
-            // Reload indexed IDs after indexing/merge.
-            indexed_ids = self
-                .app_db
-                .get_chain_block_ids(&end_block_id, index_start_height, end_height)
-                .await?;
-        }
-
-        if indexed_ids.is_empty() {
-            return Err(anyhow!(
-                "No blocks found in indexed range {index_start_height} to {end_height}"
-            ));
-        }
-
-        if indexed_ids.len() != expected_indexed_count {
-            return Err(anyhow!(
-                "Index still incomplete after indexing (found {}, expected {expected_indexed_count})",
-                indexed_ids.len(),
-            ));
-        }
-
-        // Return only the requested range [start_height..=end_height].
-        let block_ids: Vec<StacksBlockId> = if start_height > 0 {
-            indexed_ids.into_iter().skip(1).collect()
+        // If we have an in-range anchor, do *all* AppDb recursive queries anchored at it.
+        // That makes the "already indexed?" check cheap and reliable.
+        let indexed_ids = if let Some(end_id) = &cached_end_id {
+            self.app_db
+                .get_indexed_chain_block_ids(end_id, index_start_height, plan.end_height)
+                .await?
         } else {
-            indexed_ids
+            // Fallback: may be useless if anchor tip header isn't present in AppDb.
+            self.app_db
+                .get_indexed_chain_block_ids(
+                    &plan.anchor_tip.id,
+                    index_start_height,
+                    plan.end_height,
+                )
+                .await?
         };
 
-        let expected_count = (end_height - start_height + 1) as usize;
-        if block_ids.len() != expected_count {
-            return Err(anyhow!(
-                "Unexpected block id count (found {}, expected {expected_count})",
-                block_ids.len(),
-            ));
+        if indexed_ids.len() == expected_indexed_count {
+            // Already indexed: if we also have end_id cached, we can resolve the whole range
+            // without any node DB access.
+            if let Some(end_id) = cached_end_id {
+                let mut ids = self
+                    .app_db
+                    .get_chain_block_ids(&end_id, index_start_height, plan.end_height)
+                    .await?;
+
+                if plan.start_height > 0 && !ids.is_empty() {
+                    ids.remove(0); // drop start-1 helper
+                }
+
+                if ids.is_empty() {
+                    return Err(anyhow!(
+                        "Indexed chain query returned no ids for range {index_start_height}..={}",
+                        plan.end_height
+                    ));
+                }
+
+                let start_id = ids
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Missing first id in resolved id list"))?;
+
+                let resolved = self
+                    .build_resolved_from_ids(
+                        plan.anchor_tip,
+                        start_id,
+                        plan.start_height,
+                        end_id,
+                        plan.end_height,
+                    )
+                    .await?;
+
+                return Ok((resolved, ids));
+            }
+
+            // Already indexed but no cached end_id: fall back to node-walk to get ids
+            // (this will get cheaper once caching has been built by at least one run).
+            let resolved = self
+                .resolve_range_ids_via_node_walk(
+                    plan.anchor_tip.clone(),
+                    plan.start_height,
+                    plan.end_height,
+                )
+                .await?;
+
+            let mut ids = self
+                .app_db
+                .get_chain_block_ids(&resolved.end.id, index_start_height, plan.end_height)
+                .await?;
+
+            if plan.start_height > 0 && !ids.is_empty() {
+                ids.remove(0);
+            }
+
+            return Ok((resolved, ids));
         }
 
-        Ok(block_ids)
+        println!(
+            "App DB tx index incomplete (found {}, expected {expected_indexed_count}). Indexing from Node DB...",
+            indexed_ids.len(),
+        );
+
+        // Slow path: run the real pipeline (single canonical walk + tx loading)
+        let resolved = self
+            .run_indexing_pipeline(plan.anchor_tip.clone(), index_start_height, plan.end_height)
+            .await?;
+
+        println!("Checkpointing database...");
+        self.app_db.checkpoint(true).await?;
+        println!("Vacuuming database...");
+        self.app_db.vacuum().await?;
+
+        let mut ids = self
+            .app_db
+            .get_chain_block_ids(&resolved.end.id, index_start_height, plan.end_height)
+            .await?;
+
+        if plan.start_height > 0 && !ids.is_empty() {
+            ids.remove(0);
+        }
+
+        Ok((resolved, ids))
     }
 
-    async fn run_indexing_pipeline(&mut self, start_height: u64, end_height: u64) -> Result<()> {
+    async fn run_indexing_pipeline(
+        &mut self,
+        anchor_tip: BlockRef,
+        start_height: u64,
+        end_height: u64,
+    ) -> Result<ResolvedRange> {
         // Channel for passing loaded blocks to the writer
         let (tx_sender, tx_receiver) =
             mpsc::channel::<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>(100);
@@ -156,7 +306,8 @@ impl<'a> ChainstateIndexer<'a> {
         let metrics = Arc::new(IndexerMetrics::default());
 
         let loader_task = Self::run_loader(
-            &mut self.context,
+            self.env,
+            anchor_tip.clone(),
             start_height,
             end_height,
             self.channel_buffer_size,
@@ -167,76 +318,62 @@ impl<'a> ChainstateIndexer<'a> {
         let writer_task = Self::run_writer(
             &mut self.app_db,
             tx_receiver,
+            &anchor_tip,
+            start_height, // NEW
+            end_height,   // NEW
             self.batch_size,
             self.merge_threshold,
             metrics.clone(),
         );
 
-        // Spawn the reporter task so it runs independently of the loader/writer loop.
-        // This prevents the reporter from stalling if the writer performs a long blocking operation (like a merge/checkpoint).
         let reporter_handle = task::spawn(run_reporter(metrics.clone(), start_height, end_height));
-
-        // Run loader and writer concurrently on the current task
-        let result = tokio::try_join!(loader_task, writer_task);
-
-        // Abort the reporter once the work is done (or if it failed)
+        let (resolved, _) = tokio::try_join!(loader_task, writer_task)?;
         reporter_handle.abort();
 
-        result.map(|_| ())
+        Ok(resolved)
     }
 
     async fn run_loader(
-        context: &mut BenchContext,
+        env: &BenchEnv,
+        anchor_tip: BlockRef,
         start_height: u64,
         end_height: u64,
         channel_buffer_size: usize,
         tx_sender: mpsc::Sender<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>,
         metrics: Arc<IndexerMetrics>,
-    ) -> Result<()> {
+    ) -> Result<ResolvedRange> {
         println!("  Indexing loader started");
-        let chainstate_dir = context.chainstate_dir();
-        let blocks_dir = chainstate_dir.blocks_dir();
 
-        let nakamoto_db = context.open_nakamoto_db_for_read().await?;
+        let blocks_dir = env.chainstate_dir.blocks_dir();
+        let nakamoto_db = env.open_nakamoto_db_for_read().await?;
         let min_naka_height = nakamoto_db
             .get_min_block_height()
             .await?
             .unwrap_or(u64::MAX);
-        println!("Nakamoto blocks DB first block height: {min_naka_height:?}");
 
-        // Limit concurrent DB opens/reads
         let available_parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-
         let worker_count = available_parallelism * 2;
 
-        // Create a channel to distribute work to the workers.
         let (work_tx, work_rx) = mpsc::channel::<StacksBlockHeader>(channel_buffer_size);
-
-        // Wrap the receiver in a tokio Mutex to share it among async workers.
         let work_rx = Arc::new(tokio::sync::Mutex::new(work_rx));
 
         let mut handles = Vec::new();
-
-        // Spawn persistent workers
         for _ in 0..worker_count {
             let rx = work_rx.clone();
             let tx = tx_sender.clone();
             let b_dir = blocks_dir.clone();
             let metrics = metrics.clone();
-            // One read-only instance of the naka db per worker
             let mut naka_db = nakamoto_db.clone();
 
             handles.push(tokio::spawn(async move {
                 loop {
-                    // Fetch next job
                     let header = {
-                        // Lock the shared receiver
                         let mut locked_rx = rx.lock().await;
                         match locked_rx.recv().await {
                             Some(h) => h,
-                            None => break, // Channel closed, work finished
+                            None => break,
                         }
                     };
 
@@ -253,13 +390,12 @@ impl<'a> ChainstateIndexer<'a> {
                                 .await
                                 .is_err()
                             {
-                                break; // Receiver dropped
+                                break;
                             }
                         }
                         Err(e) => {
-                            // Send the error to the writer/main thread so it can abort gracefully
                             let _ = tx.send(Err(e)).await;
-                            break; // Worker exits after reporting error
+                            break;
                         }
                     }
                 }
@@ -267,106 +403,177 @@ impl<'a> ChainstateIndexer<'a> {
             }));
         }
 
-        // Feed the workers from the main stream
-        let mut stream = context
-            .canonical_block_stream(start_height as u32, end_height as u32)
-            .await;
+        let chainstate_db = env.open_chainstate_db_for_read().await?;
+
+        let mut resolved_start: Option<StacksBlockHeader> = None;
+        let mut resolved_end: Option<StacksBlockHeader> = None;
+
+        let mut stream = chainstate_db.canonical_block_stream_from_tip(
+            anchor_tip.id.clone(),
+            start_height,
+            end_height,
+        );
+
         while let Some(block_res) = stream.next().await {
-            // If the writer has stopped (e.g. due to error), stop spawning new tasks immediately.
             if tx_sender.is_closed() {
                 break;
             }
 
-            match block_res {
-                Ok(header) => {
-                    // Use .await here to handle backpressure without blocking the runtime
-                    if work_tx.send(header).await.is_err() {
-                        break; // Workers died
-                    }
-                }
-                Err(e) => {
-                    // Propagate error to writer and stop
-                    let _ = tx_sender.send(Err(e)).await;
-                    break;
-                }
+            let header = block_res?;
+
+            if header.height == end_height && resolved_end.is_none() {
+                resolved_end = Some(header.clone());
+            }
+            if header.height == start_height && resolved_start.is_none() {
+                resolved_start = Some(header.clone());
+            }
+
+            if work_tx.send(header).await.is_err() {
+                break;
             }
         }
 
-        // Close the work channel to signal workers to exit
         drop(work_tx);
 
-        // Wait for all workers to finish cleanly
         for handle in handles {
             match handle.await {
                 Ok(res) => res?,
                 Err(e) => return Err(anyhow!("Worker task panicked: {}", e)),
             }
         }
-        println!("Indexing loader finished");
 
-        Ok(())
+        let start_hdr = resolved_start.ok_or_else(|| anyhow!("Failed to resolve start height"))?;
+        let end_hdr = resolved_end.ok_or_else(|| anyhow!("Failed to resolve end height"))?;
+
+        Ok(ResolvedRange {
+            anchor_tip,
+            start: BlockRef {
+                id: start_hdr.id,
+                height: start_hdr.height,
+            },
+            end: BlockRef {
+                id: end_hdr.id,
+                height: end_hdr.height,
+            },
+        })
     }
 
     async fn run_writer(
         app_db: &mut AppDb,
         mut tx_receiver: mpsc::Receiver<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>,
+        anchor_tip: &BlockRef,
+        start_height: u64, // NEW
+        end_height: u64,   // NEW
         batch_size: usize,
         merge_threshold: usize,
         metrics: Arc<IndexerMetrics>,
     ) -> Result<()> {
         println!("  Indexing writer started with a batch size of {batch_size}");
         let mut batch = Vec::with_capacity(batch_size);
-        let mut txs_since_last_merge = 0;
+
+        let mut txs_since_last_merge: usize = 0;
+        let mut blocks_since_last_merge: usize = 0;
+
+        // Local helper: aggressively cache jump points.
+        async fn cache_points(
+            app_db: &mut AppDb,
+            anchor_tip_id: &StacksBlockId,
+            headers: &[StacksBlockHeader],
+            start_height: u64,
+            end_height: u64,
+        ) {
+            if headers.is_empty() {
+                return;
+            }
+
+            // Cache every 1000 blocks (aggressive, bounded write rate).
+            for h in headers.iter().filter(|h| h.height % 1_000 == 0) {
+                let _ = app_db.cache_ancestor(anchor_tip_id, h.height, &h.id).await;
+            }
+
+            // Cache batch edges to densify quickly.
+            let first = &headers[0];
+            let last = &headers[headers.len() - 1];
+            let _ = app_db
+                .cache_ancestor(anchor_tip_id, first.height, &first.id)
+                .await;
+            let _ = app_db
+                .cache_ancestor(anchor_tip_id, last.height, &last.id)
+                .await;
+
+            // Cache exact query-critical heights if present in this batch.
+            for h in headers {
+                if h.height == end_height
+                    || h.height == start_height
+                    || h.height + 1 == start_height
+                {
+                    let _ = app_db.cache_ancestor(anchor_tip_id, h.height, &h.id).await;
+                }
+            }
+        }
 
         while let Some(res) = tx_receiver.recv().await {
             let (header, transactions) = res?;
             batch.push((header, transactions));
 
-            // We still batch writes by block count to keep memory usage predictable
             if batch.len() >= batch_size {
                 let block_count = batch.len();
                 let headers: Vec<_> = batch.iter().map(|(h, _)| h.clone()).collect();
-
-                // Calculate total txs in this batch for the merge threshold
                 let tx_count: usize = batch.iter().map(|(_, txs)| txs.len()).sum();
-                txs_since_last_merge += tx_count;
 
-                app_db.stage_blocks(headers).await?;
+                app_db.stage_blocks(&headers).await?;
                 app_db.stage_transactions(batch.drain(..)).await?;
+                app_db.stage_indexed_blocks(&headers).await?;
 
+                cache_points(app_db, &anchor_tip.id, &headers, start_height, end_height).await;
+
+                blocks_since_last_merge += block_count;
+                txs_since_last_merge += tx_count;
                 metrics.record_flush(block_count, tx_count);
 
-                // Check if we should merge staging data based on TRANSACTION count
                 if txs_since_last_merge >= merge_threshold {
                     println!(
                         "  Merge threshold reached ({txs_since_last_merge} txs). Merging staging data..."
                     );
                     let start = Instant::now();
                     app_db.merge_staging().await?;
-
-                    // Checkpoint to keep WAL size manageable since auto-checkpoint is disabled
                     app_db.checkpoint(false).await?;
-
                     println!(
                         "  Incremental merge & checkpoint complete in {:.2?}",
                         start.elapsed()
                     );
+
                     txs_since_last_merge = 0;
+                    blocks_since_last_merge = 0;
                 }
             }
         }
 
-        // Flush remaining
         if !batch.is_empty() {
-            let headers: Vec<_> = batch.iter().map(|(b, _)| b.clone()).collect();
-            app_db.stage_blocks(headers).await?;
+            let block_count = batch.len();
+            let headers: Vec<_> = batch.iter().map(|(h, _)| h.clone()).collect();
+            let tx_count: usize = batch.iter().map(|(_, txs)| txs.len()).sum();
+
+            app_db.stage_blocks(&headers).await?;
             app_db.stage_transactions(batch).await?;
+            app_db.stage_indexed_blocks(&headers).await?;
+
+            cache_points(app_db, &anchor_tip.id, &headers, start_height, end_height).await;
+
+            blocks_since_last_merge += block_count;
+            metrics.record_flush(block_count, tx_count);
         }
 
-        println!("  Last block received - performing final staging data merge");
-        let start = Instant::now();
-        app_db.merge_staging().await?;
-        println!("  Final merge complete in {:.2?}", start.elapsed());
+        if blocks_since_last_merge > 0 {
+            println!("  Performing final staging data merge...");
+            let start = Instant::now();
+            app_db.merge_staging().await?;
+            app_db.checkpoint(false).await?;
+            println!(
+                "  Final merge & checkpoint complete in {:.2?}",
+                start.elapsed()
+            );
+        }
 
         println!("Indexing writer finished");
         Ok(())

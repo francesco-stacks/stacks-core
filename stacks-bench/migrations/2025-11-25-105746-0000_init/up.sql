@@ -116,10 +116,11 @@ CREATE TABLE stacks_block (
   id INTEGER PRIMARY KEY NOT NULL,
   index_hash BLOB NOT NULL UNIQUE,
   block_hash BLOB NOT NULL,
-  block_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(block_hash))) STORED,
+  block_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(block_hash))) VIRTUAL,
   height INTEGER NOT NULL,
   parent_stacks_block_id INTEGER DEFAULT NULL,
   burn_block_id INTEGER NOT NULL,
+  txs_indexed BOOLEAN NOT NULL DEFAULT 0,
   FOREIGN KEY (burn_block_id) REFERENCES burn_block(id),
   FOREIGN KEY (parent_stacks_block_id) REFERENCES stacks_block(id),
   CHECK(height >= 0),
@@ -143,6 +144,11 @@ CREATE TABLE _staged_stacks_block (
     burn_block_height INTEGER NOT NULL
 );
 
+-- Staging table: marks blocks whose tx set was fully staged
+CREATE TABLE _staged_indexed_stacks_block (
+  block_index_hash BLOB PRIMARY KEY
+);
+
 -- ==========================================
 -- Dimension for Stacks transactions. Not linked to any specific chainstate as 
 -- they are cryptographically deterministic.
@@ -151,7 +157,7 @@ CREATE TABLE stacks_tx (
   id INTEGER PRIMARY KEY NOT NULL,
   stacks_block_id INTEGER NOT NULL,
   tx_hash BLOB NOT NULL,
-  tx_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(tx_hash))) STORED,
+  tx_hash_hex TEXT GENERATED ALWAYS AS (LOWER(HEX(tx_hash))) VIRTUAL,
   stacks_tx_type_id INTEGER NOT NULL,
   caller_principal_id INTEGER NOT NULL,
   contract_id INTEGER,

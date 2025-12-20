@@ -39,8 +39,8 @@ WHERE true
 ON CONFLICT (block_hash) DO NOTHING;
 
 -- Merge Stacks blocks (initial insert with NULL parent)
-INSERT INTO stacks_block (index_hash, block_hash, height, burn_block_id, parent_stacks_block_id)
-SELECT sb.index_hash, sb.block_hash, sb.height, bb.id, NULL
+INSERT INTO stacks_block (index_hash, block_hash, height, burn_block_id, parent_stacks_block_id, txs_indexed)
+SELECT sb.index_hash, sb.block_hash, sb.height, bb.id, NULL, FALSE
 FROM _staged_stacks_block sb
 JOIN burn_block bb ON sb.burn_block_hash = bb.block_hash
 ON CONFLICT (index_hash) DO NOTHING;
@@ -84,3 +84,11 @@ LEFT JOIN contract_fn cf
   ON cf.contract_id = c.id
  AND cf.name = st.contract_fn_name
 ON CONFLICT (stacks_block_id, tx_hash) DO NOTHING;
+
+-- Mark blocks as fully indexed only if the writer explicitly marked them complete
+UPDATE stacks_block
+SET txs_indexed = TRUE
+WHERE index_hash IN (
+  SELECT block_index_hash
+  FROM _staged_indexed_stacks_block
+);

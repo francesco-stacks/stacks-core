@@ -38,21 +38,21 @@ pub trait ChainCache {
 
 pub struct NoopChainCache;
 impl ChainCache for NoopChainCache {
-    fn find_closest_ancestor(
+    async fn find_closest_ancestor(
         &self,
         _tip: &StacksBlockId,
         _target_height: u64,
-    ) -> impl Future<Output = Result<Option<(StacksBlockId, u64)>>> {
-        async { Ok(None) }
+    ) -> Result<Option<(StacksBlockId, u64)>> {
+        Ok(None)
     }
 
-    fn cache_ancestor(
+    async fn cache_ancestor(
         &mut self,
         _tip: &StacksBlockId,
         _height: u64,
         _block: &StacksBlockId,
-    ) -> impl Future<Output = Result<()>> {
-        async { Ok(()) }
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -78,7 +78,7 @@ impl<T: ChainCache + ?Sized> ChainCache for &mut T {
 
 pub trait BlockHeaderProvider: Send {
     fn get_header(
-        &mut self,
+        &self,
         id: &StacksBlockId,
     ) -> impl Future<Output = Result<Option<StacksBlockHeader>>>;
 }
@@ -121,6 +121,7 @@ impl<P: BlockHeaderProvider, C: ChainCache> BackwardsBlockStream<P, C> {
         match header_opt {
             Some(header) => {
                 self.current_id = header.parent_id.clone();
+
                 if Self::should_cache_block(header.height) {
                     let _ = self
                         .cache
@@ -144,6 +145,7 @@ impl<P: BlockHeaderProvider, C: ChainCache> BackwardsBlockStream<P, C> {
             .get_header(&self.current_id)
             .await?
             .ok_or_else(|| anyhow!("Missing header for {}", self.current_id))?;
+
         let mut curr_h = header.height;
 
         if curr_h == target_height {
@@ -191,6 +193,7 @@ impl<P: BlockHeaderProvider, C: ChainCache> BackwardsBlockStream<P, C> {
                 .get_header(&self.current_id)
                 .await?
                 .ok_or_else(|| anyhow!("Missing header for {}", self.current_id))?;
+
             curr_h = header.height;
         }
 
@@ -210,6 +213,6 @@ impl<P: BlockHeaderProvider, C: ChainCache> BackwardsBlockStream<P, C> {
     }
 
     fn should_cache_block(height: u64) -> bool {
-        height % 10_000 == 0
+        height % 1_000 == 0
     }
 }

@@ -135,6 +135,7 @@ pub struct StacksBlock {
     pub height: i64,
     pub parent_stacks_block_id: Option<i64>,
     pub burn_block_id: i64,
+    pub txs_indexed: bool,
 }
 
 impl TryFrom<(StacksBlock, BurnBlock, Option<Vec<u8>>)> for crate::StacksBlockHeader {
