@@ -40,6 +40,12 @@ pub struct StacksEpoch {
     runtime_budget: u64,
 }
 
+impl Display for StacksEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Epoch {}", self.epoch_id)
+    }
+}
+
 impl StacksEpoch {
     pub fn epoch_id_le_bytes(&self) -> [u8; 4] {
         (self.epoch_id as u32).to_le_bytes()

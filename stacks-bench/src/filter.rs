@@ -1,6 +1,6 @@
 use blockstack_lib::chainstate::stacks::{StacksTransaction, TransactionPayload};
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub enum TxFilter {
     ContractCall,
 }

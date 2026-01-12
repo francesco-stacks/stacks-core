@@ -126,19 +126,19 @@ impl AppDb {
             .context("Failed to check pending migrations")?;
 
         if pending.is_empty() {
-            println!("App DB is up to date at {}", database_url);
+            // println!("App DB is up to date at {}", database_url);
         } else {
-            println!(
-                "App DB at {database_url} has {} pending migrations. Applying...",
-                pending.len()
-            );
+            // println!(
+            //     "App DB at {database_url} has {} pending migrations. Applying...",
+            //     pending.len()
+            // );
 
             harness
                 .run_pending_migrations(MIGRATIONS)
                 .map_err(anyhow::Error::from_boxed)
                 .context("Failed to run migrations")?;
 
-            println!("Database migration(s) complete");
+            // println!("Database migration(s) complete");
         }
 
         Ok(())
@@ -533,6 +533,30 @@ impl AppDb {
         (s_block, b_block, parent_hash_opt).try_into()
     }
 
+    async fn get_or_create_synth_block_id(
+        conn: &mut AsyncSqliteConnection,
+        index_hash: &[u8],
+    ) -> Result<i64> {
+        use crate::db::app::schema::synthetic_block;
+
+        diesel::insert_into(synthetic_block::table)
+            .values(synthetic_block::index_hash.eq(index_hash.to_vec()))
+            .on_conflict(synthetic_block::index_hash)
+            .do_nothing()
+            .execute(conn)
+            .await
+            .context("Failed to insert synthetic_block")?;
+
+        let id: i64 = synthetic_block::table
+            .select(synthetic_block::id)
+            .filter(synthetic_block::index_hash.eq(index_hash))
+            .first(conn)
+            .await
+            .context("Failed to load synthetic_block.id")?;
+
+        Ok(id)
+    }
+
     pub async fn stage_blocks<'a, I>(&mut self, blocks: I) -> Result<()>
     where
         I: IntoIterator<Item = &'a StacksBlockHeader> + Send,
@@ -846,6 +870,43 @@ impl AppDb {
         Ok(id)
     }
 
+    pub async fn save_block_processing_baseline(
+        &mut self,
+        run_id: i32,
+        start_parent: &StacksBlockId,
+        warmup_blocks: u32,
+        measured_blocks: u32,
+        baseline: &crate::metrics::BlockProcessingBaseline,
+    ) -> Result<()> {
+        use crate::db::app::schema::block_processing_baseline;
+
+        let conn = &mut self.get_conn().await?;
+
+        diesel::insert_into(block_processing_baseline::table)
+            .values((
+                block_processing_baseline::benchmark_run_id.eq(run_id),
+                block_processing_baseline::start_parent_index_hash
+                    .eq(start_parent.as_bytes().to_vec()),
+                block_processing_baseline::warmup_blocks.eq(warmup_blocks as i32),
+                block_processing_baseline::measured_blocks.eq(measured_blocks as i32),
+                block_processing_baseline::avg_setup_us
+                    .eq(baseline.avg_setup_duration.as_micros() as i32),
+                block_processing_baseline::avg_finalize_us
+                    .eq(baseline.avg_finalize_duration.as_micros() as i32),
+                block_processing_baseline::avg_clarity_commit_us
+                    .eq(baseline.avg_clarity_state_commit_duration.as_micros() as i32),
+                block_processing_baseline::avg_advance_tip_us
+                    .eq(baseline.avg_advance_tip_duration.as_micros() as i32),
+                block_processing_baseline::avg_index_commit_us
+                    .eq(baseline.avg_index_commit_duration.as_micros() as i32),
+            ))
+            .execute(conn)
+            .await
+            .context("Failed to insert block processing baseline")?;
+
+        Ok(())
+    }
+
     pub async fn save_block_metrics<I>(&mut self, run_id: i32, blocks: I) -> Result<()>
     where
         I: IntoIterator<Item = BlockMetrics> + Send,
@@ -866,11 +927,19 @@ impl AppDb {
                         .first(dbtx)
                         .await?;
 
+                    let synthetic_block_pk: Option<i64> =
+                        if let Some(h) = metrics.synthetic_id.as_ref() {
+                            Some(Self::get_or_create_synth_block_id(dbtx, h.as_bytes()).await?)
+                        } else {
+                            None
+                        };
+
                     // Insert block stats
                     diesel::insert_into(stacks_block_stats::table)
                         .values((
                             stacks_block_stats::benchmark_run_id.eq(run_id),
                             stacks_block_stats::stacks_block_id.eq(block_pk),
+                            stacks_block_stats::synthetic_block_id.eq(synthetic_block_pk),
                             stacks_block_stats::total_duration_us
                                 .eq(metrics.total_duration.as_micros() as i32),
                             stacks_block_stats::setup_duration_us
@@ -919,10 +988,10 @@ impl AppDb {
                                 .values((
                                     stacks_tx_stats::benchmark_run_id.eq(run_id),
                                     stacks_tx_stats::stacks_tx_id.eq(tx_pk),
+                                    stacks_tx_stats::stacks_block_id.eq(block_pk),
+                                    stacks_tx_stats::synthetic_block_id.eq(synthetic_block_pk),
                                     stacks_tx_stats::duration_us
                                         .eq(tx_metric.duration.as_micros() as i32),
-                                    stacks_tx_stats::estimated_commit_impact_us
-                                        .eq(tx_metric.estimated_commit_impact.as_micros() as i32),
                                     stacks_tx_stats::clarity_write_length
                                         .eq(tx_metric.cost.write_length as i32),
                                     stacks_tx_stats::clarity_write_count
@@ -944,6 +1013,7 @@ impl AppDb {
                     let ctx = ProfilerInsertContext {
                         run_id,
                         block_pk,
+                        synthetic_block_pk,
                         span_cache: span_cache.clone(),
                         loc_cache: loc_cache.clone(),
                     };
@@ -973,6 +1043,7 @@ impl AppDb {
 struct ProfilerInsertContext {
     run_id: i32,
     block_pk: i64,
+    synthetic_block_pk: Option<i64>,
     span_cache: Arc<RwLock<HashMap<(Option<&'static str>, &'static str), i32>>>,
     loc_cache: Arc<RwLock<HashMap<(String, i32), i32>>>,
 }
@@ -1029,6 +1100,7 @@ impl ProfilerInsertContext {
                     schema::profiler_record::profiler_location_id.eq(loc_id),
                     schema::profiler_record::child_index.eq(child_index),
                     schema::profiler_record::depth.eq(depth),
+                    schema::profiler_record::synthetic_block_id.eq(self.synthetic_block_pk),
                     schema::profiler_record::stacks_block_id.eq(Some(self.block_pk)),
                     schema::profiler_record::stacks_tx_id.eq(stacks_tx_id),
                     schema::profiler_record::wall_time_us.eq(wall_time_us),

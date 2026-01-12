@@ -13,7 +13,7 @@ use stacks_bench::paths::AppDataDir;
 
 use crate::cli::common::CliContext;
 
-const METABASE_IMAGE_TAG: &str = "v0.57.4.3";
+const METABASE_IMAGE_TAG: &str = "v0.58.1.3";
 
 #[derive(clap::Args, Debug)]
 pub struct MetabaseArgs {

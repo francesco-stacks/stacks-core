@@ -158,6 +158,7 @@ pub struct BlockProcessingBaseline {
 #[derive(Debug, Clone)]
 pub struct BlockMetrics {
     pub id: StacksBlockId,
+    pub synthetic_id: Option<StacksBlockId>,
     pub total_duration: Duration,
     pub setup_duration: Duration,
     pub execution_duration: Duration,
@@ -171,9 +172,10 @@ pub struct BlockMetrics {
 }
 
 impl BlockMetrics {
-    pub fn new_default(id: StacksBlockId) -> Self {
+    pub fn new_default(id: StacksBlockId, synthetic_id: Option<StacksBlockId>) -> Self {
         Self {
             id,
+            synthetic_id,
             total_duration: Duration::ZERO,
             setup_duration: Duration::ZERO,
             execution_duration: Duration::ZERO,
@@ -187,47 +189,29 @@ impl BlockMetrics {
     }
 
     /// Apply a predictive cost model to attribute commit times.
+    /// Now only computes block-level `commit_overhead_baseline`.
     pub fn apply_cost_model(&mut self, model: &CostModel) {
         let total_write_len = self.total_clarity_cost.write_length;
 
-        // Calculate weights based on the model
         let weight_static = model.static_overhead.as_secs_f64();
         let weight_variable = total_write_len as f64 * model.time_per_byte;
         let total_weight = weight_static + weight_variable;
 
         if total_weight <= f64::EPSILON {
-            // Fallback if model predicts zero cost
             self.commit_overhead_baseline = self.commit_duration;
             return;
         }
 
-        // We distribute the *actual* commit duration based on the model's predicted proportions
+        // Distribute actual commit duration into static vs variable (block-level only)
         let actual_seconds = self.commit_duration.as_secs_f64();
-
         let allocated_static = actual_seconds * (weight_static / total_weight);
-        let allocated_variable = actual_seconds * (weight_variable / total_weight);
 
         self.commit_overhead_baseline = Duration::from_secs_f64(allocated_static);
-
-        for tx in &mut self.transactions {
-            if total_write_len > 0 {
-                let share = tx.cost.write_length as f64 / total_write_len as f64;
-                tx.estimated_commit_impact = Duration::from_secs_f64(allocated_variable * share);
-            } else {
-                tx.estimated_commit_impact = Duration::ZERO;
-            }
-        }
     }
 
     /// Apply a heuristic when no model is available.
-    /// Uses the "Single Block" logic: Assume mostly static unless we have evidence otherwise.
     pub fn apply_heuristic(&mut self) {
-        // Default to treating it as 100% static overhead if we have absolutely no data.
-        // This is "safer" than guessing 80% variable, which might penalize small txs unfairly.
         self.commit_overhead_baseline = self.commit_duration;
-        for tx in &mut self.transactions {
-            tx.estimated_commit_impact = Duration::ZERO;
-        }
     }
 }
 
@@ -236,7 +220,6 @@ pub struct TransactionMetrics {
     pub txid: Txid,
     pub duration: Duration,
     pub cost: ExecutionCost,
-    pub estimated_commit_impact: Duration,
     /// Tx-associated profiler roots
     pub profiler_roots: Vec<ProfileStats>,
 }
@@ -265,6 +248,12 @@ impl MetricsAccumulator {
         self.runtime += m.total_clarity_cost.runtime;
         self.write_len += m.total_clarity_cost.write_length;
         self.read_len += m.total_clarity_cost.read_length;
+    }
+
+    pub fn add_many(&mut self, ms: &[BlockMetrics]) {
+        for m in ms {
+            self.add(m);
+        }
     }
 
     pub fn print_summary(&self) {

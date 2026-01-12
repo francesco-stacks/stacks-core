@@ -5,12 +5,14 @@ use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, StacksBlockId};
 
 use super::schema::{
-    _staged_stacks_block, _staged_stacks_tx, benchmark_run, burn_block, chainstate, epoch, network,
-    profiler_location, profiler_record, profiler_span, stacks_block, stacks_block_stats, stacks_tx,
-    stacks_tx_stats,
+    _staged_stacks_block, _staged_stacks_tx, benchmark_run, block_processing_baseline, burn_block,
+    chainstate, epoch, network, profiler_location, profiler_record, profiler_span, stacks_block,
+    stacks_block_stats, stacks_tx, stacks_tx_stats,
 };
 use crate::ResolveEpochFromHeight;
-use crate::db::app::schema::{chain_tip_cache, contract, contract_fn, principal, stacks_tx_type};
+use crate::db::app::schema::{
+    chain_tip_cache, contract, contract_fn, principal, stacks_tx_type, synthetic_block,
+};
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
 #[diesel(table_name = network)]
@@ -186,6 +188,13 @@ pub struct StagedStacksBlock {
     pub burn_block_height: i64,
 }
 
+#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
+#[diesel(table_name = synthetic_block)]
+pub struct SyntheticBlock {
+    pub id: i64,
+    pub index_hash: Vec<u8>,
+}
+
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(StacksBlock))]
 #[diesel(table_name = stacks_tx)]
@@ -234,12 +243,29 @@ pub struct BenchmarkRun {
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(BenchmarkRun))]
+#[diesel(table_name = block_processing_baseline)]
+pub struct BlockProcessingBaselineRow {
+    pub id: i64,
+    pub benchmark_run_id: i32,
+    pub start_parent_index_hash: Vec<u8>,
+    pub warmup_blocks: i32,
+    pub measured_blocks: i32,
+    pub avg_setup_us: i32,
+    pub avg_finalize_us: i32,
+    pub avg_clarity_commit_us: i32,
+    pub avg_advance_tip_us: i32,
+    pub avg_index_commit_us: i32,
+}
+
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[diesel(belongs_to(BenchmarkRun))]
 #[diesel(belongs_to(StacksBlock))]
 #[diesel(table_name = stacks_block_stats)]
 pub struct StacksBlockStats {
     pub id: i64,
     pub benchmark_run_id: i32,
     pub stacks_block_id: i64,
+    pub synthetic_block_id: Option<i64>,
     pub total_duration_us: i32,
     pub setup_duration_us: i32,
     pub execution_duration_us: i32,
@@ -261,8 +287,9 @@ pub struct StacksTxStats {
     pub id: i64,
     pub benchmark_run_id: i32,
     pub stacks_tx_id: i64,
+    pub stacks_block_id: i64,
+    pub synthetic_block_id: Option<i64>,
     pub duration_us: i32,
-    pub estimated_commit_impact_us: i32,
     pub clarity_write_length: i32,
     pub clarity_write_count: i32,
     pub clarity_read_length: i32,
@@ -305,6 +332,7 @@ pub struct ProfilerRecord {
     pub profiler_location_id: i32,
     pub child_index: i32,
     pub depth: i32,
+    pub synthetic_block_id: Option<i64>,
     pub stacks_block_id: Option<i64>,
     pub stacks_tx_id: Option<i64>,
     pub wall_time_us: i64,

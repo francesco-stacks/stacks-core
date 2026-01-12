@@ -144,9 +144,22 @@ CREATE TABLE _staged_stacks_block (
     burn_block_height INTEGER NOT NULL
 );
 
+-- ==========================================
 -- Staging table: marks blocks whose tx set was fully staged
+-- ==========================================
 CREATE TABLE _staged_indexed_stacks_block (
   block_index_hash BLOB PRIMARY KEY
+);
+
+-- ==========================================
+-- Dimension for synthetic blocks created during benchmarks.
+-- These are not part of any real chainstate.
+-- ==========================================
+CREATE TABLE synthetic_block (
+  id INTEGER PRIMARY KEY NOT NULL,
+  index_hash BLOB NOT NULL,
+  CHECK(length(index_hash) = 32),
+  UNIQUE(index_hash)
 );
 
 -- ==========================================
@@ -214,12 +227,39 @@ CREATE TABLE benchmark_run (
 );
 
 -- ==========================================
+-- Fact table for block processing overhead baseline measurements per run.
+-- These are the outputs of creating + committing a chain of empty Stacks blocks.
+-- ==========================================
+CREATE TABLE block_processing_baseline (
+  id INTEGER PRIMARY KEY NOT NULL,
+  benchmark_run_id INTEGER NOT NULL,
+
+  -- Parent used as the initial anchor for the baseline procedure
+  start_parent_index_hash BLOB NOT NULL,
+
+  warmup_blocks INTEGER NOT NULL,
+  measured_blocks INTEGER NOT NULL,
+
+  -- Duration metrics (microseconds), each is an average per block over the measured window
+  avg_setup_us INTEGER NOT NULL,
+  avg_finalize_us INTEGER NOT NULL,
+  avg_clarity_commit_us INTEGER NOT NULL,
+  avg_advance_tip_us INTEGER NOT NULL,
+  avg_index_commit_us INTEGER NOT NULL,
+
+  FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id) ON DELETE CASCADE,
+  CHECK(length(start_parent_index_hash) = 32),
+  UNIQUE (benchmark_run_id)
+);
+
+-- ==========================================
 -- Fact table for benchmark statistics per Stacks block.
 -- ==========================================
 CREATE TABLE stacks_block_stats (
   id INTEGER PRIMARY KEY NOT NULL,
   benchmark_run_id INTEGER NOT NULL,
   stacks_block_id INTEGER NOT NULL,
+  synthetic_block_id INTEGER,
 
   -- Duration metrics (microseconds)
   total_duration_us INTEGER NOT NULL,
@@ -240,11 +280,15 @@ CREATE TABLE stacks_block_stats (
 
   FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id),
   FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
-  UNIQUE (benchmark_run_id, stacks_block_id)
+  FOREIGN KEY (synthetic_block_id) REFERENCES synthetic_block(id)
 );
 
-CREATE INDEX idx_stacks_block_stats_block 
-  ON stacks_block_stats (stacks_block_id);
+CREATE UNIQUE INDEX uq_block_stats_real
+  ON stacks_block_stats(benchmark_run_id, stacks_block_id)
+  WHERE synthetic_block_id IS NULL;
+CREATE UNIQUE INDEX uq_block_stats_synth
+  ON stacks_block_stats(benchmark_run_id, stacks_block_id, synthetic_block_id)
+  WHERE synthetic_block_id IS NOT NULL;
 -- For block stats p95 / histograms
 CREATE INDEX idx_block_stats_run_runtime
   ON stacks_block_stats(benchmark_run_id, clarity_runtime);
@@ -256,10 +300,11 @@ CREATE TABLE stacks_tx_stats (
   id INTEGER PRIMARY KEY NOT NULL,
   benchmark_run_id INTEGER NOT NULL,
   stacks_tx_id INTEGER NOT NULL,
+  stacks_block_id INTEGER NOT NULL,
+  synthetic_block_id INTEGER,
 
   -- Duration metrics (microseconds)
   duration_us INTEGER NOT NULL,
-  estimated_commit_impact_us INTEGER NOT NULL,
 
   -- Clarity cost metrics
   clarity_write_length INTEGER NOT NULL,
@@ -270,8 +315,17 @@ CREATE TABLE stacks_tx_stats (
 
   FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id),
   FOREIGN KEY (stacks_tx_id) REFERENCES stacks_tx(id),
-  UNIQUE (benchmark_run_id, stacks_tx_id)
+  FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
+  FOREIGN KEY (synthetic_block_id) REFERENCES synthetic_block(id)
 );
+
+CREATE UNIQUE INDEX uq_tx_stats_real
+  ON stacks_tx_stats(benchmark_run_id, stacks_tx_id)
+  WHERE synthetic_block_id IS NULL;
+
+CREATE UNIQUE INDEX uq_tx_stats_synth
+  ON stacks_tx_stats(benchmark_run_id, stacks_tx_id, synthetic_block_id)
+  WHERE synthetic_block_id IS NOT NULL;
 
   -- For TX stats p95 / histograms
 CREATE INDEX idx_tx_stats_run_runtime
@@ -313,6 +367,7 @@ CREATE TABLE profiler_record (
   depth INTEGER NOT NULL,       -- Optimization for UI rendering
 
   -- Context
+  synthetic_block_id INTEGER,
   stacks_block_id INTEGER,
   stacks_tx_id INTEGER,
 
@@ -331,6 +386,7 @@ CREATE TABLE profiler_record (
   FOREIGN KEY (parent_id) REFERENCES profiler_record(id) ON DELETE CASCADE,
   FOREIGN KEY (profiler_span_id) REFERENCES profiler_span(id),
   FOREIGN KEY (profiler_location_id) REFERENCES profiler_location(id),
+  FOREIGN KEY (synthetic_block_id) REFERENCES synthetic_block(id),
   FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
   FOREIGN KEY (stacks_tx_id) REFERENCES stacks_tx(id)
 );
@@ -352,6 +408,10 @@ CREATE INDEX idx_prof_run_span
 CREATE INDEX idx_prof_run_block
   ON profiler_record(benchmark_run_id, stacks_block_id, stacks_tx_id)
   WHERE stacks_block_id IS NOT NULL;
+
+CREATE INDEX idx_prof_run_synth
+  ON profiler_record(benchmark_run_id, synthetic_block_id)
+  WHERE synthetic_block_id IS NOT NULL;
 
 -- TX CONTEXT (Lookup by TX only) 
 -- Necessary because you can't efficiently search the index above for a TX 

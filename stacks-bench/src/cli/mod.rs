@@ -4,17 +4,18 @@ use anyhow::Result;
 use bench::BenchArgs;
 use chainstate::ChainstateArgs;
 use clap::{Parser, Subcommand};
+use console::style;
 use metabase::MetabaseArgs;
 use stacks_bench::db::app::AppDb;
 use stacks_bench::paths::AppDataDir;
 
 use crate::cli::common::CliContext;
 
+#[macro_use]
+pub mod common;
 pub mod bench;
 pub mod chainstate;
 pub mod metabase;
-
-pub mod common;
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
@@ -40,6 +41,8 @@ pub struct Cli {
 
 impl Cli {
     pub async fn exec(&self) -> Result<()> {
+        cliclack::intro(style(" stacks-bench ").on_cyan().black())?;
+
         // Use AppDataPath to resolve locations
         let app_data = AppDataDir::resolve_from_opt(self.app_data_dir.as_ref())?;
 
@@ -48,10 +51,21 @@ impl Cli {
 
         let ctx = CliContext::new(app_data, app_db);
 
-        match &self.command {
+        let result = match &self.command {
             Commands::Bench(args) => args.exec(&ctx).await,
             Commands::Chainstate(args) => args.exec(&ctx).await,
             Commands::Metabase(args) => args.exec(&ctx).await,
+        };
+
+        match result {
+            Ok(_) => {
+                cliclack::outro("Finished")?;
+                Ok(())
+            }
+            Err(e) => {
+                cliclack::outro_cancel(format!("Command failed: {e:?}"))?;
+                Err(e)
+            }
         }
     }
 }

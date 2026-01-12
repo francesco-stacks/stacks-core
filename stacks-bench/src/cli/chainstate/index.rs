@@ -41,9 +41,6 @@ pub struct IndexArgs {
 }
 
 impl IndexerArgs for IndexArgs {
-    fn source_dir(&self) -> &PathBuf {
-        &self.source_dir
-    }
     fn start_at(&self) -> Option<&StacksBlockRef> {
         self.start_at.as_ref()
     }
@@ -65,7 +62,7 @@ impl IndexArgs {
     pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
         let mut app_db = ctx.app_db();
 
-        let (env, plan) = setup_bench_env_and_plan(self).await?;
+        let (env, plan) = setup_bench_env_and_plan(&self.source_dir, self).await?;
 
         let mut indexer = ChainstateIndexer::new(&mut app_db, &env);
         let (resolved, _block_ids) = indexer

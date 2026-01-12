@@ -17,25 +17,33 @@ name = "stacks-bench"
 path = "src/main.rs"
 
 [dependencies]
+# Local dependencies
 clarity = { path = "../clarity", features = ["rusqlite", "testing"] }
 stackslib = { path = "../stackslib", features = ["testing", "profiler"] }
 stacks-common = { path = "../stacks-common", features = ["testing"] }
 stx_genesis = { path = "../stx-genesis", package = "stx-genesis" }
-
-anyhow.workspace = true
-clap.workspace = true
-chrono.workspace = true
+stacks-profiler.workspace = true
+# Filesystem
 tempfile.workspace = true
-diesel.workspace = true
-diesel_migrations.workspace = true
 reflink-copy.workspace = true
 ignore.workspace = true
+# Console/CLI
+clap.workspace = true
+cliclack.workspace = true
+console.workspace = true
+# Database
+diesel.workspace = true
+diesel_migrations.workspace = true
+diesel-async.workspace = true
+# Docker
+bollard.workspace = true
+# Async
+tokio.workspace = true
+futures.workspace = true
+# Utility
+anyhow.workspace = true
+chrono.workspace = true
 hex.workspace = true
-stacks-profiler.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-bollard.workspace = true
-tokio.workspace = true
-futures.workspace = true
-diesel-async.workspace = true

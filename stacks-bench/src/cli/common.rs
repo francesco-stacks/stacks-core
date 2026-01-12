@@ -1,8 +1,8 @@
 use std::fmt::{LowerHex, UpperHex};
-use std::path::PathBuf;
+use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use stacks_bench::context::{BenchEnv, BenchEnvOpts};
 use stacks_bench::db::DbOpenForRead;
@@ -11,6 +11,7 @@ use stacks_bench::db::node::ChainStateDb;
 use stacks_bench::db::node::sortition::SortitionDb;
 use stacks_bench::indexer::ChainIndexPlan;
 use stacks_bench::paths::{AppDataDir, BurnChainDir, ChainStateDir};
+use stacks_bench::shadow::{ShadowDir, ShadowDirBuilder};
 use stacks_bench::{Network, StacksBlockRef, StacksEpoch};
 
 pub struct CliContext {
@@ -19,6 +20,29 @@ pub struct CliContext {
     app_data_dir: AppDataDir,
     /// The application database.
     app_db: AppDb,
+}
+
+pub const SUCCESS_ICON: &str = "✔";
+pub const FAILURE_ICON: &str = "✘";
+
+macro_rules! fmt_success {
+    ($($arg:tt)*) => {{
+        format!(
+            "{} {}",
+            ::console::style($crate::cli::common::SUCCESS_ICON).green(),
+            format_args!($($arg)*)
+        )
+    }};
+}
+
+macro_rules! fmt_failure {
+    ($($arg:tt)*) => {{
+        format!(
+            "{} {}",
+            ::console::style($crate::cli::common::FAILURE_ICON).green(),
+            format_args!($($arg)*)
+        )
+    }};
 }
 
 impl CliContext {
@@ -39,7 +63,6 @@ impl CliContext {
 }
 
 pub trait IndexerArgs {
-    fn source_dir(&self) -> &PathBuf;
     fn start_at(&self) -> Option<&StacksBlockRef>;
     fn end_at(&self) -> Option<&StacksBlockRef>;
     fn block_count(&self) -> Option<u32>;
@@ -55,10 +78,10 @@ impl FromStr for TxIdArg {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let bytes = hex::decode(s).with_context(|| format!("invalid hex in txid '{s}'"))?;
         if bytes.len() != 32 {
-            return Err(anyhow!(
+            bail!(
                 "invalid txid length: expected 32 bytes, got {} bytes",
                 bytes.len()
-            ));
+            );
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
@@ -103,11 +126,24 @@ pub fn get_git_hash() -> Option<Vec<u8>> {
         })
 }
 
-pub async fn setup_bench_env_and_plan<A: IndexerArgs>(
-    args: &A,
+pub fn create_shadow_dir<P: AsRef<Path>>(source_dir: P) -> Result<ShadowDir> {
+    let shadow_dir = ShadowDirBuilder::new(source_dir.as_ref())
+        .glob("burnchain/**")
+        .glob("chainstate/**")
+        .watch("chainstate/vm/clarity/marf.sqlite")
+        .watch("chainstate/vm/clarity/marf.sqlite.blobs")
+        .watch("chainstate/vm/clarity/marf.sqlite-wal")
+        .watch("chainstate/vm/index.sqlite")
+        .copy()?;
+    Ok(shadow_dir)
+}
+
+pub async fn setup_bench_env_and_plan<'a, A: IndexerArgs, P: AsRef<Path> + 'a>(
+    working_dir: P,
+    args: &'_ A,
 ) -> Result<(BenchEnv, ChainIndexPlan)> {
-    let chainstate_path = ChainStateDir::from_node_root(args.source_dir());
-    let burnchain_path = BurnChainDir::from_node_root(args.source_dir());
+    let chainstate_path = ChainStateDir::from_node_root(&working_dir);
+    let burnchain_path = BurnChainDir::from_node_root(&working_dir);
 
     // Resolve network and chain ID
     let (network, chain_id) = {
@@ -125,49 +161,24 @@ pub async fn setup_bench_env_and_plan<A: IndexerArgs>(
         (network, db_config.chain_id())
     };
 
-    println!("Using network: {}", network.to_string().to_uppercase());
-
     // Load epochs (node sortition epochs -> StacksEpoch)
     let epochs: Vec<StacksEpoch> = {
-        let mut sortition_db =
-            SortitionDb::open_for_read(burnchain_path.sortition_db_path()).await?;
-        let raw_epochs = sortition_db.get_epochs().await?;
-
-        let epochs_str = raw_epochs
-            .iter()
-            .map(|e| {
-                e.to_stacks_epoch_id()
-                    .map(|id| {
-                        let id_display = id.to_string().replace(".", "_");
-                        format!(
-                            "Epoch{id_display}[{}..{}]",
-                            e.start_block_height(),
-                            e.end_block_height()
-                        )
-                    })
-                    .unwrap_or_else(|_| "err".to_string())
-            })
-            .collect::<Vec<String>>()
-            .join(" → ");
-
-        println!(
-            "Loaded {} epochs from source sortition DB: {epochs_str}",
-            raw_epochs.len()
-        );
-
-        raw_epochs
+        SortitionDb::open_for_read(burnchain_path.sortition_db_path())
+            .await?
+            .get_epochs()
+            .await?
             .iter()
             .map(StacksEpoch::try_from)
             .collect::<Result<Vec<_>>>()?
     };
 
-    let context_opts = BenchEnvOpts::new(args.source_dir().into(), network, chain_id, epochs)?
+    let context_opts = BenchEnvOpts::new(network, chain_id, epochs)?
         .with_start_block(args.start_at().cloned())
         .with_end_block(args.end_at().cloned())
         .with_block_count(args.block_count())
         .with_tip(args.tip().cloned());
 
-    let (env, node_tip) = BenchEnv::initialize(context_opts).await?;
+    let (env, node_tip) = BenchEnv::initialize(working_dir, context_opts).await?;
 
     let chainstate_db = ChainStateDb::open_for_read(chainstate_path.index_db_path()).await?;
 

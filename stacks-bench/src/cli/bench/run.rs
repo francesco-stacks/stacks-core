@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use stacks_bench::context::BenchContext;
@@ -13,8 +13,10 @@ use stacks_bench::{Network, StacksBlockRef};
 use stacks_profiler::Profiler;
 
 use crate::cli::common::{
-    CliContext, IndexerArgs, TxIdArg, get_git_hash, setup_bench_env_and_plan,
+    CliContext, IndexerArgs, TxIdArg, create_shadow_dir, get_git_hash, setup_bench_env_and_plan,
 };
+
+const BASELINE_MEASURED_BLOCKS: u32 = 500;
 
 // TODO: Add a `--contract` arg to filter by qualified contract id
 #[derive(clap::Args, Debug, Serialize, Deserialize)]
@@ -79,9 +81,6 @@ pub enum FilterArg {
 }
 
 impl IndexerArgs for RunArgs {
-    fn source_dir(&self) -> &PathBuf {
-        &self.source_dir
-    }
     fn start_at(&self) -> Option<&StacksBlockRef> {
         self.start_at.as_ref()
     }
@@ -105,12 +104,46 @@ impl RunArgs {
     }
 
     pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
+        cliclack::log::info("Starting benchmark run")?;
         let mut app_db = ctx.app_db();
 
+        let shadow_dir_spinner = cliclack::spinner();
+        shadow_dir_spinner.start(
+            "Creating reflink copy of source node data directory (this may take some time)...",
+        );
+        let shadow_dir_timer = Instant::now();
+        let shadow_dir = create_shadow_dir(&self.source_dir)?;
+        shadow_dir_spinner.stop(format!(
+            "Chainstate working directory reflink-copied in {:.2}s",
+            shadow_dir_timer.elapsed().as_secs_f32()
+        ));
+
         // Create env + compute height plan
-        let (env, plan) = setup_bench_env_and_plan(self).await?;
+        cliclack::log::info("Setting up benchmark environment and creating indexing plan...")?;
+        let (env, plan) = setup_bench_env_and_plan(&shadow_dir, self).await?;
+
+        cliclack::note(
+            "Environment Summary",
+            format!(
+                "Chain ID:   {}\n\
+                Network:    {}\n\
+                Epochs:     {}\n\
+                Source Dir: {}\n\
+                Shadow Dir: {}",
+                env.chain_id,
+                env.network,
+                env.epochs
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                shadow_dir.source().display(),
+                shadow_dir.path().display(),
+            ),
+        )?;
 
         // Setup indexer and index chainstate range
+        cliclack::log::step("Indexing node chainstate...")?;
         let mut indexer = ChainstateIndexer::new(&mut app_db, &env);
         let (resolved, block_ids) = indexer
             .index_chainstate_range(env.network, env.chain_id, &env.epochs, plan)
@@ -123,7 +156,7 @@ impl RunArgs {
 
         // Build BenchContext from resolved BlockRefs
         let mut bench_context = BenchContext::from_env(
-            env,
+            &env,
             resolved.anchor_tip.clone(),
             resolved.start.clone(),
             resolved.end.clone(),
@@ -148,77 +181,26 @@ impl RunArgs {
         // Open the heavy databases before the loop
         let (mut chainstate, burnchain) = bench_context.open_stacks_chainstate()?;
 
-        println!("Calculating block processing overhead baseline");
-        if self.warmup > 0 {
-            println!("  Warming up for {} blocks...", self.warmup);
-            stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
-                &mut chainstate,
-                &burnchain,
+        let (block_processing_baselines1, block_processing_baselines2) = self
+            .run_overhead_baselines(&mut chainstate, &burnchain, &bench_context.end_block().id)?;
+
+        cliclack::note(
+            "Block Processing Overhead Baselines",
+            format_baseline_note(&block_processing_baselines1, &block_processing_baselines2),
+        )?;
+
+        let averaged = avg_baseline(&block_processing_baselines1, &block_processing_baselines2);
+        app_db
+            .save_block_processing_baseline(
+                run_model.id,
                 &bench_context.end_block().id,
                 self.warmup as u32,
-            )?;
-        }
+                BASELINE_MEASURED_BLOCKS,
+                &averaged,
+            )
+            .await?;
 
-        println!("  Measuring baseline over 500 blocks...");
-        let block_processing_baselines1 =
-            stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
-                &mut chainstate,
-                &burnchain,
-                &bench_context.end_block().id,
-                500,
-            )?;
-        println!(" ===Block Processing Overhead Baselines (#1) =========================");
-        println!(
-            "  - Avg Setup Duration:                 {:.2?}",
-            block_processing_baselines1.avg_setup_duration
-        );
-        println!(
-            "  - Avg Finalize Duration:              {:.2?}",
-            block_processing_baselines1.avg_finalize_duration
-        );
-        println!(
-            "  - Avg Clarity State Commit Duration:  {:.2?}",
-            block_processing_baselines1.avg_clarity_state_commit_duration
-        );
-        println!(
-            "  - Avg Advance Tip Duration:           {:.2?}",
-            block_processing_baselines1.avg_advance_tip_duration
-        );
-        println!(
-            "  - Avg Index Commit Duration:          {:.2?}",
-            block_processing_baselines1.avg_index_commit_duration
-        );
-        let block_processing_baselines2 =
-            stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
-                &mut chainstate,
-                &burnchain,
-                &bench_context.end_block().id,
-                500,
-            )?;
-        println!(" ===Block Processing Overhead Baselines (#2) =========================");
-        println!(
-            "  - Avg Setup Duration:                 {:.2?}",
-            block_processing_baselines2.avg_setup_duration
-        );
-        println!(
-            "  - Avg Finalize Duration:              {:.2?}",
-            block_processing_baselines2.avg_finalize_duration
-        );
-        println!(
-            "  - Avg Clarity State Commit Duration:  {:.2?}",
-            block_processing_baselines2.avg_clarity_state_commit_duration
-        );
-        println!(
-            "  - Avg Advance Tip Duration:           {:.2?}",
-            block_processing_baselines2.avg_advance_tip_duration
-        );
-        println!(
-            "  - Avg Index Commit Duration:          {:.2?}",
-            block_processing_baselines2.avg_index_commit_duration
-        );
-        println!(" ================================================================\n");
-
-        bench_context.calculate_storage_delta()?; // Reset storage delta baseline
+        shadow_dir.calculate_storage_delta()?; // Reset storage delta baseline
 
         println!("Re-executing {selected_block_count} selected blocks...");
 
@@ -234,7 +216,26 @@ impl RunArgs {
         let mut is_warmup = false;
         let mut total_clarity_db_checkpoint_duration = Duration::ZERO;
 
+        // Determine the execution mode
+        let replay_mode = match self.filter.as_ref() {
+            Some(FilterArg::ContractCall) => ReplayMode::SegmentedFiltered(TxFilter::ContractCall),
+            None => ReplayMode::Follower,
+        };
+
         let mut accumulator = MetricsAccumulator::default();
+        let replay_multi_pb = cliclack::multi_progress(format!(
+            "Re-executing {selected_block_count} blocks in {replay_mode} mode"
+        ));
+        let maybe_warmup_pb = if self.warmup > 0 {
+            let pb = replay_multi_pb.add(cliclack::progress_bar(self.warmup as u64));
+            pb.start(format!("Warming up for {} blocks", self.warmup));
+            Some(pb)
+        } else {
+            None
+        };
+        let replay_pb = replay_multi_pb.add(cliclack::progress_bar(
+            (selected_block_count - self.warmup) as u64,
+        ));
 
         let start = Instant::now();
         for (i, block_id) in block_ids.iter().enumerate() {
@@ -244,88 +245,87 @@ impl RunArgs {
             // Load metadata from App DB
             let block = app_db.get_block(block_id).await?;
 
-            if is_warmup {
-                if i == 0 {
-                    println!("Warming up for {} blocks...", self.warmup);
-                }
-                if i % 10 == 0 {
-                    eprint!("(Warmup {}) ", block.height);
-                }
-            } else if i == self.warmup || i % 2_500 == 0 || i == selected_block_count - 1 {
-                eprint!("{}", block.height);
-            } else if i % 250 == 0 {
-                eprint!(".");
-            }
+            // For now, if you're not actually repeating blocks yet, just pass 0.
+            // Later, plumb a real repetition counter from your benchmark config.
+            let repetition: u32 = 0;
 
             // Replay the block
-            let mode = match self.filter.as_ref() {
-                Some(FilterArg::ContractCall) => {
-                    ReplayMode::SegmentedFiltered(TxFilter::ContractCall)
-                }
-                None => ReplayMode::Follower,
-            };
-
-            let maybe_metrics = stacks_bench::replay::replay_block(
+            let maybe_metrics_vec = stacks_bench::replay::replay_block(
                 &mut bench_context,
                 &mut chainstate,
                 &burnchain,
-                mode,
+                &replay_mode,
                 &block,
+                repetition,
             )?;
 
+            // Keep this checkpointing exactly where it is (after replay).
             let checkpoint_start = Instant::now();
             chainstate.checkpoint_clarity_state()?;
             total_clarity_db_checkpoint_duration += checkpoint_start.elapsed();
 
+            // Handle warmup->execute transition
             if is_warmup {
+                let Some(warmup_pb) = &maybe_warmup_pb else {
+                    bail!("Warmup progress bar missing");
+                };
+                warmup_pb.set_position((i + 1) as u64);
                 continue;
+            } else {
+                if let Some(warmup_pb) = &maybe_warmup_pb {
+                    let elapsed = start.elapsed();
+                    warmup_pb.stop(fmt_success!(
+                        "Warmup complete ({} blocks in {:.2}s)",
+                        self.warmup,
+                        elapsed.as_secs_f32()
+                    ));
+                    replay_pb.start(format!(
+                        "Replaying {} benchmark blocks...",
+                        selected_block_count - self.warmup
+                    ));
+                }
+                replay_pb.set_position((i - self.warmup + 1) as u64);
             }
 
-            let Some(mut metrics) = maybe_metrics else {
+            let Some(metrics_vec) = maybe_metrics_vec else {
                 // No metrics collected (e.g. filtered out)
                 continue;
             };
 
-            accumulator.add(&metrics); // Accumulate
+            // Accumulate summary stats across *all* returned measurement units
+            accumulator.add_many(&metrics_vec);
 
             if !calibrated {
-                metrics_buffer.push(metrics);
+                metrics_buffer.extend(metrics_vec);
 
                 let buffer_len = metrics_buffer.len();
                 let is_last_block = i == selected_block_count - 1;
 
-                // Only attempt calibration if we met the minimum count
                 if buffer_len >= min_calibration_count {
                     let candidate_model = CostModel::compute(&metrics_buffer);
 
-                    // A model is "good" if we found variance (not SingleBlock) and a positive correlation
                     let is_good_model = candidate_model.source != ModelSource::SingleBlock
                         && candidate_model.time_per_byte > f64::EPSILON;
 
-                    // We force calibration if:
-                    // 1. We found a good model
-                    // 2. We hit the hard memory limit
-                    // 3. We ran out of blocks
                     if is_good_model || buffer_len >= max_calibration_buffer || is_last_block {
                         cost_model = candidate_model;
                         calibrated = true;
 
-                        println!("\n--- Calibration Complete ({} blocks) ---", buffer_len);
-                        println!("  Method:          {:?}", cost_model.source);
-                        println!("  Static Overhead: {:.2?}", cost_model.static_overhead);
-                        println!(
-                            "  Cost per Byte:   {:.2} µs",
-                            cost_model.time_per_byte * 1_000_000.0
-                        );
+                        // println!("\n--- Calibration Complete ({} samples) ---", buffer_len);
+                        // println!("  Method:          {:?}", cost_model.source);
+                        // println!("  Static Overhead: {:.2?}", cost_model.static_overhead);
+                        // println!(
+                        //     "  Cost per Byte:   {:.2} µs",
+                        //     cost_model.time_per_byte * 1_000_000.0
+                        // );
 
-                        if cost_model.time_per_byte <= f64::EPSILON {
-                            println!(
-                                "  [WARN] Correlation weak or negative. Falling back to default heuristic (20% static / 80% variable)."
-                            );
-                        }
-                        println!("----------------------------------------\n");
+                        // if cost_model.time_per_byte <= f64::EPSILON {
+                        //     println!(
+                        //         "  [WARN] Correlation weak or negative. Falling back to default heuristic."
+                        //     );
+                        // }
+                        // println!("----------------------------------------\n");
 
-                        // Flush buffer
                         for m in metrics_buffer.iter_mut() {
                             if cost_model.time_per_byte > f64::EPSILON {
                                 m.apply_cost_model(&cost_model);
@@ -338,25 +338,33 @@ impl RunArgs {
                             .save_block_metrics(run_model.id, metrics_buffer.drain(..))
                             .await?;
                     }
-                    // Else: continue collecting blocks to find variance
                 }
             } else {
-                if cost_model.time_per_byte > f64::EPSILON {
-                    metrics.apply_cost_model(&cost_model);
-                } else {
-                    metrics.apply_heuristic();
-                }
+                for mut metrics in metrics_vec {
+                    if cost_model.time_per_byte > f64::EPSILON {
+                        metrics.apply_cost_model(&cost_model);
+                    } else {
+                        metrics.apply_heuristic();
+                    }
 
-                metrics_buffer.push(metrics);
+                    metrics_buffer.push(metrics);
 
-                if metrics_buffer.len() >= METRICS_FLUSH_THRESHOLD {
-                    // Flush buffer
-                    app_db
-                        .save_block_metrics(run_model.id, metrics_buffer.drain(..))
-                        .await?;
+                    if metrics_buffer.len() >= METRICS_FLUSH_THRESHOLD {
+                        app_db
+                            .save_block_metrics(run_model.id, metrics_buffer.drain(..))
+                            .await?;
+                    }
                 }
             }
         }
+
+        // Finalize progress bars
+        replay_pb.stop(fmt_success!(
+            "Replayed {} blocks in {:.2}s",
+            selected_block_count - self.warmup,
+            start.elapsed().as_secs_f32()
+        ));
+        replay_multi_pb.stop();
 
         // Flush any remaining metrics in the calibration buffer
         if !metrics_buffer.is_empty() {
@@ -397,7 +405,7 @@ impl RunArgs {
         // Give the OS a moment to sync metadata
         std::thread::sleep(Duration::from_millis(100));
 
-        let storage_delta_report = bench_context.calculate_storage_delta()?;
+        let storage_delta_report = shadow_dir.calculate_storage_delta()?;
         let growth = storage_delta_report.net_growth_bytes;
         let written = storage_delta_report.estimated_bytes_written;
 
@@ -439,12 +447,157 @@ impl RunArgs {
         app_db.checkpoint(true).await?;
         app_db.vacuum().await?;
 
-        println!("Cleaning up (this may take a few moments for large chainstates)...");
+        let cleanup_spinner = cliclack::spinner();
+        let cleanup_start = Instant::now();
+        cleanup_spinner.start("Cleaning up (this may take a few moments for large chainstates)...");
         // Dropping the context will clean up the shadow dir
         drop(bench_context);
+        cleanup_spinner.stop(fmt_success!(
+            "Finished cleanup in {:.2}s",
+            cleanup_start.elapsed().as_secs_f32()
+        ));
 
-        println!("Benchmark run complete");
+        cliclack::outro("Benchmark run complete")?;
 
         Ok(())
     }
+
+    fn run_overhead_baselines(
+        &self,
+        chainstate: &mut blockstack_lib::chainstate::stacks::db::StacksChainState,
+        burnchain: &blockstack_lib::burnchains::Burnchain,
+        start_parent: &stacks_common::types::chainstate::StacksBlockId,
+    ) -> anyhow::Result<(
+        stacks_bench::metrics::BlockProcessingBaseline,
+        stacks_bench::metrics::BlockProcessingBaseline,
+    )> {
+        let baseline_multipb =
+            cliclack::multi_progress("Calculating block processing overhead baseline");
+
+        let maybe_warmup_pb = if self.warmup > 0 {
+            Some(baseline_multipb.add(cliclack::progress_bar(self.warmup as u64)))
+        } else {
+            None
+        };
+
+        let baseline_pb1 =
+            baseline_multipb.add(cliclack::progress_bar(BASELINE_MEASURED_BLOCKS.into()));
+        let baseline_pb2 =
+            baseline_multipb.add(cliclack::progress_bar(BASELINE_MEASURED_BLOCKS.into()));
+
+        if let Some(warmup_pb) = maybe_warmup_pb {
+            warmup_pb.start(format!("Warming up for {} blocks...", self.warmup));
+            let warmup_timer = Instant::now();
+            stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
+                chainstate,
+                burnchain,
+                start_parent,
+                self.warmup as u32,
+                |completed, _| warmup_pb.set_position(completed as u64),
+            )?;
+            warmup_pb.stop(fmt_success!(
+                "Warmed up for {} blocks ({:.2}s)",
+                self.warmup,
+                warmup_timer.elapsed().as_secs_f32()
+            ));
+        }
+
+        baseline_pb1.start(format!(
+            "Measuring baseline over {BASELINE_MEASURED_BLOCKS} blocks (round 1)..."
+        ));
+        let t1 = Instant::now();
+        let round1 = stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
+            chainstate,
+            burnchain,
+            start_parent,
+            BASELINE_MEASURED_BLOCKS,
+            |completed, _| baseline_pb1.set_position(completed as u64),
+        )?;
+        baseline_pb1.stop(fmt_success!(
+            "Baseline round 1 finished ({:.2}s)",
+            t1.elapsed().as_secs_f32()
+        ));
+
+        baseline_pb2.start(format!(
+            "Measuring baseline over {BASELINE_MEASURED_BLOCKS} blocks (round 2)..."
+        ));
+        let t2 = Instant::now();
+        let round2 = stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
+            chainstate,
+            burnchain,
+            start_parent,
+            BASELINE_MEASURED_BLOCKS,
+            |completed, _| baseline_pb2.set_position(completed as u64),
+        )?;
+        baseline_pb2.stop(fmt_success!(
+            "Baseline round 2 finished ({:.2}s)",
+            t2.elapsed().as_secs_f32()
+        ));
+
+        baseline_multipb.stop();
+
+        Ok((round1, round2))
+    }
+}
+
+fn avg_baseline(
+    a: &stacks_bench::metrics::BlockProcessingBaseline,
+    b: &stacks_bench::metrics::BlockProcessingBaseline,
+) -> stacks_bench::metrics::BlockProcessingBaseline {
+    stacks_bench::metrics::BlockProcessingBaseline {
+        avg_setup_duration: (a.avg_setup_duration + b.avg_setup_duration) / 2,
+        avg_finalize_duration: (a.avg_finalize_duration + b.avg_finalize_duration) / 2,
+        avg_clarity_state_commit_duration: (a.avg_clarity_state_commit_duration
+            + b.avg_clarity_state_commit_duration)
+            / 2,
+        avg_advance_tip_duration: (a.avg_advance_tip_duration + b.avg_advance_tip_duration) / 2,
+        avg_index_commit_duration: (a.avg_index_commit_duration + b.avg_index_commit_duration) / 2,
+    }
+}
+
+fn format_baseline_note(
+    round1: &stacks_bench::metrics::BlockProcessingBaseline,
+    round2: &stacks_bench::metrics::BlockProcessingBaseline,
+) -> String {
+    let fmt_duration = |d: Duration| format!("{d:.2?}");
+
+    let line = |label: &str, r1: Duration, r2: Duration| {
+        let avg = (r1 + r2) / 2;
+        format!(
+            "{label:<26} {r1s:>12} / {r2s:>12}  avg {avgs:>12}",
+            label = label,
+            r1s = fmt_duration(r1),
+            r2s = fmt_duration(r2),
+            avgs = fmt_duration(avg),
+        )
+    };
+
+    [
+        line(
+            "Setup:",
+            round1.avg_setup_duration,
+            round2.avg_setup_duration,
+        ),
+        line(
+            "Finalize:",
+            round1.avg_finalize_duration,
+            round2.avg_finalize_duration,
+        ),
+        line(
+            "Clarity commit:",
+            round1.avg_clarity_state_commit_duration,
+            round2.avg_clarity_state_commit_duration,
+        ),
+        line(
+            "Advance tip:",
+            round1.avg_advance_tip_duration,
+            round2.avg_advance_tip_duration,
+        ),
+        line(
+            "Index commit:",
+            round1.avg_index_commit_duration,
+            round2.avg_index_commit_duration,
+        ),
+    ]
+    .join("\n")
 }
