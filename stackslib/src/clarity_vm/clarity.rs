@@ -2222,7 +2222,6 @@ impl ClarityTransactionConnection<'_, '_> {
 
     /// Commit the changes from the edit log.
     /// panics if there is more than one open savepoint
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn commit(mut self) -> Result<(), Error> {
         let log = self
             .log

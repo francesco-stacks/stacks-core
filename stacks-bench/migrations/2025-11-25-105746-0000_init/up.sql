@@ -327,6 +327,10 @@ CREATE UNIQUE INDEX uq_tx_stats_synth
   ON stacks_tx_stats(benchmark_run_id, stacks_tx_id, synthetic_block_id)
   WHERE synthetic_block_id IS NOT NULL;
 
+-- Supports joins/group-bys by (run, block, segment)
+CREATE INDEX idx_tx_stats_run_block_synth
+  ON stacks_tx_stats(benchmark_run_id, stacks_block_id, synthetic_block_id);
+
   -- For TX stats p95 / histograms
 CREATE INDEX idx_tx_stats_run_runtime
   ON stacks_tx_stats(benchmark_run_id, clarity_runtime);

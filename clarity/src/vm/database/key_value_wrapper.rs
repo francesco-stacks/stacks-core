@@ -263,7 +263,6 @@ impl<'a> RollbackWrapper<'a> {
         self.stack.len()
     }
 
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn commit(&mut self) -> Result<(), InterpreterError> {
         let mut last_item = self.stack.pop().ok_or_else(|| {
             InterpreterError::Expect("ERROR: Clarity VM attempted to commit past the stack.".into())
@@ -416,7 +415,6 @@ impl RollbackWrapper<'_> {
     ///
     /// This should never be called from within the Clarity VM, or via block-processing.  It's only
     /// meant to be used by the RPC system.
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_data_by_hash<T>(&mut self, hash: &TrieHash) -> InterpreterResult<Option<T>>
     where
         T: ClarityDeserializable<T>,

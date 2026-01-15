@@ -1014,22 +1014,13 @@ impl AppDb {
                         run_id,
                         block_pk,
                         synthetic_block_pk,
+                        tx_pks: &tx_pks,
                         span_cache: span_cache.clone(),
                         loc_cache: loc_cache.clone(),
                     };
 
                     for (i, root) in metrics.profiler_roots.iter().enumerate() {
                         ctx.insert_node(dbtx, root, None, i as i32, 0, None).await?;
-                    }
-
-                    for (tx_idx, tx_metric) in metrics.transactions.iter().enumerate() {
-                        let Some(tx_pk) = tx_pks.get(tx_idx).and_then(|x| *x) else {
-                            continue;
-                        };
-                        for (i, root) in tx_metric.profiler_roots.iter().enumerate() {
-                            ctx.insert_node(dbtx, root, None, i as i32, 0, Some(tx_pk))
-                                .await?;
-                        }
                     }
                 }
 
@@ -1040,15 +1031,16 @@ impl AppDb {
     }
 }
 
-struct ProfilerInsertContext {
+struct ProfilerInsertContext<'a> {
     run_id: i32,
     block_pk: i64,
     synthetic_block_pk: Option<i64>,
+    tx_pks: &'a [Option<i64>],
     span_cache: Arc<RwLock<HashMap<(Option<&'static str>, &'static str), i32>>>,
     loc_cache: Arc<RwLock<HashMap<(String, i32), i32>>>,
 }
 
-impl ProfilerInsertContext {
+impl ProfilerInsertContext<'_> {
     fn insert_node<'b>(
         &'b self,
         conn: &'b mut AsyncSqliteConnection,
@@ -1056,9 +1048,26 @@ impl ProfilerInsertContext {
         parent_id: Option<i32>,
         child_index: i32,
         depth: i32,
-        stacks_tx_id: Option<i64>,
+        active_tx_id: Option<i64>,
     ) -> BoxFuture<'b, Result<()>> {
         async move {
+            let mut stacks_tx_id = active_tx_id;
+
+            if node.name() == "Transaction" {
+                if let Some(tag) = node.tag() {
+                    let idx = match tag {
+                        stacks_profiler::Tag::Usize(v) => Some(*v),
+                        stacks_profiler::Tag::U64(v) => usize::try_from(*v).ok(),
+                        stacks_profiler::Tag::I64(v) => usize::try_from(*v).ok(), // negative => None
+                        stacks_profiler::Tag::Str(_) => None,
+                    };
+
+                    if let Some(i) = idx {
+                        stacks_tx_id = self.tx_pks.get(i).and_then(|x| *x);
+                    }
+                }
+            }
+
             let loc_id = AppDb::resolve_profiler_location(
                 conn,
                 self.loc_cache.clone(),
