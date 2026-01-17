@@ -74,8 +74,6 @@ impl IndexArgs {
             resolved.start, resolved.end
         );
 
-        // build context only if you actually need it for something else;
-        // otherwise, drop env to cleanup shadow dir
         drop(env);
 
         Ok(())

@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
-use stacks_profiler::{Profiler, measure, span};
+use stacks_profiler::{Profiler, measure, span, record};
 
 fn bench_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("Profiler Overhead");
@@ -239,9 +239,66 @@ fn bench_10m_sampled_spans(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_record(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Profiler Record Overhead");
+
+    // Record overhead: no span (should be near-zero due to early return)
+    group.bench_function("record_no_span", |b| {
+        b.iter(|| {
+            record!("k", 123u64);
+            black_box(());
+        });
+    });
+
+    // Record overhead: span + record u64 (no allocation)
+    group.bench_function("record_u64", |b| {
+        b.iter(|| {
+            let _g = span!("record_u64_span");
+            record!("k", 123u64);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    // Record overhead: span + record str (allocates)
+    group.bench_function("record_str", |b| {
+        b.iter(|| {
+            let _g = span!("record_str_span");
+            record!("k", "some-key");
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    // Record overhead: span + record bytes (allocates)
+    group.bench_function("record_bytes", |b| {
+        let bytes = [0u8; 32];
+        b.iter(|| {
+            let _g = span!("record_bytes_span");
+            record!("k", &bytes[..]);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    // Record overhead: many records in one span
+    group.bench_function("record_1k_u64", |b| {
+        b.iter(|| {
+            let _g = span!("record_1k_u64_span");
+            for i in 0..1000u64 {
+                record!("k", i);
+            }
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_overhead, bench_10m_sampled_spans
+    targets = bench_overhead, bench_10m_sampled_spans, bench_record
 }
 criterion_main!(benches);

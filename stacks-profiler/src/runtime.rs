@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
-use crate::{ProfileStats, SpanId, Tag};
+use crate::{ProfileStats, Record, SpanId, Tag};
 
 type NodeId = u32;
 
@@ -17,6 +17,8 @@ struct Node {
 
     children: Vec<NodeId>,
     last_child: Option<NodeId>,
+
+    records: Vec<Record>,
 }
 
 impl Node {
@@ -72,6 +74,7 @@ impl ThreadState {
             sampled_count: 0,
             children: Vec::new(),
             last_child: None,
+            records: Vec::with_capacity(4),
         });
         idx as NodeId
     }
@@ -148,12 +151,14 @@ impl ThreadState {
         }
     }
 
-    fn materialize_node(&self, node_id: NodeId) -> ProfileStats {
-        let node = self.node(node_id);
+    fn materialize_node(nodes: &mut Vec<Option<Node>>, node_id: NodeId) -> ProfileStats {
+        let node = nodes[node_id as usize]
+            .take()
+            .expect("node already materialized or missing");
 
         let mut children = Vec::with_capacity(node.children.len());
         for &child_id in &node.children {
-            children.push(self.materialize_node(child_id));
+            children.push(Self::materialize_node(nodes, child_id));
         }
 
         ProfileStats {
@@ -164,6 +169,7 @@ impl ThreadState {
             children,
             entered_count: node.entered_count,
             sampled_count: node.sampled_count,
+            records: node.records, // moved
         }
     }
 
@@ -173,14 +179,19 @@ impl ThreadState {
             "take_results called while spans are still active"
         );
 
-        let mut out = Vec::with_capacity(self.roots.len());
-        for &root in &self.roots {
-            out.push(self.materialize_node(root));
+        // Move nodes and roots out, so we can consume nodes without cloning.
+        let nodes = std::mem::take(&mut self.nodes);
+        let roots = std::mem::take(&mut self.roots);
+
+        // Convert into Option<Node> so we can `take()` by index.
+        let mut nodes_opt: Vec<Option<Node>> = nodes.into_iter().map(Some).collect();
+
+        let mut out = Vec::with_capacity(roots.len());
+        for root in roots {
+            out.push(Self::materialize_node(&mut nodes_opt, root));
         }
 
         self.stack.clear();
-        self.nodes.clear();
-        self.roots.clear();
         self.roots_last_child = None;
 
         out
@@ -279,6 +290,37 @@ pub fn end_span() {
                 node.entered_count += 1;
             }
         }
+    });
+}
+
+#[inline]
+pub fn record_kv(key: &'static str, value: crate::RecordValue) {
+    // Ignore if suppressed or no active span.
+    if is_suppressed() {
+        return;
+    }
+
+    STATE.with(|cell| {
+        let mut st = cell.borrow_mut();
+        let (node_id, is_count_only) = match st.stack.last() {
+            Some(frame) => (frame.node, matches!(frame.kind, ActiveKind::CountOnly)),
+            None => return,
+        };
+
+        // Skip count-only spans (no timing) to avoid noisy data.
+        if is_count_only {
+            return;
+        }
+
+        let node = st.node_mut(node_id);
+
+        // // Bounded storage: keep last N records.
+        // const MAX_RECORDS: usize = 8;
+        // if node.records.len() == MAX_RECORDS {
+        //     // drop oldest
+        //     node.records.remove(0);
+        // }
+        node.records.push(crate::Record { key, value });
     });
 }
 

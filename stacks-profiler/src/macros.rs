@@ -431,3 +431,11 @@ macro_rules! span {
         }
     }};
 }
+
+/// Attach a key/value record to the current span (if any).
+#[macro_export]
+macro_rules! record {
+    ($key:literal, $val:expr) => {{
+        $crate::Profiler::record($key, ($val).into());
+    }};
+}

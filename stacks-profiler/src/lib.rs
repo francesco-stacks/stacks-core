@@ -14,6 +14,43 @@ mod runtime;
 
 pub mod print;
 
+/// Small metadata attached to spans
+#[derive(Debug, Clone)]
+pub enum RecordValue {
+    U64(u64),
+    I64(i64),
+    Str(Box<str>),
+    Bytes(Box<[u8]>),
+}
+
+impl From<u64> for RecordValue {
+    #[inline(always)]
+    fn from(v: u64) -> Self { RecordValue::U64(v) }
+}
+impl From<i64> for RecordValue {
+    #[inline(always)]
+    fn from(v: i64) -> Self { RecordValue::I64(v) }
+}
+impl From<&str> for RecordValue {
+    #[inline(always)]
+    fn from(v: &str) -> Self { RecordValue::Str(v.into()) }
+}
+impl From<String> for RecordValue {
+    #[inline(always)]
+    fn from(v: String) -> Self { RecordValue::Str(v.into_boxed_str()) }
+}
+impl From<&[u8]> for RecordValue {
+    #[inline(always)]
+    fn from(v: &[u8]) -> Self { RecordValue::Bytes(v.into()) }
+}
+
+/// Key/value record attached to a span node.
+#[derive(Debug, Clone)]
+pub struct Record {
+    pub key: &'static str,
+    pub value: RecordValue,
+}
+
 /// A lightweight tag for distinguishing spans with the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tag {
@@ -117,6 +154,7 @@ pub struct ProfileStats {
     pub children: Vec<ProfileStats>,
     pub entered_count: usize,
     pub sampled_count: usize,
+    pub records: Vec<Record>,
 }
 
 impl ProfileStats {
@@ -239,6 +277,11 @@ impl Profiler {
     #[doc(hidden)]
     pub fn end_suppression() {
         runtime::end_suppression();
+    }
+
+    #[inline(always)]
+    pub fn record(key: &'static str, value: RecordValue) {
+        runtime::record_kv(key, value);
     }
 
     #[inline]

@@ -138,6 +138,7 @@ pub trait MarfConnection<T: MarfTrieId> {
     fn get_and_check_with_hash(&mut self, _block_hash: &T, _key: &str) {}
 
     /// Resolve a key from the MARF to a MARFValue with respect to the given block height.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn get(&mut self, block_hash: &T, key: &str) -> Result<Option<MARFValue>, Error> {
         self.get_and_check_with_hash(block_hash, key);
         self.with_conn(|c| MARF::get_by_key(c, block_hash, key))
@@ -527,6 +528,7 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
 
     /// Insert a batch of key/value pairs.  More efficient than inserting them individually, since
     /// the trie root hash will only be calculated once (which is an O(log B) operation).
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn insert_batch(&mut self, keys: &[String], values: Vec<MARFValue>) -> Result<(), Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
@@ -1092,6 +1094,7 @@ impl<T: MarfTrieId> MARF<T> {
         }
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn do_insert_leaf(
         storage: &mut TrieStorageTransaction<T>,
         block_hash: &T,
@@ -1123,6 +1126,7 @@ impl<T: MarfTrieId> MARF<T> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn insert_leaf(
         storage: &mut TrieStorageTransaction<T>,
         block_hash: &T,
@@ -1136,6 +1140,7 @@ impl<T: MarfTrieId> MARF<T> {
     }
 
     // like insert_leaf, but don't update the merkle skiplist
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn insert_leaf_in_batch(
         storage: &mut TrieStorageTransaction<T>,
         block_hash: &T,
