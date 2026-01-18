@@ -47,17 +47,17 @@ struct TxSegment {
     record: bool,
 }
 
-fn is_full_replay_segments(
-    block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
-    segments: &[TxSegment],
-) -> bool {
-    if segments.len() != 1 {
-        return false;
-    }
-    let seg = &segments[0];
+// fn is_full_replay_segments(
+//     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
+//     segments: &[TxSegment],
+// ) -> bool {
+//     if segments.len() != 1 {
+//         return false;
+//     }
+//     let seg = &segments[0];
 
-    seg.record && seg.range.start == 0 && seg.range.end == block.txs.len()
-}
+//     seg.record && seg.range.start == 0 && seg.range.end == block.txs.len()
+// }
 
 fn build_segments_full(
     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
@@ -229,8 +229,6 @@ fn replay_nakamoto_by_segments(
     if segments.is_empty() {
         return Ok(vec![]);
     }
-
-    let is_full_replay = is_full_replay_segments(block, segments);
 
     let parent_block_id = block.header.parent_block_id.clone();
     let parent_info = NakamotoChainState::get_block_header(chainstate.db(), &parent_block_id)?
@@ -509,13 +507,7 @@ fn replay_nakamoto_by_segments(
         // Emit one block metrics row per *recorded* segment
         // -------------------------------------------------------------------
         if seg.record {
-            let synthetic_id = if is_full_replay {
-                None
-            } else {
-                Some(compute_synthetic_id(
-                    &origin_id, seg_ix, &seg.range, repetition,
-                ))
-            };
+            let synthetic_id = compute_synthetic_id(&origin_id, seg_ix, &seg.range, repetition);
 
             let mut m = BlockMetrics::new_default(origin_id.clone(), synthetic_id);
             m.setup_duration = setup_duration;
@@ -541,280 +533,6 @@ fn replay_nakamoto_by_segments(
 
     Ok(out)
 }
-
-// fn re_execute_prenakamoto(
-//     chainstate: &mut StacksChainState,
-//     burnchain: &Burnchain,
-//     block: &StacksBlock,
-//     block_size: u64,
-//     consensus_hash: &ConsensusHash,
-//     block_hash: &BlockHeaderHash,
-// ) -> Result<()> {
-//     // Load StagingBlock metadata
-//     let index_hash = StacksBlockId::new(consensus_hash, block_hash);
-//     let staging_block = StacksChainState::load_staging_block_info(chainstate.db(), &index_hash)?
-//         .ok_or_else(|| anyhow!("Staging block info not found for {}", index_hash))?;
-
-//     let (mut chainstate_tx, clarity_instance) = chainstate.chainstate_tx_begin()?;
-
-//     let parent_header_info =
-//         StacksChainState::get_parent_header_info(&mut chainstate_tx, &staging_block)?
-//             .ok_or_else(|| anyhow!("Parent header info not found"))?;
-
-//     let parent_block_hash = parent_header_info.anchored_header.block_hash();
-//     let parent_micro_hash = block.header.parent_microblock.clone();
-//     let parent_micro_seq = block.header.parent_microblock_sequence;
-
-//     let next_microblocks = StacksChainState::inner_find_parent_microblock_stream(
-//         &chainstate_tx.tx,
-//         block_hash,
-//         &parent_block_hash,
-//         &parent_header_info.consensus_hash,
-//         &parent_micro_hash,
-//         parent_micro_seq,
-//     )?
-//     .ok_or_else(|| anyhow!("Microblock stream not found"))?;
-
-//     let connecting_microblocks = StacksChainState::extract_connecting_microblocks(
-//         &parent_header_info,
-//         consensus_hash,
-//         block_hash,
-//         block,
-//         next_microblocks,
-//     )?;
-
-//     let mut sortdb = burnchain.open_sortition_db(true)?;
-
-//     let snapshot = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), consensus_hash)?
-//         .ok_or_else(|| anyhow!("Snapshot not found"))?;
-
-//     let pox_constants = sortdb.pox_constants.clone();
-//     let mut sort_tx = sortdb.tx_begin_at_tip();
-
-//     let commit_burn = 0;
-//     let sortition_burn = 0;
-
-//     StacksChainState::append_block(
-//         &mut chainstate_tx,
-//         clarity_instance,
-//         &mut sort_tx,
-//         &pox_constants,
-//         &parent_header_info,
-//         consensus_hash,
-//         &snapshot.burn_header_hash,
-//         snapshot.block_height as u32,
-//         snapshot.burn_header_timestamp,
-//         block,
-//         block_size,
-//         &connecting_microblocks,
-//         commit_burn,
-//         sortition_burn,
-//         false,
-//     )
-//     .with_context(|| format!("append_block failed"))?;
-
-//     // Commit the updated chainstate.
-//     chainstate_tx.commit()?;
-//     Ok(())
-// }
-
-// fn re_execute_nakamoto_miner(
-//     context: &mut BenchContext,
-//     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
-// ) -> Result<BlockMetrics> {
-//     with_executed_nakamoto_block(
-//         context,
-//         block,
-//         |builder, mut tenure_tx, burn_chain_height| {
-//             profile_scope!("Mining", {
-//                 builder.mine_nakamoto_block(&mut tenure_tx, burn_chain_height);
-//             });
-
-//             let mut fake_consensus_hash = block.header.consensus_hash.clone();
-//             fake_consensus_hash.0[0] ^= 0xFF;
-//             let mut fake_block_hash = block.header.block_hash();
-//             fake_block_hash.0[0] ^= 0xFF;
-//             let block_id = StacksBlockId::new(&fake_consensus_hash, &fake_block_hash);
-
-//             profile_scope!("Block Commit", {
-//                 tenure_tx.commit_mined_block(&block_id)?;
-//             });
-
-//             Ok(())
-//         },
-//     )
-// }
-
-// /// Re-execute a block simulating a FOLLOWER node.
-// fn re_execute_nakamoto_follower(
-//     chainstate: &mut StacksChainState,
-//     burnchain: &Burnchain,
-//     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
-// ) -> Result<BlockMetrics> {
-//     with_executed_nakamoto_block(
-//         chainstate,
-//         burnchain,
-//         block,
-//         |_builder, tenure_tx, _burn_chain_height| {
-//             let mut fake_consensus_hash = block.header.consensus_hash.clone();
-//             fake_consensus_hash.0[0] ^= 0xAA;
-//             let mut fake_block_hash = block.header.block_hash();
-//             fake_block_hash.0[0] ^= 0xAA;
-
-//             stacks_profiler::measure!("Block Commit", {
-//                 tenure_tx.commit_to_block(&fake_consensus_hash, &fake_block_hash);
-//             });
-//             Ok(())
-//         },
-//     )
-// }
-
-// fn with_executed_nakamoto_block<F>(
-//     chainstate: &mut StacksChainState,
-//     burnchain: &Burnchain,
-//     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
-//     commit_callback: F,
-// ) -> Result<BlockMetrics>
-// where
-//     F: FnOnce(&mut NakamotoBlockBuilder, ClarityTx, u32) -> Result<()>,
-// {
-//     // ========================================================================
-//     // 1. Setup Phase
-//     // ========================================================================
-//     // We use manual span!()/drop() here because the DB handles created
-//     // in this phase are self-referential (tenure_tx borrows burn_dbconn).
-//     // A block-scoped macro cannot return both the owner and the borrower safely.
-//     let setup_guard = stacks_profiler::span!("Setup");
-
-//     let start_total = Instant::now();
-//     let parent_block_id = block.header.parent_block_id.clone();
-
-//     let parent_header = NakamotoChainState::get_block_header(chainstate.db(), &parent_block_id)?
-//         .ok_or_else(|| anyhow!("Parent header not found"))?;
-
-//     let coinbase = block.get_coinbase_tx();
-//     let tenure_change_payload = block.try_get_tenure_change_payload();
-//     let tenure_change = tenure_change_payload.and(block.txs.first());
-
-//     let tenure_cause = tenure_change_payload
-//         .map(|tc| MinerTenureInfoCause::from(tc.cause))
-//         .unwrap_or(MinerTenureInfoCause::NoTenureChange);
-
-//     let mut builder = NakamotoBlockBuilder::new(
-//         &parent_header,
-//         &block.header.consensus_hash,
-//         block.header.burn_spent,
-//         tenure_change,
-//         coinbase,
-//         block.header.pox_treatment.len(),
-//         None,
-//         None,
-//         Some(block.header.timestamp),
-//     )?;
-
-//     let sortdb = burnchain.open_sortition_db(true)?;
-//     let burn_dbconn = sortdb.index_handle_at_block(chainstate, &parent_block_id)?;
-
-//     let mut miner_tenure_info = builder.load_tenure_info(chainstate, &burn_dbconn, tenure_cause)?;
-
-//     let burn_chain_height = miner_tenure_info.burn_tip_height;
-//     let mut tenure_tx = builder.tenure_begin(&burn_dbconn, &mut miner_tenure_info)?;
-
-//     // Explicitly end the Setup span here, but the variables stay alive!
-//     drop(setup_guard);
-
-//     let setup_duration = start_total.elapsed();
-
-//     // ========================================================================
-//     // 2. Execution Phase
-//     // ========================================================================
-//     let start_exec = Instant::now();
-
-//     let (tx_metrics, total_clarity_cost) = stacks_profiler::measure!("Transaction Replay", {
-//         let mut tx_metrics = Vec::with_capacity(block.txs.len());
-//         let mut total_clarity_cost = ExecutionCost::ZERO;
-
-//         for (i, tx) in block.txs.iter().enumerate() {
-//             let tx_len = tx.tx_len();
-//             let start_tx = Instant::now();
-
-//             let result = stacks_profiler::measure!("Transaction", i, {
-//                 builder.try_mine_tx_with_len(
-//                     &mut tenure_tx,
-//                     tx,
-//                     tx_len,
-//                     &BlockLimitFunction::NO_LIMIT_HIT,
-//                     None,
-//                 )
-//             });
-
-//             let duration_tx = start_tx.elapsed();
-//             let mut cost = ExecutionCost::ZERO;
-
-//             match result {
-//                 TransactionResult::Success(ref success_data) => {
-//                     cost = success_data.receipt.execution_cost.clone();
-//                     total_clarity_cost
-//                         .add(&cost)
-//                         .context(format!("Execution cost addition failure"))?;
-//                 }
-//                 TransactionResult::ProcessingError(ref error_data) => {
-//                     eprintln!("  Tx #{i} (0x{}) failed: {:?}", tx.txid(), error_data.error);
-//                 }
-//                 TransactionResult::Skipped(ref skipped_data) => {
-//                     eprintln!(
-//                         "  Tx #{i} (0x{}) skipped: {:?}",
-//                         tx.txid(),
-//                         skipped_data.error
-//                     );
-//                 }
-//                 TransactionResult::Problematic(ref prob_data) => {
-//                     eprintln!(
-//                         "  Tx #{i} (0x{}) problematic: {:?}",
-//                         tx.txid(),
-//                         prob_data.error
-//                     );
-//                 }
-//             }
-
-//             tx_metrics.push(TransactionMetrics {
-//                 txid: tx.txid(),
-//                 duration: duration_tx,
-//                 cost,
-//                 profiler_roots: vec![],
-//             });
-//         }
-
-//         (tx_metrics, total_clarity_cost)
-//     });
-
-//     let execution_duration = start_exec.elapsed();
-
-//     // ========================================================================
-//     // 3. Commit Phase
-//     // ========================================================================
-//     let start_commit = Instant::now();
-
-//     stacks_profiler::measure!("Commit", {
-//         commit_callback(&mut builder, tenure_tx, burn_chain_height)?;
-//     });
-
-//     let commit_duration = start_commit.elapsed();
-
-//     Ok(BlockMetrics {
-//         id: block.block_id(),
-//         synthetic_id: None,
-//         total_duration: start_total.elapsed(),
-//         setup_duration,
-//         execution_duration,
-//         commit_duration,
-//         total_clarity_cost,
-//         transactions: tx_metrics,
-//         commit_overhead_baseline: Duration::ZERO,
-//         total_storage_delta: 0,
-//         profiler_roots: vec![],
-//     })
-// }
 
 pub fn replay_nakamoto_empty_chain_baseline<F>(
     chainstate: &mut StacksChainState,

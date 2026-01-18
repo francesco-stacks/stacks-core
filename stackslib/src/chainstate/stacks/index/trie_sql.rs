@@ -159,7 +159,7 @@ pub fn migrate_tables_if_needed<T: MarfTrieId>(conn: &mut Connection) -> Result<
 
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn get_block_identifier<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<u32, Error> {
     conn.query_row(
@@ -172,7 +172,7 @@ pub fn get_block_identifier<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result
 
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn get_mined_block_identifier<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<u32, Error> {
     conn.query_row(
@@ -185,7 +185,7 @@ pub fn get_mined_block_identifier<T: MarfTrieId>(conn: &Connection, bhh: &T) -> 
 
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn get_confirmed_block_identifier<T: MarfTrieId>(
     conn: &Connection,
@@ -202,7 +202,7 @@ pub fn get_confirmed_block_identifier<T: MarfTrieId>(
 
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn get_unconfirmed_block_identifier<T: MarfTrieId>(
     conn: &Connection,
@@ -217,7 +217,7 @@ pub fn get_unconfirmed_block_identifier<T: MarfTrieId>(
     .map_err(|e| e.into())
 }
 
-#[cfg_attr(feature = "profiler", stacks_profiler::profile(sample_rate = 256))]
+#[cfg_attr(feature = "profiler", stacks_profiler::profile(sample_rate = 8))]
 pub fn get_block_hash<T: MarfTrieId>(conn: &Connection, local_id: u32) -> Result<T, Error> {
     let result = conn
         .query_row(
@@ -406,7 +406,7 @@ pub fn write_trie_blob_to_unconfirmed<T: MarfTrieId>(
 /// Open a trie blob. Returns a Blob<'a> readable/writeable handle to it.
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn open_trie_blob(conn: &Connection, block_id: u32) -> Result<Blob<'_>, Error> {
     let blob = conn.blob_open(
@@ -629,7 +629,7 @@ pub fn get_node_hash_bytes(
 
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn get_node_hash_bytes_by_bhh<T: MarfTrieId>(
     conn: &Connection,
@@ -648,7 +648,7 @@ pub fn get_node_hash_bytes_by_bhh<T: MarfTrieId>(
 
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn tx_lock_bhh_for_extension<T: MarfTrieId>(
     tx: &Connection,
@@ -692,7 +692,7 @@ pub fn tx_lock_bhh_for_extension<T: MarfTrieId>(
 
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn lock_bhh_for_extension<T: MarfTrieId>(
     tx: &Transaction,
@@ -705,7 +705,7 @@ pub fn lock_bhh_for_extension<T: MarfTrieId>(
 
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn count_blocks(conn: &Connection) -> Result<u32, Error> {
     let result = conn.query_row(
@@ -718,7 +718,7 @@ pub fn count_blocks(conn: &Connection) -> Result<u32, Error> {
 
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn is_unconfirmed_block(conn: &Connection, block_id: u32) -> Result<bool, Error> {
     let res: i64 = conn.query_row(
@@ -739,7 +739,7 @@ pub fn drop_lock<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<(), Error>
 
 #[cfg_attr(
     feature = "profiler",
-    stacks_profiler::profile(sample_rate = 64, unsampled = "count_only")
+    stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
 )]
 pub fn drop_unconfirmed_trie<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<(), Error> {
     debug!("Drop unconfirmed trie sqlite blob {}", bhh);

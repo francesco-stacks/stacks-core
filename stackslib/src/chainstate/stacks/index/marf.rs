@@ -667,6 +667,7 @@ impl<T: MarfTrieId> MARF<T> {
     }
 
     // helper method for walking a node's backpr
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn walk_backptr(
         storage: &mut TrieStorageConnection<T>,
         start_node: &TrieNodeType,
@@ -793,6 +794,7 @@ impl<T: MarfTrieId> MARF<T> {
     /// On Ok, s will point to new_bhh and will be open for reading.
     /// Returns true/false, based on whether or not the trie will be created (this can return false
     /// if we're resuming work on an unconfirmed trie)
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn extend_trie(storage: &mut TrieStorageTransaction<T>, new_bhh: &T) -> Result<(), Error> {
         if storage.readonly() {
             unreachable!("CORRUPTION: constructed read-only TrieStorageTransaction instance");
@@ -1050,6 +1052,7 @@ impl<T: MarfTrieId> MARF<T> {
         storage.write_nodetype(root_ptr, &node_type, hash)
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn get_path(
         storage: &mut TrieStorageConnection<T>,
         block_hash: &T,
@@ -1210,6 +1213,7 @@ impl<T: MarfTrieId> MARF<T> {
         block_hash: &T,
         key: &str,
     ) -> Result<Option<MARFValue>, Error> {
+        stacks_profiler::record!("MARF_KEY", key);
         let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
 
         let path = TrieHash::from_key(key);
@@ -1238,6 +1242,7 @@ impl<T: MarfTrieId> MARF<T> {
         block_hash: &T,
         path: &TrieHash,
     ) -> Result<Option<MARFValue>, Error> {
+        stacks_profiler::record!("BLOCK_HASH", block_hash.as_bytes());
         let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
 
         let result = MARF::get_path(storage, block_hash, path).or_else(|e| match e {

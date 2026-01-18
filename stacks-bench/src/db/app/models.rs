@@ -6,8 +6,8 @@ use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, Sta
 
 use super::schema::{
     _staged_stacks_block, _staged_stacks_tx, benchmark_run, block_processing_baseline, burn_block,
-    chainstate, epoch, network, profiler_location, profiler_record, profiler_span, stacks_block,
-    stacks_block_stats, stacks_tx, stacks_tx_stats,
+    chainstate, epoch, network, profiler_location, profiler_record, profiler_record_kv,
+    profiler_span, stacks_block, stacks_block_stats, stacks_tx, stacks_tx_stats,
 };
 use crate::ResolveEpochFromHeight;
 use crate::db::app::schema::{
@@ -192,6 +192,7 @@ pub struct StagedStacksBlock {
 #[diesel(table_name = synthetic_block)]
 pub struct SyntheticBlock {
     pub id: i64,
+    pub stacks_block_id: i64,
     pub index_hash: Vec<u8>,
 }
 
@@ -242,10 +243,10 @@ pub struct BenchmarkRun {
 }
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[diesel(primary_key(benchmark_run_id))]
 #[diesel(belongs_to(BenchmarkRun))]
 #[diesel(table_name = block_processing_baseline)]
 pub struct BlockProcessingBaselineRow {
-    pub id: i64,
     pub benchmark_run_id: i32,
     pub start_parent_index_hash: Vec<u8>,
     pub warmup_blocks: i32,
@@ -258,14 +259,13 @@ pub struct BlockProcessingBaselineRow {
 }
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[diesel(primary_key(benchmark_run_id, synthetic_block_id))]
 #[diesel(belongs_to(BenchmarkRun))]
-#[diesel(belongs_to(StacksBlock))]
+#[diesel(belongs_to(SyntheticBlock))]
 #[diesel(table_name = stacks_block_stats)]
 pub struct StacksBlockStats {
-    pub id: i64,
     pub benchmark_run_id: i32,
-    pub stacks_block_id: i64,
-    pub synthetic_block_id: Option<i64>,
+    pub synthetic_block_id: i64,
     pub total_duration_us: i32,
     pub setup_duration_us: i32,
     pub execution_duration_us: i32,
@@ -280,15 +280,14 @@ pub struct StacksBlockStats {
 }
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[diesel(primary_key(benchmark_run_id, synthetic_block_id, stacks_tx_id))]
 #[diesel(belongs_to(BenchmarkRun))]
 #[diesel(belongs_to(StacksTx))]
 #[diesel(table_name = stacks_tx_stats)]
 pub struct StacksTxStats {
-    pub id: i64,
     pub benchmark_run_id: i32,
     pub stacks_tx_id: i64,
-    pub stacks_block_id: i64,
-    pub synthetic_block_id: Option<i64>,
+    pub synthetic_block_id: i64,
     pub duration_us: i32,
     pub clarity_write_length: i32,
     pub clarity_write_count: i32,
@@ -318,7 +317,7 @@ pub struct ProfilerSpan {
 #[diesel(belongs_to(BenchmarkRun))]
 #[diesel(belongs_to(ProfilerSpan))]
 #[diesel(belongs_to(ProfilerLocation))]
-#[diesel(belongs_to(StacksBlock))]
+#[diesel(belongs_to(SyntheticBlock))]
 #[diesel(belongs_to(StacksTx))]
 #[diesel(belongs_to(ProfilerRecord, foreign_key = parent_id))]
 #[diesel(table_name = profiler_record)]
@@ -332,8 +331,7 @@ pub struct ProfilerRecord {
     pub profiler_location_id: i32,
     pub child_index: i32,
     pub depth: i32,
-    pub synthetic_block_id: Option<i64>,
-    pub stacks_block_id: Option<i64>,
+    pub synthetic_block_id: i64,
     pub stacks_tx_id: Option<i64>,
     pub wall_time_us: i64,
     pub cpu_time_us: i64,
@@ -341,6 +339,21 @@ pub struct ProfilerRecord {
     pub self_cpu_time_us: i64,
     pub call_count: i32,
     pub sample_count: i32,
+}
+
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[diesel(belongs_to(ProfilerRecord, foreign_key = profiler_record_id))]
+#[diesel(table_name = profiler_record_kv)]
+#[diesel(treat_none_as_null = true)]
+pub struct ProfilerRecordKv {
+    pub id: i32,
+    pub profiler_record_id: i32,
+    pub key: String,
+    pub value_type: i32,
+    pub value_int: Option<i64>,
+    pub value_text: Option<String>,
+    pub value_blob: Option<Vec<u8>>,
+    pub value: String,
 }
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]

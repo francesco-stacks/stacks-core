@@ -106,6 +106,7 @@ table! {
 table! {
     synthetic_block (id) {
         id -> BigInt,
+        stacks_block_id -> BigInt,
         index_hash -> Binary,
     }
 }
@@ -150,8 +151,7 @@ table! {
 }
 
 table! {
-    block_processing_baseline (id) {
-        id -> BigInt,
+    block_processing_baseline (benchmark_run_id) {
         benchmark_run_id -> Integer,
         start_parent_index_hash -> Binary,
         warmup_blocks -> Integer,
@@ -165,11 +165,9 @@ table! {
 }
 
 table! {
-    stacks_block_stats (id) {
-        id -> BigInt,
+    stacks_block_stats (benchmark_run_id, synthetic_block_id) {
         benchmark_run_id -> Integer,
-        stacks_block_id -> BigInt,
-        synthetic_block_id -> Nullable<BigInt>,
+        synthetic_block_id -> BigInt,
         total_duration_us -> Integer,
         setup_duration_us -> Integer,
         execution_duration_us -> Integer,
@@ -185,12 +183,10 @@ table! {
 }
 
 table! {
-    stacks_tx_stats (id) {
-        id -> BigInt,
+    stacks_tx_stats (benchmark_run_id, synthetic_block_id, stacks_tx_id) {
         benchmark_run_id -> Integer,
         stacks_tx_id -> BigInt,
-        stacks_block_id -> BigInt,
-        synthetic_block_id -> Nullable<BigInt>,
+        synthetic_block_id -> BigInt,
         duration_us -> Integer,
         clarity_write_length -> Integer,
         clarity_write_count -> Integer,
@@ -226,8 +222,7 @@ table! {
         profiler_location_id -> Integer,
         child_index -> Integer,
         depth -> Integer,
-        synthetic_block_id -> Nullable<BigInt>,
-        stacks_block_id -> Nullable<BigInt>,
+        synthetic_block_id -> BigInt,
         stacks_tx_id -> Nullable<BigInt>,
         wall_time_us -> BigInt,
         cpu_time_us -> BigInt,
@@ -235,6 +230,19 @@ table! {
         self_cpu_time_us -> BigInt,
         call_count -> Integer,
         sample_count -> Integer,
+    }
+}
+
+table! {
+    profiler_record_kv (id) {
+        id -> Integer,
+        profiler_record_id -> Integer,
+        key -> Text,
+        value_type -> Integer,
+        value_int -> Nullable<BigInt>,
+        value_text -> Nullable<Text>,
+        value_blob -> Nullable<Binary>,
+        value -> Text,
     }
 }
 
@@ -250,6 +258,7 @@ joinable!(chainstate -> network (network_id));
 joinable!(epoch -> chainstate (chainstate_id));
 joinable!(benchmark_run -> chainstate (chainstate_id));
 joinable!(stacks_block -> burn_block (burn_block_id));
+joinable!(synthetic_block -> stacks_block (stacks_block_id));
 joinable!(stacks_tx -> stacks_block (stacks_block_id));
 joinable!(stacks_tx -> stacks_tx_type (stacks_tx_type_id));
 joinable!(stacks_tx -> principal (caller_principal_id));
@@ -258,9 +267,7 @@ joinable!(stacks_tx -> contract_fn (contract_fn_id));
 joinable!(contract_fn -> contract (contract_id));
 joinable!(block_processing_baseline -> benchmark_run (benchmark_run_id));
 joinable!(stacks_block_stats -> benchmark_run (benchmark_run_id));
-joinable!(stacks_block_stats -> stacks_block (stacks_block_id));
 joinable!(stacks_block_stats -> synthetic_block (synthetic_block_id));
-joinable!(stacks_tx_stats -> stacks_block (stacks_block_id));
 joinable!(stacks_tx_stats -> synthetic_block (synthetic_block_id));
 joinable!(stacks_tx_stats -> benchmark_run (benchmark_run_id));
 joinable!(stacks_tx_stats -> stacks_tx (stacks_tx_id));
@@ -268,8 +275,8 @@ joinable!(profiler_record -> benchmark_run (benchmark_run_id));
 joinable!(profiler_record -> profiler_span (profiler_span_id));
 joinable!(profiler_record -> profiler_location (profiler_location_id));
 joinable!(profiler_record -> synthetic_block (synthetic_block_id));
-joinable!(profiler_record -> stacks_block (stacks_block_id));
 joinable!(profiler_record -> stacks_tx (stacks_tx_id));
+joinable!(profiler_record_kv -> profiler_record (profiler_record_id));
 
 allow_tables_to_appear_in_same_query!(
     network,
@@ -293,5 +300,6 @@ allow_tables_to_appear_in_same_query!(
     profiler_location,
     profiler_span,
     profiler_record,
+    profiler_record_kv,
     chain_tip_cache,
 );

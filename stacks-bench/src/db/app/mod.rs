@@ -41,7 +41,8 @@ use super::{AsyncSqliteConnection, SqlitePool};
 // This macro embeds the SQL files from the "migrations" directory into the binary
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
-const MERGE_STAGING_SQL: &str = include_str!("merge_staging.sql");
+const MERGE_STAGING_SQL: &str = include_str!("scripts/merge_staging.sql");
+const POST_RUN_SQL: &str = include_str!("scripts/post_run.sql");
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -366,6 +367,14 @@ impl AppDb {
             .execute(&mut self.get_conn().await?)
             .await
             .context("Failed to update benchmark run end time")?;
+
+        // inside finish_benchmark_run, after end_time update:
+        let sql = POST_RUN_SQL.replace("?1", &run_id.to_string());
+        self.get_conn()
+            .await?
+            .batch_execute(&sql)
+            .await
+            .context("Failed to build profiler span summary")?;
         Ok(())
     }
 
@@ -536,23 +545,35 @@ impl AppDb {
     async fn get_or_create_synth_block_id(
         conn: &mut AsyncSqliteConnection,
         index_hash: &[u8],
+        source_stacks_block_id: i64,
     ) -> Result<i64> {
         use crate::db::app::schema::synthetic_block;
 
         diesel::insert_into(synthetic_block::table)
-            .values(synthetic_block::index_hash.eq(index_hash.to_vec()))
+            .values((
+                synthetic_block::index_hash.eq(index_hash.to_vec()),
+                synthetic_block::stacks_block_id.eq(source_stacks_block_id),
+            ))
             .on_conflict(synthetic_block::index_hash)
             .do_nothing()
             .execute(conn)
             .await
             .context("Failed to insert synthetic_block")?;
 
-        let id: i64 = synthetic_block::table
-            .select(synthetic_block::id)
+        let (id, existing_stacks_block_id): (i64, i64) = synthetic_block::table
+            .select((synthetic_block::id, synthetic_block::stacks_block_id))
             .filter(synthetic_block::index_hash.eq(index_hash))
             .first(conn)
             .await
-            .context("Failed to load synthetic_block.id")?;
+            .context("Failed to load synthetic_block")?;
+
+        if existing_stacks_block_id != source_stacks_block_id {
+            return Err(anyhow!(
+                "synthetic_block index_hash collision: existing stacks_block_id={} new stacks_block_id={}",
+                existing_stacks_block_id,
+                source_stacks_block_id
+            ));
+        }
 
         Ok(id)
     }
@@ -927,18 +948,17 @@ impl AppDb {
                         .first(dbtx)
                         .await?;
 
-                    let synthetic_block_pk: Option<i64> =
-                        if let Some(h) = metrics.synthetic_id.as_ref() {
-                            Some(Self::get_or_create_synth_block_id(dbtx, h.as_bytes()).await?)
-                        } else {
-                            None
-                        };
+                    let synthetic_block_pk = Self::get_or_create_synth_block_id(
+                        dbtx,
+                        metrics.synthetic_id.as_bytes(),
+                        block_pk,
+                    )
+                    .await?;
 
                     // Insert block stats
                     diesel::insert_into(stacks_block_stats::table)
                         .values((
                             stacks_block_stats::benchmark_run_id.eq(run_id),
-                            stacks_block_stats::stacks_block_id.eq(block_pk),
                             stacks_block_stats::synthetic_block_id.eq(synthetic_block_pk),
                             stacks_block_stats::total_duration_us
                                 .eq(metrics.total_duration.as_micros() as i32),
@@ -988,7 +1008,6 @@ impl AppDb {
                                 .values((
                                     stacks_tx_stats::benchmark_run_id.eq(run_id),
                                     stacks_tx_stats::stacks_tx_id.eq(tx_pk),
-                                    stacks_tx_stats::stacks_block_id.eq(block_pk),
                                     stacks_tx_stats::synthetic_block_id.eq(synthetic_block_pk),
                                     stacks_tx_stats::duration_us
                                         .eq(tx_metric.duration.as_micros() as i32),
@@ -1012,7 +1031,6 @@ impl AppDb {
                     // Insert profiler records (block roots + tx roots)
                     let ctx = ProfilerInsertContext {
                         run_id,
-                        block_pk,
                         synthetic_block_pk,
                         tx_pks: &tx_pks,
                         span_cache: span_cache.clone(),
@@ -1033,8 +1051,7 @@ impl AppDb {
 
 struct ProfilerInsertContext<'a> {
     run_id: i32,
-    block_pk: i64,
-    synthetic_block_pk: Option<i64>,
+    synthetic_block_pk: i64,
     tx_pks: &'a [Option<i64>],
     span_cache: Arc<RwLock<HashMap<(Option<&'static str>, &'static str), i32>>>,
     loc_cache: Arc<RwLock<HashMap<(String, i32), i32>>>,
@@ -1110,7 +1127,6 @@ impl ProfilerInsertContext<'_> {
                     schema::profiler_record::child_index.eq(child_index),
                     schema::profiler_record::depth.eq(depth),
                     schema::profiler_record::synthetic_block_id.eq(self.synthetic_block_pk),
-                    schema::profiler_record::stacks_block_id.eq(Some(self.block_pk)),
                     schema::profiler_record::stacks_tx_id.eq(stacks_tx_id),
                     schema::profiler_record::wall_time_us.eq(wall_time_us),
                     schema::profiler_record::cpu_time_us.eq(cpu_time_us),
@@ -1122,6 +1138,23 @@ impl ProfilerInsertContext<'_> {
                 .returning(schema::profiler_record::id)
                 .get_result(conn)
                 .await?;
+
+            if !node.records.is_empty() {
+                for r in &node.records {
+                    let (value_type, value_int, value_text, value_blob) = map_record_value(r);
+                    diesel::insert_into(schema::profiler_record_kv::table)
+                        .values((
+                            schema::profiler_record_kv::profiler_record_id.eq(record_id),
+                            schema::profiler_record_kv::key.eq(r.key),
+                            schema::profiler_record_kv::value_type.eq(value_type),
+                            schema::profiler_record_kv::value_int.eq(value_int),
+                            schema::profiler_record_kv::value_text.eq(value_text),
+                            schema::profiler_record_kv::value_blob.eq(value_blob),
+                        ))
+                        .execute(conn)
+                        .await?;
+                }
+            }
 
             for (idx, child) in node.children.iter().enumerate() {
                 self.insert_node(
@@ -1138,6 +1171,17 @@ impl ProfilerInsertContext<'_> {
             Ok(())
         }
         .boxed()
+    }
+}
+
+fn map_record_value(
+    r: &stacks_profiler::Record,
+) -> (i32, Option<i64>, Option<String>, Option<Vec<u8>>) {
+    match &r.value {
+        stacks_profiler::RecordValue::U64(v) => (1, Some(*v as i64), None, None),
+        stacks_profiler::RecordValue::I64(v) => (2, Some(*v), None, None),
+        stacks_profiler::RecordValue::Str(s) => (3, None, Some(s.to_string()), None),
+        stacks_profiler::RecordValue::Bytes(b) => (4, None, None, Some(b.to_vec())),
     }
 }
 

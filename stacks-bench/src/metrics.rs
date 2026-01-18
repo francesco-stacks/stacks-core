@@ -158,7 +158,7 @@ pub struct BlockProcessingBaseline {
 #[derive(Debug, Clone)]
 pub struct BlockMetrics {
     pub id: StacksBlockId,
-    pub synthetic_id: Option<StacksBlockId>,
+    pub synthetic_id: StacksBlockId,
     pub total_duration: Duration,
     pub setup_duration: Duration,
     pub execution_duration: Duration,
@@ -172,7 +172,7 @@ pub struct BlockMetrics {
 }
 
 impl BlockMetrics {
-    pub fn new_default(id: StacksBlockId, synthetic_id: Option<StacksBlockId>) -> Self {
+    pub fn new_default(id: StacksBlockId, synthetic_id: StacksBlockId) -> Self {
         Self {
             id,
             synthetic_id,

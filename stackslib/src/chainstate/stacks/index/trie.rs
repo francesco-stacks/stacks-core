@@ -186,6 +186,7 @@ impl Trie {
     ///
     /// Either way, return the node, its hash, and the ptr to the node in the block in which it was
     /// found (it will _not_ be a back-pointer).
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn walk_backptr<T: MarfTrieId>(
         storage: &mut TrieStorageConnection<T>,
         ptr: &TriePtr,

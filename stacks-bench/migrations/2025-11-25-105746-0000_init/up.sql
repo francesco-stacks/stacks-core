@@ -124,6 +124,7 @@ CREATE TABLE stacks_block (
   FOREIGN KEY (burn_block_id) REFERENCES burn_block(id),
   FOREIGN KEY (parent_stacks_block_id) REFERENCES stacks_block(id),
   CHECK(height >= 0),
+  CHECK(length(block_hash) = 32),
   CHECK(length(index_hash) = 32)
 );
 
@@ -149,7 +150,7 @@ CREATE TABLE _staged_stacks_block (
 -- ==========================================
 CREATE TABLE _staged_indexed_stacks_block (
   block_index_hash BLOB PRIMARY KEY
-);
+) WITHOUT ROWID;
 
 -- ==========================================
 -- Dimension for synthetic blocks created during benchmarks.
@@ -157,10 +158,15 @@ CREATE TABLE _staged_indexed_stacks_block (
 -- ==========================================
 CREATE TABLE synthetic_block (
   id INTEGER PRIMARY KEY NOT NULL,
+  stacks_block_id INTEGER NOT NULL,
   index_hash BLOB NOT NULL,
   CHECK(length(index_hash) = 32),
-  UNIQUE(index_hash)
+  UNIQUE(index_hash),
+  FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id)
 );
+
+CREATE INDEX idx_synth_block_source
+  ON synthetic_block(stacks_block_id);
 
 -- ==========================================
 -- Dimension for Stacks transactions. Not linked to any specific chainstate as 
@@ -231,8 +237,7 @@ CREATE TABLE benchmark_run (
 -- These are the outputs of creating + committing a chain of empty Stacks blocks.
 -- ==========================================
 CREATE TABLE block_processing_baseline (
-  id INTEGER PRIMARY KEY NOT NULL,
-  benchmark_run_id INTEGER NOT NULL,
+  benchmark_run_id INTEGER PRIMARY KEY NOT NULL,
 
   -- Parent used as the initial anchor for the baseline procedure
   start_parent_index_hash BLOB NOT NULL,
@@ -248,18 +253,15 @@ CREATE TABLE block_processing_baseline (
   avg_index_commit_us INTEGER NOT NULL,
 
   FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id) ON DELETE CASCADE,
-  CHECK(length(start_parent_index_hash) = 32),
-  UNIQUE (benchmark_run_id)
-);
+  CHECK(length(start_parent_index_hash) = 32)
+) WITHOUT ROWID;
 
 -- ==========================================
 -- Fact table for benchmark statistics per Stacks block.
 -- ==========================================
 CREATE TABLE stacks_block_stats (
-  id INTEGER PRIMARY KEY NOT NULL,
   benchmark_run_id INTEGER NOT NULL,
-  stacks_block_id INTEGER NOT NULL,
-  synthetic_block_id INTEGER,
+  synthetic_block_id INTEGER NOT NULL,
 
   -- Duration metrics (microseconds)
   total_duration_us INTEGER NOT NULL,
@@ -278,17 +280,12 @@ CREATE TABLE stacks_block_stats (
   -- Total storage delta (in bytes) resulting from block processing
   total_storage_delta INTEGER NOT NULL,
 
-  FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id),
-  FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
-  FOREIGN KEY (synthetic_block_id) REFERENCES synthetic_block(id)
-);
+  PRIMARY KEY (benchmark_run_id, synthetic_block_id),
 
-CREATE UNIQUE INDEX uq_block_stats_real
-  ON stacks_block_stats(benchmark_run_id, stacks_block_id)
-  WHERE synthetic_block_id IS NULL;
-CREATE UNIQUE INDEX uq_block_stats_synth
-  ON stacks_block_stats(benchmark_run_id, stacks_block_id, synthetic_block_id)
-  WHERE synthetic_block_id IS NOT NULL;
+  FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id),
+  FOREIGN KEY (synthetic_block_id) REFERENCES synthetic_block(id)
+) WITHOUT ROWID;
+
 -- For block stats p95 / histograms
 CREATE INDEX idx_block_stats_run_runtime
   ON stacks_block_stats(benchmark_run_id, clarity_runtime);
@@ -297,11 +294,9 @@ CREATE INDEX idx_block_stats_run_runtime
 -- Fact table for benchmark statistics per Stacks transaction.
 -- ==========================================
 CREATE TABLE stacks_tx_stats (
-  id INTEGER PRIMARY KEY NOT NULL,
   benchmark_run_id INTEGER NOT NULL,
   stacks_tx_id INTEGER NOT NULL,
-  stacks_block_id INTEGER NOT NULL,
-  synthetic_block_id INTEGER,
+  synthetic_block_id INTEGER NOT NULL,
 
   -- Duration metrics (microseconds)
   duration_us INTEGER NOT NULL,
@@ -313,23 +308,15 @@ CREATE TABLE stacks_tx_stats (
   clarity_read_count   INTEGER NOT NULL,
   clarity_runtime      INTEGER NOT NULL,
 
+  PRIMARY KEY (benchmark_run_id, synthetic_block_id, stacks_tx_id),
+
   FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id),
   FOREIGN KEY (stacks_tx_id) REFERENCES stacks_tx(id),
-  FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
   FOREIGN KEY (synthetic_block_id) REFERENCES synthetic_block(id)
-);
+) WITHOUT ROWID;
 
-CREATE UNIQUE INDEX uq_tx_stats_real
-  ON stacks_tx_stats(benchmark_run_id, stacks_tx_id)
-  WHERE synthetic_block_id IS NULL;
-
-CREATE UNIQUE INDEX uq_tx_stats_synth
-  ON stacks_tx_stats(benchmark_run_id, stacks_tx_id, synthetic_block_id)
-  WHERE synthetic_block_id IS NOT NULL;
-
--- Supports joins/group-bys by (run, block, segment)
-CREATE INDEX idx_tx_stats_run_block_synth
-  ON stacks_tx_stats(benchmark_run_id, stacks_block_id, synthetic_block_id);
+CREATE INDEX idx_tx_stats_run_tx
+  ON stacks_tx_stats(benchmark_run_id, stacks_tx_id);
 
   -- For TX stats p95 / histograms
 CREATE INDEX idx_tx_stats_run_runtime
@@ -371,8 +358,7 @@ CREATE TABLE profiler_record (
   depth INTEGER NOT NULL,       -- Optimization for UI rendering
 
   -- Context
-  synthetic_block_id INTEGER,
-  stacks_block_id INTEGER,
+  synthetic_block_id INTEGER NOT NULL,
   stacks_tx_id INTEGER,
 
   -- Metrics
@@ -385,13 +371,33 @@ CREATE TABLE profiler_record (
   call_count INTEGER NOT NULL,
   sample_count INTEGER NOT NULL,
 
+   -- Sampling expansion factor and estimated totals (NULL when sample_count = 0)
+  expand_factor REAL GENERATED ALWAYS AS (
+    CASE
+      WHEN sample_count > 0 THEN (call_count * 1.0 / sample_count)
+      ELSE NULL
+    END
+  ) VIRTUAL,
+
+  est_wall_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN wall_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+  est_self_wall_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN self_wall_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+  est_cpu_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN cpu_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+  est_self_cpu_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN self_cpu_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+
   -- Constraints
   FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id) ON DELETE CASCADE,
   FOREIGN KEY (parent_id) REFERENCES profiler_record(id) ON DELETE CASCADE,
   FOREIGN KEY (profiler_span_id) REFERENCES profiler_span(id),
   FOREIGN KEY (profiler_location_id) REFERENCES profiler_location(id),
   FOREIGN KEY (synthetic_block_id) REFERENCES synthetic_block(id),
-  FOREIGN KEY (stacks_block_id) REFERENCES stacks_block(id),
   FOREIGN KEY (stacks_tx_id) REFERENCES stacks_tx(id)
 );
 
@@ -399,23 +405,22 @@ CREATE TABLE profiler_record (
 -- Finds children of a node, pre-sorted by execution order. Critical for 
 -- performant UI rendering.
 CREATE INDEX idx_prof_parent_ordered
-  ON profiler_record(parent_id, child_index);
+  ON profiler_record(parent_id, child_index)
+  WHERE parent_id IS NOT NULL;
+
+-- ROOT NODES LOOKUP
+CREATE INDEX idx_prof_run_roots
+  ON profiler_record(benchmark_run_id, id)
+  WHERE parent_id IS NULL;
 
 -- HOT PATH / AGGREGATION
 -- "Show me stats for span X in run Y".
 CREATE INDEX idx_prof_run_span
   ON profiler_record(benchmark_run_id, profiler_span_id);
 
--- BLOCK CONTEXT
--- Finds everything in a block (and optionally specific txs within that block).
--- Also acts as the FK index for benchmark_run_id (satisfies ON DELETE CASCADE).
-CREATE INDEX idx_prof_run_block
-  ON profiler_record(benchmark_run_id, stacks_block_id, stacks_tx_id)
-  WHERE stacks_block_id IS NOT NULL;
-
+-- SYNTHETIC BLOCK CONTEXT
 CREATE INDEX idx_prof_run_synth
-  ON profiler_record(benchmark_run_id, synthetic_block_id)
-  WHERE synthetic_block_id IS NOT NULL;
+  ON profiler_record(benchmark_run_id, synthetic_block_id);
 
 -- TX CONTEXT (Lookup by TX only) 
 -- Necessary because you can't efficiently search the index above for a TX 
@@ -424,11 +429,143 @@ CREATE INDEX idx_prof_run_tx
   ON profiler_record(benchmark_run_id, stacks_tx_id)
   WHERE stacks_tx_id IS NOT NULL;
 
--- TAG LOOKUP
-CREATE INDEX idx_prof_run_tag
-  ON profiler_record(benchmark_run_id, tag)
-  WHERE tag IS NOT NULL;
+-- ==========================================
+-- Fact table for profiler key/value records per profiler_record node.
+-- ==========================================
+CREATE TABLE profiler_record_kv (
+  id INTEGER PRIMARY KEY NOT NULL,
+  profiler_record_id INTEGER NOT NULL,
+  key TEXT NOT NULL,
+  value_type INTEGER NOT NULL, -- 1=u64, 2=i64, 3=str, 4=bytes
+  value_int INTEGER,
+  value_text TEXT,
+  value_blob BLOB,
+  -- Value as text for easy querying
+  value TEXT GENERATED ALWAYS AS (
+    COALESCE(value_text, CAST(value_int AS TEXT), HEX(value_blob))
+  ) VIRTUAL,
 
+  FOREIGN KEY (profiler_record_id) REFERENCES profiler_record(id) ON DELETE CASCADE,
+
+  CHECK (value_type IN (1,2,3,4)),
+  CHECK (
+    (value_type IN (1,2) AND value_int IS NOT NULL AND value_text IS NULL AND value_blob IS NULL) OR
+    (value_type = 3 AND value_text IS NOT NULL AND value_int IS NULL AND value_blob IS NULL) OR
+    (value_type = 4 AND value_blob IS NOT NULL AND value_int IS NULL AND value_text IS NULL)
+  )
+);
+
+-- FAST LOOKUP BY PARENT RECORD (most common)
+CREATE INDEX idx_prof_kv_record
+  ON profiler_record_kv(profiler_record_id);
+
+-- QUERY BY KEY
+CREATE INDEX idx_prof_kv_key
+  ON profiler_record_kv(key);
+
+-- KEY + VALUE (common filter in analysis)
+CREATE INDEX idx_prof_kv_key_val_int
+  ON profiler_record_kv(key, value_int)
+  WHERE value_int IS NOT NULL;
+
+CREATE INDEX idx_prof_kv_key_val_text
+  ON profiler_record_kv(key, value_text)
+  WHERE value_text IS NOT NULL;
+
+CREATE INDEX idx_prof_kv_value
+  ON profiler_record_kv(value);
+
+-- ==========================================
+-- Summary table for profiler spans per run+block (real or synthetic).
+-- ==========================================
+CREATE TABLE profiler_span_block_summary (
+  benchmark_run_id INTEGER NOT NULL,
+  synthetic_block_id INTEGER NOT NULL,
+  profiler_span_id INTEGER NOT NULL,
+
+  record_count INTEGER NOT NULL,
+  call_count INTEGER NOT NULL,
+  sample_count INTEGER NOT NULL,
+
+  wall_time_us INTEGER NOT NULL,
+  self_wall_time_us INTEGER NOT NULL,
+  cpu_time_us INTEGER NOT NULL,
+  self_cpu_time_us INTEGER NOT NULL,
+
+  -- Sampling expansion factor and estimated totals (NULL when sample_count = 0)
+  expand_factor REAL GENERATED ALWAYS AS (
+    CASE
+      WHEN sample_count > 0 THEN (call_count * 1.0 / sample_count)
+      ELSE NULL
+    END
+  ) VIRTUAL,
+
+  est_wall_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN wall_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+  est_self_wall_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN self_wall_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+  est_cpu_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN cpu_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+  est_self_cpu_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN self_cpu_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+
+  PRIMARY KEY (benchmark_run_id, synthetic_block_id, profiler_span_id),
+
+  FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id) ON DELETE CASCADE,
+  FOREIGN KEY (synthetic_block_id) REFERENCES synthetic_block(id),
+  FOREIGN KEY (profiler_span_id) REFERENCES profiler_span(id)
+);
+
+CREATE INDEX idx_prof_span_block_summary_run_span
+  ON profiler_span_block_summary(benchmark_run_id, profiler_span_id);
+
+-- ==========================================
+-- Summary table for profiler spans per run.
+-- ==========================================
+CREATE TABLE profiler_span_summary (
+  benchmark_run_id INTEGER NOT NULL,
+  profiler_span_id INTEGER NOT NULL,
+
+  record_count INTEGER NOT NULL,
+  call_count INTEGER NOT NULL,
+  sample_count INTEGER NOT NULL,
+
+  wall_time_us INTEGER NOT NULL,
+  self_wall_time_us INTEGER NOT NULL,
+  cpu_time_us INTEGER NOT NULL,
+  self_cpu_time_us INTEGER NOT NULL,
+
+    -- Sampling expansion factor and estimated totals (NULL when sample_count = 0)
+  expand_factor REAL GENERATED ALWAYS AS (
+    CASE
+      WHEN sample_count > 0 THEN (call_count * 1.0 / sample_count)
+      ELSE NULL
+    END
+  ) VIRTUAL,
+
+  est_wall_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN wall_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+  est_self_wall_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN self_wall_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+  est_cpu_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN cpu_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+  est_self_cpu_us REAL GENERATED ALWAYS AS (
+    CASE WHEN sample_count > 0 THEN self_cpu_time_us * (call_count * 1.0 / sample_count) END
+  ) VIRTUAL,
+
+  PRIMARY KEY (benchmark_run_id, profiler_span_id),
+
+  FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id) ON DELETE CASCADE,
+  FOREIGN KEY (profiler_span_id) REFERENCES profiler_span(id),
+  UNIQUE (benchmark_run_id, profiler_span_id)
+);
 
 -- ==========================================
 -- Cache table for chain tip lookups to speed up ancestor queries (e.g. when
@@ -442,4 +579,4 @@ CREATE TABLE chain_tip_cache (
   CHECK(LENGTH(tip_index_hash) = 32),
   CHECK(LENGTH(index_hash) = 32),
   CHECK(height >= 0)
-);
+) WITHOUT ROWID;
