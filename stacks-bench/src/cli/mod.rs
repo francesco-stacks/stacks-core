@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Result;
 use bench::BenchArgs;
@@ -16,6 +17,7 @@ pub mod common;
 pub mod bench;
 pub mod chainstate;
 pub mod metabase;
+mod theme;
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
@@ -41,6 +43,8 @@ pub struct Cli {
 
 impl Cli {
     pub async fn exec(&self) -> Result<()> {
+        let started_at = Instant::now();
+        cliclack::set_theme(theme::CliTheme);
         cliclack::intro(style(" stacks-bench ").on_cyan().black())?;
 
         // Use AppDataPath to resolve locations
@@ -57,13 +61,28 @@ impl Cli {
             Commands::Metabase(args) => args.exec(&ctx).await,
         };
 
+        let exec_duration = started_at.elapsed();
+        let secs = exec_duration.as_secs();
+        let hh = secs / 3600;
+        let mm = (secs % 3600) / 60;
+        let ss = secs % 60;
+        let exec_duration_str = format!("{:02}:{:02}:{:02}", hh, mm, ss);
+
         match result {
             Ok(_) => {
-                cliclack::outro("Finished")?;
+                let finished = style("Finished").green().bold();
+                let timing = style(format!("in {exec_duration_str} ({secs}s)"))
+                    .dim()
+                    .italic();
+                cliclack::outro(format!("{finished} {timing}"))?;
                 Ok(())
             }
             Err(e) => {
-                cliclack::outro_cancel(format!("Command failed: {e:?}"))?;
+                let failed = style("Failed").red().bold();
+                let timing = style(format!("after {exec_duration_str} ({secs}s)"))
+                    .dim()
+                    .italic();
+                cliclack::outro_cancel(format!("{failed} {timing}\n  {e:?}"))?;
                 Err(e)
             }
         }

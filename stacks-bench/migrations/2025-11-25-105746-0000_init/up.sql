@@ -343,6 +343,14 @@ CREATE TABLE profiler_span (
 );
 
 -- ==========================================
+-- Dimension table for profiler tags (arbitrary labels).
+-- ==========================================
+CREATE TABLE profiler_tag (
+  id INTEGER PRIMARY KEY NOT NULL,
+  tag TEXT NOT NULL UNIQUE
+);
+
+-- ==========================================
 -- Dimension table for profiler records (hierarchical timing data, per span and parent).
 -- ==========================================
 CREATE TABLE profiler_record (
@@ -352,7 +360,7 @@ CREATE TABLE profiler_record (
   -- Hierarchy
   parent_id INTEGER,
   profiler_span_id INTEGER NOT NULL,
-  tag TEXT,
+  profiler_tag_id INTEGER,
   profiler_location_id INTEGER NOT NULL,
   child_index INTEGER NOT NULL, -- Preserves execution order for flamegraphs
   depth INTEGER NOT NULL,       -- Optimization for UI rendering
@@ -397,6 +405,7 @@ CREATE TABLE profiler_record (
   FOREIGN KEY (parent_id) REFERENCES profiler_record(id) ON DELETE CASCADE,
   FOREIGN KEY (profiler_span_id) REFERENCES profiler_span(id),
   FOREIGN KEY (profiler_location_id) REFERENCES profiler_location(id),
+  FOREIGN KEY (profiler_tag_id) REFERENCES profiler_tag(id),
   FOREIGN KEY (synthetic_block_id) REFERENCES synthetic_block(id),
   FOREIGN KEY (stacks_tx_id) REFERENCES stacks_tx(id)
 );
@@ -422,58 +431,81 @@ CREATE INDEX idx_prof_run_span
 CREATE INDEX idx_prof_run_synth
   ON profiler_record(benchmark_run_id, synthetic_block_id);
 
--- TX CONTEXT (Lookup by TX only) 
--- Necessary because you can't efficiently search the index above for a TX 
--- without also knowing the Block ID.
+-- TX CONTEXT (Lookup by TX only)
 CREATE INDEX idx_prof_run_tx
   ON profiler_record(benchmark_run_id, stacks_tx_id)
   WHERE stacks_tx_id IS NOT NULL;
+
+CREATE INDEX idx_prof_run_tag
+  ON profiler_record(benchmark_run_id, profiler_tag_id)
+  WHERE profiler_tag_id IS NOT NULL;
+
+-- ==========================================
+-- Dimension table for profiler KV value types.
+-- ==========================================
+CREATE TABLE profiler_kv_value_type (
+  id INTEGER PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL UNIQUE
+);
+
+INSERT INTO profiler_kv_value_type (id, name)
+VALUES 
+  (1, 'Unsigned Integer'),
+  (2, 'Signed Integer'),
+  (3, 'String'),
+  (4, 'Bytes');
+
+-- ==========================================
+-- Dimension table for profiler KV keys.
+-- ==========================================
+CREATE TABLE profiler_kv_key (
+  id INTEGER PRIMARY KEY NOT NULL,
+  key TEXT NOT NULL UNIQUE
+);
+
+-- ==========================================
+-- Dimension table for profiler KV values.
+-- ==========================================
+CREATE TABLE profiler_kv_value (
+  id INTEGER PRIMARY KEY NOT NULL,
+  profiler_kv_value_type_id INTEGER NOT NULL,
+  value TEXT NOT NULL,
+
+  FOREIGN KEY (profiler_kv_value_type_id) REFERENCES profiler_kv_value_type(id),
+  UNIQUE (value, profiler_kv_value_type_id)
+);
 
 -- ==========================================
 -- Fact table for profiler key/value records per profiler_record node.
 -- ==========================================
 CREATE TABLE profiler_record_kv (
-  id INTEGER PRIMARY KEY NOT NULL,
   profiler_record_id INTEGER NOT NULL,
-  key TEXT NOT NULL,
-  value_type INTEGER NOT NULL, -- 1=u64, 2=i64, 3=str, 4=bytes
-  value_int INTEGER,
-  value_text TEXT,
-  value_blob BLOB,
-  -- Value as text for easy querying
-  value TEXT GENERATED ALWAYS AS (
-    COALESCE(value_text, CAST(value_int AS TEXT), HEX(value_blob))
-  ) VIRTUAL,
+  profiler_kv_key_id INTEGER NOT NULL,
+  profiler_kv_value_id INTEGER NOT NULL,
+  count INTEGER NOT NULL DEFAULT 1,
+
+  PRIMARY KEY (profiler_record_id, profiler_kv_key_id, profiler_kv_value_id),
 
   FOREIGN KEY (profiler_record_id) REFERENCES profiler_record(id) ON DELETE CASCADE,
+  FOREIGN KEY (profiler_kv_key_id) REFERENCES profiler_kv_key(id),
+  FOREIGN KEY (profiler_kv_value_id) REFERENCES profiler_kv_value(id)
+) WITHOUT ROWID;
 
-  CHECK (value_type IN (1,2,3,4)),
-  CHECK (
-    (value_type IN (1,2) AND value_int IS NOT NULL AND value_text IS NULL AND value_blob IS NULL) OR
-    (value_type = 3 AND value_text IS NOT NULL AND value_int IS NULL AND value_blob IS NULL) OR
-    (value_type = 4 AND value_blob IS NOT NULL AND value_int IS NULL AND value_text IS NULL)
-  )
-);
+CREATE INDEX idx_prkv_key_val_record
+  ON profiler_record_kv(profiler_kv_key_id, profiler_kv_value_id, profiler_record_id);
 
--- FAST LOOKUP BY PARENT RECORD (most common)
-CREATE INDEX idx_prof_kv_record
-  ON profiler_record_kv(profiler_record_id);
+-- ==========================================
+-- Staging table for profiler KV rows.
+-- ==========================================
+CREATE TABLE _staged_profiler_record_kv (
+  profiler_record_id INTEGER NOT NULL,
+  key TEXT NOT NULL,
+  value_type_id INTEGER NOT NULL,
+  value TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 1,
 
--- QUERY BY KEY
-CREATE INDEX idx_prof_kv_key
-  ON profiler_record_kv(key);
-
--- KEY + VALUE (common filter in analysis)
-CREATE INDEX idx_prof_kv_key_val_int
-  ON profiler_record_kv(key, value_int)
-  WHERE value_int IS NOT NULL;
-
-CREATE INDEX idx_prof_kv_key_val_text
-  ON profiler_record_kv(key, value_text)
-  WHERE value_text IS NOT NULL;
-
-CREATE INDEX idx_prof_kv_value
-  ON profiler_record_kv(value);
+  PRIMARY KEY (profiler_record_id, key, value_type_id, value)
+) WITHOUT ROWID;
 
 -- ==========================================
 -- Summary table for profiler spans per run+block (real or synthetic).
@@ -518,7 +550,7 @@ CREATE TABLE profiler_span_block_summary (
   FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id) ON DELETE CASCADE,
   FOREIGN KEY (synthetic_block_id) REFERENCES synthetic_block(id),
   FOREIGN KEY (profiler_span_id) REFERENCES profiler_span(id)
-);
+) WITHOUT ROWID;
 
 CREATE INDEX idx_prof_span_block_summary_run_span
   ON profiler_span_block_summary(benchmark_run_id, profiler_span_id);
@@ -563,9 +595,8 @@ CREATE TABLE profiler_span_summary (
   PRIMARY KEY (benchmark_run_id, profiler_span_id),
 
   FOREIGN KEY (benchmark_run_id) REFERENCES benchmark_run(id) ON DELETE CASCADE,
-  FOREIGN KEY (profiler_span_id) REFERENCES profiler_span(id),
-  UNIQUE (benchmark_run_id, profiler_span_id)
-);
+  FOREIGN KEY (profiler_span_id) REFERENCES profiler_span(id)
+) WITHOUT ROWID;
 
 -- ==========================================
 -- Cache table for chain tip lookups to speed up ancestor queries (e.g. when

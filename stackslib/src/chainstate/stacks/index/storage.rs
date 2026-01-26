@@ -1130,6 +1130,10 @@ pub struct TrieSqlHashMapCursor<'a, T: MarfTrieId> {
 }
 
 impl NodeHashReader for TrieSqlCursor<'_> {
+    #[cfg_attr(
+        feature = "profiler",
+        stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
+    )]
     fn read_node_hash_bytes<W: Write>(&mut self, ptr: &TriePtr, w: &mut W) -> Result<(), Error> {
         trie_sql::read_node_hash_bytes(self.db, w, self.block_id, ptr)
     }
@@ -2552,6 +2556,10 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     }
 
     /// Read a persisted node's hash
+    #[cfg_attr(
+        feature = "profiler",
+        stacks_profiler::profile(sample_rate = 8, unsampled = "count_only")
+    )]
     pub fn read_node_hash_bytes(&mut self, ptr: &TriePtr) -> Result<TrieHash, Error> {
         if let Some((ref uncommitted_bhh, ref mut trie_ram)) = self.data.uncommitted_writes {
             // special case
@@ -2566,10 +2574,13 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
                 self.bench.read_node_hash_start();
                 if let Some(node_hash) = self.cache.load_node_hash(block_id, ptr) {
                     let res = node_hash;
+                    stacks_profiler::record!("MARF_NODE_HASH_CACHE", "hit");
                     self.bench.read_node_hash_finish(true);
                     Ok(res)
                 } else {
+                    stacks_profiler::record!("MARF_NODE_HASH_CACHE", "miss");
                     let node_hash = self.inner_read_persisted_node_hash(block_id, ptr)?;
+                    stacks_profiler::record!("MARF_NODE_HASH_DISK_READ", block_id as u64);
                     self.cache.store_node_hash(block_id, *ptr, node_hash);
                     self.bench.read_node_hash_finish(false);
                     Ok(node_hash)
@@ -2651,16 +2662,17 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     ) -> Result<(TrieNodeType, TrieHash), Error> {
         trace!("read_nodetype({:?}): {:?}", &self.data.cur_block, ptr);
 
+        let clear_ptr = ptr.from_backptr();
+        let is_leaf = clear_ptr.id() == TrieNodeID::Leaf as u8;
+
         self.data.read_count += 1;
         if is_backptr(ptr.id()) {
             self.data.read_backptr_count += 1;
-        } else if ptr.id() == TrieNodeID::Leaf as u8 {
+        } else if is_leaf {
             self.data.read_leaf_count += 1;
         } else {
             self.data.read_node_count += 1;
         }
-
-        let clear_ptr = ptr.from_backptr();
 
         if let Some((ref uncommitted_bhh, ref mut uncommitted_trie)) = self.data.uncommitted_writes
         {

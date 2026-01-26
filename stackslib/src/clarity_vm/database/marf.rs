@@ -175,13 +175,6 @@ impl MarfedKV {
         }
     }
 
-    pub fn checkpoint(&self) -> Result<(), DatabaseError> {
-        let conn = self.marf.sqlite_conn();
-        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-            .map_err(DatabaseError::SqliteError)?;
-        Ok(())
-    }
-
     pub fn begin_read_only<'a>(
         &'a mut self,
         at_block: Option<&StacksBlockId>,

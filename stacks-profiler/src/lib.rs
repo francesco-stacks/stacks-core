@@ -2,9 +2,11 @@
 //!
 //! A high-performance, allocation-optimized profiler using Thread Local Storage.
 
+use std::cell::RefCell;
 use std::panic::Location;
 use std::time::Duration;
 
+use rapidhash::{HashMapExt, RapidHashMap};
 // Re-export the profiling procedural macro
 pub use stacks_profiler_macros::profile;
 
@@ -25,23 +27,33 @@ pub enum RecordValue {
 
 impl From<u64> for RecordValue {
     #[inline(always)]
-    fn from(v: u64) -> Self { RecordValue::U64(v) }
+    fn from(v: u64) -> Self {
+        RecordValue::U64(v)
+    }
 }
 impl From<i64> for RecordValue {
     #[inline(always)]
-    fn from(v: i64) -> Self { RecordValue::I64(v) }
+    fn from(v: i64) -> Self {
+        RecordValue::I64(v)
+    }
 }
 impl From<&str> for RecordValue {
     #[inline(always)]
-    fn from(v: &str) -> Self { RecordValue::Str(v.into()) }
+    fn from(v: &str) -> Self {
+        RecordValue::Str(v.into())
+    }
 }
 impl From<String> for RecordValue {
     #[inline(always)]
-    fn from(v: String) -> Self { RecordValue::Str(v.into_boxed_str()) }
+    fn from(v: String) -> Self {
+        RecordValue::Str(v.into_boxed_str())
+    }
 }
 impl From<&[u8]> for RecordValue {
     #[inline(always)]
-    fn from(v: &[u8]) -> Self { RecordValue::Bytes(v.into()) }
+    fn from(v: &[u8]) -> Self {
+        RecordValue::Bytes(v.into())
+    }
 }
 
 /// Key/value record attached to a span node.
@@ -49,6 +61,25 @@ impl From<&[u8]> for RecordValue {
 pub struct Record {
     pub key: &'static str,
     pub value: RecordValue,
+}
+
+thread_local! {
+    static TAG_INTERNER: RefCell<RapidHashMap<Box<str>, &'static str>> =
+        RefCell::new(RapidHashMap::with_capacity(64));
+}
+
+#[inline]
+fn intern_tag_str(s: String) -> &'static str {
+    TAG_INTERNER.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if let Some(&interned) = map.get(s.as_str()) {
+            return interned;
+        }
+        let boxed: Box<str> = s.into_boxed_str();
+        let leaked: &'static str = Box::leak(boxed);
+        map.insert(leaked.into(), leaked);
+        leaked
+    })
 }
 
 /// A lightweight tag for distinguishing spans with the same name.
@@ -92,6 +123,20 @@ impl From<usize> for Tag {
     #[inline(always)]
     fn from(v: usize) -> Self {
         Tag::Usize(v)
+    }
+}
+
+impl From<&'static str> for Tag {
+    #[inline(always)]
+    fn from(v: &'static str) -> Self {
+        Tag::Str(v)
+    }
+}
+
+impl From<String> for Tag {
+    #[inline(always)]
+    fn from(v: String) -> Self {
+        Tag::Str(intern_tag_str(v))
     }
 }
 
@@ -277,6 +322,21 @@ impl Profiler {
     #[doc(hidden)]
     pub fn end_suppression() {
         runtime::end_suppression();
+    }
+
+    #[inline(always)]
+    pub fn enable_record() {
+        runtime::enable_record();
+    }
+
+    #[inline(always)]
+    pub fn disable_record() {
+        runtime::disable_record();
+    }
+
+    #[inline(always)]
+    pub fn is_record_enabled() -> bool {
+        runtime::is_record_enabled()
     }
 
     #[inline(always)]

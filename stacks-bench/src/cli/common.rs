@@ -23,6 +23,7 @@ pub struct CliContext {
 }
 
 pub const SUCCESS_ICON: &str = "✔";
+#[allow(unused)]
 pub const FAILURE_ICON: &str = "✘";
 
 macro_rules! fmt_success {
@@ -35,6 +36,7 @@ macro_rules! fmt_success {
     }};
 }
 
+#[allow(unused)]
 macro_rules! fmt_failure {
     ($($arg:tt)*) => {{
         format!(
@@ -126,15 +128,31 @@ pub fn get_git_hash() -> Option<Vec<u8>> {
         })
 }
 
-pub fn create_shadow_dir<P: AsRef<Path>>(source_dir: P) -> Result<ShadowDir> {
-    let shadow_dir = ShadowDirBuilder::new(source_dir.as_ref())
+pub fn create_shadow_dir<P: AsRef<Path>>(
+    source_dir: P,
+    with_pre_nakamoto_blocks: bool,
+) -> Result<ShadowDir> {
+    let mut builder = ShadowDirBuilder::new(source_dir.as_ref())
         .glob("burnchain/**")
-        .glob("chainstate/**")
+        .glob("chainstate/vm/**");
+
+    if with_pre_nakamoto_blocks {
+        builder = builder.glob("chainstate/blocks/**");
+    } else {
+        builder = builder
+            .glob("chainstate/blocks/nakamoto.sqlite")
+            .glob("chainstate/blocks/nakamoto.sqlite-wal");
+    }
+
+    builder = builder
         .watch("chainstate/vm/clarity/marf.sqlite")
         .watch("chainstate/vm/clarity/marf.sqlite.blobs")
         .watch("chainstate/vm/clarity/marf.sqlite-wal")
         .watch("chainstate/vm/index.sqlite")
-        .copy()?;
+        .watch("chainstate/vm/index.sqlite.blobs")
+        .watch("chainstate/vm/index.sqlite-wal");
+
+    let shadow_dir = builder.copy()?;
     Ok(shadow_dir)
 }
 

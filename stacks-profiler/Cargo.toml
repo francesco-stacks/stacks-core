@@ -11,6 +11,7 @@ edition = "2024"
 [dependencies]
 stacks-profiler-macros = { path = "../stacks-profiler-macros" }
 libc.workspace = true
+rapidhash.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

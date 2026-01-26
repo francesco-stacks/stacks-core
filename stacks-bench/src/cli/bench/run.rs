@@ -5,10 +5,11 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use stacks_bench::context::BenchContext;
+use stacks_bench::db::app::CheckpointMode;
 use stacks_bench::filter::TxFilter;
 use stacks_bench::indexer::ChainstateIndexer;
-use stacks_bench::metrics::{CostModel, MetricsAccumulator, ModelSource};
-use stacks_bench::replay::ReplayMode;
+use stacks_bench::metrics::{BlockMetrics, CostModel, MetricsAccumulator, ModelSource};
+use stacks_bench::replay::{ReplayMode, SegmentReplayInfo};
 use stacks_bench::{Network, StacksBlockRef};
 use stacks_profiler::Profiler;
 
@@ -16,7 +17,8 @@ use crate::cli::common::{
     CliContext, IndexerArgs, TxIdArg, create_shadow_dir, get_git_hash, setup_bench_env_and_plan,
 };
 
-const BASELINE_MEASURED_BLOCKS: u32 = 500;
+const BASELINE_MEASURED_BLOCKS: u32 = 1000;
+const BLOCK_PROGRESS_BAR_TEMPLATE: &str = "{msg:20} {percent:>3}% |{bar:30.cyan/blue}| {pos:>8}/{len} • {per_sec:<6!} blk/s • ETA {eta_precise}";
 
 // TODO: Add a `--contract` arg to filter by qualified contract id
 #[derive(clap::Args, Debug, Serialize, Deserialize)]
@@ -70,9 +72,22 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 0)]
     warmup: usize,
 
+    /// Filter to apply when selecting transactions to process.
     #[arg(long, short = 'f', conflicts_with_all = ["txid"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     filter: Option<FilterArg>,
+
+    /// Disable capturing of profiler key-value records generated via `record!()`. This can
+    /// provide a slight performance benefit and reduce storage if you do not need them.
+    #[arg(long, default_value_t = false)]
+    no_profiler_kv: bool,
+
+    /// Whether or not to include pre-Nakamoto blocks in the reflink copy of the source node data
+    /// directory, which is necessary if benchmarking from blocks prior to the chainstate's Nakamoto
+    /// start height + 1. Enabling this can add significant time when creating the reflink copy
+    /// for large chainstates. Defaults to false/disabled.
+    #[arg(long = "with-pre-naka", default_value_t = false)]
+    include_pre_nakamoto_blocks: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, Serialize, Deserialize)]
@@ -104,7 +119,9 @@ impl RunArgs {
     }
 
     pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
-        cliclack::log::info("Starting benchmark run")?;
+        // Disable capturing `record!()` entries during setup/warmup.
+        stacks_profiler::Profiler::disable_record();
+
         let mut app_db = ctx.app_db();
 
         let shadow_dir_spinner = cliclack::spinner();
@@ -112,14 +129,13 @@ impl RunArgs {
             "Creating reflink copy of source node data directory (this may take some time)...",
         );
         let shadow_dir_timer = Instant::now();
-        let shadow_dir = create_shadow_dir(&self.source_dir)?;
+        let shadow_dir = create_shadow_dir(&self.source_dir, self.include_pre_nakamoto_blocks)?;
         shadow_dir_spinner.stop(format!(
             "Chainstate working directory reflink-copied in {:.2}s",
             shadow_dir_timer.elapsed().as_secs_f32()
         ));
 
         // Create env + compute height plan
-        cliclack::log::info("Setting up benchmark environment and creating indexing plan...")?;
         let (env, plan) = setup_bench_env_and_plan(&shadow_dir, self).await?;
 
         cliclack::note(
@@ -163,6 +179,7 @@ impl RunArgs {
         );
 
         let selected_block_count = block_ids.len();
+        let actual_block_count = selected_block_count - self.warmup;
 
         let run_name = format!("{}", Utc::now().format("%Y%m%d-%H%M%S"));
 
@@ -202,9 +219,12 @@ impl RunArgs {
 
         shadow_dir.calculate_storage_delta()?; // Reset storage delta baseline
 
-        println!("Re-executing {selected_block_count} selected blocks...");
+        println!(
+            "Re-executing {selected_block_count} selected blocks ({} block warmup)...",
+            self.warmup
+        );
 
-        const METRICS_FLUSH_THRESHOLD: usize = 1000;
+        const METRICS_FLUSH_THRESHOLD: usize = 250;
         let mut metrics_buffer = Vec::new();
         let mut cost_model = CostModel::default();
 
@@ -215,6 +235,7 @@ impl RunArgs {
         let mut calibrated = false;
         let mut is_warmup = false;
         let mut total_clarity_db_checkpoint_duration = Duration::ZERO;
+        let mut last_storage_delta: i64 = 0;
 
         // Determine the execution mode
         let replay_mode = match self.filter.as_ref() {
@@ -224,18 +245,22 @@ impl RunArgs {
 
         let mut accumulator = MetricsAccumulator::default();
         let replay_multi_pb = cliclack::multi_progress(format!(
-            "Re-executing {selected_block_count} blocks in {replay_mode} mode"
+            "Re-executing {actual_block_count} blocks in {replay_mode} mode"
         ));
         let maybe_warmup_pb = if self.warmup > 0 {
-            let pb = replay_multi_pb.add(cliclack::progress_bar(self.warmup as u64));
-            pb.start(format!("Warming up for {} blocks", self.warmup));
+            let pb = replay_multi_pb.add(
+                cliclack::progress_bar(self.warmup as u64)
+                    .with_template(BLOCK_PROGRESS_BAR_TEMPLATE),
+            );
+            pb.start("Warming up");
             Some(pb)
         } else {
             None
         };
-        let replay_pb = replay_multi_pb.add(cliclack::progress_bar(
-            (selected_block_count - self.warmup) as u64,
-        ));
+        let replay_pb = replay_multi_pb.add(
+            cliclack::progress_bar((selected_block_count - self.warmup) as u64)
+                .with_template(BLOCK_PROGRESS_BAR_TEMPLATE),
+        );
 
         let start = Instant::now();
         for (i, block_id) in block_ids.iter().enumerate() {
@@ -245,9 +270,24 @@ impl RunArgs {
             // Load metadata from App DB
             let block = app_db.get_block(block_id).await?;
 
-            // For now, if you're not actually repeating blocks yet, just pass 0.
-            // Later, plumb a real repetition counter from your benchmark config.
+            // Not used yet; intended to enable repeating block execution to get
+            // an averaged processing time.
             let repetition: u32 = 0;
+
+            let mut on_segment =
+                |_: &SegmentReplayInfo, m: Option<&mut BlockMetrics>| -> Result<()> {
+                    let storage_report = shadow_dir.calculate_storage_delta()?;
+                    let current_delta = storage_report.net_growth_bytes;
+                    let delta_since_last = current_delta - last_storage_delta;
+                    last_storage_delta = current_delta;
+
+                    // If warmup, just advance baseline and skip setting metrics
+                    if !is_warmup && let Some(m) = m {
+                        m.total_storage_delta = delta_since_last;
+                        total_clarity_db_checkpoint_duration += m.clarity_db_checkpoint_duration;
+                    }
+                    Ok(())
+                };
 
             // Replay the block
             let maybe_metrics_vec = stacks_bench::replay::replay_block(
@@ -257,12 +297,8 @@ impl RunArgs {
                 &replay_mode,
                 &block,
                 repetition,
+                Some(&mut on_segment),
             )?;
-
-            // Keep this checkpointing exactly where it is (after replay).
-            let checkpoint_start = Instant::now();
-            chainstate.checkpoint_clarity_state()?;
-            total_clarity_db_checkpoint_duration += checkpoint_start.elapsed();
 
             // Handle warmup->execute transition
             if is_warmup {
@@ -273,17 +309,25 @@ impl RunArgs {
                 continue;
             } else {
                 if let Some(warmup_pb) = &maybe_warmup_pb {
-                    let elapsed = start.elapsed();
+                    // Close out the warmup progress bar
                     warmup_pb.stop(fmt_success!(
                         "Warmup complete ({} blocks in {:.2}s)",
                         self.warmup,
-                        elapsed.as_secs_f32()
+                        start.elapsed().as_secs_f32()
                     ));
-                    replay_pb.start(format!(
-                        "Replaying {} benchmark blocks...",
-                        selected_block_count - self.warmup
-                    ));
+
+                    // Start the replay progress bar
+                    replay_pb.start("Replaying selected blocks...");
+
+                    // Enable/disable the capturing of `record!()` entries depending on args
+                    if self.no_profiler_kv {
+                        stacks_profiler::Profiler::disable_record();
+                    } else {
+                        stacks_profiler::Profiler::enable_record();
+                    }
                 }
+
+                // Update replay progress bar position
                 replay_pb.set_position((i - self.warmup + 1) as u64);
             }
 
@@ -443,8 +487,9 @@ impl RunArgs {
         println!("========================================");
 
         println!();
-        println!("Checkpointing & vacuuming database...");
-        app_db.checkpoint(true).await?;
+        println!("Checkpointing database...");
+        app_db.checkpoint(CheckpointMode::Truncate).await?;
+        println!("Vacuuming database...");
         app_db.vacuum().await?;
 
         let cleanup_spinner = cliclack::spinner();
@@ -456,8 +501,6 @@ impl RunArgs {
             "Finished cleanup in {:.2}s",
             cleanup_start.elapsed().as_secs_f32()
         ));
-
-        cliclack::outro("Benchmark run complete")?;
 
         Ok(())
     }
@@ -475,18 +518,27 @@ impl RunArgs {
             cliclack::multi_progress("Calculating block processing overhead baseline");
 
         let maybe_warmup_pb = if self.warmup > 0 {
-            Some(baseline_multipb.add(cliclack::progress_bar(self.warmup as u64)))
+            Some(
+                baseline_multipb.add(
+                    cliclack::progress_bar(self.warmup as u64)
+                        .with_template(BLOCK_PROGRESS_BAR_TEMPLATE),
+                ),
+            )
         } else {
             None
         };
 
-        let baseline_pb1 =
-            baseline_multipb.add(cliclack::progress_bar(BASELINE_MEASURED_BLOCKS.into()));
-        let baseline_pb2 =
-            baseline_multipb.add(cliclack::progress_bar(BASELINE_MEASURED_BLOCKS.into()));
+        let baseline_pb1 = baseline_multipb.add(
+            cliclack::progress_bar(BASELINE_MEASURED_BLOCKS.into())
+                .with_template(BLOCK_PROGRESS_BAR_TEMPLATE),
+        );
+        let baseline_pb2 = baseline_multipb.add(
+            cliclack::progress_bar(BASELINE_MEASURED_BLOCKS.into())
+                .with_template(BLOCK_PROGRESS_BAR_TEMPLATE),
+        );
 
         if let Some(warmup_pb) = maybe_warmup_pb {
-            warmup_pb.start(format!("Warming up for {} blocks...", self.warmup));
+            warmup_pb.start("Warming up");
             let warmup_timer = Instant::now();
             stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
                 chainstate,
@@ -502,9 +554,7 @@ impl RunArgs {
             ));
         }
 
-        baseline_pb1.start(format!(
-            "Measuring baseline over {BASELINE_MEASURED_BLOCKS} blocks (round 1)..."
-        ));
+        baseline_pb1.start(format!("Measuring baseline (round 1)..."));
         let t1 = Instant::now();
         let round1 = stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
             chainstate,
@@ -518,9 +568,7 @@ impl RunArgs {
             t1.elapsed().as_secs_f32()
         ));
 
-        baseline_pb2.start(format!(
-            "Measuring baseline over {BASELINE_MEASURED_BLOCKS} blocks (round 2)..."
-        ));
+        baseline_pb2.start(format!("Measuring baseline (round 2)..."));
         let t2 = Instant::now();
         let round2 = stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
             chainstate,
@@ -535,6 +583,10 @@ impl RunArgs {
         ));
 
         baseline_multipb.stop();
+
+        // Checkpoint the chainstate/clarity dbs so we don't incur the cost of overhead calculations
+        // during replay
+        chainstate.checkpoint_sqlite_dbs()?;
 
         Ok((round1, round2))
     }

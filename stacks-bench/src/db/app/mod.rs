@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use blockstack_lib::chainstate::stacks::{StacksTransaction, TransactionPayload};
 use chrono::NaiveDateTime;
 use diesel::sql_types::{BigInt, Binary};
+use diesel::upsert::excluded;
 use diesel::{
     ExpressionMethods as _, JoinOnDsl as _, NullableExpressionMethods as _, OptionalExtension as _,
     QueryDsl as _, QueryableByName, SelectableHelper as _, SqliteConnection, sql_query,
@@ -43,6 +44,37 @@ pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 const MERGE_STAGING_SQL: &str = include_str!("scripts/merge_staging.sql");
 const POST_RUN_SQL: &str = include_str!("scripts/post_run.sql");
+const MERGE_PROFILER_KV_SQL: &str = include_str!("scripts/merge_profiler_kv.sql");
+
+#[derive(Debug, Clone, Copy)]
+pub enum SynchronizationMode {
+    Normal,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ForeignKeyMode {
+    Enforced,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CheckpointMode {
+    Full,
+    Truncate,
+    Restart,
+    Passive,
+}
+
+#[derive(Debug, QueryableByName)]
+struct CheckpointResult {
+    #[diesel(sql_type = BigInt)]
+    busy: i64,
+    #[diesel(sql_type = BigInt)]
+    log: i64,
+    #[diesel(sql_type = BigInt)]
+    checkpointed: i64,
+}
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -51,6 +83,8 @@ pub struct AppDb {
     profiler_span_cache: Arc<RwLock<HashMap<(Option<&'static str>, &'static str), i32>>>,
     /// Cache of profiler location (file,line) to ID mappings.
     profiler_loc_cache: Arc<RwLock<HashMap<(String, i32), i32>>>,
+    /// Cache of profiler tag string to ID mappings.
+    profiler_tag_cache: Arc<RwLock<HashMap<&'static str, i32>>>,
 }
 
 impl AppDb {
@@ -62,6 +96,16 @@ impl AppDb {
     async fn setup_connection(
         conn: &mut AsyncSqliteConnection,
     ) -> Result<(), diesel::ConnectionError> {
+        sql_query("PRAGMA page_size = 8192;")
+            .execute(conn)
+            .await
+            .inspect_err(|e| eprintln!("Failed to set PRAGMA page_size=8192: {}", e))
+            .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
+        sql_query("PRAGMA wal_autocheckpoint = 0;")
+            .execute(conn)
+            .await
+            .inspect_err(|e| eprintln!("Failed to set PRAGMA wal_autocheckpoint=0: {}", e))
+            .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         sql_query("PRAGMA journal_mode=WAL")
             .execute(conn)
             .await
@@ -81,11 +125,6 @@ impl AppDb {
             .execute(conn)
             .await
             .inspect_err(|e| eprintln!("Failed to set PRAGMA temp_store=MEMORY: {}", e))
-            .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
-        sql_query("PRAGMA page_size = 8192;")
-            .execute(conn)
-            .await
-            .inspect_err(|e| eprintln!("Failed to set PRAGMA page_size=8192: {}", e))
             .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         sql_query("PRAGMA cache_size = -262144;")
             .execute(conn)
@@ -185,6 +224,7 @@ impl AppDb {
             pool,
             profiler_span_cache: Arc::new(RwLock::new(HashMap::new())),
             profiler_loc_cache: Arc::new(RwLock::new(HashMap::new())),
+            profiler_tag_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -197,18 +237,48 @@ impl AppDb {
         Ok(conn)
     }
 
-    pub async fn checkpoint(&mut self, truncate: bool) -> Result<()> {
+    pub async fn set_synchronization_mode(&mut self, mode: SynchronizationMode) -> Result<()> {
+        let pragma_sql = match mode {
+            SynchronizationMode::Normal => "PRAGMA synchronous = NORMAL;",
+            SynchronizationMode::Off => "PRAGMA synchronous = OFF;",
+        };
+        sql_query(pragma_sql)
+            .execute(&mut self.get_conn().await?)
+            .await
+            .with_context(|| format!("Failed to set synchronization mode: {}", pragma_sql))?;
+        Ok(())
+    }
+
+    pub async fn set_foreign_key_enforcement(&mut self, mode: ForeignKeyMode) -> Result<()> {
+        let pragma_sql = match mode {
+            ForeignKeyMode::Enforced => "PRAGMA foreign_keys = ON;",
+            ForeignKeyMode::Off => "PRAGMA foreign_keys = OFF;",
+        };
+        sql_query(pragma_sql)
+            .execute(&mut self.get_conn().await?)
+            .await
+            .with_context(|| {
+                format!("Failed to set foreign key enforcement mode: {}", pragma_sql)
+            })?;
+        Ok(())
+    }
+
+    pub async fn checkpoint(&mut self, mode: CheckpointMode) -> Result<()> {
+        let sql = match mode {
+            CheckpointMode::Full => "PRAGMA wal_checkpoint(FULL)",
+            CheckpointMode::Truncate => "PRAGMA wal_checkpoint(TRUNCATE)",
+            CheckpointMode::Restart => "PRAGMA wal_checkpoint(RESTART)",
+            CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
+        };
+
         let conn = &mut self.get_conn().await?;
-        if truncate {
-            diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
-                .execute(conn)
-                .await
-                .context("Failed to perform WAL checkpoint with TRUNCATE")?;
-        } else {
-            diesel::sql_query("PRAGMA wal_checkpoint(FULL)")
-                .execute(conn)
-                .await
-                .context("Failed to perform WAL checkpoint with FULL")?;
+        let res: CheckpointResult = sql_query(sql)
+            .get_result(conn)
+            .await
+            .with_context(|| format!("Failed to run checkpoint with mode {:?}", mode))?;
+
+        if res.busy != 0 || res.log != res.checkpointed {
+            return Err(anyhow!("Checkpoint incomplete: {:?}", res));
         }
         Ok(())
     }
@@ -891,6 +961,38 @@ impl AppDb {
         Ok(id)
     }
 
+    async fn resolve_profiler_tag(
+        conn: &mut AsyncSqliteConnection,
+        cache: Arc<RwLock<HashMap<&'static str, i32>>>,
+        tag: &'static str,
+    ) -> Result<i32> {
+        if let Some(&id) = cache.read().await.get(&tag) {
+            return Ok(id);
+        }
+
+        let id_opt: Option<i32> = diesel::insert_into(profiler_tag::table)
+            .values(profiler_tag::tag.eq(tag))
+            .on_conflict(profiler_tag::tag)
+            .do_nothing()
+            .returning(profiler_tag::id)
+            .get_result(conn)
+            .await
+            .optional()?;
+
+        let id = if let Some(id) = id_opt {
+            id
+        } else {
+            profiler_tag::table
+                .select(profiler_tag::id)
+                .filter(profiler_tag::tag.eq(tag))
+                .first(conn)
+                .await?
+        };
+
+        cache.write().await.insert(tag, id);
+        Ok(id)
+    }
+
     pub async fn save_block_processing_baseline(
         &mut self,
         run_id: i32,
@@ -935,126 +1037,162 @@ impl AppDb {
     {
         let span_cache = self.profiler_span_cache.clone();
         let loc_cache = self.profiler_loc_cache.clone();
+        let mut staged_kv_count = 0;
 
-        let conn = &mut self.get_conn().await?;
+        self.set_synchronization_mode(SynchronizationMode::Off)
+            .await?;
+        self.set_foreign_key_enforcement(ForeignKeyMode::Off)
+            .await?;
 
-        conn.transaction::<(), anyhow::Error, _>(|dbtx| {
-            Box::pin(async {
-                for metrics in blocks.into_iter() {
-                    // Resolve Stacks block PK
-                    let block_pk: i64 = stacks_block::table
-                        .select(stacks_block::id)
-                        .filter(stacks_block::index_hash.eq(metrics.id.as_bytes()))
-                        .first(dbtx)
+        self.get_conn()
+            .await?
+            .transaction::<(), anyhow::Error, _>(|dbtx| {
+                Box::pin(async {
+                    for metrics in blocks.into_iter() {
+                        // Resolve Stacks block PK
+                        let block_pk: i64 = stacks_block::table
+                            .select(stacks_block::id)
+                            .filter(stacks_block::index_hash.eq(metrics.id.as_bytes()))
+                            .first(dbtx)
+                            .await?;
+
+                        let synthetic_block_pk = Self::get_or_create_synth_block_id(
+                            dbtx,
+                            metrics.synthetic_id.as_bytes(),
+                            block_pk,
+                        )
                         .await?;
 
-                    let synthetic_block_pk = Self::get_or_create_synth_block_id(
-                        dbtx,
-                        metrics.synthetic_id.as_bytes(),
-                        block_pk,
-                    )
-                    .await?;
+                        // Insert block stats
+                        diesel::insert_into(stacks_block_stats::table)
+                            .values((
+                                stacks_block_stats::benchmark_run_id.eq(run_id),
+                                stacks_block_stats::synthetic_block_id.eq(synthetic_block_pk),
+                                stacks_block_stats::total_duration_us
+                                    .eq(metrics.total_duration.as_micros() as i32),
+                                stacks_block_stats::setup_duration_us
+                                    .eq(metrics.setup_duration.as_micros() as i32),
+                                stacks_block_stats::execution_duration_us
+                                    .eq(metrics.execution_duration.as_micros() as i32),
+                                stacks_block_stats::commit_duration_us
+                                    .eq(metrics.commit_duration.as_micros() as i32),
+                                stacks_block_stats::commit_overhead_baseline_us
+                                    .eq(metrics.commit_overhead_baseline.as_micros() as i32),
+                                stacks_block_stats::clarity_write_length
+                                    .eq(metrics.total_clarity_cost.write_length as i32),
+                                stacks_block_stats::clarity_write_count
+                                    .eq(metrics.total_clarity_cost.write_count as i32),
+                                stacks_block_stats::clarity_read_length
+                                    .eq(metrics.total_clarity_cost.read_length as i32),
+                                stacks_block_stats::clarity_read_count
+                                    .eq(metrics.total_clarity_cost.read_count as i32),
+                                stacks_block_stats::clarity_runtime
+                                    .eq(metrics.total_clarity_cost.runtime as i32),
+                                stacks_block_stats::total_storage_delta.eq(metrics.total_storage_delta),
+                            ))
+                            .execute(dbtx)
+                            .await
+                            .context("Failed to insert stacks block stats")?;
 
-                    // Insert block stats
-                    diesel::insert_into(stacks_block_stats::table)
-                        .values((
-                            stacks_block_stats::benchmark_run_id.eq(run_id),
-                            stacks_block_stats::synthetic_block_id.eq(synthetic_block_pk),
-                            stacks_block_stats::total_duration_us
-                                .eq(metrics.total_duration.as_micros() as i32),
-                            stacks_block_stats::setup_duration_us
-                                .eq(metrics.setup_duration.as_micros() as i32),
-                            stacks_block_stats::execution_duration_us
-                                .eq(metrics.execution_duration.as_micros() as i32),
-                            stacks_block_stats::commit_duration_us
-                                .eq(metrics.commit_duration.as_micros() as i32),
-                            stacks_block_stats::commit_overhead_baseline_us
-                                .eq(metrics.commit_overhead_baseline.as_micros() as i32),
-                            stacks_block_stats::clarity_write_length
-                                .eq(metrics.total_clarity_cost.write_length as i32),
-                            stacks_block_stats::clarity_write_count
-                                .eq(metrics.total_clarity_cost.write_count as i32),
-                            stacks_block_stats::clarity_read_length
-                                .eq(metrics.total_clarity_cost.read_length as i32),
-                            stacks_block_stats::clarity_read_count
-                                .eq(metrics.total_clarity_cost.read_count as i32),
-                            stacks_block_stats::clarity_runtime
-                                .eq(metrics.total_clarity_cost.runtime as i32),
-                            stacks_block_stats::total_storage_delta.eq(metrics.total_storage_delta),
-                        ))
-                        .execute(dbtx)
-                        .await
-                        .context("Failed to insert stacks block stats")?;
+                        // Load tx_id map for this block
+                        let tx_map: HashMap<Vec<u8>, i64> = stacks_tx::table
+                            .select((stacks_tx::tx_hash, stacks_tx::id))
+                            .filter(stacks_tx::stacks_block_id.eq(block_pk))
+                            .load::<(Vec<u8>, i64)>(dbtx)
+                            .await?
+                            .into_iter()
+                            .collect();
 
-                    // Load tx_id map for this block
-                    let tx_map: HashMap<Vec<u8>, i64> = stacks_tx::table
-                        .select((stacks_tx::tx_hash, stacks_tx::id))
-                        .filter(stacks_tx::stacks_block_id.eq(block_pk))
-                        .load::<(Vec<u8>, i64)>(dbtx)
-                        .await?
-                        .into_iter()
-                        .collect();
+                        // Insert tx stats + remember tx PKs for profiler attachment
+                        let mut tx_pks: Vec<Option<i64>> =
+                            Vec::with_capacity(metrics.transactions.len());
+                        for tx_metric in &metrics.transactions {
+                            let tx_hash = tx_metric.txid.as_bytes().to_vec();
+                            let tx_pk = tx_map.get(&tx_hash).copied();
+                            tx_pks.push(tx_pk);
 
-                    // Insert tx stats + remember tx PKs for profiler attachment
-                    let mut tx_pks: Vec<Option<i64>> =
-                        Vec::with_capacity(metrics.transactions.len());
-                    for tx_metric in &metrics.transactions {
-                        let tx_hash = tx_metric.txid.as_bytes().to_vec();
-                        let tx_pk = tx_map.get(&tx_hash).copied();
-                        tx_pks.push(tx_pk);
+                            if let Some(tx_pk) = tx_pk {
+                                diesel::insert_into(stacks_tx_stats::table)
+                                    .values((
+                                        stacks_tx_stats::benchmark_run_id.eq(run_id),
+                                        stacks_tx_stats::stacks_tx_id.eq(tx_pk),
+                                        stacks_tx_stats::synthetic_block_id.eq(synthetic_block_pk),
+                                        stacks_tx_stats::duration_us
+                                            .eq(tx_metric.duration.as_micros() as i32),
+                                        stacks_tx_stats::clarity_write_length
+                                            .eq(tx_metric.cost.write_length as i32),
+                                        stacks_tx_stats::clarity_write_count
+                                            .eq(tx_metric.cost.write_count as i32),
+                                        stacks_tx_stats::clarity_read_length
+                                            .eq(tx_metric.cost.read_length as i32),
+                                        stacks_tx_stats::clarity_read_count
+                                            .eq(tx_metric.cost.read_count as i32),
+                                        stacks_tx_stats::clarity_runtime
+                                            .eq(tx_metric.cost.runtime as i32),
+                                    ))
+                                    .execute(dbtx)
+                                    .await
+                                    .context("Failed to insert stacks tx stats")?;
+                            }
+                        }
 
-                        if let Some(tx_pk) = tx_pk {
-                            diesel::insert_into(stacks_tx_stats::table)
-                                .values((
-                                    stacks_tx_stats::benchmark_run_id.eq(run_id),
-                                    stacks_tx_stats::stacks_tx_id.eq(tx_pk),
-                                    stacks_tx_stats::synthetic_block_id.eq(synthetic_block_pk),
-                                    stacks_tx_stats::duration_us
-                                        .eq(tx_metric.duration.as_micros() as i32),
-                                    stacks_tx_stats::clarity_write_length
-                                        .eq(tx_metric.cost.write_length as i32),
-                                    stacks_tx_stats::clarity_write_count
-                                        .eq(tx_metric.cost.write_count as i32),
-                                    stacks_tx_stats::clarity_read_length
-                                        .eq(tx_metric.cost.read_length as i32),
-                                    stacks_tx_stats::clarity_read_count
-                                        .eq(tx_metric.cost.read_count as i32),
-                                    stacks_tx_stats::clarity_runtime
-                                        .eq(tx_metric.cost.runtime as i32),
-                                ))
-                                .execute(dbtx)
-                                .await
-                                .context("Failed to insert stacks tx stats")?;
+                        // Insert profiler records (block roots + tx roots)
+                        let ctx = ProfilerInsertContext {
+                            run_id,
+                            synthetic_block_pk,
+                            tx_pks: &tx_pks,
+                            span_cache: span_cache.clone(),
+                            loc_cache: loc_cache.clone(),
+                            tag_cache: self.profiler_tag_cache.clone(),
+                        };
+
+                        for (i, root) in metrics.profiler_roots.iter().enumerate() {
+                            let result = ctx.insert_node(dbtx, root, None, i as i32, 0, None).await?;
+                            staged_kv_count += result.inserted_kv_records;
                         }
                     }
 
-                    // Insert profiler records (block roots + tx roots)
-                    let ctx = ProfilerInsertContext {
-                        run_id,
-                        synthetic_block_pk,
-                        tx_pks: &tx_pks,
-                        span_cache: span_cache.clone(),
-                        loc_cache: loc_cache.clone(),
-                    };
-
-                    for (i, root) in metrics.profiler_roots.iter().enumerate() {
-                        ctx.insert_node(dbtx, root, None, i as i32, 0, None).await?;
+                    if staged_kv_count > 0 {
+                        dbtx
+                            .batch_execute(MERGE_PROFILER_KV_SQL)
+                            .await
+                            .with_context(|| format!("Failed to execute profiler KV staging merge script ({staged_kv_count} staged records)"))?;
                     }
-                }
 
-                Ok(())
+                    Ok(())
+                })
             })
-        })
-        .await
+            .await?;
+
+        self.set_synchronization_mode(SynchronizationMode::Normal)
+            .await?;
+        self.set_foreign_key_enforcement(ForeignKeyMode::Enforced)
+            .await?;
+        self.checkpoint(CheckpointMode::Passive).await?;
+
+        Ok(())
     }
 }
 
+#[derive(Debug, Default)]
 struct ProfilerInsertContext<'a> {
     run_id: i32,
     synthetic_block_pk: i64,
     tx_pks: &'a [Option<i64>],
     span_cache: Arc<RwLock<HashMap<(Option<&'static str>, &'static str), i32>>>,
     loc_cache: Arc<RwLock<HashMap<(String, i32), i32>>>,
+    tag_cache: Arc<RwLock<HashMap<&'static str, i32>>>,
+}
+
+#[derive(Debug, Default)]
+struct InsertNodeResult {
+    inserted_kv_records: usize,
+}
+
+impl std::ops::AddAssign for InsertNodeResult {
+    fn add_assign(&mut self, other: Self) {
+        self.inserted_kv_records += other.inserted_kv_records;
+    }
 }
 
 impl ProfilerInsertContext<'_> {
@@ -1062,13 +1200,15 @@ impl ProfilerInsertContext<'_> {
         &'b self,
         conn: &'b mut AsyncSqliteConnection,
         node: &'b stacks_profiler::ProfileStats,
-        parent_id: Option<i32>,
+        parent_id: Option<i64>,
         child_index: i32,
         depth: i32,
         active_tx_id: Option<i64>,
-    ) -> BoxFuture<'b, Result<()>> {
+    ) -> BoxFuture<'b, Result<InsertNodeResult>> {
         async move {
             let mut stacks_tx_id = active_tx_id;
+
+            let mut result = InsertNodeResult::default();
 
             if node.name() == "Transaction" {
                 if let Some(tag) = node.tag() {
@@ -1101,6 +1241,13 @@ impl ProfilerInsertContext<'_> {
             )
             .await?;
 
+            let tag_id: Option<i32> = match node.tag() {
+                Some(stacks_profiler::Tag::Str(s)) => {
+                    Some(AppDb::resolve_profiler_tag(conn, self.tag_cache.clone(), *s).await?)
+                }
+                _ => None, // numeric tags used for tx routing only
+            };
+
             let wall_time_us = node.wall_time_micros() as i64;
             let children_wall_time_us: i64 = node
                 .children
@@ -1117,12 +1264,12 @@ impl ProfilerInsertContext<'_> {
                 .sum();
             let self_cpu_time_us = cpu_time_us.saturating_sub(children_cpu_time_us);
 
-            let record_id: i32 = diesel::insert_into(schema::profiler_record::table)
+            let record_id: i64 = diesel::insert_into(schema::profiler_record::table)
                 .values((
                     schema::profiler_record::benchmark_run_id.eq(self.run_id),
                     schema::profiler_record::parent_id.eq(parent_id),
                     schema::profiler_record::profiler_span_id.eq(span_id),
-                    schema::profiler_record::tag.eq(&node.tag().map(|t| t.to_string())),
+                    schema::profiler_record::profiler_tag_id.eq(tag_id),
                     schema::profiler_record::profiler_location_id.eq(loc_id),
                     schema::profiler_record::child_index.eq(child_index),
                     schema::profiler_record::depth.eq(depth),
@@ -1139,49 +1286,63 @@ impl ProfilerInsertContext<'_> {
                 .get_result(conn)
                 .await?;
 
-            if !node.records.is_empty() {
-                for r in &node.records {
-                    let (value_type, value_int, value_text, value_blob) = map_record_value(r);
-                    diesel::insert_into(schema::profiler_record_kv::table)
-                        .values((
-                            schema::profiler_record_kv::profiler_record_id.eq(record_id),
-                            schema::profiler_record_kv::key.eq(r.key),
-                            schema::profiler_record_kv::value_type.eq(value_type),
-                            schema::profiler_record_kv::value_int.eq(value_int),
-                            schema::profiler_record_kv::value_text.eq(value_text),
-                            schema::profiler_record_kv::value_blob.eq(value_blob),
-                        ))
-                        .execute(conn)
-                        .await?;
+            let staged_kvs = node.records.iter().map(|r| {
+                let (value_type_id, value_str) = map_record_value_string(r);
+                StagedProfilerRecordKv {
+                    profiler_record_id: record_id,
+                    key: r.key.to_string(),
+                    value_type_id,
+                    value: value_str,
+                    count: 1,
                 }
+            });
+
+            for row in staged_kvs {
+                diesel::insert_into(schema::_staged_profiler_record_kv::table)
+                    .values(row)
+                    .on_conflict((
+                        schema::_staged_profiler_record_kv::profiler_record_id,
+                        schema::_staged_profiler_record_kv::key,
+                        schema::_staged_profiler_record_kv::value_type_id,
+                        schema::_staged_profiler_record_kv::value,
+                    ))
+                    .do_update()
+                    .set(
+                        schema::_staged_profiler_record_kv::count
+                            .eq(schema::_staged_profiler_record_kv::count
+                                + excluded(schema::_staged_profiler_record_kv::count)),
+                    )
+                    .execute(conn)
+                    .await
+                    .context("Failed to insert profiler KV staging record")?;
+                result.inserted_kv_records += 1;
             }
 
             for (idx, child) in node.children.iter().enumerate() {
-                self.insert_node(
-                    conn,
-                    child,
-                    Some(record_id),
-                    idx as i32,
-                    depth + 1,
-                    stacks_tx_id,
-                )
-                .await?;
+                result += self
+                    .insert_node(
+                        conn,
+                        child,
+                        Some(record_id),
+                        idx as i32,
+                        depth + 1,
+                        stacks_tx_id,
+                    )
+                    .await?;
             }
 
-            Ok(())
+            Ok(result)
         }
         .boxed()
     }
 }
 
-fn map_record_value(
-    r: &stacks_profiler::Record,
-) -> (i32, Option<i64>, Option<String>, Option<Vec<u8>>) {
+fn map_record_value_string(r: &stacks_profiler::Record) -> (i32, String) {
     match &r.value {
-        stacks_profiler::RecordValue::U64(v) => (1, Some(*v as i64), None, None),
-        stacks_profiler::RecordValue::I64(v) => (2, Some(*v), None, None),
-        stacks_profiler::RecordValue::Str(s) => (3, None, Some(s.to_string()), None),
-        stacks_profiler::RecordValue::Bytes(b) => (4, None, None, Some(b.to_vec())),
+        stacks_profiler::RecordValue::U64(v) => (1, v.to_string()),
+        stacks_profiler::RecordValue::I64(v) => (2, v.to_string()),
+        stacks_profiler::RecordValue::Str(s) => (3, s.to_string()),
+        stacks_profiler::RecordValue::Bytes(b) => (4, hex::encode(b)),
     }
 }
 

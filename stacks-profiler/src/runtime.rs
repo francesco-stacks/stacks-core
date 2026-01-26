@@ -1,9 +1,12 @@
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::{ProfileStats, Record, SpanId, Tag};
 
 type NodeId = u32;
+
+static RECORD_ENABLED: AtomicBool = AtomicBool::new(true);
 
 #[derive(Debug)]
 struct Node {
@@ -293,8 +296,28 @@ pub fn end_span() {
     });
 }
 
+#[inline(always)]
+pub fn enable_record() {
+    RECORD_ENABLED.store(true, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn disable_record() {
+    RECORD_ENABLED.store(false, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn is_record_enabled() -> bool {
+    RECORD_ENABLED.load(Ordering::Relaxed)
+}
+
 #[inline]
 pub fn record_kv(key: &'static str, value: crate::RecordValue) {
+    // Return early if recording is disabled.
+    if !is_record_enabled() {
+        return;
+    }
+
     // Ignore if suppressed or no active span.
     if is_suppressed() {
         return;

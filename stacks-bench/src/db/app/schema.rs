@@ -213,12 +213,19 @@ table! {
 }
 
 table! {
-    profiler_record (id) {
+    profiler_tag (id) {
         id -> Integer,
+        tag -> Text,
+    }
+}
+
+table! {
+    profiler_record (id) {
+        id -> BigInt,
         benchmark_run_id -> Integer,
-        parent_id -> Nullable<Integer>,
+        parent_id -> Nullable<BigInt>,
         profiler_span_id -> Integer,
-        tag -> Nullable<Text>,
+        profiler_tag_id -> Nullable<Integer>,
         profiler_location_id -> Integer,
         child_index -> Integer,
         depth -> Integer,
@@ -234,15 +241,43 @@ table! {
 }
 
 table! {
-    profiler_record_kv (id) {
+    profiler_kv_value_type (id) {
         id -> Integer,
-        profiler_record_id -> Integer,
+        name -> Text,
+    }
+}
+
+table! {
+    profiler_kv_key (id) {
+        id -> Integer,
         key -> Text,
-        value_type -> Integer,
-        value_int -> Nullable<BigInt>,
-        value_text -> Nullable<Text>,
-        value_blob -> Nullable<Binary>,
+    }
+}
+
+table! {
+    profiler_kv_value (id) {
+        id -> Integer,
+        profiler_kv_value_type_id -> Integer,
         value -> Text,
+    }
+}
+
+table! {
+    profiler_record_kv (profiler_record_id, profiler_kv_key_id, profiler_kv_value_id) {
+        profiler_record_id -> BigInt,
+        profiler_kv_key_id -> Integer,
+        profiler_kv_value_id -> Integer,
+        count -> Integer,
+    }
+}
+
+table! {
+    _staged_profiler_record_kv (profiler_record_id, key, value_type_id, value) {
+        profiler_record_id -> BigInt,
+        key -> Text,
+        value_type_id -> Integer,
+        value -> Text,
+        count -> Integer,
     }
 }
 
@@ -274,9 +309,13 @@ joinable!(stacks_tx_stats -> stacks_tx (stacks_tx_id));
 joinable!(profiler_record -> benchmark_run (benchmark_run_id));
 joinable!(profiler_record -> profiler_span (profiler_span_id));
 joinable!(profiler_record -> profiler_location (profiler_location_id));
+joinable!(profiler_record -> profiler_tag (profiler_tag_id));
 joinable!(profiler_record -> synthetic_block (synthetic_block_id));
 joinable!(profiler_record -> stacks_tx (stacks_tx_id));
+joinable!(profiler_kv_value -> profiler_kv_value_type (profiler_kv_value_type_id));
 joinable!(profiler_record_kv -> profiler_record (profiler_record_id));
+joinable!(profiler_record_kv -> profiler_kv_key (profiler_kv_key_id));
+joinable!(profiler_record_kv -> profiler_kv_value (profiler_kv_value_id));
 
 allow_tables_to_appear_in_same_query!(
     network,
@@ -299,7 +338,12 @@ allow_tables_to_appear_in_same_query!(
     _staged_stacks_tx,
     profiler_location,
     profiler_span,
+    profiler_tag,
     profiler_record,
+    profiler_kv_value_type,
+    profiler_kv_key,
+    profiler_kv_value,
     profiler_record_kv,
+    _staged_profiler_record_kv,
     chain_tip_cache,
 );

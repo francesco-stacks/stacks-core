@@ -1114,6 +1114,7 @@ impl<'a, 'b, 'hooks> Environment<'a, 'b, 'hooks> {
     ///  this ensures that only `define-public` and `define-read-only` methods can
     ///  be invoked. The `allow_private` mode should only be used by
     ///  `Environment::execute_contract_allow_private`.
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn inner_execute_contract(
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
@@ -1199,6 +1200,12 @@ impl<'a, 'b, 'hooks> Environment<'a, 'b, 'hooks> {
         next_contract_context: Option<&ContractContext>,
         allow_private: bool,
     ) -> Result<Value> {
+        #[cfg(feature = "profiler")]
+        let _profiler_span = stacks_profiler::span!(
+            "execute_function_as_transaction",
+            function.get_identifier().to_string()
+        );
+
         let make_read_only = function.is_read_only();
 
         if make_read_only {
@@ -1230,6 +1237,7 @@ impl<'a, 'b, 'hooks> Environment<'a, 'b, 'hooks> {
         }
     }
 
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn evaluate_at_block(
         &mut self,
         bhh: StacksBlockId,

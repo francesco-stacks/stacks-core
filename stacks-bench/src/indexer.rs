@@ -11,7 +11,7 @@ use tokio::task;
 
 use crate::blocks::{BlockRef, ChainCache as _};
 use crate::context::BenchEnv;
-use crate::db::app::AppDb;
+use crate::db::app::{AppDb, CheckpointMode, ForeignKeyMode, SynchronizationMode};
 use crate::{Network, StacksBlockHeader, StacksBlockLoader, StacksEpoch};
 
 pub struct ChainIndexPlan {
@@ -277,7 +277,7 @@ impl<'a> ChainstateIndexer<'a> {
             .await?;
 
         println!("Checkpointing database...");
-        self.app_db.checkpoint(true).await?;
+        self.app_db.checkpoint(CheckpointMode::Truncate).await?;
         println!("Vacuuming database...");
         self.app_db.vacuum().await?;
 
@@ -469,6 +469,12 @@ impl<'a> ChainstateIndexer<'a> {
         metrics: Arc<IndexerMetrics>,
     ) -> Result<()> {
         println!("  Indexing writer started with a batch size of {batch_size}");
+        app_db
+            .set_synchronization_mode(SynchronizationMode::Off)
+            .await?;
+        app_db
+            .set_foreign_key_enforcement(ForeignKeyMode::Off)
+            .await?;
         let mut batch = Vec::with_capacity(batch_size);
 
         let mut txs_since_last_merge: usize = 0;
@@ -537,7 +543,7 @@ impl<'a> ChainstateIndexer<'a> {
                     );
                     let start = Instant::now();
                     app_db.merge_staging().await?;
-                    app_db.checkpoint(false).await?;
+                    app_db.checkpoint(CheckpointMode::Passive).await?;
                     println!(
                         "  Incremental merge & checkpoint complete in {:.2?}",
                         start.elapsed()
@@ -568,12 +574,19 @@ impl<'a> ChainstateIndexer<'a> {
             println!("  Performing final staging data merge...");
             let start = Instant::now();
             app_db.merge_staging().await?;
-            app_db.checkpoint(false).await?;
+            app_db.checkpoint(CheckpointMode::Truncate).await?;
             println!(
                 "  Final merge & checkpoint complete in {:.2?}",
                 start.elapsed()
             );
         }
+
+        app_db
+            .set_synchronization_mode(SynchronizationMode::Normal)
+            .await?;
+        app_db
+            .set_foreign_key_enforcement(ForeignKeyMode::Enforced)
+            .await?;
 
         println!("Indexing writer finished");
         Ok(())

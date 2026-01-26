@@ -1,7 +1,20 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
-use stacks_profiler::{Profiler, measure, span, record};
+use stacks_profiler::{Profiler, measure, record, span};
+
+fn make_unique_tag(i: u64) -> String {
+    // Unique each iteration -> always a miss in interner
+    format!("contract::call::{}", i)
+}
+
+#[inline]
+fn clear_every(counter: &mut u64, n: u64) {
+    *counter += 1;
+    if *counter % n == 0 {
+        Profiler::clear();
+    }
+}
 
 fn bench_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("Profiler Overhead");
@@ -52,6 +65,47 @@ fn bench_overhead(c: &mut Criterion) {
 
         b.iter(|| {
             let _guard = Profiler::begin_span(id, Some(12345u64.into()));
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    group.bench_function("record_str_as_tag_baseline", |b| {
+        b.iter(|| {
+            let _g = span!("record_str_tag_baseline");
+            record!("tag", "contract::call::foo");
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    // Tagged Span Overhead: interned string tag (warm hit)
+    group.bench_function("span_tagged_str_interned_hit", |b| {
+        let id = Box::leak(Box::new(Profiler::new_span_id("bench_tag_str_hit")));
+
+        // Pre-intern once (warm hit for tag)
+        let tag = "contract::call::foo".to_string();
+        let _warm = Profiler::begin_span(id, Some(tag.clone().into()));
+        drop(_warm);
+
+        b.iter(|| {
+            // Same string content each time -> interner hit
+            let _guard = Profiler::begin_span(id, Some(tag.clone().into()));
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    // Tagged Span Overhead: interned string tag (cold miss)
+    group.bench_function("span_tagged_str_interned_miss", |b| {
+        let id = Box::leak(Box::new(Profiler::new_span_id("bench_tag_str_miss")));
+
+        let mut counter: u64 = 0;
+        b.iter(|| {
+            counter += 1;
+            // Unique content each time -> interner miss
+            let tag = make_unique_tag(counter);
+            let _guard = Profiler::begin_span(id, Some(tag.into()));
             black_box(());
         });
         Profiler::clear();
@@ -250,44 +304,100 @@ fn bench_record(c: &mut Criterion) {
         });
     });
 
-    // Record overhead: span + record u64 (no allocation)
     group.bench_function("record_u64", |b| {
+        let mut c = 0u64;
         b.iter(|| {
             let _g = span!("record_u64_span");
             record!("k", 123u64);
+            clear_every(&mut c, 1_000);
             black_box(());
         });
         Profiler::clear();
     });
 
-    // Record overhead: span + record str (allocates)
     group.bench_function("record_str", |b| {
+        let mut c = 0u64;
         b.iter(|| {
             let _g = span!("record_str_span");
             record!("k", "some-key");
+            clear_every(&mut c, 1_000);
             black_box(());
         });
         Profiler::clear();
     });
 
-    // Record overhead: span + record bytes (allocates)
     group.bench_function("record_bytes", |b| {
         let bytes = [0u8; 32];
+        let mut c = 0u64;
         b.iter(|| {
             let _g = span!("record_bytes_span");
             record!("k", &bytes[..]);
+            clear_every(&mut c, 1_000);
             black_box(());
         });
         Profiler::clear();
     });
 
-    // Record overhead: many records in one span
     group.bench_function("record_1k_u64", |b| {
+        let mut c = 0u64;
         b.iter(|| {
             let _g = span!("record_1k_u64_span");
             for i in 0..1000u64 {
                 record!("k", i);
             }
+            clear_every(&mut c, 50);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    group.bench_function("record_string", |b| {
+        let mut c = 0u64;
+        b.iter(|| {
+            let _g = span!("record_string_span");
+            let s = String::from("some-key");
+            record!("k", s);
+            clear_every(&mut c, 1_000);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    group.bench_function("record_1k_string", |b| {
+        let mut c = 0u64;
+        b.iter(|| {
+            let _g = span!("record_1k_string_span");
+            for i in 0..1000u64 {
+                let s = format!("k{i}");
+                record!("k", s);
+            }
+            clear_every(&mut c, 50);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    group.bench_function("record_string_no_span", |b| {
+        let _g = span!("record_string_no_span");
+        let mut c = 0u64;
+        b.iter(|| {
+            let s = String::from("some-key");
+            record!("k", s);
+            clear_every(&mut c, 1_000);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    group.bench_function("record_1k_string_no_span", |b| {
+        let _g = span!("record_1k_string_no_span");
+        let mut c = 0u64;
+        b.iter(|| {
+            for i in 0..1000u64 {
+                let s = format!("k{i}");
+                record!("k", s);
+            }
+            clear_every(&mut c, 50);
             black_box(());
         });
         Profiler::clear();

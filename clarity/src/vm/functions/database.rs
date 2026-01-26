@@ -57,6 +57,7 @@ switch_on_global_epoch!(special_delete_entry(
     special_delete_entry_v205
 ));
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn special_contract_call(
     args: &[SymbolicExpression],
     env: &mut Environment,
@@ -221,6 +222,7 @@ pub fn special_contract_call(
     Ok(result)
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn special_fetch_variable_v200(
     args: &[SymbolicExpression],
     env: &mut Environment,
@@ -252,6 +254,7 @@ pub fn special_fetch_variable_v200(
 
 /// The Stacks v205 version of fetch_variable uses the actual stored size of the
 ///  value as input to the cost tabulation. Otherwise identical to v200.
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn special_fetch_variable_v205(
     args: &[SymbolicExpression],
     env: &mut Environment,
@@ -366,6 +369,7 @@ pub fn special_set_variable_v205(
     result.map(|data| data.value)
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn special_fetch_entry_v200(
     args: &[SymbolicExpression],
     env: &mut Environment,
@@ -399,6 +403,7 @@ pub fn special_fetch_entry_v200(
 
 /// The Stacks v205 version of fetch_entry uses the actual stored size of the
 ///  value as input to the cost tabulation. Otherwise identical to v200.
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn special_fetch_entry_v205(
     args: &[SymbolicExpression],
     env: &mut Environment,
@@ -434,6 +439,7 @@ pub fn special_fetch_entry_v205(
     result.map(|data| data.value)
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn special_at_block(
     args: &[SymbolicExpression],
     env: &mut Environment,

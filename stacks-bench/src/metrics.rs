@@ -167,6 +167,7 @@ pub struct BlockMetrics {
     pub transactions: Vec<TransactionMetrics>,
     pub commit_overhead_baseline: Duration,
     pub total_storage_delta: i64,
+    pub clarity_db_checkpoint_duration: Duration,
     /// Block-associated profiler roots
     pub profiler_roots: Vec<ProfileStats>,
 }
@@ -184,6 +185,7 @@ impl BlockMetrics {
             transactions: vec![],
             commit_overhead_baseline: Duration::ZERO,
             total_storage_delta: 0,
+            clarity_db_checkpoint_duration: Duration::ZERO,
             profiler_roots: vec![],
         }
     }

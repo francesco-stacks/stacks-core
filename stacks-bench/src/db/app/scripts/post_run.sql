@@ -72,3 +72,4 @@ COMMIT;
 PRAGMA analysis_limit = 0;
 ANALYZE profiler_span_block_summary;
 ANALYZE profiler_span_summary;
+PRAGMA optimize;

@@ -5,13 +5,14 @@ use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, StacksBlockId};
 
 use super::schema::{
-    _staged_stacks_block, _staged_stacks_tx, benchmark_run, block_processing_baseline, burn_block,
-    chainstate, epoch, network, profiler_location, profiler_record, profiler_record_kv,
-    profiler_span, stacks_block, stacks_block_stats, stacks_tx, stacks_tx_stats,
+    _staged_profiler_record_kv, _staged_stacks_block, _staged_stacks_tx, benchmark_run,
+    block_processing_baseline, burn_block, chainstate, epoch, network, profiler_location,
+    profiler_record, profiler_span, stacks_block, stacks_block_stats, stacks_tx, stacks_tx_stats,
 };
 use crate::ResolveEpochFromHeight;
 use crate::db::app::schema::{
-    chain_tip_cache, contract, contract_fn, principal, stacks_tx_type, synthetic_block,
+    chain_tip_cache, contract, contract_fn, principal, profiler_tag, stacks_tx_type,
+    synthetic_block,
 };
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
@@ -313,6 +314,13 @@ pub struct ProfilerSpan {
     pub name: String,
 }
 
+#[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]
+#[diesel(table_name = profiler_tag)]
+pub struct ProfilerTag {
+    pub id: i32,
+    pub tag: String,
+}
+
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
 #[diesel(belongs_to(BenchmarkRun))]
 #[diesel(belongs_to(ProfilerSpan))]
@@ -323,11 +331,11 @@ pub struct ProfilerSpan {
 #[diesel(table_name = profiler_record)]
 #[diesel(treat_none_as_null = true)]
 pub struct ProfilerRecord {
-    pub id: i32,
+    pub id: i64,
     pub benchmark_run_id: i32,
-    pub parent_id: Option<i32>,
+    pub parent_id: Option<i64>,
     pub profiler_span_id: i32,
-    pub tag: Option<String>,
+    pub profiler_tag_id: Option<i32>,
     pub profiler_location_id: i32,
     pub child_index: i32,
     pub depth: i32,
@@ -341,19 +349,14 @@ pub struct ProfilerRecord {
     pub sample_count: i32,
 }
 
-#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
-#[diesel(belongs_to(ProfilerRecord, foreign_key = profiler_record_id))]
-#[diesel(table_name = profiler_record_kv)]
-#[diesel(treat_none_as_null = true)]
-pub struct ProfilerRecordKv {
-    pub id: i32,
-    pub profiler_record_id: i32,
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = _staged_profiler_record_kv)]
+pub struct StagedProfilerRecordKv {
+    pub profiler_record_id: i64,
     pub key: String,
-    pub value_type: i32,
-    pub value_int: Option<i64>,
-    pub value_text: Option<String>,
-    pub value_blob: Option<Vec<u8>>,
+    pub value_type_id: i32,
     pub value: String,
+    pub count: i32,
 }
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Debug, Clone)]

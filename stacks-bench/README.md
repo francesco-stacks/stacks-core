@@ -66,11 +66,11 @@ WRITE: bw=179MiB/s
 ## Benchmark Data Storage
 
 `stacks-bench` stores its benchmarking data in an SQLite database, which by default is written
-to `./.stacks-bench/appdata/stacks-bench.db`, relative to the `stacks-bench` binary's working directory.
+to `./.stacks-bench/appdata/stacks-bench.db`, relative to the `stacks-bench` binary's working directory (e.g. the workspace `target/release/` directory if executed using `cargo run` or the `cargo stacks-bench` alias).
 
 ## Analyzing Benchmark Data
 
-To help users better understand their benchmarking/profiling data, a small [Metabase](https://www.metabase.com/) instance is supplied with some pre-configured questions/dashboards.
+To help users better understand their benchmarking/profiling data, a small [Metabase](https://www.metabase.com/) instance is supplied with pre-configured questions/dashboards.
 
 Running `stacks-bench metabase` will have `stacks-bench` setup/configure a PostgreSQL database for Metabase as well as Metabase itself using Docker. You can then access Metabase at <http://localhost:3000/>.
 
