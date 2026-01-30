@@ -10,6 +10,7 @@ use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use blockstack_lib::chainstate::stacks::miner::{
     BlockBuilder, BlockLimitFunction, TransactionResult,
 };
+use blockstack_lib::config::DEFAULT_MAX_TENURE_BYTES;
 use clarity::types::chainstate::ConsensusHash;
 use clarity::vm::costs::ExecutionCost;
 use stacks_common::types::chainstate::StacksBlockId;
@@ -438,6 +439,7 @@ fn execute_segment(
         None,
         None,
         Some(block.header.timestamp),
+        DEFAULT_MAX_TENURE_BYTES,
     )?;
 
     let cur_parent_block_id = StacksBlockId::new(
@@ -470,6 +472,7 @@ fn execute_segment(
 
     let mut segment_tx_metrics: Vec<(Txid, Duration, ExecutionCost)> = Vec::new();
     let mut segment_total_clarity_cost = ExecutionCost::ZERO;
+    let mut total_receipts_size = 0u64;
 
     let starting_cost = clarity_tx.cost_so_far();
 
@@ -497,6 +500,7 @@ fn execute_segment(
             tx_len,
             &BlockLimitFunction::NO_LIMIT_HIT,
             None,
+            &mut total_receipts_size,
         );
 
         drop(_tx_guard);
@@ -689,6 +693,7 @@ where
             None,
             None,
             None,
+            DEFAULT_MAX_TENURE_BYTES,
         )?;
 
         let mut miner_tenure_info = builder.load_tenure_info(

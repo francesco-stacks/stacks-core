@@ -15,6 +15,7 @@ members = [
     "stacks-profiler",
     "stacks-profiler-macros",
     "contrib/stacks-inspect",
+    "contrib/clarity-cli",
     "contrib/stacks-cli"
 ]
 
