@@ -5,9 +5,10 @@ use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, StacksBlockId};
 
 use super::schema::{
-    _staged_profiler_record_kv, _staged_stacks_block, _staged_stacks_tx, benchmark_run,
-    block_processing_baseline, burn_block, chainstate, epoch, network, profiler_location,
-    profiler_record, profiler_span, stacks_block, stacks_block_stats, stacks_tx, stacks_tx_stats,
+    _staged_profiler_record_clarity_costs, _staged_profiler_record_kv, _staged_stacks_block,
+    _staged_stacks_tx, benchmark_run, block_processing_baseline, burn_block, chainstate, epoch,
+    network, profiler_location, profiler_record, profiler_record_clarity_costs, profiler_span,
+    stacks_block, stacks_block_stats, stacks_tx, stacks_tx_stats,
 };
 use crate::ResolveEpochFromHeight;
 use crate::db::app::schema::{
@@ -347,6 +348,30 @@ pub struct ProfilerRecord {
     pub self_cpu_time_us: i64,
     pub call_count: i32,
     pub sample_count: i32,
+}
+
+#[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
+#[diesel(belongs_to(ProfilerRecord, foreign_key = profiler_record_id))]
+#[diesel(table_name = profiler_record_clarity_costs)]
+#[diesel(primary_key(profiler_record_id))]
+pub struct ProfilerRecordClarityCosts {
+    pub profiler_record_id: i64,
+    pub runtime: i64,
+    pub read_count: i64,
+    pub read_length: i64,
+    pub write_count: i64,
+    pub write_length: i64,
+}
+
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = _staged_profiler_record_clarity_costs)]
+pub struct StagedProfilerRecordClarityCosts {
+    pub profiler_record_id: i64,
+    pub runtime: i64,
+    pub read_count: i64,
+    pub read_length: i64,
+    pub write_count: i64,
+    pub write_length: i64,
 }
 
 #[derive(Insertable, Debug, Clone)]

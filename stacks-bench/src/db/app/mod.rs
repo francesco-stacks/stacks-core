@@ -45,6 +45,8 @@ pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 const MERGE_STAGING_SQL: &str = include_str!("scripts/merge_staging.sql");
 const POST_RUN_SQL: &str = include_str!("scripts/post_run.sql");
 const MERGE_PROFILER_KV_SQL: &str = include_str!("scripts/merge_profiler_kv.sql");
+const MERGE_PROFILER_CLARITY_COSTS_SQL: &str =
+    include_str!("scripts/merge_profiler_clarity_costs.sql");
 
 #[derive(Debug, Clone, Copy)]
 pub enum SynchronizationMode {
@@ -1038,6 +1040,7 @@ impl AppDb {
         let span_cache = self.profiler_span_cache.clone();
         let loc_cache = self.profiler_loc_cache.clone();
         let mut staged_kv_count = 0;
+        let mut staged_clarity_costs_count = 0;
 
         self.set_synchronization_mode(SynchronizationMode::Off)
             .await?;
@@ -1149,6 +1152,7 @@ impl AppDb {
                         for (i, root) in metrics.profiler_roots.iter().enumerate() {
                             let result = ctx.insert_node(dbtx, root, None, i as i32, 0, None).await?;
                             staged_kv_count += result.inserted_kv_records;
+                            staged_clarity_costs_count += result.inserted_clarity_cost_records;
                         }
                     }
 
@@ -1157,6 +1161,13 @@ impl AppDb {
                             .batch_execute(MERGE_PROFILER_KV_SQL)
                             .await
                             .with_context(|| format!("Failed to execute profiler KV staging merge script ({staged_kv_count} staged records)"))?;
+                    }
+
+                    if staged_clarity_costs_count > 0 {
+                        dbtx
+                            .batch_execute(MERGE_PROFILER_CLARITY_COSTS_SQL)
+                            .await
+                            .with_context(|| format!("Failed to execute profiler clarity costs staging merge script ({staged_clarity_costs_count} staged records)"))?;
                     }
 
                     Ok(())
@@ -1187,11 +1198,13 @@ struct ProfilerInsertContext<'a> {
 #[derive(Debug, Default)]
 struct InsertNodeResult {
     inserted_kv_records: usize,
+    inserted_clarity_cost_records: usize,
 }
 
 impl std::ops::AddAssign for InsertNodeResult {
     fn add_assign(&mut self, other: Self) {
         self.inserted_kv_records += other.inserted_kv_records;
+        self.inserted_clarity_cost_records += other.inserted_clarity_cost_records;
     }
 }
 
@@ -1297,12 +1310,48 @@ impl ProfilerInsertContext<'_> {
                 }
             });
 
-            let staged_counter_kvs = node.counters.iter().map(|c| StagedProfilerRecordKv {
-                profiler_record_id: record_id,
-                key: format!("counter:{}", c.key),
-                value_type_id: 1, // U64
-                value: c.value.to_string(),
-                count: 1,
+            let mut clarity_costs_runtime: i64 = 0;
+            let mut clarity_costs_read_count: i64 = 0;
+            let mut clarity_costs_read_length: i64 = 0;
+            let mut clarity_costs_write_count: i64 = 0;
+            let mut clarity_costs_write_length: i64 = 0;
+            let mut has_clarity_costs = false;
+
+            let staged_counter_kvs = node.counters.iter().filter_map(|c| {
+                match c.key {
+                    "CR" => {
+                        has_clarity_costs = true;
+                        clarity_costs_runtime = c.value as i64;
+                        None
+                    }
+                    "CRC" => {
+                        has_clarity_costs = true;
+                        clarity_costs_read_count = c.value as i64;
+                        None
+                    }
+                    "CRL" => {
+                        has_clarity_costs = true;
+                        clarity_costs_read_length = c.value as i64;
+                        None
+                    }
+                    "CWC" => {
+                        has_clarity_costs = true;
+                        clarity_costs_write_count = c.value as i64;
+                        None
+                    }
+                    "CWL" => {
+                        has_clarity_costs = true;
+                        clarity_costs_write_length = c.value as i64;
+                        None
+                    }
+                    _ => Some(StagedProfilerRecordKv {
+                        profiler_record_id: record_id,
+                        key: format!("counter:{}", c.key),
+                        value_type_id: 1, // U64
+                        value: c.value.to_string(),
+                        count: 1,
+                    }),
+                }
             });
 
             for row in staged_kvs.chain(staged_counter_kvs) {
@@ -1324,6 +1373,42 @@ impl ProfilerInsertContext<'_> {
                     .await
                     .context("Failed to insert profiler KV staging record")?;
                 result.inserted_kv_records += 1;
+            }
+
+            if has_clarity_costs {
+                diesel::insert_into(schema::_staged_profiler_record_clarity_costs::table)
+                    .values((
+                        schema::_staged_profiler_record_clarity_costs::profiler_record_id
+                            .eq(record_id),
+                        schema::_staged_profiler_record_clarity_costs::runtime
+                            .eq(clarity_costs_runtime),
+                        schema::_staged_profiler_record_clarity_costs::read_count
+                            .eq(clarity_costs_read_count),
+                        schema::_staged_profiler_record_clarity_costs::read_length
+                            .eq(clarity_costs_read_length),
+                        schema::_staged_profiler_record_clarity_costs::write_count
+                            .eq(clarity_costs_write_count),
+                        schema::_staged_profiler_record_clarity_costs::write_length
+                            .eq(clarity_costs_write_length),
+                    ))
+                    .on_conflict(schema::_staged_profiler_record_clarity_costs::profiler_record_id)
+                    .do_update()
+                    .set((
+                        schema::_staged_profiler_record_clarity_costs::runtime
+                            .eq(clarity_costs_runtime),
+                        schema::_staged_profiler_record_clarity_costs::read_count
+                            .eq(clarity_costs_read_count),
+                        schema::_staged_profiler_record_clarity_costs::read_length
+                            .eq(clarity_costs_read_length),
+                        schema::_staged_profiler_record_clarity_costs::write_count
+                            .eq(clarity_costs_write_count),
+                        schema::_staged_profiler_record_clarity_costs::write_length
+                            .eq(clarity_costs_write_length),
+                    ))
+                    .execute(conn)
+                    .await
+                    .context("Failed to insert profiler clarity costs staging record")?;
+                result.inserted_clarity_cost_records += 1;
             }
 
             for (idx, child) in node.children.iter().enumerate() {

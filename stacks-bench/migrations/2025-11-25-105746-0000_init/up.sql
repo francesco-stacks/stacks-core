@@ -440,6 +440,12 @@ CREATE INDEX idx_prof_run_tag
   ON profiler_record(benchmark_run_id, profiler_tag_id)
   WHERE profiler_tag_id IS NOT NULL;
 
+CREATE INDEX idx_prof_run_hot
+  ON profiler_record(
+    benchmark_run_id,
+    COALESCE(est_wall_us, wall_time_us)
+  );
+
 -- ==========================================
 -- Dimension table for profiler KV value types.
 -- ==========================================
@@ -493,6 +499,34 @@ CREATE TABLE profiler_record_kv (
 
 CREATE INDEX idx_prkv_key_val_record
   ON profiler_record_kv(profiler_kv_key_id, profiler_kv_value_id, profiler_record_id);
+
+-- ==========================================
+-- Fact table for extracted Clarity cost counters per profiler_record.
+-- ==========================================
+CREATE TABLE profiler_record_clarity_costs (
+  profiler_record_id INTEGER PRIMARY KEY NOT NULL,
+  runtime INTEGER NOT NULL,
+  read_count INTEGER NOT NULL,
+  read_length INTEGER NOT NULL,
+  write_count INTEGER NOT NULL,
+  write_length INTEGER NOT NULL,
+
+  FOREIGN KEY (profiler_record_id) REFERENCES profiler_record(id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+-- ==========================================
+-- Staging table for profiler Clarity cost rows.
+-- ==========================================
+CREATE TABLE _staged_profiler_record_clarity_costs (
+  profiler_record_id INTEGER NOT NULL,
+  runtime INTEGER NOT NULL,
+  read_count INTEGER NOT NULL,
+  read_length INTEGER NOT NULL,
+  write_count INTEGER NOT NULL,
+  write_length INTEGER NOT NULL,
+
+  PRIMARY KEY (profiler_record_id)
+) WITHOUT ROWID;
 
 -- ==========================================
 -- Staging table for profiler KV rows.

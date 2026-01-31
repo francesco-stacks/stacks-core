@@ -272,6 +272,28 @@ table! {
 }
 
 table! {
+    profiler_record_clarity_costs (profiler_record_id) {
+        profiler_record_id -> BigInt,
+        runtime -> BigInt,
+        read_count -> BigInt,
+        read_length -> BigInt,
+        write_count -> BigInt,
+        write_length -> BigInt,
+    }
+}
+
+table! {
+    _staged_profiler_record_clarity_costs (profiler_record_id) {
+        profiler_record_id -> BigInt,
+        runtime -> BigInt,
+        read_count -> BigInt,
+        read_length -> BigInt,
+        write_count -> BigInt,
+        write_length -> BigInt,
+    }
+}
+
+table! {
     _staged_profiler_record_kv (profiler_record_id, key, value_type_id, value) {
         profiler_record_id -> BigInt,
         key -> Text,
@@ -316,6 +338,7 @@ joinable!(profiler_kv_value -> profiler_kv_value_type (profiler_kv_value_type_id
 joinable!(profiler_record_kv -> profiler_record (profiler_record_id));
 joinable!(profiler_record_kv -> profiler_kv_key (profiler_kv_key_id));
 joinable!(profiler_record_kv -> profiler_kv_value (profiler_kv_value_id));
+joinable!(profiler_record_clarity_costs -> profiler_record (profiler_record_id));
 
 allow_tables_to_appear_in_same_query!(
     network,
@@ -344,6 +367,8 @@ allow_tables_to_appear_in_same_query!(
     profiler_kv_key,
     profiler_kv_value,
     profiler_record_kv,
+    profiler_record_clarity_costs,
+    _staged_profiler_record_clarity_costs,
     _staged_profiler_record_kv,
     chain_tip_cache,
 );
