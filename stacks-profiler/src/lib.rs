@@ -63,6 +63,13 @@ pub struct Record {
     pub value: RecordValue,
 }
 
+/// Aggregated counter attached to a span node.
+#[derive(Debug, Clone)]
+pub struct Counter {
+    pub key: &'static str,
+    pub value: u64,
+}
+
 thread_local! {
     static TAG_INTERNER: RefCell<RapidHashMap<Box<str>, &'static str>> =
         RefCell::new(RapidHashMap::with_capacity(64));
@@ -200,6 +207,7 @@ pub struct ProfileStats {
     pub entered_count: usize,
     pub sampled_count: usize,
     pub records: Vec<Record>,
+    pub counters: Vec<Counter>,
 }
 
 impl ProfileStats {
@@ -342,6 +350,11 @@ impl Profiler {
     #[inline(always)]
     pub fn record(key: &'static str, value: RecordValue) {
         runtime::record_kv(key, value);
+    }
+
+    #[inline(always)]
+    pub fn counter(key: &'static str, delta: u64) {
+        runtime::counter_add(key, delta);
     }
 
     #[inline]

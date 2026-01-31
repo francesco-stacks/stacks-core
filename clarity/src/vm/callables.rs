@@ -406,6 +406,76 @@ impl CallableType {
             }
         }
     }
+
+    pub fn apply_special(
+        &self,
+        args: &[SymbolicExpression],
+        env: &mut Environment,
+        context: &LocalContext,
+    ) -> Result<Value, VmExecutionError> {
+        match self {
+            CallableType::SpecialFunction(_name, function) => {
+                #[cfg(feature = "profiler")]
+                let _span = stacks_profiler::span_if!(
+                    crate::profiler::capture_costs()
+                        && stacks_profiler::Profiler::is_record_enabled(),
+                    "(special function)",
+                    *_name
+                );
+                function(args, env, context)
+            }
+            _ => Err(VmInternalError::Expect("Should be unreachable.".into()).into()),
+        }
+    }
+
+    pub fn apply_evaluated(
+        &self,
+        evaluated_args: Vec<Value>,
+        env: &mut Environment,
+    ) -> Result<Value, VmExecutionError> {
+        match self {
+            CallableType::NativeFunction(_name, function, cost_function) => {
+                runtime_cost(cost_function.clone(), env, evaluated_args.len())
+                    .map_err(VmExecutionError::from)?;
+                #[cfg(feature = "profiler")]
+                let _span = stacks_profiler::span_if!(
+                    crate::profiler::capture_costs()
+                        && stacks_profiler::Profiler::is_record_enabled(),
+                    "(native function)",
+                    *_name
+                );
+                function.apply(evaluated_args, env)
+            }
+            CallableType::NativeFunction205(_name, function, cost_function, cost_input_handle) => {
+                let cost_input = if env.epoch() >= &StacksEpochId::Epoch2_05 {
+                    cost_input_handle(evaluated_args.as_slice())?
+                } else {
+                    evaluated_args.len() as u64
+                };
+                runtime_cost(cost_function.clone(), env, cost_input)
+                    .map_err(VmExecutionError::from)?;
+                #[cfg(feature = "profiler")]
+                let _span = stacks_profiler::span_if!(
+                    crate::profiler::capture_costs()
+                        && stacks_profiler::Profiler::is_record_enabled(),
+                    "(native function 2.05)",
+                    *_name
+                );
+                function.apply(evaluated_args, env)
+            }
+            CallableType::UserFunction(function) => {
+                #[cfg(feature = "profiler")]
+                let _span = stacks_profiler::span_if!(
+                    crate::profiler::capture_costs()
+                        && stacks_profiler::Profiler::is_record_enabled(),
+                    "(user function)",
+                    function.get_identifier().to_string()
+                );
+                function.apply(&evaluated_args, env)
+            }
+            _ => Err(VmInternalError::Expect("Should be unreachable.".into()).into()),
+        }
+    }
 }
 
 // Implicitly cast principals to traits and traits to other traits as needed,

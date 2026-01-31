@@ -1213,7 +1213,8 @@ impl<T: MarfTrieId> MARF<T> {
         block_hash: &T,
         key: &str,
     ) -> Result<Option<MARFValue>, Error> {
-        stacks_profiler::record!("MARF_KEY", key);
+        #[cfg(feature = "profiler")]
+        stacks_profiler::record_if!(crate::profiler::capture_marf_keys(), "KEY", key);
         let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
 
         let path = TrieHash::from_key(key);
@@ -1242,7 +1243,12 @@ impl<T: MarfTrieId> MARF<T> {
         block_hash: &T,
         path: &TrieHash,
     ) -> Result<Option<MARFValue>, Error> {
-        stacks_profiler::record!("BLOCK_HASH", block_hash.as_bytes());
+        #[cfg(feature = "profiler")]
+        stacks_profiler::record_if!(
+            crate::profiler::capture_marf_hash_lookups(),
+            "BH",
+            block_hash.as_bytes()
+        );
         let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
 
         let result = MARF::get_path(storage, block_hash, path).or_else(|e| match e {

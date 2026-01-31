@@ -2574,13 +2574,28 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
                 self.bench.read_node_hash_start();
                 if let Some(node_hash) = self.cache.load_node_hash(block_id, ptr) {
                     let res = node_hash;
-                    stacks_profiler::record!("MARF_NODE_HASH_CACHE", "hit");
+                    #[cfg(feature = "profiler")]
+                    stacks_profiler::counter_if!(
+                        crate::profiler::capture_marf_cache_counts(),
+                        "MARF_NODE_HASH_CACHE_HIT",
+                        1u64
+                    );
                     self.bench.read_node_hash_finish(true);
                     Ok(res)
                 } else {
-                    stacks_profiler::record!("MARF_NODE_HASH_CACHE", "miss");
+                    #[cfg(feature = "profiler")]
+                    stacks_profiler::counter_if!(
+                        crate::profiler::capture_marf_cache_counts(),
+                        "MARF_NODE_HASH_CACHE_MISS",
+                        1u64
+                    );
                     let node_hash = self.inner_read_persisted_node_hash(block_id, ptr)?;
-                    stacks_profiler::record!("MARF_NODE_HASH_DISK_READ", block_id as u64);
+                    #[cfg(feature = "profiler")]
+                    stacks_profiler::record_if!(
+                        crate::profiler::capture_marf_disk_reads(),
+                        "MARF_NODE_HASH_DISK_READ",
+                        block_id as u64
+                    );
                     self.cache.store_node_hash(block_id, *ptr, node_hash);
                     self.bench.read_node_hash_finish(false);
                     Ok(node_hash)

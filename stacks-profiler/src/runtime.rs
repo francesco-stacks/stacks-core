@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::{ProfileStats, Record, SpanId, Tag};
+use crate::{Counter, ProfileStats, Record, SpanId, Tag};
 
 type NodeId = u32;
 
@@ -22,6 +22,7 @@ struct Node {
     last_child: Option<NodeId>,
 
     records: Vec<Record>,
+    counters: Vec<Counter>,
 }
 
 impl Node {
@@ -78,6 +79,7 @@ impl ThreadState {
             children: Vec::new(),
             last_child: None,
             records: Vec::with_capacity(4),
+            counters: Vec::with_capacity(4),
         });
         idx as NodeId
     }
@@ -172,7 +174,8 @@ impl ThreadState {
             children,
             entered_count: node.entered_count,
             sampled_count: node.sampled_count,
-            records: node.records, // moved
+            records: node.records,   // moved
+            counters: node.counters, // moved
         }
     }
 
@@ -344,6 +347,36 @@ pub fn record_kv(key: &'static str, value: crate::RecordValue) {
         //     node.records.remove(0);
         // }
         node.records.push(crate::Record { key, value });
+    });
+}
+
+#[inline]
+pub fn counter_add(key: &'static str, delta: u64) {
+    if !is_record_enabled() {
+        return;
+    }
+
+    if is_suppressed() {
+        return;
+    }
+
+    STATE.with(|cell| {
+        let mut st = cell.borrow_mut();
+        let (node_id, is_count_only) = match st.stack.last() {
+            Some(frame) => (frame.node, matches!(frame.kind, ActiveKind::CountOnly)),
+            None => return,
+        };
+
+        if is_count_only {
+            return;
+        }
+
+        let node = st.node_mut(node_id);
+        if let Some(counter) = node.counters.iter_mut().find(|c| c.key == key) {
+            counter.value = counter.value.saturating_add(delta);
+        } else {
+            node.counters.push(crate::Counter { key, value: delta });
+        }
     });
 }
 

@@ -1240,10 +1240,14 @@ impl<'a, 'b, 'hooks> Environment<'a, 'b, 'hooks> {
         allow_private: bool,
     ) -> Result<Value, VmExecutionError> {
         #[cfg(feature = "profiler")]
-        let _profiler_span = stacks_profiler::span!(
-            "execute_function_as_transaction",
-            function.get_identifier().to_string()
-        );
+        let _profiler_span = if crate::profiler::capture_contract_call_ident() {
+            stacks_profiler::span!(
+                "execute_function_as_transaction",
+                function.get_identifier().to_string()
+            )
+        } else {
+            stacks_profiler::span!("execute_function_as_transaction")
+        };
 
         let make_read_only = function.is_read_only();
 

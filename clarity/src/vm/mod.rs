@@ -53,6 +53,7 @@ use std::collections::BTreeMap;
 
 pub use clarity_types::MAX_CALL_STACK_DEPTH;
 use costs::CostErrors;
+#[cfg(any(test, feature = "testing"))]
 use stacks_common::types::StacksEpochId;
 
 use self::analysis::ContractAnalysis;
@@ -245,9 +246,9 @@ pub fn apply(
         return Err(RuntimeError::MaxStackDepthReached.into());
     }
 
-    if let CallableType::SpecialFunction(_, function) = function {
+    if matches!(function, CallableType::SpecialFunction(_, _)) {
         env.call_stack.insert(&identifier, track_recursion);
-        let mut resp = function(args, env, context);
+        let mut resp = function.apply_special(args, env, context);
         add_stack_trace(&mut resp, env);
         env.call_stack.remove(&identifier, track_recursion)?;
         resp
@@ -279,25 +280,7 @@ pub fn apply(
         env.call_stack.decr_apply_depth();
 
         env.call_stack.insert(&identifier, track_recursion);
-        let mut resp = match function {
-            CallableType::NativeFunction(_, function, cost_function) => {
-                runtime_cost(cost_function.clone(), env, evaluated_args.len())
-                    .map_err(VmExecutionError::from)
-                    .and_then(|_| function.apply(evaluated_args, env))
-            }
-            CallableType::NativeFunction205(_, function, cost_function, cost_input_handle) => {
-                let cost_input = if env.epoch() >= &StacksEpochId::Epoch2_05 {
-                    cost_input_handle(evaluated_args.as_slice())?
-                } else {
-                    evaluated_args.len() as u64
-                };
-                runtime_cost(cost_function.clone(), env, cost_input)
-                    .map_err(VmExecutionError::from)
-                    .and_then(|_| function.apply(evaluated_args, env))
-            }
-            CallableType::UserFunction(function) => function.apply(&evaluated_args, env),
-            _ => return Err(VmInternalError::Expect("Should be unreachable.".into()).into()),
-        };
+        let mut resp = function.apply_evaluated(evaluated_args, env);
         add_stack_trace(&mut resp, env);
         env.drop_memory(used_memory)?;
         env.call_stack.remove(&identifier, track_recursion)?;

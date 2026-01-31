@@ -1205,7 +1205,7 @@ impl CostTracker for LimitedCostTracker {
                     )),
                 )?;
 
-                match cost_function_ref {
+                let cost = match cost_function_ref {
                     ClarityCostFunctionEvaluator::Default(
                         cost_function_ref,
                         clarity_cost_function,
@@ -1214,7 +1214,26 @@ impl CostTracker for LimitedCostTracker {
                     ClarityCostFunctionEvaluator::Clarity(cost_function_ref) => {
                         compute_cost(data, cost_function_ref.clone(), input, data.epoch)
                     }
+                };
+
+                // If the `profiler` feature is enabled, AND cost-capturing is enabled, AND
+                // profiler KV-recording is enabled, then we write out
+                #[cfg(feature = "profiler")]
+                if let Ok(cost) = cost.as_ref() {
+                    let capture = crate::profiler::capture_costs()
+                        && !cost.is_zero()
+                        && stacks_profiler::Profiler::is_record_enabled();
+
+                    if capture {
+                        stacks_profiler::counter_if!(capture, "CR", cost.runtime);
+                        stacks_profiler::counter_if!(capture, "CRC", cost.read_count);
+                        stacks_profiler::counter_if!(capture, "CRL", cost.read_length);
+                        stacks_profiler::counter_if!(capture, "CWC", cost.write_count);
+                        stacks_profiler::counter_if!(capture, "CWL", cost.write_length);
+                    }
                 }
+
+                cost
             }
         }
     }

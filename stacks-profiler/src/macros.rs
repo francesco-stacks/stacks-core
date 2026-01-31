@@ -432,10 +432,53 @@ macro_rules! span {
     }};
 }
 
+/// Conditionally create a profiling span guard based on a predicate.
+///
+/// This macro returns `None` when the predicate is false and otherwise forwards
+/// its arguments to [`span!`](crate::span).
+#[macro_export]
+macro_rules! span_if {
+    ($pred:expr, $($rest:tt)+) => {{
+        if $pred {
+            $crate::span!($($rest)+)
+        } else {
+            None
+        }
+    }};
+}
+
 /// Attach a key/value record to the current span (if any).
 #[macro_export]
 macro_rules! record {
     ($key:literal, $val:expr) => {{
         $crate::Profiler::record($key, ($val).into());
+    }};
+}
+
+/// Attach a key/value record to the current span (if any), when a predicate is true.
+#[macro_export]
+macro_rules! record_if {
+    ($pred:expr, $key:literal, $val:expr) => {{
+        if $pred {
+            $crate::Profiler::record($key, ($val).into());
+        }
+    }};
+}
+
+/// Add a numeric counter to the current span (aggregated by key).
+#[macro_export]
+macro_rules! counter {
+    ($key:literal, $delta:expr) => {{
+        $crate::Profiler::counter($key, $delta);
+    }};
+}
+
+/// Add a numeric counter to the current span (aggregated by key), when a predicate is true.
+#[macro_export]
+macro_rules! counter_if {
+    ($pred:expr, $key:literal, $delta:expr) => {{
+        if $pred {
+            $crate::Profiler::counter($key, $delta);
+        }
     }};
 }

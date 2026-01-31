@@ -1297,7 +1297,15 @@ impl ProfilerInsertContext<'_> {
                 }
             });
 
-            for row in staged_kvs {
+            let staged_counter_kvs = node.counters.iter().map(|c| StagedProfilerRecordKv {
+                profiler_record_id: record_id,
+                key: format!("counter:{}", c.key),
+                value_type_id: 1, // U64
+                value: c.value.to_string(),
+                count: 1,
+            });
+
+            for row in staged_kvs.chain(staged_counter_kvs) {
                 diesel::insert_into(schema::_staged_profiler_record_kv::table)
                     .values(row)
                     .on_conflict((

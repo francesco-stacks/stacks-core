@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
-use stacks_profiler::{Profiler, measure, record, span};
+use stacks_profiler::{Profiler, counter, measure, record, span};
 
 fn make_unique_tag(i: u64) -> String {
     // Unique each iteration -> always a miss in interner
@@ -406,9 +406,47 @@ fn bench_record(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_counter(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Profiler Counter Overhead");
+
+    // Counter overhead: no span (should be near-zero due to early return)
+    group.bench_function("counter_no_span", |b| {
+        b.iter(|| {
+            counter!("k", 1u64);
+            black_box(());
+        });
+    });
+
+    group.bench_function("counter_u64", |b| {
+        let mut c = 0u64;
+        b.iter(|| {
+            let _g = span!("counter_u64_span");
+            counter!("k", 1u64);
+            clear_every(&mut c, 1_000);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    group.bench_function("counter_1k_u64", |b| {
+        let mut c = 0u64;
+        b.iter(|| {
+            let _g = span!("counter_1k_u64_span");
+            for _ in 0..1000u64 {
+                counter!("k", 1u64);
+            }
+            clear_every(&mut c, 50);
+            black_box(());
+        });
+        Profiler::clear();
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_overhead, bench_10m_sampled_spans, bench_record
+    targets = bench_overhead, bench_10m_sampled_spans, bench_record, bench_counter
 }
 criterion_main!(benches);
