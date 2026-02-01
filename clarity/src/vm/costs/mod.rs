@@ -1225,6 +1225,11 @@ impl CostTracker for LimitedCostTracker {
                         && stacks_profiler::Profiler::is_record_enabled();
 
                     if capture {
+                        stacks_profiler::counter_if!(
+                            capture,
+                            "CIN",
+                            *input.first().unwrap_or(&0_u64)
+                        );
                         stacks_profiler::counter_if!(capture, "CR", cost.runtime);
                         stacks_profiler::counter_if!(capture, "CRC", cost.read_count);
                         stacks_profiler::counter_if!(capture, "CRL", cost.read_length);

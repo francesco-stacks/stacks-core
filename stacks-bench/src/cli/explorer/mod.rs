@@ -9,13 +9,12 @@ use clap::{Args, Subcommand};
 use crate::cli::common::CliContext;
 
 const EXPLORER_REL_PATH: &str = "tools/profiler-explorer";
-const VENV_DIR_NAME: &str = ".venv";
-const REQUIREMENTS_FILE: &str = "requirements.txt";
-const APP_FILE: &str = "app.py";
+const SERVER_FILE: &str = "server.js";
 const DIST_DIR_NAME: &str = "dist";
+const NODE_MODULES_DIR_NAME: &str = "node_modules";
 const PID_FILE_NAME: &str = "profiler-explorer.pid";
 const LOG_FILE_NAME: &str = "profiler-explorer.log";
-const SENTINEL_FILE_NAME: &str = ".requirements-installed";
+const SENTINEL_FILE_NAME: &str = ".node-deps-installed";
 
 #[derive(Args, Debug)]
 pub struct ExplorerArgs {
@@ -87,7 +86,7 @@ async fn start_explorer(ctx: &CliContext, args: &ExplorerStartArgs) -> Result<()
         build_ui(&explorer_root)?;
     }
     ensure_ui_build(&explorer_root)?;
-    ensure_venv(&explorer_root)?;
+    ensure_node_deps(&explorer_root)?;
 
     let pid_path = app_data.path().join(PID_FILE_NAME);
     if let Some(pid) = read_pid(&pid_path)? {
@@ -97,7 +96,6 @@ async fn start_explorer(ctx: &CliContext, args: &ExplorerStartArgs) -> Result<()
         let _ = fs::remove_file(&pid_path);
     }
 
-    let venv_python = venv_python(&explorer_root);
     let log_path = app_data.path().join(LOG_FILE_NAME);
     let log_file = OpenOptions::new()
         .create(true)
@@ -105,8 +103,8 @@ async fn start_explorer(ctx: &CliContext, args: &ExplorerStartArgs) -> Result<()
         .open(&log_path)
         .with_context(|| format!("Failed to open log file at {log_path:?}"))?;
 
-    let child = Command::new(&venv_python)
-        .arg(APP_FILE)
+    let child = Command::new("node")
+        .arg(SERVER_FILE)
         .arg("--db")
         .arg(&db_path)
         .arg("--port")
@@ -173,46 +171,31 @@ fn explorer_root() -> Result<PathBuf> {
     Ok(root)
 }
 
-fn venv_python(explorer_root: &Path) -> PathBuf {
-    explorer_root.join(VENV_DIR_NAME).join("bin").join("python")
-}
+fn ensure_node_deps(explorer_root: &Path) -> Result<()> {
+    let node_modules_dir = explorer_root.join(NODE_MODULES_DIR_NAME);
+    let package_json = explorer_root.join("package.json");
+    let sentinel = explorer_root.join(SENTINEL_FILE_NAME);
 
-fn ensure_venv(explorer_root: &Path) -> Result<()> {
-    let venv_dir = explorer_root.join(VENV_DIR_NAME);
-    let venv_python = venv_python(explorer_root);
-    let requirements = explorer_root.join(REQUIREMENTS_FILE);
-    let sentinel = venv_dir.join(SENTINEL_FILE_NAME);
-
-    if !venv_python.exists() {
-        Command::new("python3")
-            .arg("-m")
-            .arg("venv")
-            .arg(&venv_dir)
-            .current_dir(explorer_root)
-            .status()
-            .context("Failed to create python venv for profiler explorer")?;
-    }
-
-    let should_install = match (requirements.metadata(), sentinel.metadata()) {
-        (Ok(req_meta), Ok(sent_meta)) => {
-            let req_time = req_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let should_install = match (package_json.metadata(), sentinel.metadata()) {
+        (Ok(pkg_meta), Ok(sent_meta)) => {
+            let pkg_time = pkg_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let sent_time = sent_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            req_time > sent_time
+            pkg_time > sent_time
         }
         (Ok(_), Err(_)) => true,
         (Err(_), _) => false,
     };
 
-    if should_install {
-        Command::new(&venv_python)
-            .arg("-m")
-            .arg("pip")
+    if should_install || !node_modules_dir.exists() {
+        let status = Command::new("npm")
             .arg("install")
-            .arg("-r")
-            .arg(&requirements)
             .current_dir(explorer_root)
             .status()
-            .context("Failed to install profiler explorer dependencies")?;
+            .context("Failed to install profiler explorer Node dependencies")?;
+
+        if !status.success() {
+            bail!("npm install failed with status {:?}", status.code());
+        }
 
         File::create(&sentinel)
             .with_context(|| format!("Failed to write sentinel file at {sentinel:?}"))?;

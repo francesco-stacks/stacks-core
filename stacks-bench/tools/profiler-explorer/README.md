@@ -6,9 +6,7 @@ Lightweight single-page app for exploring profiler traces with a true tree view.
 
 ```bash
 cd stacks-bench/tools/profiler-explorer
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+npm install
 ```
 
 Install the UI dependencies (once):
@@ -27,7 +25,7 @@ npm run build
 ## Run
 
 ```bash
-python app.py --db /path/to/stacks-bench.db --port 8800
+node server.js --db /path/to/stacks-bench.db --port 8800
 ```
 
 Defaults:
@@ -44,7 +42,7 @@ cd stacks-bench/tools/profiler-explorer/web
 npm run dev
 ```
 
-This starts the Vite dev server on <http://127.0.0.1:5173/> and proxies `/api/*` to the Python backend on port 8800.
+This starts the Vite dev server on <http://127.0.0.1:5173/> and proxies `/api/*` to the Node backend on port 8800.
 
 ## Notes
 

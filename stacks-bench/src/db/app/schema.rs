@@ -279,6 +279,7 @@ table! {
         read_length -> BigInt,
         write_count -> BigInt,
         write_length -> BigInt,
+        input_n -> BigInt,
     }
 }
 
@@ -290,6 +291,7 @@ table! {
         read_length -> BigInt,
         write_count -> BigInt,
         write_length -> BigInt,
+        input_n -> BigInt,
     }
 }
 

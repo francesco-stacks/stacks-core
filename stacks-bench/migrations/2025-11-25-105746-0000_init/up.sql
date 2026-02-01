@@ -510,6 +510,7 @@ CREATE TABLE profiler_record_clarity_costs (
   read_length INTEGER NOT NULL,
   write_count INTEGER NOT NULL,
   write_length INTEGER NOT NULL,
+  input_n INTEGER NOT NULL,
 
   FOREIGN KEY (profiler_record_id) REFERENCES profiler_record(id) ON DELETE CASCADE
 ) WITHOUT ROWID;
@@ -524,6 +525,7 @@ CREATE TABLE _staged_profiler_record_clarity_costs (
   read_length INTEGER NOT NULL,
   write_count INTEGER NOT NULL,
   write_length INTEGER NOT NULL,
+  input_n INTEGER NOT NULL,
 
   PRIMARY KEY (profiler_record_id)
 ) WITHOUT ROWID;

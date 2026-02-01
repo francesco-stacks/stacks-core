@@ -361,6 +361,7 @@ pub struct ProfilerRecordClarityCosts {
     pub read_length: i64,
     pub write_count: i64,
     pub write_length: i64,
+    pub input_n: i64,
 }
 
 #[derive(Insertable, Debug, Clone)]
@@ -372,6 +373,7 @@ pub struct StagedProfilerRecordClarityCosts {
     pub read_length: i64,
     pub write_count: i64,
     pub write_length: i64,
+    pub input_n: i64,
 }
 
 #[derive(Insertable, Debug, Clone)]

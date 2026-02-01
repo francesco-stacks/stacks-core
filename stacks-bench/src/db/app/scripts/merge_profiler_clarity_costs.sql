@@ -9,7 +9,8 @@ SELECT
   SUM(read_count) AS read_count,
   SUM(read_length) AS read_length,
   SUM(write_count) AS write_count,
-  SUM(write_length) AS write_length
+  SUM(write_length) AS write_length,
+  SUM(input_n) AS input_n
 FROM _staged_profiler_record_clarity_costs
 GROUP BY profiler_record_id;
 
@@ -20,7 +21,8 @@ INSERT INTO profiler_record_clarity_costs (
   read_count,
   read_length,
   write_count,
-  write_length
+  write_length,
+  input_n
 )
 SELECT
   profiler_record_id,
@@ -28,7 +30,8 @@ SELECT
   read_count,
   read_length,
   write_count,
-  write_length
+  write_length,
+  input_n
 FROM _agg_profiler_clarity_costs
 WHERE 1
 ON CONFLICT (profiler_record_id) DO UPDATE SET
@@ -36,7 +39,8 @@ ON CONFLICT (profiler_record_id) DO UPDATE SET
   read_count = excluded.read_count,
   read_length = excluded.read_length,
   write_count = excluded.write_count,
-  write_length = excluded.write_length;
+  write_length = excluded.write_length,
+  input_n = excluded.input_n;
 
 DROP TABLE _agg_profiler_clarity_costs;
 

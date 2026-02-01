@@ -1,6 +1,29 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Grid } from "@svar-ui/react-grid";
 import { WillowDark } from "@svar-ui/react-core";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { Sun, Moon, RotateCcw, Settings, Loader2, Columns3, X } from "lucide-react";
 
 const DEFAULT_AUTO_EXPAND = {
   depth: 2,
@@ -16,6 +39,8 @@ const COLUMN_DEFS = [
     width: 360,
     flexgrow: 1,
     default: true,
+    selectable: false,
+    alwaysVisible: true,
     treetoggle: true,
   },
   {
@@ -190,10 +215,20 @@ const COLUMN_DEFS = [
     getter: (row) => row.clarity_runtime ?? "-",
   },
   {
+    key: "clarity_input_n",
+    label: "Input n",
+    width: 110,
+    default: false,
+    format: { decimals: 0 },
+    getter: (row) => row.clarity_input_n ?? "-",
+  },
+  {
     key: "record_id",
     label: "Record ID",
     width: 120,
     default: false,
+    selectable: false,
+    alwaysHidden: true,
     format: { decimals: 0 },
     getter: (row) => row.id,
   },
@@ -221,14 +256,38 @@ const NUMERIC_COLUMN_KEYS = new Set([
   "wait_total",
   "wait_avg",
   "clarity_runtime",
+  "clarity_input_n",
   "clarity_rw",
   "clarity_len",
   "record_id",
 ]);
 
-const COUNT_DIM_KEYS = new Set(["clarity_rw", "clarity_len", "clarity_runtime"]);
+const COUNT_DIM_KEYS = new Set([
+  "clarity_rw",
+  "clarity_len",
+  "clarity_runtime",
+  "clarity_input_n",
+]);
 
-const DEFAULT_COLUMNS = COLUMN_DEFS.filter((c) => c.default).map((c) => c.key);
+const ALWAYS_VISIBLE_KEYS = new Set(
+  COLUMN_DEFS.filter((c) => c.alwaysVisible).map((c) => c.key)
+);
+const ALWAYS_HIDDEN_KEYS = new Set(
+  COLUMN_DEFS.filter((c) => c.alwaysHidden).map((c) => c.key)
+);
+const SELECTABLE_COLUMNS = COLUMN_DEFS.filter((c) => c.selectable !== false);
+
+const DEFAULT_COLUMNS = COLUMN_DEFS.filter((c) => c.default)
+  .map((c) => c.key)
+  .filter((key) => !ALWAYS_HIDDEN_KEYS.has(key));
+
+const sanitizeSelectedColumns = (values) => {
+  const base = Array.isArray(values) ? values.filter((key) => !ALWAYS_HIDDEN_KEYS.has(key)) : [];
+  ALWAYS_VISIBLE_KEYS.forEach((key) => {
+    if (!base.includes(key)) base.push(key);
+  });
+  return base.length > 0 ? base : DEFAULT_COLUMNS;
+};
 
 function toMs(value) {
   if (value === null || value === undefined) return null;
@@ -771,48 +830,28 @@ function computeDefaultOpenSet(nodes) {
 }
 
 function ColumnDropdown({ columns, selected, onChange }) {
-  const [open, setOpen] = useState(false);
-  const toggleRef = useRef(null);
-
-  useEffect(() => {
-    const handleClick = (event) => {
-      if (!toggleRef.current) return;
-      if (!toggleRef.current.contains(event.target)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("click", handleClick);
-    return () => document.removeEventListener("click", handleClick);
-  }, []);
-
   return (
-    <div className="relative w-fit" ref={toggleRef}>
-      <button
-        type="button"
-        className="inline-flex min-w-[180px] items-center justify-between rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground shadow-sm transition hover:bg-accent/60"
-        onClick={() => setOpen(!open)}
-      >
-        Columns…
-      </button>
-      {open ? (
-        <div className="absolute left-0 top-full z-20 mt-2 max-h-80 min-w-[240px] overflow-auto rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-soft">
-          {columns.map((col) => (
-            <label
-              key={col.key}
-              className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-accent/60"
-            >
-              <input
-                className="h-4 w-4 accent-[var(--primary)]"
-                type="checkbox"
-                checked={selected.includes(col.key)}
-                onChange={() => onChange(col.key)}
-              />
-              <span className="text-foreground/90">{col.label}</span>
-            </label>
-          ))}
-        </div>
-      ) : null}
-    </div>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="sm" className="gap-2">
+          <Columns3 className="h-4 w-4" />
+          Columns
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="max-h-80 w-56 overflow-auto">
+        <DropdownMenuLabel>Visible Columns</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {columns.map((col) => (
+          <DropdownMenuCheckboxItem
+            key={col.key}
+            checked={selected.includes(col.key)}
+            onCheckedChange={() => onChange(col.key)}
+          >
+            {col.label}
+          </DropdownMenuCheckboxItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -1062,12 +1101,12 @@ export default function App() {
   });
   const [selectedColumns, setSelectedColumns] = useState(() => {
     const stored = localStorage.getItem("profilerColumns");
-    if (!stored) return DEFAULT_COLUMNS;
+    if (!stored) return sanitizeSelectedColumns(DEFAULT_COLUMNS);
     try {
       const parsed = JSON.parse(stored);
-      return Array.isArray(parsed) ? parsed : DEFAULT_COLUMNS;
+      return sanitizeSelectedColumns(parsed);
     } catch {
-      return DEFAULT_COLUMNS;
+      return sanitizeSelectedColumns(DEFAULT_COLUMNS);
     }
   });
   const [numberFormatId, setNumberFormatId] = useState(() => {
@@ -1083,6 +1122,15 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem("profilerTheme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === "dark") {
+      root.classList.add("dark");
+    } else {
+      root.classList.remove("dark");
+    }
   }, [theme]);
 
   const toggleTheme = useCallback(() => {
@@ -1426,10 +1474,13 @@ export default function App() {
       id: col.key,
       header: col.group
         ? buildGroupHeader(col)
-        : col.key === "clarity_rw" || col.key === "clarity_len" || col.key === "clarity_runtime"
+        : col.key === "clarity_rw" ||
+            col.key === "clarity_len" ||
+            col.key === "clarity_runtime" ||
+            col.key === "clarity_input_n"
           ? [
               col.key === "clarity_rw"
-                ? { text: "Clarity", colspan: 3, css: "grid-group-header" }
+                ? { text: "Clarity", colspan: 4, css: "grid-group-header" }
                 : { text: "", _hidden: true },
               col.heatKey ? buildHeatHeader(col) : { text: col.label },
             ]
@@ -1500,16 +1551,26 @@ export default function App() {
                 }
               : col.cell,
       getter: col.getter,
-      hidden: selectedColumns.includes(col.key) ? false : true,
+      hidden: col.alwaysHidden
+        ? true
+        : col.alwaysVisible
+          ? false
+          : selectedColumns.includes(col.key)
+            ? false
+            : true,
       resize: true,
     }));
   }, [selectedColumns, toggleChain, focusNode, buildHeatHeader, buildGroupHeader, getHeatBounds, numberFormat]);
 
   const toggleColumn = (key) => {
     setSelectedColumns((prev) => {
+      if (ALWAYS_VISIBLE_KEYS.has(key) || ALWAYS_HIDDEN_KEYS.has(key)) return prev;
+      const columnDef = COLUMN_DEFS.find((col) => col.key === key);
+      if (!columnDef || columnDef.selectable === false) return prev;
       const next = prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key];
-      localStorage.setItem("profilerColumns", JSON.stringify(next));
-      return next;
+      const sanitized = sanitizeSelectedColumns(next);
+      localStorage.setItem("profilerColumns", JSON.stringify(sanitized));
+      return sanitized;
     });
   };
 
@@ -1536,7 +1597,7 @@ export default function App() {
         stacksBlockId={stacksBlockId}
         setStacksBlockId={setStacksBlockId}
         blocks={blocks}
-        columns={COLUMN_DEFS}
+        columns={SELECTABLE_COLUMNS}
         selectedColumns={selectedColumns}
         toggleColumn={toggleColumn}
       />
@@ -1546,19 +1607,18 @@ export default function App() {
         <div className="header-left">
           <h1 className="header-title">Profiler Explorer</h1>
           <div className="header-divider" />
-          <div className="header-run-select">
-            <select
-              className="run-select"
-              value={runId}
-              onChange={(e) => setRunId(e.target.value)}
-            >
+          <Select value={runId} onValueChange={setRunId}>
+            <SelectTrigger className="w-[200px]">
+              <SelectValue placeholder="Select a run" />
+            </SelectTrigger>
+            <SelectContent>
               {runs.map((run) => (
-                <option key={run.id} value={run.id}>
+                <SelectItem key={run.id} value={String(run.id)}>
                   {run.run_name ? `${run.id} · ${run.run_name}` : `Run ${run.id}`}
-                </option>
+                </SelectItem>
               ))}
-            </select>
-          </div>
+            </SelectContent>
+          </Select>
         </div>
 
         <div className="header-center">
@@ -1586,16 +1646,14 @@ export default function App() {
                 <span className={`search-length ${txQuery.length === 64 ? "search-length-valid" : ""}`}>
                   {txQuery.length}/64
                 </span>
-                <button
-                  type="button"
-                  className="search-clear"
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6 mr-1"
                   onClick={() => setTxQuery("")}
-                  title="Clear search"
                 >
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M4 4l8 8M12 4l-8 8" />
-                  </svg>
-                </button>
+                  <X className="h-3 w-3" />
+                </Button>
               </>
             )}
           </div>
@@ -1605,62 +1663,52 @@ export default function App() {
           <div className="header-stats">
             <span className="stat-badge">{rows.length.toLocaleString()} rows</span>
           </div>
-          <button
-            type="button"
-            className="header-btn header-btn-secondary"
-            onClick={toggleTheme}
-            title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-          >
-            {theme === "dark" ? (
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-                <circle cx="8" cy="8" r="4" />
-                <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.5 3.5l1.5 1.5M11 11l1.5 1.5M3.5 12.5l1.5-1.5M11 5l1.5-1.5" />
-              </svg>
-            ) : (
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-                <path d="M13.5 8.5a5.5 5.5 0 1 1-6-6 4.5 4.5 0 0 0 6 6z" />
-              </svg>
-            )}
-          </button>
-          <button
-            type="button"
-            className="header-btn header-btn-secondary"
-            onClick={resetQuery}
-            title="Reset all filters"
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <path d="M2 2v5h5M14 14v-5h-5" />
-              <path d="M13.5 6A6 6 0 0 0 3 4l-1 1m12 6a6 6 0 0 1-10.5 2l-1-1" />
-            </svg>
-          </button>
-          <button
-            type="button"
-            className="header-btn header-btn-secondary"
-            onClick={() => setSettingsOpen(true)}
-            title="Settings"
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <path d="M6.86 1.01a1 1 0 0 1 .98.76l.29 1.16a5.5 5.5 0 0 1 1.3.75l1.13-.37a1 1 0 0 1 1.11.41l1.14 1.97a1 1 0 0 1-.14 1.17l-.84.8a5.5 5.5 0 0 1 0 1.5l.84.79a1 1 0 0 1 .14 1.17l-1.14 1.97a1 1 0 0 1-1.1.41l-1.14-.37a5.5 5.5 0 0 1-1.3.75l-.29 1.16a1 1 0 0 1-.97.76H5.14a1 1 0 0 1-.97-.76l-.3-1.16a5.5 5.5 0 0 1-1.29-.75l-1.14.37a1 1 0 0 1-1.1-.41L-.8 11.25a1 1 0 0 1 .14-1.17l.84-.8a5.5 5.5 0 0 1 0-1.49l-.84-.8A1 1 0 0 1-.8 5.82l1.14-1.97a1 1 0 0 1 1.1-.41l1.14.37a5.5 5.5 0 0 1 1.3-.75l.29-1.16a1 1 0 0 1 .97-.76h1.72z" transform="translate(2 2) scale(0.75)" />
-              <circle cx="8" cy="8" r="2" />
-            </svg>
-          </button>
-          <button
-            className={`header-btn header-btn-primary ${!isDirty || isLoading ? "header-btn-disabled" : ""}`}
-            onClick={loadTrace}
-            disabled={!isDirty || isLoading}
-          >
+          <TooltipProvider delayDuration={300}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="outline" size="icon" onClick={toggleTheme}>
+                  {theme === "dark" ? (
+                    <Sun className="h-4 w-4" />
+                  ) : (
+                    <Moon className="h-4 w-4" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          <TooltipProvider delayDuration={300}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="outline" size="icon" onClick={resetQuery}>
+                  <RotateCcw className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Reset all filters</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          <TooltipProvider delayDuration={300}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="outline" size="icon" onClick={() => setSettingsOpen(true)}>
+                  <Settings className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Settings</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          <Button onClick={loadTrace} disabled={!isDirty || isLoading}>
             {isLoading ? (
               <>
-                <svg className="animate-spin" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="8" cy="8" r="6" strokeOpacity="0.3" />
-                  <path d="M8 2a6 6 0 0 1 6 6" />
-                </svg>
+                <Loader2 className="h-4 w-4 animate-spin" />
                 Loading...
               </>
             ) : (
               "Load Trace"
             )}
-          </button>
+          </Button>
         </div>
       </header>
 
@@ -1668,7 +1716,7 @@ export default function App() {
       <div className="app-toolbar">
         <div className="toolbar-left">
           <ColumnDropdown
-            columns={COLUMN_DEFS}
+            columns={SELECTABLE_COLUMNS}
             selected={selectedColumns}
             onChange={toggleColumn}
           />
@@ -1676,33 +1724,34 @@ export default function App() {
           <div className="toolbar-group">
             <span className="toolbar-label">Depth:</span>
             {[2, 4, 6].map((depth) => (
-              <button
+              <Button
                 key={depth}
-                type="button"
-                className="toolbar-btn"
+                variant="outline"
+                size="sm"
                 onClick={() => expandToDepth(depth)}
                 disabled={hotPathMode !== "off"}
               >
                 {depth}
-              </button>
+              </Button>
             ))}
           </div>
-          <button
-            type="button"
-            className="toolbar-btn"
+          <Button
+            variant="outline"
+            size="sm"
             onClick={collapseSiblings}
             disabled={!activeId}
           >
             Collapse siblings
-          </button>
+          </Button>
           {focusId && (
-            <button
-              type="button"
-              className="toolbar-btn toolbar-btn-accent"
+            <Button
+              variant="outline"
+              size="sm"
               onClick={clearFocus}
+              className="border-primary text-primary hover:bg-primary/10"
             >
               Clear focus
-            </button>
+            </Button>
           )}
         </div>
         <div className="toolbar-right">

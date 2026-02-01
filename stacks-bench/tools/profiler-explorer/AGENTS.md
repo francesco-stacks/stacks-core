@@ -2,16 +2,41 @@
 
 This document provides context for AI agents working with the Stacks Bench Profiler Explorer codebase.
 
+## AI Guidelines
+
+### Context discipline
+
+- Do not read or paste full files unless explicitly necessary.
+- When reading a file, read only the smallest relevant region (function/impl/module), ideally ≤ 200 lines.
+- Prefer rg/symbol search first; open files only after narrowing to a target.
+- When showing code, quote only the minimal snippet required to justify a change.
+
+### Log discipline
+
+- Never include full build/test logs in the conversation.
+- Summarize failures in ≤ 10 bullets and include only the last ~200 lines (or less) of relevant output.
+
+### Diff discipline
+
+- Avoid repeating large diffs in chat. Summarize changes and reference filenames + key functions instead.
+
+### Code Review Discipline
+
+Use a two-pass review and only escalate when needed:
+
+1. Pass 1: Scan the diff only. Flag high-risk issues, invariants violated, and questions. Do not open additional files unless you see a red flag.
+2. Pass 2: Now open only the specific functions/modules you flagged and do a deep review.
+
 ## Overview
 
 The Profiler Explorer is a web-based tool for visualizing and analyzing profiler traces from Stacks Bench benchmark runs. It displays hierarchical call trees with timing metrics (wall time, CPU time, wait time), Clarity VM costs, and key-value operation counts.
 
 ## Architecture
 
-```
+```text
 profiler-explorer/
-├── app.py                    # Flask REST API backend
-├── requirements.txt          # Python dependencies
+├── server.js                 # Node/Express REST API backend
+├── package.json              # Node dependencies/scripts
 ├── static/                   # Vanilla JS fallback UI
 │   ├── index.html
 │   ├── app.js
@@ -28,16 +53,16 @@ profiler-explorer/
 
 ### Technology Stack
 
-- **Backend**: Python 3, Flask 3.0.2, SQLite3
-- **Frontend**: React 18, Vite 5, Tailwind CSS 3.4, @svar-ui/react-grid
+- **Backend**: Node.js, Express, better-sqlite3
+- **Frontend**: React 18, Vite 5, Tailwind CSS 3.4, shadcn/ui, @svar-ui/react-grid
 - **Database**: SQLite (located at `~/.stacks-bench/appdata/stacks-bench.db` or via `STACKS_BENCH_DB` env var)
 
-## Backend API (`app.py`)
+## Backend API (`server.js`)
 
 ### Endpoints
 
 | Endpoint | Purpose |
-|----------|---------|
+| ---------- | --------- |
 | `GET /api/runs` | List benchmark runs (latest 200) |
 | `GET /api/blocks?run_id=N` | List blocks in a run |
 | `GET /api/txs?run_id=N&q=prefix` | List/search transactions |
@@ -55,6 +80,7 @@ profiler-explorer/
 ### SQL Query Patterns
 
 The backend uses recursive CTEs to build ancestor/descendant trees:
+
 - Walk up parent chain from seed nodes
 - Walk down child chain from seed nodes
 - Union both for complete trace
@@ -107,6 +133,7 @@ rows (records array), summary (status text)
 ### Column System
 
 18 columns defined in `COLUMN_DEFS`:
+
 - Span (tree toggle + flame bar + name)
 - Calls, Wall Time (Total/Avg), Busy Time (Total/Avg), Wait Time (Total)
 - Samples, KV Operations
@@ -117,6 +144,7 @@ Each column has: `key`, `label`, `width`, `default`, `getter`, `format`, `heatKe
 ### Heat Map System
 
 Per-metric configuration with:
+
 - Enable/disable toggle
 - Auto-calculated or custom min/max bounds
 - Alpha gradient (5-27% opacity)
@@ -136,8 +164,8 @@ Heat keys: `wallTotalUs`, `selfWallUs`, `busyTotalUs`, `selfBusyUs`, `waitTotalU
 ```bash
 # Backend
 cd stacks-bench/tools/profiler-explorer
-pip install -r requirements.txt
-python app.py  # Starts on port 8800
+npm install
+node server.js  # Starts on port 8800
 
 # Frontend (development)
 cd web
@@ -164,7 +192,7 @@ npm run build  # Outputs to dist/
 
 ### Adding a New API Endpoint
 
-1. Add route in `app.py` with `@app.route()`
+1. Add route in `server.js` with `app.get()`
 2. Use parameterized SQL queries (never string interpolation)
 3. Return JSON with appropriate error handling
 

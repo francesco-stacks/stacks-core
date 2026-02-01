@@ -1320,6 +1320,7 @@ impl ProfilerInsertContext<'_> {
             let mut clarity_costs_read_length: i64 = 0;
             let mut clarity_costs_write_count: i64 = 0;
             let mut clarity_costs_write_length: i64 = 0;
+            let mut clarity_costs_input_n: i64 = 0;
             let mut has_clarity_costs = false;
 
             let staged_counter_kvs = node.counters.iter().filter_map(|c| {
@@ -1337,6 +1338,11 @@ impl ProfilerInsertContext<'_> {
                     "CRL" => {
                         has_clarity_costs = true;
                         clarity_costs_read_length = c.value as i64;
+                        None
+                    }
+                    "CIN" => {
+                        has_clarity_costs = true;
+                        clarity_costs_input_n = c.value as i64;
                         None
                     }
                     "CWC" => {
@@ -1395,6 +1401,8 @@ impl ProfilerInsertContext<'_> {
                             .eq(clarity_costs_write_count),
                         schema::_staged_profiler_record_clarity_costs::write_length
                             .eq(clarity_costs_write_length),
+                        schema::_staged_profiler_record_clarity_costs::input_n
+                            .eq(clarity_costs_input_n),
                     ))
                     .on_conflict(schema::_staged_profiler_record_clarity_costs::profiler_record_id)
                     .do_update()
@@ -1409,6 +1417,8 @@ impl ProfilerInsertContext<'_> {
                             .eq(clarity_costs_write_count),
                         schema::_staged_profiler_record_clarity_costs::write_length
                             .eq(clarity_costs_write_length),
+                        schema::_staged_profiler_record_clarity_costs::input_n
+                            .eq(clarity_costs_input_n),
                     ))
                     .execute(conn)
                     .await
