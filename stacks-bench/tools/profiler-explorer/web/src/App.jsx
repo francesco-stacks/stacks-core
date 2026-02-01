@@ -95,6 +95,7 @@ export default function App() {
     return localStorage.getItem("profilerThemePreset") || "default";
   });
   const [isLoading, setIsLoading] = useState(false);
+  const abortControllerRef = useRef(null);
   const [lastLoadedQuery, setLastLoadedQuery] = useState(null);
   const [heatConfig, setHeatConfig] = useState(() => {
     const stored = localStorage.getItem("profilerHeatConfig");
@@ -279,6 +280,15 @@ export default function App() {
 
   const loadTrace = useCallback(async () => {
     if (!runId) return;
+    
+    // Cancel any existing request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    
     const url = new URL("/api/trace", window.location.origin);
     url.searchParams.set("run_id", runId);
     url.searchParams.set("mode", mode);
@@ -289,30 +299,54 @@ export default function App() {
     if (mode === "run") {
       if (stacksBlockId) url.searchParams.set("stacks_block_id", stacksBlockId);
       if (segmentRootId) url.searchParams.set("segment_root_id", segmentRootId);
-      if (minWallMs) url.searchParams.set("min_wall_ms", minWallMs);
     }
+    // Apply minWallMs filter in both modes
+    if (minWallMs) url.searchParams.set("min_wall_ms", minWallMs);
 
+    // Clear data immediately when starting a new search
+    setRows([]);
     setSummary("Loading trace...");
     setIsLoading(true);
     try {
-      const data = await fetchJson(url.toString());
+      const response = await fetch(url.toString(), { signal: controller.signal });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const data = await response.json();
       setRows(data);
-      setSummary(`${data.length} records loaded.`);
+      if (data.length === 0) {
+        setSummary("No data found.");
+      } else {
+        setSummary(`${data.length} records loaded.`);
+      }
+      setLastLoadedQuery({
+        runId,
+        mode,
+        txQuery,
+        stacksTxId,
+        stacksBlockId,
+        segmentRootId,
+        minWallMs,
+        limit,
+        hotPathMode,
+      });
+    } catch (err) {
+      if (err.name === "AbortError") {
+        setSummary("Request cancelled.");
+      } else {
+        setSummary(`Error: ${err.message}`);
+      }
     } finally {
       setIsLoading(false);
+      abortControllerRef.current = null;
     }
-    setLastLoadedQuery({
-      runId,
-      mode,
-      txQuery,
-      stacksTxId,
-      stacksBlockId,
-      segmentRootId,
-      minWallMs,
-      limit,
-      hotPathMode,
-    });
   }, [runId, mode, limit, stacksTxId, stacksBlockId, segmentRootId, minWallMs, txQuery, hotPathMode]);
+
+  const cancelLoad = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+  }, []);
 
   const isDirty = useMemo(() => {
     if (!lastLoadedQuery) return true;
@@ -785,6 +819,25 @@ export default function App() {
     });
   };
 
+  const toggleColumnGroup = (keys, enable) => {
+    setSelectedColumns((prev) => {
+      let next = [...prev];
+      for (const key of keys) {
+        if (ALWAYS_VISIBLE_KEYS.has(key) || ALWAYS_HIDDEN_KEYS.has(key)) continue;
+        const columnDef = COLUMN_DEFS.find((col) => col.key === key);
+        if (!columnDef || columnDef.selectable === false) continue;
+        if (enable && !next.includes(key)) {
+          next.push(key);
+        } else if (!enable && next.includes(key)) {
+          next = next.filter((k) => k !== key);
+        }
+      }
+      const sanitized = sanitizeSelectedColumns(next);
+      localStorage.setItem("profilerColumns", JSON.stringify(sanitized));
+      return sanitized;
+    });
+  };
+
   return (
     <div className={`app-container ${theme}`}>
       {/* Settings Panel */}
@@ -810,9 +863,6 @@ export default function App() {
         stacksBlockId={stacksBlockId}
         setStacksBlockId={setStacksBlockId}
         blocks={blocks}
-        columns={SELECTABLE_COLUMNS}
-        selectedColumns={selectedColumns}
-        toggleColumn={toggleColumn}
         numberFormats={NUMBER_FORMATS}
         themePresets={THEME_PRESETS}
       />
@@ -831,6 +881,7 @@ export default function App() {
         resetQuery={resetQuery}
         onOpenSettings={() => setSettingsOpen(true)}
         loadTrace={loadTrace}
+        cancelLoad={cancelLoad}
         isDirty={isDirty}
         isLoading={isLoading}
       />
@@ -840,8 +891,12 @@ export default function App() {
         columns={SELECTABLE_COLUMNS}
         selectedColumns={selectedColumns}
         toggleColumn={toggleColumn}
+        toggleColumnGroup={toggleColumnGroup}
         expandToDepth={expandToDepth}
         hotPathMode={hotPathMode}
+        setHotPathMode={setHotPathMode}
+        chainCompression={chainCompression}
+        setChainCompression={setChainCompression}
         collapseSiblings={collapseSiblings}
         activeId={activeId}
         focusId={focusId}
@@ -858,6 +913,8 @@ export default function App() {
         columns={visibleColumns}
         spanVizEnabled={spanVizConfig.enabled}
         spanVizStyle={spanVizConfig.style}
+        isLoading={isLoading}
+        isEmpty={rows.length === 0 && !isLoading}
         rowStyle={() => "profiler-row"}
         columnStyle={(column) =>
           NUMERIC_COLUMN_KEYS.has(column.id)

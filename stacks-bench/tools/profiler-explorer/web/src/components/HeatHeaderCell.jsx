@@ -1,4 +1,54 @@
-import React from "react";
+import React, { useState, useEffect } from "react";
+
+// Settings cog icon (Heroicons style)
+function SettingsIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M10 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
+      <path d="M16.4 12.7a1.2 1.2 0 0 0 .2 1.3l.1.1a1.5 1.5 0 0 1-1 2.6 1.5 1.5 0 0 1-1.1-.5l-.1-.1a1.2 1.2 0 0 0-1.3-.2 1.2 1.2 0 0 0-.7 1.1v.2a1.5 1.5 0 1 1-3 0v-.1a1.2 1.2 0 0 0-.8-1.1 1.2 1.2 0 0 0-1.3.2l-.1.1a1.5 1.5 0 1 1-2.1-2.1l.1-.1a1.2 1.2 0 0 0 .2-1.3 1.2 1.2 0 0 0-1.1-.7h-.2a1.5 1.5 0 1 1 0-3h.1a1.2 1.2 0 0 0 1.1-.8 1.2 1.2 0 0 0-.2-1.3l-.1-.1a1.5 1.5 0 1 1 2.1-2.1l.1.1a1.2 1.2 0 0 0 1.3.2h.1a1.2 1.2 0 0 0 .7-1.1v-.2a1.5 1.5 0 0 1 3 0v.1a1.2 1.2 0 0 0 .7 1.1 1.2 1.2 0 0 0 1.3-.2l.1-.1a1.5 1.5 0 1 1 2.1 2.1l-.1.1a1.2 1.2 0 0 0-.2 1.3v.1a1.2 1.2 0 0 0 1.1.7h.2a1.5 1.5 0 0 1 0 3h-.1a1.2 1.2 0 0 0-1.1.7Z" />
+    </svg>
+  );
+}
+
+// Local input that commits on blur or Enter
+function DeferredInput({ value, onChange, ...props }) {
+  const [localValue, setLocalValue] = useState(value ?? "");
+  
+  useEffect(() => {
+    setLocalValue(value ?? "");
+  }, [value]);
+  
+  const commit = () => {
+    if (localValue !== (value ?? "")) {
+      onChange(localValue);
+    }
+  };
+  
+  return (
+    <input
+      {...props}
+      value={localValue}
+      onChange={(e) => setLocalValue(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          commit();
+          e.target.blur();
+        }
+      }}
+    />
+  );
+}
 
 export default function HeatHeaderCell({
   column,
@@ -20,94 +70,121 @@ export default function HeatHeaderCell({
   const heatKey = column.heatKey;
   const isOpen = openId === column.id;
   if (!heatKey) {
-    return <div className="heat-header">{cell.text}</div>;
+    return <div className="column-header">{cell.text}</div>;
   }
   const config = heatConfig[heatKey] || { enabled: true, min: null, max: null };
   return (
-    <div className="heat-header">
-      <span>{cell.text}</span>
+    <div className="column-header">
+      <span className="column-header-label">{cell.text}</span>
       <button
         type="button"
-        className="heat-header-btn"
+        className="column-header-btn"
         onClick={(event) => {
           event.stopPropagation();
           setOpenId(isOpen ? null : column.id);
         }}
+        aria-label="Column settings"
+        aria-expanded={isOpen}
       >
-        ⚙
+        <SettingsIcon />
       </button>
-      {isOpen ? (
+      {isOpen && (
         <div
-          className="heat-menu"
-          onClick={(event) => {
-            event.stopPropagation();
-          }}
+          className="column-popover"
+          onClick={(event) => event.stopPropagation()}
         >
-          <label>
-            <input
-              type="checkbox"
-              checked={config.enabled}
-              onChange={() => onToggle(heatKey)}
-            />
-            Heatmap enabled
-          </label>
-          <label>
-            Min
-            <input
-              type="number"
-              placeholder="auto"
-              value={config.min ?? ""}
-              onChange={(event) => onMinChange(heatKey, event.target.value)}
-            />
-          </label>
-          <label>
-            Max
-            <input
-              type="number"
-              placeholder="auto"
-              value={config.max ?? ""}
-              onChange={(event) => onMaxChange(heatKey, event.target.value)}
-            />
-          </label>
-          <label>
-            Heat Style
-            <select
-              className="heat-style-select"
-              value={heatStyle}
-              onChange={(event) => setHeatStyle(heatKey, event.target.value)}
-            >
-              <option value="fill">Fill</option>
-              <option value="edge">Edge</option>
-              <option value="meter">Meter</option>
-            </select>
-          </label>
-          <label>
-            Heat Color
-            <select
-              className="heat-style-select"
-              value={heatColor}
-              onChange={(event) => setHeatColor(heatKey, event.target.value)}
-            >
-              {heatColorOptions.map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          {column.id === "wall_total" ? (
-            <label>
-              Min (table ms)
+          <div className="column-popover-section">
+            <label className="column-popover-toggle">
               <input
-                type="number"
-                placeholder="off"
-                value={minWallFilterMs}
-                onChange={(event) => setMinWallFilterMs(event.target.value)}
+                type="checkbox"
+                checked={config.enabled}
+                onChange={() => onToggle(heatKey)}
               />
+              <span>Heatmap enabled</span>
             </label>
-          ) : null}
+          </div>
+
+          <div className="column-popover-divider" />
+
+          <div className="column-popover-section">
+            <div className="column-popover-row">
+              <label className="column-popover-label">Min</label>
+              <DeferredInput
+                type="number"
+                className="column-popover-input"
+                placeholder="auto"
+                value={config.min}
+                onChange={(val) => onMinChange(heatKey, val)}
+              />
+            </div>
+            <div className="column-popover-row">
+              <label className="column-popover-label">Max</label>
+              <DeferredInput
+                type="number"
+                className="column-popover-input"
+                placeholder="auto"
+                value={config.max}
+                onChange={(val) => onMaxChange(heatKey, val)}
+              />
+            </div>
+          </div>
+
+          <div className="column-popover-divider" />
+
+          <div className="column-popover-section">
+            <div className="column-popover-row">
+              <label className="column-popover-label">Style</label>
+              <select
+                className="column-popover-select"
+                value={heatStyle}
+                onChange={(event) => setHeatStyle(heatKey, event.target.value)}
+              >
+                <option value="fill">Fill</option>
+                <option value="edge">Edge</option>
+                <option value="meter">Meter</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="column-popover-divider" />
+
+          <div className="column-popover-section">
+            <div className="column-popover-row-start">
+              <label className="column-popover-label">Color</label>
+              <div className="color-swatch-grid">
+                {heatColorOptions.map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    className={`color-swatch color-swatch-${option.id} ${heatColor === option.id ? "color-swatch-selected" : ""}`}
+                    onClick={() => setHeatColor(heatKey, option.id)}
+                    aria-label={option.label}
+                    title={option.label}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {column.id === "wall_total" && (
+            <>
+              <div className="column-popover-divider" />
+              <div className="column-popover-section">
+                <div className="column-popover-row">
+                  <label className="column-popover-label">Min (ms)</label>
+                  <DeferredInput
+                    type="number"
+                    className="column-popover-input"
+                    placeholder="off"
+                    value={minWallFilterMs}
+                    onChange={(val) => setMinWallFilterMs(val)}
+                  />
+                </div>
+              </div>
+            </>
+          )}
         </div>
-      ) : null}
+      )}
     </div>
   );
 }

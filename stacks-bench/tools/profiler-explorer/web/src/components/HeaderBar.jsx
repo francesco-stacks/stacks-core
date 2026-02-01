@@ -13,7 +13,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { Sun, Moon, RotateCcw, Settings, Loader2, X } from "lucide-react";
+import { Sun, Moon, RotateCcw, Settings, Loader2, X, Square } from "lucide-react";
 
 export default function HeaderBar({
   runs,
@@ -28,9 +28,19 @@ export default function HeaderBar({
   resetQuery,
   onOpenSettings,
   loadTrace,
+  cancelLoad,
   isDirty,
   isLoading,
 }) {
+  const canSearch = txQuery.length === 64 && /^[0-9a-fA-F]{64}$/.test(txQuery);
+  
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && canSearch) {
+      e.preventDefault();
+      loadTrace();
+    }
+  };
+  
   return (
     <header className="app-header">
       <div className="header-left">
@@ -80,6 +90,7 @@ export default function HeaderBar({
                 setTxQuery(value);
               }
             }}
+            onKeyDown={handleKeyDown}
             placeholder={
               mode === "tx" ? "Enter transaction hash (64 hex chars)..." : "Search..."
             }
@@ -146,16 +157,16 @@ export default function HeaderBar({
             <TooltipContent>Settings</TooltipContent>
           </Tooltip>
         </TooltipProvider>
-        <Button onClick={loadTrace} disabled={!isDirty || isLoading}>
-          {isLoading ? (
-            <>
-              <Loader2 className="h-4 w-4 animate-spin" />
-              Loading...
-            </>
-          ) : (
-            "Load Trace"
-          )}
-        </Button>
+        {isLoading ? (
+          <Button variant="destructive" onClick={cancelLoad}>
+            <Square className="h-4 w-4 mr-2" />
+            Cancel
+          </Button>
+        ) : (
+          <Button onClick={loadTrace} disabled={!isDirty}>
+            Load Trace
+          </Button>
+        )}
       </div>
     </header>
   );

@@ -20,8 +20,11 @@ export const HEAT_COLOR_OPTIONS = [
   { id: "orange", label: "Orange" },
   { id: "amber", label: "Amber" },
   { id: "green", label: "Green" },
+  { id: "teal", label: "Teal" },
+  { id: "cyan", label: "Cyan" },
   { id: "blue", label: "Blue" },
   { id: "purple", label: "Purple" },
+  { id: "pink", label: "Pink" },
   { id: "gray", label: "Gray" },
 ];
 

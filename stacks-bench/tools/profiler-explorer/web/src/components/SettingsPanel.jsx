@@ -22,9 +22,6 @@ export default function SettingsPanel({
   stacksBlockId,
   setStacksBlockId,
   blocks,
-  columns,
-  selectedColumns,
-  toggleColumn,
   numberFormats,
   themePresets,
 }) {
@@ -198,22 +195,6 @@ export default function SettingsPanel({
               />
               <span>Compress linear chains</span>
             </label>
-          </div>
-
-          <div className="settings-section">
-            <h3 className="settings-section-title">Visible Columns</h3>
-            <div className="settings-columns-grid">
-              {columns.map((col) => (
-                <label key={col.key} className="settings-checkbox">
-                  <input
-                    type="checkbox"
-                    checked={selectedColumns.includes(col.key)}
-                    onChange={() => toggleColumn(col.key)}
-                  />
-                  <span>{col.label}</span>
-                </label>
-              ))}
-            </div>
           </div>
         </div>
       </div>
