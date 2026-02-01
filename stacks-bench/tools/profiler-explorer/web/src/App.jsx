@@ -242,6 +242,13 @@ const NUMBER_FORMATS = [
 
 const DEFAULT_NUMBER_FORMAT_ID = "comma-dot";
 
+const THEME_PRESETS = [
+  { id: "default", label: "Default" },
+  { id: "ocean", label: "Ocean" },
+  { id: "grape", label: "Grape" },
+  { id: "ember", label: "Ember" },
+];
+
 const NUMERIC_COLUMN_KEYS = new Set([
   "calls",
   "samples",
@@ -519,6 +526,8 @@ function HeatHeaderCell({
   setOpenId,
   heatStyle,
   setHeatStyle,
+  minWallFilterMs,
+  setMinWallFilterMs,
 }) {
   const heatKey = column.heatKey;
   const isOpen = openId === column.id;
@@ -584,6 +593,17 @@ function HeatHeaderCell({
               <option value="meter">Meter</option>
             </select>
           </label>
+          {column.id === "wall_total" ? (
+            <label>
+              Min (table ms)
+              <input
+                type="number"
+                placeholder="off"
+                value={minWallFilterMs}
+                onChange={(event) => setMinWallFilterMs(event.target.value)}
+              />
+            </label>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -991,6 +1011,8 @@ function SettingsPanel({
   setChainCompression,
   numberFormatId,
   setNumberFormatId,
+  themePreset,
+  setThemePreset,
   segmentRootId,
   setSegmentRootId,
   stacksBlockId,
@@ -1143,6 +1165,20 @@ function SettingsPanel({
                 ))}
               </select>
             </div>
+            <div className="settings-field">
+              <label className="settings-label">Theme</label>
+              <select
+                className="settings-input"
+                value={themePreset}
+                onChange={(e) => setThemePreset(e.target.value)}
+              >
+                {THEME_PRESETS.map((preset) => (
+                  <option key={preset.id} value={preset.id}>
+                    {preset.label}
+                  </option>
+                ))}
+              </select>
+            </div>
             <label className="settings-checkbox">
               <input
                 type="checkbox"
@@ -1198,6 +1234,12 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setTheme] = useState(() => {
     return localStorage.getItem("profilerTheme") || "dark";
+  });
+  const [minWallFilterMs, setMinWallFilterMs] = useState(() => {
+    return localStorage.getItem("profilerWallMinFilterMs") || "";
+  });
+  const [themePreset, setThemePreset] = useState(() => {
+    return localStorage.getItem("profilerThemePreset") || "default";
   });
   const [isLoading, setIsLoading] = useState(false);
   const [lastLoadedQuery, setLastLoadedQuery] = useState(null);
@@ -1261,6 +1303,14 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
+    localStorage.setItem("profilerWallMinFilterMs", minWallFilterMs);
+  }, [minWallFilterMs]);
+
+  useEffect(() => {
+    localStorage.setItem("profilerThemePreset", themePreset);
+  }, [themePreset]);
+
+  useEffect(() => {
     const root = document.documentElement;
     if (theme === "dark") {
       root.classList.add("dark");
@@ -1268,6 +1318,15 @@ export default function App() {
       root.classList.remove("dark");
     }
   }, [theme]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (themePreset === "default") {
+      root.removeAttribute("data-theme");
+    } else {
+      root.setAttribute("data-theme", themePreset);
+    }
+  }, [themePreset]);
 
   const toggleTheme = useCallback(() => {
     setTheme((prev) => (prev === "dark" ? "light" : "dark"));
@@ -1384,6 +1443,7 @@ export default function App() {
     setStacksBlockId("");
     setSegmentRootId("");
     setMinWallMs("");
+    setMinWallFilterMs("");
     setLimit("5000");
     setHotPathMode("off");
     setChainCompression(true);
@@ -1406,11 +1466,14 @@ export default function App() {
 
   const baseTree = useMemo(() => buildTreeIndex(baseRows), [baseRows]);
 
-  const minWallUs = useMemo(() => (minWallMs ? Number(minWallMs) * 1000 : null), [minWallMs]);
+  const minWallFilterUs = useMemo(
+    () => (minWallFilterMs ? Number(minWallFilterMs) * 1000 : null),
+    [minWallFilterMs]
+  );
 
   const prunedRoots = useMemo(
-    () => pruneTree(baseTree.roots, minWallUs),
-    [baseTree.roots, minWallUs]
+    () => pruneTree(baseTree.roots, minWallFilterUs),
+    [baseTree.roots, minWallFilterUs]
   );
 
   const prunedById = useMemo(() => indexTree(prunedRoots), [prunedRoots]);
@@ -1576,7 +1639,7 @@ export default function App() {
 
   useEffect(() => {
     setOpenNodes(computeDefaultOpenSet(focusedTree.roots));
-  }, [rows, focusId, minWallMs, focusedTree.roots]);
+  }, [rows, focusId, minWallFilterMs, focusedTree.roots]);
 
   const toggleChain = useCallback((rowId) => {
     setExpandedChains((prev) => {
@@ -1647,10 +1710,20 @@ export default function App() {
           setOpenId={setHeatMenuOpenId}
           heatStyle={heatStyle}
           setHeatStyle={setHeatStyle}
+          minWallFilterMs={minWallFilterMs}
+          setMinWallFilterMs={setMinWallFilterMs}
         />
       ),
     }),
-    [heatConfig, heatMenuOpenId, heatStyle, setHeatMax, setHeatMin, toggleHeat]
+    [
+      heatConfig,
+      heatMenuOpenId,
+      heatStyle,
+      minWallFilterMs,
+      setHeatMax,
+      setHeatMin,
+      toggleHeat,
+    ]
   );
 
   const buildSpanHeader = useCallback(
@@ -1812,6 +1885,8 @@ export default function App() {
         setChainCompression={setChainCompression}
         numberFormatId={numberFormatId}
         setNumberFormatId={setNumberFormatId}
+        themePreset={themePreset}
+        setThemePreset={setThemePreset}
         segmentRootId={segmentRootId}
         setSegmentRootId={setSegmentRootId}
         stacksBlockId={stacksBlockId}
