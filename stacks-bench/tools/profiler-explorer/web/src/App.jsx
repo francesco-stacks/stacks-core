@@ -590,6 +590,89 @@ function HeatHeaderCell({
   );
 }
 
+const SPAN_VIZ_METRICS = [
+  { key: "wallTotalUs", label: "Wall Total" },
+  { key: "selfWallUs", label: "Wall Self" },
+  { key: "busyTotalUs", label: "Busy Total" },
+  { key: "selfBusyUs", label: "Busy Self" },
+  { key: "waitTotalUs", label: "Wait Total" },
+  { key: "selfWaitUs", label: "Wait Self" },
+  { key: "clarityRuntime", label: "Clarity Runtime" },
+];
+
+function SpanHeaderCell({
+  cell,
+  spanVizConfig,
+  setSpanVizConfig,
+  isOpen,
+  setIsOpen,
+}) {
+  return (
+    <div className="span-header">
+      <span>{cell.text}</span>
+      <button
+        type="button"
+        className="span-header-btn"
+        onClick={(event) => {
+          event.stopPropagation();
+          setIsOpen(!isOpen);
+        }}
+      >
+        ⚙
+      </button>
+      {isOpen ? (
+        <div
+          className="span-viz-menu"
+          onClick={(event) => {
+            event.stopPropagation();
+          }}
+        >
+          <label>
+            <input
+              type="checkbox"
+              checked={spanVizConfig.enabled}
+              onChange={() =>
+                setSpanVizConfig((prev) => ({ ...prev, enabled: !prev.enabled }))
+              }
+            />
+            Show Span Viz
+          </label>
+          <label>
+            Style
+            <select
+              className="span-viz-select"
+              value={spanVizConfig.style}
+              onChange={(event) =>
+                setSpanVizConfig((prev) => ({ ...prev, style: event.target.value }))
+              }
+            >
+              <option value="fill">Fill</option>
+              <option value="edge">Edge</option>
+              <option value="meter">Meter</option>
+            </select>
+          </label>
+          <label>
+            Metric
+            <select
+              className="span-viz-select"
+              value={spanVizConfig.metric}
+              onChange={(event) =>
+                setSpanVizConfig((prev) => ({ ...prev, metric: event.target.value }))
+              }
+            >
+              {SPAN_VIZ_METRICS.map((m) => (
+                <option key={m.key} value={m.key}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function fetchJson(url) {
   return fetch(url).then((res) => {
     if (!res.ok) {
@@ -601,7 +684,8 @@ function fetchJson(url) {
   });
 }
 
-function SpanCell({ row, onToggleChain, onFocus }) {
+function SpanCell({ row, onToggleChain, onFocus, spanVizConfig, getSpanVizValue }) {
+  const cellRef = useRef(null);
   const percent = row.flame_percent ?? 0;
   const label = row.chain_label ?? row.span_name ?? "-";
   const chainCount = row.chain_count ?? 0;
@@ -617,17 +701,28 @@ function SpanCell({ row, onToggleChain, onFocus }) {
     tooltipLines.push(`1. ${prefix}${row.span_name}`);
   }
   const tooltip = tooltipLines.join("\n");
+
+  // Compute span viz severity and set CSS vars on parent .wx-cell
+  useEffect(() => {
+    if (!cellRef.current) return;
+    const wxCell = cellRef.current.closest(".wx-cell");
+    if (!wxCell) return;
+
+    if (!spanVizConfig?.enabled) {
+      wxCell.style.setProperty("--span-viz-width", "0");
+      wxCell.style.setProperty("--span-viz-alpha", "0");
+      return;
+    }
+
+    const { level, pct } = getSpanVizValue?.(row) ?? { level: 0, pct: 0 };
+    const alpha = level > 0 ? 0.04 + level * 0.2 : 0;
+
+    wxCell.style.setProperty("--span-viz-width", String(pct));
+    wxCell.style.setProperty("--span-viz-alpha", String(alpha));
+  }, [row, spanVizConfig, getSpanVizValue]);
+
   return (
-    <div className="span-cell" title={tooltip}>
-      <div className="span-bar">
-        <div
-          className="span-bar-fill"
-          style={{
-            width: `${percent}%`,
-            minWidth: percent > 0 ? "1px" : "0",
-          }}
-        />
-      </div>
+    <div className="span-cell" title={tooltip} ref={cellRef}>
       <div className="span-label">
         <span className="span-percent">{percent.toFixed(1)}%</span>
         <span className="span-name">{label}</span>
@@ -1141,6 +1236,18 @@ export default function App() {
   const [heatStyle, setHeatStyle] = useState(() => {
     return localStorage.getItem("profilerHeatStyle") || "fill";
   });
+  const [spanVizConfig, setSpanVizConfig] = useState(() => {
+    const stored = localStorage.getItem("profilerSpanVizConfig");
+    if (stored) {
+      try {
+        return JSON.parse(stored);
+      } catch {
+        return { enabled: true, style: "fill", metric: "wallTotalUs" };
+      }
+    }
+    return { enabled: true, style: "fill", metric: "wallTotalUs" };
+  });
+  const [spanVizMenuOpen, setSpanVizMenuOpen] = useState(false);
   const numberFormat = useMemo(() => getNumberFormat(numberFormatId), [numberFormatId]);
 
   const gridApiRef = useRef(null);
@@ -1175,7 +1282,14 @@ export default function App() {
   }, [heatStyle]);
 
   useEffect(() => {
-    const handleClick = () => setHeatMenuOpenId(null);
+    localStorage.setItem("profilerSpanVizConfig", JSON.stringify(spanVizConfig));
+  }, [spanVizConfig]);
+
+  useEffect(() => {
+    const handleClick = () => {
+      setHeatMenuOpenId(null);
+      setSpanVizMenuOpen(false);
+    };
     document.addEventListener("click", handleClick);
     return () => document.removeEventListener("click", handleClick);
   }, []);
@@ -1413,6 +1527,51 @@ export default function App() {
     }));
   }, []);
 
+  // Get raw value for a given metric key from a row
+  const getMetricValue = useCallback((row, metricKey) => {
+    switch (metricKey) {
+      case "wallTotalUs":
+        return getWallUs(row);
+      case "busyTotalUs":
+        return row.est_cpu_us ?? row.cpu_time_us ?? null;
+      case "waitTotalUs": {
+        const wall = getWallUs(row);
+        const cpu = row.est_cpu_us ?? row.cpu_time_us ?? null;
+        if (wall == null || cpu == null) return null;
+        return Math.max(0, wall - cpu);
+      }
+      case "selfWallUs":
+        return getSelfWallUs(row);
+      case "selfBusyUs":
+        return getSelfCpuUs(row);
+      case "selfWaitUs":
+        return getSelfWaitUs(row);
+      case "clarityRuntime":
+        return typeof row.clarity_runtime === "number" ? row.clarity_runtime : null;
+      default:
+        return null;
+    }
+  }, []);
+
+  // Compute span viz value (level 0-1 and pct 0-100) for a row
+  const getSpanVizValue = useCallback(
+    (row) => {
+      const metric = spanVizConfig.metric || "wallTotalUs";
+      const raw = getMetricValue(row, metric);
+      const max = heatMax[metric] ?? 0;
+      const min = 0; // Always use 0 as min for span viz (auto scaling)
+
+      if (raw == null || raw <= 0 || max <= min) {
+        return { level: 0, pct: 0 };
+      }
+
+      const pct = Math.min(100, Math.max(0, ((raw - min) / (max - min)) * 100));
+      const level = pct / 100;
+      return { level, pct };
+    },
+    [spanVizConfig.metric, heatMax, getMetricValue]
+  );
+
   const breadcrumb = focusedTree.breadcrumb ?? [];
 
   useEffect(() => {
@@ -1494,6 +1653,22 @@ export default function App() {
     [heatConfig, heatMenuOpenId, heatStyle, setHeatMax, setHeatMin, toggleHeat]
   );
 
+  const buildSpanHeader = useCallback(
+    (col) => ({
+      text: col.label,
+      cell: (props) => (
+        <SpanHeaderCell
+          {...props}
+          spanVizConfig={spanVizConfig}
+          setSpanVizConfig={setSpanVizConfig}
+          isOpen={spanVizMenuOpen}
+          setIsOpen={setSpanVizMenuOpen}
+        />
+      ),
+    }),
+    [spanVizConfig, spanVizMenuOpen]
+  );
+
   const buildGroupHeader = useCallback(
     (col) => [
       col.groupStart
@@ -1509,26 +1684,36 @@ export default function App() {
       id: col.key,
       header: col.group
         ? buildGroupHeader(col)
-        : col.key === "clarity_rw" ||
-            col.key === "clarity_len" ||
-            col.key === "clarity_runtime" ||
-            col.key === "clarity_input_n"
-          ? [
-              col.key === "clarity_rw"
-                ? { text: "Clarity", colspan: 4, css: "grid-group-header" }
-                : { text: "", _hidden: true },
-              col.heatKey ? buildHeatHeader(col) : { text: col.label },
-            ]
-          : col.heatKey
-            ? buildHeatHeader(col)
-            : col.label,
+        : col.key === "span"
+          ? buildSpanHeader(col)
+          : col.key === "clarity_rw" ||
+              col.key === "clarity_len" ||
+              col.key === "clarity_runtime" ||
+              col.key === "clarity_input_n"
+            ? [
+                col.key === "clarity_rw"
+                  ? { text: "Clarity", colspan: 4, css: "grid-group-header" }
+                  : { text: "", _hidden: true },
+                col.heatKey ? buildHeatHeader(col) : { text: col.label },
+              ]
+            : col.heatKey
+              ? buildHeatHeader(col)
+              : col.label,
       width: col.width,
       flexgrow: col.flexgrow,
       heatKey: col.heatKey,
       treetoggle: col.treetoggle,
       cell:
         col.key === "span"
-          ? (props) => <SpanCell {...props} onToggleChain={toggleChain} onFocus={focusNode} />
+          ? (props) => (
+              <SpanCell
+                {...props}
+                onToggleChain={toggleChain}
+                onFocus={focusNode}
+                spanVizConfig={spanVizConfig}
+                getSpanVizValue={getSpanVizValue}
+              />
+            )
           : col.heatKey
             ? (props) => {
                 const raw =
@@ -1595,7 +1780,7 @@ export default function App() {
             : true,
       resize: true,
     }));
-  }, [selectedColumns, toggleChain, focusNode, buildHeatHeader, buildGroupHeader, getHeatBounds, numberFormat]);
+  }, [selectedColumns, toggleChain, focusNode, buildHeatHeader, buildSpanHeader, buildGroupHeader, getHeatBounds, numberFormat, spanVizConfig, getSpanVizValue]);
 
   const toggleColumn = (key) => {
     setSelectedColumns((prev) => {
@@ -1808,7 +1993,7 @@ export default function App() {
       )}
 
       {/* Grid */}
-      <section className={`app-grid-container heat-style-${heatStyle}`}>
+      <section className={`app-grid-container heat-style-${heatStyle}${spanVizConfig.enabled ? ` span-viz-${spanVizConfig.style}` : ""}`}>
         <WillowDark>
           <Grid
             tree={true}

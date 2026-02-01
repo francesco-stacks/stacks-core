@@ -157,29 +157,6 @@
   position: relative;
 }
 
-.span-bar {
-  position: absolute;
-  inset: 0;
-  left: 0;
-  right: 0;
-  background: transparent;
-  pointer-events: none;
-  z-index: 0;
-}
-
-.span-bar-fill {
-  position: absolute;
-  inset: 0;
-  width: 0;
-  background: linear-gradient(
-    90deg,
-    color-mix(in srgb, var(--primary) 22%, transparent),
-    color-mix(in srgb, var(--chart-2) 18%, transparent)
-  );
-  opacity: 0.25;
-  pointer-events: none;
-}
-
 .span-label {
   position: relative;
   display: flex;
@@ -508,6 +485,141 @@
   background: var(--background);
   color: var(--foreground);
   font-size: 11px;
+}
+
+/* ==========================================================================
+   Span Visualization
+   ========================================================================== */
+
+.span-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  position: relative;
+}
+
+.span-header-btn {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted-foreground);
+  border-radius: 6px;
+  padding: 0 6px;
+  height: 20px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.span-viz-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  display: grid;
+  gap: 8px;
+  min-width: 180px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: var(--shadow-soft);
+}
+
+.span-viz-menu label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
+.span-viz-select {
+  width: 110px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 6px;
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 11px;
+}
+
+/* Span cell viz container - positioned relative for pseudo-elements */
+.wx-cell[data-col-id="span"] {
+  position: relative;
+  overflow: hidden;
+}
+
+/* Span viz CSS vars (set via JS on the .wx-cell element) */
+.wx-cell[data-col-id="span"] {
+  --span-viz-width: 0;
+  --span-viz-alpha: 0;
+}
+
+/* Span cell content must be above viz layers */
+.wx-cell[data-col-id="span"] .span-cell {
+  position: relative;
+  z-index: 1;
+}
+
+/* Fill style: progress bar behind text using ::before */
+.span-viz-fill .wx-cell[data-col-id="span"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: calc(var(--span-viz-width) * 1%);
+  background: color-mix(in oklab, var(--primary) 25%, transparent);
+  opacity: var(--span-viz-alpha);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Edge style: 3px left band using ::before */
+.span-viz-edge .wx-cell[data-col-id="span"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  background: var(--primary);
+  opacity: min(0.9, calc(var(--span-viz-alpha) * 3));
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Meter style: bottom bar using ::after, width from --span-viz-width */
+.span-viz-meter .wx-cell[data-col-id="span"]::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: calc(var(--span-viz-width) * 1%);
+  background: var(--primary);
+  opacity: min(0.9, calc(var(--span-viz-alpha) * 3));
+  pointer-events: none;
+  z-index: 0;
+  border-radius: 0 0 6px 6px;
+}
+
+/* Meter mode: reserve space at bottom so bar doesn't overlap text */
+.span-viz-meter .wx-cell[data-col-id="span"] .span-cell {
+  padding-bottom: 6px;
+}
+
+/* Reduce viz opacity when row is selected (like heat cells) */
+.span-viz-fill .wx-body .wx-row.wx-selected .wx-cell[data-col-id="span"]::before {
+  opacity: calc(var(--span-viz-alpha) * 0.6);
+}
+
+.span-viz-edge .wx-body .wx-row.wx-selected .wx-cell[data-col-id="span"]::before,
+.span-viz-meter .wx-body .wx-row.wx-selected .wx-cell[data-col-id="span"]::after {
+  opacity: min(0.6, calc(var(--span-viz-alpha) * 2));
 }
 
 /* ==========================================================================
