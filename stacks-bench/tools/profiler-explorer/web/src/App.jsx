@@ -426,8 +426,8 @@ function formatSideValue(value, format, decimals) {
 
 function HeatCell({ row, value, percent, format, numberFormat, dimZero }) {
   const pct = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
-  const alpha = 0.05 + (pct / 100) * 0.22;
-  const showHeat = pct > 0;
+  const level = pct > 0 ? pct / 100 : 0;
+  const alpha = level > 0 ? 0.04 + level * 0.2 : 0;
   const aggregated = isCompressed(row);
   const showAggregate = aggregated && hasDisplayValue(value);
   const dimmed = isZeroDisplay(value);
@@ -435,11 +435,14 @@ function HeatCell({ row, value, percent, format, numberFormat, dimZero }) {
     <div
       className="heat-cell"
       style={{
-        background: showHeat
-          ? `linear-gradient(90deg, rgba(239, 68, 68, ${alpha}), rgba(220, 38, 38, ${alpha}))`
-          : "transparent",
+        "--heat-alpha": alpha,
+        "--heat-level": level,
+        "--heat-width": `${pct}%`,
       }}
     >
+      <span className="heat-fill" />
+      <span className="heat-edge" />
+      <span className="heat-meter" />
       <div className={`heat-text${dimmed ? " numeric-zero" : ""}`}>
         {showAggregate ? (
           <span className="aggregate-badge" title="Aggregated via chain compression">
@@ -505,7 +508,18 @@ function NumericCell({ row, value, format, numberFormat, dimZero }) {
   );
 }
 
-function HeatHeaderCell({ column, cell, heatConfig, onToggle, onMinChange, onMaxChange, openId, setOpenId }) {
+function HeatHeaderCell({
+  column,
+  cell,
+  heatConfig,
+  onToggle,
+  onMinChange,
+  onMaxChange,
+  openId,
+  setOpenId,
+  heatStyle,
+  setHeatStyle,
+}) {
   const heatKey = column.heatKey;
   const isOpen = openId === column.id;
   if (!heatKey) {
@@ -558,6 +572,18 @@ function HeatHeaderCell({ column, cell, heatConfig, onToggle, onMinChange, onMax
               onChange={(event) => onMaxChange(heatKey, event.target.value)}
             />
           </label>
+          <label>
+            Heat Style
+            <select
+              className="heat-style-select"
+              value={heatStyle}
+              onChange={(event) => setHeatStyle(event.target.value)}
+            >
+              <option value="fill">Fill</option>
+              <option value="edge">Edge</option>
+              <option value="meter">Meter</option>
+            </select>
+          </label>
         </div>
       ) : null}
     </div>
@@ -609,7 +635,7 @@ function SpanCell({ row, onToggleChain, onFocus }) {
         {chainCount > 0 ? (
           <button
             type="button"
-            className="rounded-full border border-border bg-secondary px-2 py-0.5 text-[10px] text-secondary-foreground"
+            className="span-muted-badge"
             onClick={(event) => {
               event.stopPropagation();
               onToggleChain?.(row.id);
@@ -619,13 +645,13 @@ function SpanCell({ row, onToggleChain, onFocus }) {
           </button>
         ) : null}
         {hiddenSiblings > 0 ? (
-          <span className="rounded-full border border-border bg-secondary px-2 py-0.5 text-[10px] text-secondary-foreground">
+          <span className="span-muted-badge">
             +{hiddenSiblings} siblings
           </span>
         ) : null}
         <button
           type="button"
-          className="rounded-full border border-border bg-background px-2 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+          className="span-focus-btn"
           onClick={(event) => {
             event.stopPropagation();
             onFocus?.(row.id);
@@ -1091,12 +1117,12 @@ export default function App() {
     }
     return {
       wallTotalUs: { enabled: true, min: null, max: null },
-      selfWallUs: { enabled: true, min: null, max: null },
+      selfWallUs: { enabled: false, min: null, max: null },
       busyTotalUs: { enabled: true, min: null, max: null },
-      selfBusyUs: { enabled: true, min: null, max: null },
-      waitTotalUs: { enabled: true, min: null, max: null },
-      selfWaitUs: { enabled: true, min: null, max: null },
-      clarityRuntime: { enabled: true, min: null, max: null },
+      selfBusyUs: { enabled: false, min: null, max: null },
+      waitTotalUs: { enabled: false, min: null, max: null },
+      selfWaitUs: { enabled: false, min: null, max: null },
+      clarityRuntime: { enabled: false, min: null, max: null },
     };
   });
   const [selectedColumns, setSelectedColumns] = useState(() => {
@@ -1111,6 +1137,9 @@ export default function App() {
   });
   const [numberFormatId, setNumberFormatId] = useState(() => {
     return localStorage.getItem("profilerNumberFormat") || DEFAULT_NUMBER_FORMAT_ID;
+  });
+  const [heatStyle, setHeatStyle] = useState(() => {
+    return localStorage.getItem("profilerHeatStyle") || "fill";
   });
   const numberFormat = useMemo(() => getNumberFormat(numberFormatId), [numberFormatId]);
 
@@ -1140,6 +1169,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("profilerNumberFormat", numberFormatId);
   }, [numberFormatId]);
+
+  useEffect(() => {
+    localStorage.setItem("profilerHeatStyle", heatStyle);
+  }, [heatStyle]);
 
   useEffect(() => {
     const handleClick = () => setHeatMenuOpenId(null);
@@ -1453,10 +1486,12 @@ export default function App() {
           onMaxChange={setHeatMax}
           openId={heatMenuOpenId}
           setOpenId={setHeatMenuOpenId}
+          heatStyle={heatStyle}
+          setHeatStyle={setHeatStyle}
         />
       ),
     }),
-    [heatConfig, heatMenuOpenId, setHeatMax, setHeatMin, toggleHeat]
+    [heatConfig, heatMenuOpenId, heatStyle, setHeatMax, setHeatMin, toggleHeat]
   );
 
   const buildGroupHeader = useCallback(
@@ -1773,7 +1808,7 @@ export default function App() {
       )}
 
       {/* Grid */}
-      <section className="app-grid-container">
+      <section className={`app-grid-container heat-style-${heatStyle}`}>
         <WillowDark>
           <Grid
             tree={true}
