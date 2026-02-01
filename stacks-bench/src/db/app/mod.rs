@@ -192,6 +192,11 @@ impl AppDb {
             .to_str()
             .ok_or_else(|| anyhow!("Invalid database path (non-UTF8): {path_ref:?}"))?;
 
+        if let Some(parent) = path_ref.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create database directory at {:?}", parent))?;
+        }
+
         Self::run_migrations(database_url).await?;
 
         // Manager config that sets up each new connection with our pragmas.

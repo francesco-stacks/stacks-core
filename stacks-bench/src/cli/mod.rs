@@ -6,6 +6,7 @@ use bench::BenchArgs;
 use chainstate::ChainstateArgs;
 use clap::{Parser, Subcommand};
 use console::style;
+use explorer::ExplorerArgs;
 use metabase::MetabaseArgs;
 use stacks_bench::db::app::AppDb;
 use stacks_bench::paths::AppDataDir;
@@ -16,6 +17,7 @@ use crate::cli::common::CliContext;
 pub mod common;
 pub mod bench;
 pub mod chainstate;
+pub mod explorer;
 pub mod metabase;
 mod theme;
 
@@ -27,6 +29,8 @@ pub enum Commands {
     Chainstate(ChainstateArgs),
     /// Launch a pre-configured Metabase instance to analyze results
     Metabase(MetabaseArgs),
+    /// Launch the profiler explorer web UI
+    Explorer(ExplorerArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -59,6 +63,7 @@ impl Cli {
             Commands::Bench(args) => args.exec(&ctx).await,
             Commands::Chainstate(args) => args.exec(&ctx).await,
             Commands::Metabase(args) => args.exec(&ctx).await,
+            Commands::Explorer(args) => args.exec(&ctx).await,
         };
 
         let exec_duration = started_at.elapsed();
