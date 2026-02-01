@@ -335,7 +335,7 @@
   justify-content: flex-start;
   padding: 0 8px;
   overflow: hidden;
-  border-radius: 6px;
+  border-radius: 0;
   --heat-alpha: 0;
   --heat-level: 0;
   --heat-width: 0%;
@@ -354,7 +354,7 @@
 
 .heat-fill {
   inset: 0;
-  background: var(--heat-danger);
+  background: var(--heat-color, var(--heat-danger));
   opacity: 0;
 }
 
@@ -363,7 +363,7 @@
   top: 4px;
   bottom: 4px;
   width: 3px;
-  background: var(--heat-danger-strong);
+  background: var(--heat-color-strong, var(--heat-danger-strong));
   opacity: 0;
 }
 
@@ -373,26 +373,61 @@
   bottom: 0;
   height: 2px;
   width: 100%;
-  background: var(--heat-danger-strong);
+  background: var(--heat-color-strong, var(--heat-danger-strong));
   opacity: 0;
   transform-origin: left;
   transform: scaleX(var(--heat-level));
   border-radius: 0 0 6px 6px;
 }
 
-.heat-style-fill .heat-fill {
+.heat-cell.heat-color-red {
+  --heat-color: #b91c1c;
+  --heat-color-strong: #dc2626;
+}
+
+.heat-cell.heat-color-orange {
+  --heat-color: #c2410c;
+  --heat-color-strong: #ea580c;
+}
+
+.heat-cell.heat-color-amber {
+  --heat-color: #b45309;
+  --heat-color-strong: #f59e0b;
+}
+
+.heat-cell.heat-color-green {
+  --heat-color: #15803d;
+  --heat-color-strong: #22c55e;
+}
+
+.heat-cell.heat-color-blue {
+  --heat-color: #1d4ed8;
+  --heat-color-strong: #3b82f6;
+}
+
+.heat-cell.heat-color-purple {
+  --heat-color: #6d28d9;
+  --heat-color-strong: #8b5cf6;
+}
+
+.heat-cell.heat-color-gray {
+  --heat-color: #6b7280;
+  --heat-color-strong: #9ca3af;
+}
+
+.heat-cell.heat-style-fill .heat-fill {
   opacity: var(--heat-alpha);
 }
 
-.heat-style-edge .heat-edge {
+.heat-cell.heat-style-edge .heat-edge {
   opacity: calc(var(--heat-level) * 0.9);
 }
 
-.heat-style-meter .heat-meter {
+.heat-cell.heat-style-meter .heat-meter {
   opacity: calc(var(--heat-level) * 0.9);
 }
 
-.heat-style-meter .heat-cell {
+.heat-cell.heat-style-meter {
   padding-bottom: 6px;
 }
 

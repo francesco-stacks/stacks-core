@@ -100,6 +100,15 @@ The backend uses recursive CTEs to build ancestor/descendant trees:
 
 ## Frontend (`web/src/App.jsx`)
 
+### Frontend Module Map
+
+- `columnsConfig.js`: column definitions, selectable/visible helpers
+- `profilerConfig.js`: shared defaults (themes, heat colors, number formats, auto-expand)
+- `treeTransforms.js`: tree transforms + metric helpers
+- `columnBuilders.jsx`: header builder helpers
+- `components/`: extracted UI pieces (`HeaderBar`, `ToolbarBar`, `BreadcrumbBar`, `HeatCells`,
+  `SpanCell`, `HeatHeaderCell`, `SpanHeaderCell`, `SettingsPanel`, `ProfilerGrid`)
+
 ### State Structure
 
 ```javascript
@@ -185,7 +194,7 @@ npm run build  # Outputs to dist/
 
 ### Adding a New Column
 
-1. Add entry to `COLUMN_DEFS` array in `App.jsx`
+1. Add entry to `COLUMN_DEFS` array in `columnsConfig.js`
 2. Define `key`, `label`, `width`, `getter` function
 3. Optionally add `heatKey` for heat map support
 4. Add custom `render` function if needed
