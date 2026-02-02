@@ -28,6 +28,14 @@ function parseOptionalInt(value, name) {
   return parsed;
 }
 
+function parseCsvList(value) {
+  if (!value) return [];
+  return String(value)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 function openDb(dbPath) {
   return new Database(dbPath, { fileMustExist: true });
 }
@@ -395,6 +403,347 @@ app.get("/api/tx-lookup", (req, res) => {
   }
 });
 
+// Transaction browsing endpoint with pagination, filtering, and sorting
+app.get("/api/transactions", (req, res) => {
+  try {
+    const runId = parseOptionalInt(req.query.run_id, "run_id");
+    const offset = parseOptionalInt(req.query.offset, "offset") || 0;
+    const limit = parseOptionalInt(req.query.limit, "limit") || 100;
+    const minDurationMs = parseOptionalInt(req.query.min_duration_ms, "min_duration_ms");
+    const principalFilters = parseCsvList(req.query.principal);
+    const contractFilters = parseCsvList(req.query.contract);
+    const contractFnFilters = parseCsvList(req.query.contract_fn);
+    const sortBy = req.query.sort_by || "duration_ms";
+    const sortDir = req.query.sort_dir === "asc" ? "ASC" : "DESC";
+
+    if (runId == null) {
+      return res.status(400).json({ error: "run_id is required" });
+    }
+
+    // Validate sort column to prevent SQL injection
+    const validSortColumns = [
+      "duration_ms",
+      "clarity_runtime",
+      "clarity_read_count",
+      "clarity_read_length",
+      "clarity_write_count",
+      "clarity_write_length",
+      "stacks_block_height",
+      "tx_hash_hex",
+    ];
+    const safeSortBy = validSortColumns.includes(sortBy) ? sortBy : "duration_ms";
+
+    // Build dynamic WHERE clauses
+    const conditions = ["sts.benchmark_run_id = :run_id"];
+    const params = { run_id: runId, limit, offset };
+
+    if (minDurationMs != null) {
+      conditions.push("sts.duration_us >= :min_duration_us");
+      params.min_duration_us = minDurationMs * 1000;
+    }
+    if (principalFilters.length) {
+      const clauses = principalFilters.map((value, index) => {
+        const key = `principal_filter_${index}`;
+        params[key] = `%${value}%`;
+        return `p.address LIKE :${key}`;
+      });
+      conditions.push(`(${clauses.join(" OR ")})`);
+    }
+    if (contractFilters.length) {
+      const clauses = contractFilters.map((value, index) => {
+        const key = `contract_filter_${index}`;
+        params[key] = `%${value}%`;
+        return `c.name LIKE :${key}`;
+      });
+      conditions.push(`(${clauses.join(" OR ")})`);
+    }
+    if (contractFnFilters.length) {
+      const clauses = contractFnFilters.map((value, index) => {
+        const key = `contract_fn_filter_${index}`;
+        params[key] = `%${value}%`;
+        return `cf.name LIKE :${key}`;
+      });
+      conditions.push(`(${clauses.join(" OR ")})`);
+    }
+
+    const whereClause = conditions.join(" AND ");
+
+    // Count total for pagination
+    const countSql = `
+      SELECT COUNT(*) as total
+      FROM stacks_tx_stats sts
+      JOIN stacks_tx tx ON tx.id = sts.stacks_tx_id
+      LEFT JOIN contract c ON c.id = tx.contract_id
+      LEFT JOIN principal p ON p.id = c.issuer_principal_id
+      LEFT JOIN contract_fn cf ON cf.id = tx.contract_fn_id
+      WHERE ${whereClause}
+    `;
+    const countResult = queryAll(db, countSql, params);
+    const total = countResult[0]?.total || 0;
+
+    // Main query
+    const sql = `
+      SELECT
+        sts.benchmark_run_id,
+        sts.synthetic_block_id,
+        sts.stacks_tx_id,
+        tx.tx_hash_hex,
+        sb.height AS stacks_block_height,
+        sb.block_hash_hex AS stacks_block_hash,
+        p.address AS contract_issuer,
+        c.name AS contract_name,
+        cf.name AS contract_fn,
+        sts.duration_us / 1000.0 AS duration_ms,
+        sts.clarity_runtime,
+        sts.clarity_read_count,
+        sts.clarity_read_length,
+        sts.clarity_write_count,
+        sts.clarity_write_length
+      FROM stacks_tx_stats sts
+      JOIN stacks_tx tx ON tx.id = sts.stacks_tx_id
+      JOIN synthetic_block synth ON synth.id = sts.synthetic_block_id
+      JOIN stacks_block sb ON sb.id = synth.stacks_block_id
+      LEFT JOIN contract c ON c.id = tx.contract_id
+      LEFT JOIN principal p ON p.id = c.issuer_principal_id
+      LEFT JOIN contract_fn cf ON cf.id = tx.contract_fn_id
+      WHERE ${whereClause}
+      ORDER BY ${safeSortBy} ${sortDir}
+      LIMIT :limit OFFSET :offset
+    `;
+
+    const rows = queryAll(db, sql, params);
+    return res.json({ rows, total, offset, limit });
+  } catch (error) {
+    console.error("Transactions query error:", error);
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// Transaction heatmap max values endpoint (for virtual scrolling)
+app.get("/api/transactions/maxes", (req, res) => {
+  try {
+    const runId = parseOptionalInt(req.query.run_id, "run_id");
+    const minDurationMs = parseOptionalInt(req.query.min_duration_ms, "min_duration_ms");
+    const principalFilters = parseCsvList(req.query.principal);
+    const contractFilters = parseCsvList(req.query.contract);
+    const contractFnFilters = parseCsvList(req.query.contract_fn);
+
+    if (runId == null) {
+      return res.status(400).json({ error: "run_id is required" });
+    }
+
+    const conditions = ["sts.benchmark_run_id = :run_id"];
+    const params = { run_id: runId };
+
+    if (minDurationMs != null) {
+      conditions.push("sts.duration_us >= :min_duration_us");
+      params.min_duration_us = minDurationMs * 1000;
+    }
+    if (principalFilters.length) {
+      const clauses = principalFilters.map((value, index) => {
+        const key = `principal_filter_${index}`;
+        params[key] = `%${value}%`;
+        return `p.address LIKE :${key}`;
+      });
+      conditions.push(`(${clauses.join(" OR ")})`);
+    }
+    if (contractFilters.length) {
+      const clauses = contractFilters.map((value, index) => {
+        const key = `contract_filter_${index}`;
+        params[key] = `%${value}%`;
+        return `c.name LIKE :${key}`;
+      });
+      conditions.push(`(${clauses.join(" OR ")})`);
+    }
+    if (contractFnFilters.length) {
+      const clauses = contractFnFilters.map((value, index) => {
+        const key = `contract_fn_filter_${index}`;
+        params[key] = `%${value}%`;
+        return `cf.name LIKE :${key}`;
+      });
+      conditions.push(`(${clauses.join(" OR ")})`);
+    }
+
+    const whereClause = conditions.join(" AND ");
+
+    const sql = `
+      SELECT
+        COALESCE(MAX(sts.duration_us / 1000.0), 0) AS duration_ms,
+        COALESCE(MAX(sts.clarity_runtime), 0) AS clarity_runtime,
+        COALESCE(MAX(sts.clarity_read_count), 0) AS clarity_read_count,
+        COALESCE(MAX(sts.clarity_read_length), 0) AS clarity_read_length,
+        COALESCE(MAX(sts.clarity_write_count), 0) AS clarity_write_count,
+        COALESCE(MAX(sts.clarity_write_length), 0) AS clarity_write_length
+      FROM stacks_tx_stats sts
+      JOIN stacks_tx tx ON tx.id = sts.stacks_tx_id
+      LEFT JOIN contract c ON c.id = tx.contract_id
+      LEFT JOIN principal p ON p.id = c.issuer_principal_id
+      LEFT JOIN contract_fn cf ON cf.id = tx.contract_fn_id
+      WHERE ${whereClause}
+    `;
+
+    const rows = queryAll(db, sql, params);
+    return res.json({ maxes: rows[0] || {} });
+  } catch (error) {
+    console.error("Transactions maxes query error:", error);
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// Autocomplete for transactions filters
+app.get("/api/transactions/autocomplete", (req, res) => {
+  try {
+    const runId = parseOptionalInt(req.query.run_id, "run_id");
+    const type = req.query.type;
+    const query = String(req.query.q || "").trim();
+    const limit = parseOptionalInt(req.query.limit, "limit") || 20;
+    const principalFilters = parseCsvList(req.query.principal);
+    const contractFilters = parseCsvList(req.query.contract);
+    const contractFnFilters = parseCsvList(req.query.contract_fn);
+
+    if (runId == null) {
+      return res.status(400).json({ error: "run_id is required" });
+    }
+    if (!type || !["principal", "contract", "function"].includes(type)) {
+      return res.status(400).json({ error: "type must be principal, contract, or function" });
+    }
+    if (!query) {
+      return res.json({ values: [] });
+    }
+
+    const params = {
+      run_id: runId,
+      query: `%${query}%`,
+      limit,
+    };
+    const conditions = ["sts.benchmark_run_id = :run_id"];
+
+    if (type !== "principal" && principalFilters.length) {
+      const clauses = principalFilters.map((value, index) => {
+        const key = `principal_filter_${index}`;
+        params[key] = `%${value}%`;
+        return `p.address LIKE :${key}`;
+      });
+      conditions.push(`(${clauses.join(" OR ")})`);
+    }
+    if (type !== "contract" && contractFilters.length) {
+      const clauses = contractFilters.map((value, index) => {
+        const key = `contract_filter_${index}`;
+        params[key] = `%${value}%`;
+        return `c.name LIKE :${key}`;
+      });
+      conditions.push(`(${clauses.join(" OR ")})`);
+    }
+    if (type !== "function" && contractFnFilters.length) {
+      const clauses = contractFnFilters.map((value, index) => {
+        const key = `contract_fn_filter_${index}`;
+        params[key] = `%${value}%`;
+        return `cf.name LIKE :${key}`;
+      });
+      conditions.push(`(${clauses.join(" OR ")})`);
+    }
+
+    let selectField = "";
+    let orderField = "";
+    if (type === "principal") {
+      selectField = "p.address";
+      orderField = "p.address";
+      conditions.push("p.address LIKE :query");
+    } else if (type === "contract") {
+      selectField = "c.name";
+      orderField = "c.name";
+      conditions.push("c.name LIKE :query");
+    } else {
+      selectField = "cf.name";
+      orderField = "cf.name";
+      conditions.push("cf.name LIKE :query");
+    }
+
+    const sql = `
+      SELECT DISTINCT ${selectField} AS value
+      FROM stacks_tx_stats sts
+      JOIN stacks_tx tx ON tx.id = sts.stacks_tx_id
+      LEFT JOIN contract c ON c.id = tx.contract_id
+      LEFT JOIN principal p ON p.id = c.issuer_principal_id
+      LEFT JOIN contract_fn cf ON cf.id = tx.contract_fn_id
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY ${orderField}
+      LIMIT :limit
+    `;
+
+    const rows = queryAll(db, sql, params).filter((row) => row.value);
+    return res.json({ values: rows.map((row) => row.value) });
+  } catch (error) {
+    console.error("Transactions autocomplete error:", error);
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// Get available contracts for filtering
+app.get("/api/contracts", (req, res) => {
+  try {
+    const runId = parseOptionalInt(req.query.run_id, "run_id");
+    if (runId == null) {
+      return res.status(400).json({ error: "run_id is required" });
+    }
+
+    const rows = queryAll(
+      db,
+      `
+        SELECT DISTINCT c.id, c.name, p.address AS issuer
+        FROM stacks_tx_stats sts
+        JOIN stacks_tx tx ON tx.id = sts.stacks_tx_id
+        JOIN contract c ON c.id = tx.contract_id
+        JOIN principal p ON p.id = c.issuer_principal_id
+        WHERE sts.benchmark_run_id = :run_id
+        ORDER BY c.name
+        LIMIT 1000
+      `,
+      { run_id: runId }
+    );
+    return res.json(rows);
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// Get available contract functions for filtering
+app.get("/api/contract-functions", (req, res) => {
+  try {
+    const runId = parseOptionalInt(req.query.run_id, "run_id");
+    const contractName = req.query.contract || null;
+    if (runId == null) {
+      return res.status(400).json({ error: "run_id is required" });
+    }
+
+    let filterSql = "";
+    const params = { run_id: runId };
+    if (contractName) {
+      filterSql = "AND c.name = :contract_name";
+      params.contract_name = contractName;
+    }
+
+    const rows = queryAll(
+      db,
+      `
+        SELECT DISTINCT cf.id, cf.name, c.name AS contract_name
+        FROM stacks_tx_stats sts
+        JOIN stacks_tx tx ON tx.id = sts.stacks_tx_id
+        JOIN contract c ON c.id = tx.contract_id
+        JOIN contract_fn cf ON cf.id = tx.contract_fn_id
+        WHERE sts.benchmark_run_id = :run_id
+          ${filterSql}
+        ORDER BY cf.name
+        LIMIT 1000
+      `,
+      params
+    );
+    return res.json(rows);
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
 app.get("/api/trace", (req, res) => {
   try {
     const mode = req.query.mode || "tx";
@@ -409,6 +758,11 @@ app.get("/api/trace", (req, res) => {
       return res.status(400).json({ error: "run_id is required" });
     }
 
+    // For tx mode, require stacks_tx_id
+    if (mode === "tx" && stacksTxId == null) {
+      return res.status(400).json({ error: "stacks_tx_id is required for tx mode" });
+    }
+
     const params = {
       run_id: runId,
       stacks_tx_id: stacksTxId,
@@ -420,8 +774,15 @@ app.get("/api/trace", (req, res) => {
 
     const sql = mode === "tx" ? traceSqlTxMode() : traceSqlRunMode();
     const rows = queryAll(db, sql, params);
+    
+    // Return 404 if no results in tx mode (transaction not found)
+    if (mode === "tx" && rows.length === 0) {
+      return res.status(404).json({ error: "Transaction not found in this run" });
+    }
+    
     return res.json(rows);
   } catch (error) {
+    console.error("Trace query error:", error);
     return res.status(error.status || 500).json({ error: error.message });
   }
 });

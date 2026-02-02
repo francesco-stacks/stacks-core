@@ -1,4 +1,9 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useContext } from "react";
+
+export const HeatHeaderMenuContext = React.createContext({
+  openId: null,
+  setOpenId: () => {},
+});
 
 // Settings cog icon (Heroicons style)
 function SettingsIcon() {
@@ -67,21 +72,39 @@ export default function HeatHeaderCell({
   minWallFilterMs,
   setMinWallFilterMs,
 }) {
+  const menuContext = useContext(HeatHeaderMenuContext);
+  const effectiveOpenId = openId ?? menuContext.openId;
+  const effectiveSetOpenId = setOpenId ?? menuContext.setOpenId;
   const heatKey = column.heatKey;
-  const isOpen = openId === column.id;
+  const isOpen = effectiveOpenId === column.id;
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleOutsideClick = (event) => {
+      if (!containerRef.current) return;
+      if (!containerRef.current.contains(event.target)) {
+        effectiveSetOpenId(null);
+      }
+    };
+    document.addEventListener("mousedown", handleOutsideClick);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+    };
+  }, [isOpen, effectiveSetOpenId]);
   if (!heatKey) {
     return <div className="column-header">{cell.text}</div>;
   }
   const config = heatConfig[heatKey] || { enabled: true, min: null, max: null };
   return (
-    <div className="column-header">
+    <div className="column-header" ref={containerRef}>
       <span className="column-header-label">{cell.text}</span>
       <button
         type="button"
         className="column-header-btn"
         onClick={(event) => {
           event.stopPropagation();
-          setOpenId(isOpen ? null : column.id);
+          effectiveSetOpenId(isOpen ? null : column.id);
         }}
         aria-label="Column settings"
         aria-expanded={isOpen}
@@ -166,7 +189,7 @@ export default function HeatHeaderCell({
             </div>
           </div>
 
-          {column.id === "wall_total" && (
+          {(column.id === "wall_total" || (minWallFilterMs !== undefined && setMinWallFilterMs)) && (
             <>
               <div className="column-popover-divider" />
               <div className="column-popover-section">

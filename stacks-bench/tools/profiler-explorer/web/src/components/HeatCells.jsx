@@ -90,7 +90,7 @@ function formatSideValue(value, format, decimals) {
   return `${parts.sign}${parts.int}${parts.frac ? `${parts.decimal}${parts.frac}` : ""}`;
 }
 
-export function HeatCell({ row, value, percent, format, numberFormat, heatStyle, heatColor }) {
+export const HeatCell = React.memo(function HeatCell({ row, value, percent, format, numberFormat, heatStyle, heatColor }) {
   const pct = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
   const level = pct > 0 ? pct / 100 : 0;
   const alpha = level > 0 ? 0.04 + level * 0.2 : 0;
@@ -120,13 +120,13 @@ export function HeatCell({ row, value, percent, format, numberFormat, heatStyle,
         <FormattedNumber
           value={value}
           format={numberFormat}
-          decimals={format?.decimals ?? 0}
-          className="heat-number"
+          decimals={format.decimals}
+          className="numeric-value"
         />
       </div>
     </div>
   );
-}
+});
 
 export function NumericCell({ row, value, format, numberFormat }) {
   const aggregated = isCompressed(row);

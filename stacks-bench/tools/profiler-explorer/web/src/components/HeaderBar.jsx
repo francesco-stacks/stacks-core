@@ -13,7 +13,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { Sun, Moon, RotateCcw, Settings, Loader2, X, Square } from "lucide-react";
+import { Sun, Moon, RotateCcw, Settings, Loader2, X, Square, GitGraph, List } from "lucide-react";
 
 export default function HeaderBar({
   runs,
@@ -31,6 +31,8 @@ export default function HeaderBar({
   cancelLoad,
   isDirty,
   isLoading,
+  activeTab,
+  setActiveTab,
 }) {
   const canSearch = txQuery.length === 64 && /^[0-9a-fA-F]{64}$/.test(txQuery);
   
@@ -58,6 +60,25 @@ export default function HeaderBar({
             ))}
           </SelectContent>
         </Select>
+        <div className="header-divider" />
+        <div className="header-tabs">
+          <button
+            type="button"
+            className={`header-tab ${activeTab === "transactions" ? "header-tab-active" : ""}`}
+            onClick={() => setActiveTab("transactions")}
+          >
+            <List className="h-4 w-4" />
+            Transactions
+          </button>
+          <button
+            type="button"
+            className={`header-tab ${activeTab === "trace" ? "header-tab-active" : ""}`}
+            onClick={() => setActiveTab("trace")}
+          >
+            <GitGraph className="h-4 w-4" />
+            Trace
+          </button>
+        </div>
       </div>
 
       <div className="header-center">
@@ -91,9 +112,7 @@ export default function HeaderBar({
               }
             }}
             onKeyDown={handleKeyDown}
-            placeholder={
-              mode === "tx" ? "Enter transaction hash (64 hex chars)..." : "Search..."
-            }
+            placeholder="Enter transaction hash (64 hex chars)..."
             maxLength={64}
             spellCheck={false}
           />
@@ -118,9 +137,11 @@ export default function HeaderBar({
       </div>
 
       <div className="header-right">
-        <div className="header-stats">
-          <span className="stat-badge">{rowsLength.toLocaleString()} rows</span>
-        </div>
+        {activeTab === "trace" && (
+          <div className="header-stats">
+            <span className="stat-badge">{rowsLength.toLocaleString()} rows</span>
+          </div>
+        )}
         <TooltipProvider delayDuration={300}>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -140,16 +161,6 @@ export default function HeaderBar({
         <TooltipProvider delayDuration={300}>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button variant="outline" size="icon" onClick={resetQuery}>
-                <RotateCcw className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Reset all filters</TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-        <TooltipProvider delayDuration={300}>
-          <Tooltip>
-            <TooltipTrigger asChild>
               <Button variant="outline" size="icon" onClick={onOpenSettings}>
                 <Settings className="h-4 w-4" />
               </Button>
@@ -157,15 +168,29 @@ export default function HeaderBar({
             <TooltipContent>Settings</TooltipContent>
           </Tooltip>
         </TooltipProvider>
-        {isLoading ? (
-          <Button variant="destructive" onClick={cancelLoad}>
-            <Square className="h-4 w-4 mr-2" />
-            Cancel
-          </Button>
-        ) : (
-          <Button onClick={loadTrace} disabled={!isDirty}>
-            Load Trace
-          </Button>
+        {activeTab === "trace" && (
+          <>
+            <TooltipProvider delayDuration={300}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="outline" size="icon" onClick={resetQuery}>
+                    <RotateCcw className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Reset all filters</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            {isLoading ? (
+              <Button variant="destructive" onClick={cancelLoad}>
+                <Square className="h-4 w-4 mr-2" />
+                Cancel
+              </Button>
+            ) : (
+              <Button onClick={loadTrace} disabled={!isDirty}>
+                Load Trace
+              </Button>
+            )}
+          </>
         )}
       </div>
     </header>

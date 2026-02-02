@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ProfilerGrid from "./components/ProfilerGrid";
 import SettingsPanel from "./components/SettingsPanel";
+import TransactionsTab from "./components/TransactionsTab";
 import SpanCell from "./components/SpanCell";
 import { HeatCell, NumericCell } from "./components/HeatCells";
 import HeaderBar from "./components/HeaderBar";
@@ -26,7 +27,7 @@ import {
   getWallUs,
   indexTree,
   pruneTree,
-} from "./treeTransforms";
+} from "./treeTransforms.ts";
 import {
   ALWAYS_HIDDEN_KEYS,
   ALWAYS_VISIBLE_KEYS,
@@ -36,7 +37,7 @@ import {
   NUMERIC_COLUMN_KEYS,
   SELECTABLE_COLUMNS,
   sanitizeSelectedColumns,
-} from "./columnsConfig";
+} from "./columnsConfig.ts";
 import {
   DEFAULT_AUTO_EXPAND,
   DEFAULT_HEAT_COLOR,
@@ -45,7 +46,8 @@ import {
   HEAT_COLOR_OPTIONS,
   NUMBER_FORMATS,
   THEME_PRESETS,
-} from "./profilerConfig";
+} from "./profilerConfig.ts";
+import { getBlocks, getRuns, getTrace, lookupTx } from "./lib/api.ts";
 
 
 
@@ -53,21 +55,11 @@ function getNumberFormat(id) {
   return NUMBER_FORMATS.find((format) => format.id === id) || NUMBER_FORMATS[2];
 }
 
-function fetchJson(url) {
-  return fetch(url).then((res) => {
-    if (!res.ok) {
-      return res.text().then((text) => {
-        throw new Error(text || `HTTP ${res.status}`);
-      });
-    }
-    return res.json();
-  });
-}
-
 export default function App() {
   const [runs, setRuns] = useState([]);
   const [blocks, setBlocks] = useState([]);
   const [runId, setRunId] = useState("");
+  const [activeTab, setActiveTab] = useState("transactions"); // "trace" | "transactions"
   const [mode, setMode] = useState("tx");
   const [txQuery, setTxQuery] = useState("");
   const [stacksTxId, setStacksTxId] = useState("");
@@ -97,6 +89,16 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const abortControllerRef = useRef(null);
   const [lastLoadedQuery, setLastLoadedQuery] = useState(null);
+  const setTab = useCallback((tab, { replace = false } = {}) => {
+    setActiveTab(tab);
+    const url = new URL(window.location.href);
+    url.hash = tab === "trace" ? "trace" : "transactions";
+    if (replace) {
+      window.history.replaceState({ tab }, "", url);
+    } else {
+      window.history.pushState({ tab }, "", url);
+    }
+  }, []);
   const [heatConfig, setHeatConfig] = useState(() => {
     const stored = localStorage.getItem("profilerHeatConfig");
     if (stored) {
@@ -248,7 +250,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetchJson("/api/runs")
+    getRuns()
       .then((data) => {
         setRuns(data);
         if (data.length > 0) setRunId(String(data[0].id));
@@ -258,16 +260,29 @@ export default function App() {
 
   useEffect(() => {
     if (!runId) return;
-    fetchJson(`/api/blocks?run_id=${runId}`)
+    getBlocks(runId)
       .then(setBlocks)
       .catch(() => setBlocks([]));
   }, [runId]);
 
   useEffect(() => {
+    const initialTab = window.location.hash === "#trace" ? "trace" : "transactions";
+    setActiveTab(initialTab);
+    window.history.replaceState({ tab: initialTab }, "", window.location.href);
+
+    const handlePopState = (event) => {
+      const tab = event.state?.tab || (window.location.hash === "#trace" ? "trace" : "transactions");
+      setActiveTab(tab);
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  useEffect(() => {
     if (!runId) return;
     const normalized = txQuery.trim().toLowerCase();
     if (normalized.length !== 64) return;
-    fetchJson(`/api/tx-lookup?run_id=${runId}&tx_hash=${normalized}`)
+    lookupTx(runId, normalized)
       .then((data) => {
         if (data?.stacks_tx_id) {
           setStacksTxId(String(data.stacks_tx_id));
@@ -281,6 +296,9 @@ export default function App() {
   const loadTrace = useCallback(async () => {
     if (!runId) return;
     
+    // Switch to trace tab when loading trace
+    setTab("trace");
+    
     // Cancel any existing request
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -289,30 +307,22 @@ export default function App() {
     const controller = new AbortController();
     abortControllerRef.current = controller;
     
-    const url = new URL("/api/trace", window.location.origin);
-    url.searchParams.set("run_id", runId);
-    url.searchParams.set("mode", mode);
-    url.searchParams.set("limit", limit || "5000");
-    if (mode === "tx" && stacksTxId) {
-      url.searchParams.set("stacks_tx_id", stacksTxId);
-    }
-    if (mode === "run") {
-      if (stacksBlockId) url.searchParams.set("stacks_block_id", stacksBlockId);
-      if (segmentRootId) url.searchParams.set("segment_root_id", segmentRootId);
-    }
-    // Apply minWallMs filter in both modes
-    if (minWallMs) url.searchParams.set("min_wall_ms", minWallMs);
+    const params = {
+      run_id: runId,
+      mode,
+      limit: limit || "5000",
+      stacks_tx_id: mode === "tx" && stacksTxId ? stacksTxId : undefined,
+      stacks_block_id: mode === "run" && stacksBlockId ? stacksBlockId : undefined,
+      segment_root_id: mode === "run" && segmentRootId ? segmentRootId : undefined,
+      min_wall_ms: minWallMs || undefined,
+    };
 
     // Clear data immediately when starting a new search
     setRows([]);
     setSummary("Loading trace...");
     setIsLoading(true);
     try {
-      const response = await fetch(url.toString(), { signal: controller.signal });
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      const data = await response.json();
+      const data = await getTrace(params, { signal: controller.signal });
       setRows(data);
       if (data.length === 0) {
         setSummary("No data found.");
@@ -340,7 +350,7 @@ export default function App() {
       setIsLoading(false);
       abortControllerRef.current = null;
     }
-  }, [runId, mode, limit, stacksTxId, stacksBlockId, segmentRootId, minWallMs, txQuery, hotPathMode]);
+  }, [runId, mode, limit, stacksTxId, stacksBlockId, segmentRootId, minWallMs, txQuery, hotPathMode, setTab]);
 
   const cancelLoad = useCallback(() => {
     if (abortControllerRef.current) {
@@ -375,6 +385,49 @@ export default function App() {
     setHotPathMode("off");
     setChainCompression(true);
   }, []);
+
+  // Navigate to trace view for a specific transaction
+  const viewTransactionTrace = useCallback((txHashHex, stacksTxIdValue) => {
+    setTxQuery(txHashHex);
+    setStacksTxId(String(stacksTxIdValue));
+    setTab("trace");
+    // Trigger load after switching to trace tab
+    setTimeout(() => {
+      const params = {
+        run_id: runId,
+        mode: "tx",
+        stacks_tx_id: String(stacksTxIdValue),
+        limit: limit || "5000",
+      };
+
+      setRows([]);
+      setSummary("Loading trace...");
+      setIsLoading(true);
+
+      getTrace(params)
+        .then((data) => {
+          setRows(data);
+          setSummary(data.length === 0 ? "No data found." : `${data.length} records loaded.`);
+          setLastLoadedQuery({
+            runId,
+            mode: "tx",
+            txQuery: txHashHex,
+            stacksTxId: String(stacksTxIdValue),
+            stacksBlockId: "",
+            segmentRootId: "",
+            minWallMs: "",
+            limit,
+            hotPathMode,
+          });
+        })
+        .catch((err) => {
+          setSummary(`Error: ${err.message}`);
+        })
+        .finally(() => {
+          setIsLoading(false);
+        });
+    }, 50);
+  }, [runId, limit, hotPathMode, setTab]);
 
   const maxWallUs = useMemo(() => {
     return rows.reduce((maxVal, row) => {
@@ -884,12 +937,17 @@ export default function App() {
         cancelLoad={cancelLoad}
         isDirty={isDirty}
         isLoading={isLoading}
+        activeTab={activeTab}
+        setActiveTab={setTab}
       />
 
-      {/* Toolbar */}
-      <ToolbarBar
-        columns={SELECTABLE_COLUMNS}
-        selectedColumns={selectedColumns}
+      {/* Trace View */}
+      {activeTab === "trace" && (
+        <>
+          {/* Toolbar */}
+          <ToolbarBar
+            columns={SELECTABLE_COLUMNS}
+            selectedColumns={selectedColumns}
         toggleColumn={toggleColumn}
         toggleColumnGroup={toggleColumnGroup}
         expandToDepth={expandToDepth}
@@ -904,42 +962,52 @@ export default function App() {
         summary={summary}
       />
 
-      {/* Breadcrumb */}
-      <BreadcrumbBar breadcrumb={breadcrumb} />
+          {/* Breadcrumb */}
+          <BreadcrumbBar breadcrumb={breadcrumb} />
 
-      {/* Grid */}
-      <ProfilerGrid
-        data={roots}
-        columns={visibleColumns}
-        spanVizEnabled={spanVizConfig.enabled}
-        spanVizStyle={spanVizConfig.style}
-        isLoading={isLoading}
-        isEmpty={rows.length === 0 && !isLoading}
-        rowStyle={() => "profiler-row"}
-        columnStyle={(column) =>
-          NUMERIC_COLUMN_KEYS.has(column.id)
-            ? "grid-col-numeric"
-            : column.id === "span"
-              ? "grid-col-span"
-              : ""
-        }
-        onInit={(api) => {
-          gridApiRef.current = api;
-        }}
-        onOpenRow={(ev) => {
-          setOpenNodes((prev) => new Set(prev).add(ev.id));
-        }}
-        onCloseRow={(ev) => {
-          setOpenNodes((prev) => {
-            const next = new Set(prev);
-            next.delete(ev.id);
-            return next;
-          });
-        }}
-        onSelectRow={(ev) => {
-          if (ev?.id != null) setActiveId(ev.id);
-        }}
-      />
+          {/* Grid */}
+          <ProfilerGrid
+            data={roots}
+            columns={visibleColumns}
+            spanVizEnabled={spanVizConfig.enabled}
+            spanVizStyle={spanVizConfig.style}
+            isLoading={isLoading}
+            isEmpty={rows.length === 0 && !isLoading}
+            rowStyle={() => "profiler-row"}
+            columnStyle={(column) =>
+              NUMERIC_COLUMN_KEYS.has(column.id)
+                ? "grid-col-numeric"
+                : column.id === "span"
+                  ? "grid-col-span"
+                  : ""
+            }
+            onInit={(api) => {
+              gridApiRef.current = api;
+            }}
+            onOpenRow={(ev) => {
+              setOpenNodes((prev) => new Set(prev).add(ev.id));
+            }}
+            onCloseRow={(ev) => {
+              setOpenNodes((prev) => {
+                const next = new Set(prev);
+                next.delete(ev.id);
+                return next;
+              });
+            }}
+            onSelectRow={(ev) => {
+              if (ev?.id != null) setActiveId(ev.id);
+            }}
+          />
+        </>
+      )}
+
+      {/* Transactions View */}
+      {activeTab === "transactions" && (
+        <TransactionsTab
+          runId={runId}
+          onViewTrace={viewTransactionTrace}
+        />
+      )}
     </div>
   );
 }
