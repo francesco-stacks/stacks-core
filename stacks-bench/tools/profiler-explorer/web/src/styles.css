@@ -1,6 +1,6 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@config "../tailwind.config.js";
+@reference "tailwindcss";
 
 :root {
   --radius: 0.65rem;
@@ -527,6 +527,21 @@
 .grid-group-header {
   justify-content: center !important;
   text-align: center !important;
+}
+
+.grid-level1-header {
+  font-weight: 600;
+  background: color-mix(in srgb, var(--muted) 15%, transparent);
+}
+
+.grid-level2-header {
+  font-weight: 500;
+  background: color-mix(in srgb, var(--muted) 8%, transparent);
+}
+
+.grid-level1-empty,
+.grid-level2-empty {
+  /* Empty header cells for non-grouped columns */
 }
 
 .grid-group-header .wx-text {
@@ -1457,14 +1472,31 @@
   padding: 12px 16px 16px;
   overflow: hidden;
   position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
 .app-grid-container > div {
-  height: calc(100vh - 180px);
-  min-height: 400px;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
   border-radius: 10px;
   border: 1px solid var(--border);
   overflow: hidden;
+  display: flex;
+}
+
+.app-grid-container .wx-willow-dark-theme {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+}
+
+.app-grid-container .wx-grid {
+  height: 100%;
+  width: 100%;
+  flex: 1;
 }
 
 /* Loading overlay for grid */
@@ -1810,6 +1842,11 @@
 
 .tx-hash-link:hover {
   text-decoration: underline;
+}
+
+.tx-hash-text {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
 }
 
 .transactions-table td.contract-name,

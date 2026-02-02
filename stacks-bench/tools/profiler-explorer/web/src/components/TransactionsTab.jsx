@@ -49,18 +49,11 @@ function formatNumber(value, format, decimals = 0) {
 }
 
 // Cell component for transaction hash with click handler
-function TxHashCell({ row, onViewTrace }) {
+function TxHashCell({ row }) {
   return (
-    <button
-      className="tx-hash-link"
-      onClick={(e) => {
-        e.stopPropagation();
-        onViewTrace(row);
-      }}
-      title={row.tx_hash_hex}
-    >
+    <span className="tx-hash-text numeric-text" title={row.tx_hash_hex}>
       {row.tx_hash_hex || "-"}
-    </button>
+    </span>
   );
 }
 
@@ -307,13 +300,27 @@ export default function TransactionsTab({ runId, onViewTrace }) {
     
     return [
       {
+        id: "row_number",
+        header: "#",
+        width: 60,
+        resize: true,
+        css: "numeric",
+        template: (val) => (val == null ? "-" : String(val)),
+      },
+      {
+        id: "_actions",
+        header: "",
+        width: 50,
+        cell: (props) => <ActionCell {...props} onViewTrace={handleView} />,
+      },
+      {
         id: "tx_hash_hex",
         header: "Transaction Hash",
         width: 420,
         flexgrow: 1,
         sort: true,
         resize: true,
-        cell: (props) => <TxHashCell {...props} onViewTrace={handleView} />,
+        cell: (props) => <TxHashCell {...props} />,
       },
       {
         id: "contract_issuer",
@@ -406,20 +413,16 @@ export default function TransactionsTab({ runId, onViewTrace }) {
         resize: true,
         cell: makeHeatCell("clarity_write_length", 0),
       },
-      {
-        id: "_actions",
-        header: "",
-        width: 50,
-        cell: (props) => <ActionCell {...props} onViewTrace={handleView} />,
-      },
     ];
   }, [onViewTrace, heatMaxes, numberFormat, heatConfig, heatStyleByKey, heatColorByKey, toggleHeat, setHeatMin, setHeatMax, setHeatStyleForKey, setHeatColorForKey, minWallFilterMs]);
 
   const heatMaxAbortRef = useRef(null);
+  const [heatMaxesLoaded, setHeatMaxesLoaded] = useState(false);
 
   useEffect(() => {
     if (!runId) {
       setHeatMaxes(DEFAULT_HEAT_MAXES);
+      setHeatMaxesLoaded(true);
       return;
     }
 
@@ -431,6 +434,7 @@ export default function TransactionsTab({ runId, onViewTrace }) {
 
     const fetchHeatMaxes = async () => {
       try {
+        setHeatMaxesLoaded(false);
         const data = await getTransactionsMaxes(
           {
             run_id: runId,
@@ -446,6 +450,8 @@ export default function TransactionsTab({ runId, onViewTrace }) {
         if (err.name !== "AbortError") {
           setHeatMaxes(DEFAULT_HEAT_MAXES);
         }
+      } finally {
+        setHeatMaxesLoaded(true);
       }
     };
 
@@ -512,7 +518,11 @@ export default function TransactionsTab({ runId, onViewTrace }) {
         data.rows.forEach((row, i) => {
           const index = fetchStart + i;
           // Add unique id for the grid
-          next[index] = { ...row, id: `${row.stacks_tx_id}-${row.synthetic_block_id}` };
+          next[index] = {
+            ...row,
+            id: `${row.stacks_tx_id}-${row.synthetic_block_id}`,
+            row_number: index + 1,
+          };
         });
         return next;
       });
@@ -593,27 +603,6 @@ export default function TransactionsTab({ runId, onViewTrace }) {
       filters.minDurationMs
     );
   }, [filters]);
-
-  const rowById = useMemo(() => {
-    const map = new Map();
-    dataCache.forEach((row) => {
-      if (row && row.id) {
-        map.set(row.id, row);
-      }
-    });
-    return map;
-  }, [dataCache]);
-
-  // Handle row selection - navigate to trace
-  const handleSelectRow = useCallback((ev) => {
-    const { id } = ev;
-    if (id) {
-      const row = rowById.get(id);
-      if (row) {
-        onViewTrace(row.tx_hash_hex, row.stacks_tx_id);
-      }
-    }
-  }, [rowById, onViewTrace]);
 
   // Grid init callback
   const handleInit = useCallback((api) => {
@@ -749,10 +738,8 @@ export default function TransactionsTab({ runId, onViewTrace }) {
                 sizes={{ rowHeight: 36 }}
                 dynamic={total > 0 ? { rowCount: total } : null}
                 onRequestData={handleRequestData}
-                onSelectRow={handleSelectRow}
                 init={handleInit}
-                select={true}
-                overlay={isLoading && !hasAnyData ? "Loading transactions..." : null}
+                overlay={isLoading && !hasAnyData || !heatMaxesLoaded ? "Loading transactions..." : null}
               />
             </HeatHeaderMenuContext.Provider>
           </WillowDark>

@@ -159,7 +159,6 @@ pub trait EvalHook {
     // Called upon completion of the execution
     fn did_complete(&mut self, _result: core::result::Result<&mut ExecutionResult, String>);
 }
-
 fn lookup_variable(
     name: &str,
     context: &LocalContext,
@@ -173,6 +172,9 @@ fn lookup_variable(
     } else if let Some(value) = variables::lookup_reserved_variable(name, context, env)? {
         Ok(value)
     } else {
+        #[cfg(feature = "profiler")]
+        let _span = stacks_profiler::span!("lookup_variable", name);
+        
         runtime_cost(
             ClarityCostFunction::LookupVariableDepth,
             env,
@@ -199,6 +201,7 @@ fn lookup_variable(
     }
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn lookup_function(
     name: &str,
     env: &mut Environment,

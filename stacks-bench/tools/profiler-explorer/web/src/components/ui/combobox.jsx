@@ -30,6 +30,8 @@ export function Combobox({
   const [search, setSearch] = React.useState("");
   const inlineInputRef = React.useRef(null);
   const inlinePointerDownRef = React.useRef(false);
+  const onSearchRef = React.useRef(onSearch);
+  const searchTimerRef = React.useRef(null);
 
   const selectedValues = React.useMemo(() => {
     return multiple ? (Array.isArray(value) ? value : []) : value ? [value] : [];
@@ -43,14 +45,28 @@ export function Combobox({
   }, [selectedValues, options, multiple, placeholder]);
 
   React.useEffect(() => {
-    if (onSearch) {
-      onSearch(search);
+    onSearchRef.current = onSearch;
+  }, [onSearch]);
+
+  React.useEffect(() => {
+    if (!onSearchRef.current) return undefined;
+    if (searchTimerRef.current) {
+      clearTimeout(searchTimerRef.current);
     }
-  }, [search, onSearch]);
+    searchTimerRef.current = setTimeout(() => {
+      onSearchRef.current?.(search);
+    }, 200);
+    return () => {
+      if (searchTimerRef.current) {
+        clearTimeout(searchTimerRef.current);
+      }
+    };
+  }, [search]);
 
   const toggleValue = (val) => {
     if (!multiple) {
       onChange?.(val);
+      setSearch("");
       setOpen(false);
       return;
     }
@@ -58,6 +74,7 @@ export function Combobox({
       ? selectedValues.filter((item) => item !== val)
       : [...selectedValues, val];
     onChange?.(next);
+    setSearch("");
   };
 
   const removeValue = (val, event) => {
@@ -96,6 +113,9 @@ export function Combobox({
       }
     }
     setOpen(nextOpen);
+    if (!nextOpen) {
+      setSearch("");
+    }
   };
 
   return (

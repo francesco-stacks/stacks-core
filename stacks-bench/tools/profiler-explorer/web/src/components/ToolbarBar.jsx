@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React from "react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -8,104 +8,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Columns3, Flame, Link2, ChevronRight } from "lucide-react";
-
-function ColumnDropdown({ columns, selected, onChange, onToggleGroup }) {
-  // Build hierarchical structure: ungrouped columns + groups with children
-  const { ungrouped, groups } = useMemo(() => {
-    const ungrouped = [];
-    const groupMap = new Map();
-    
-    for (const col of columns) {
-      if (col.group) {
-        if (!groupMap.has(col.group)) {
-          groupMap.set(col.group, []);
-        }
-        groupMap.get(col.group).push(col);
-      } else {
-        ungrouped.push(col);
-      }
-    }
-    
-    const groups = Array.from(groupMap.entries()).map(([name, cols]) => ({
-      name,
-      columns: cols,
-    }));
-    
-    return { ungrouped, groups };
-  }, [columns]);
-
-  const isGroupFullySelected = (group) => 
-    group.columns.every((col) => selected.includes(col.key));
-  
-  const isGroupPartiallySelected = (group) =>
-    group.columns.some((col) => selected.includes(col.key)) && 
-    !isGroupFullySelected(group);
-
-  const handleGroupToggle = (group) => {
-    const keys = group.columns.map((c) => c.key);
-    onToggleGroup(keys, !isGroupFullySelected(group));
-  };
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="sm" className="gap-2">
-          <Columns3 className="h-4 w-4" />
-          Columns
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="max-h-96 w-64 overflow-auto">
-        <DropdownMenuLabel>Visible Columns</DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        
-        {/* Ungrouped columns */}
-        {ungrouped.map((col) => (
-          <DropdownMenuCheckboxItem
-            key={col.key}
-            checked={selected.includes(col.key)}
-            onCheckedChange={() => onChange(col.key)}
-            onSelect={(e) => e.preventDefault()}
-          >
-            {col.label}
-          </DropdownMenuCheckboxItem>
-        ))}
-        
-        {ungrouped.length > 0 && groups.length > 0 && <DropdownMenuSeparator />}
-        
-        {/* Grouped columns */}
-        {groups.map((group) => (
-          <div key={group.name} className="column-group">
-            <DropdownMenuCheckboxItem
-              checked={isGroupFullySelected(group)}
-              className="font-medium"
-              onCheckedChange={() => handleGroupToggle(group)}
-              onSelect={(e) => e.preventDefault()}
-            >
-              <span className="flex items-center gap-1">
-                <ChevronRight className={`h-3 w-3 transition-transform ${isGroupPartiallySelected(group) || isGroupFullySelected(group) ? "rotate-90" : ""}`} />
-                {group.name}
-              </span>
-            </DropdownMenuCheckboxItem>
-            <div className="column-group-children">
-              {group.columns.map((col) => (
-                <DropdownMenuCheckboxItem
-                  key={col.key}
-                  checked={selected.includes(col.key)}
-                  onCheckedChange={() => onChange(col.key)}
-                  onSelect={(e) => e.preventDefault()}
-                  className="pl-6 text-muted-foreground text-xs"
-                >
-                  {col.headerLabel || col.label.replace(/ \(ms\)$/, "").replace(group.name.replace(" (ms)", "") + " ", "")}
-                </DropdownMenuCheckboxItem>
-              ))}
-            </div>
-          </div>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
+import { Flame, Link2 } from "lucide-react";
+import ColumnSelector from "./ColumnSelector";
 
 function HotPathDropdown({ hotPathMode, setHotPathMode }) {
   const isActive = hotPathMode !== "off";
@@ -148,7 +52,6 @@ function HotPathDropdown({ hotPathMode, setHotPathMode }) {
 }
 
 export default function ToolbarBar({
-  columns,
   selectedColumns,
   toggleColumn,
   expandToDepth,
@@ -166,8 +69,7 @@ export default function ToolbarBar({
   return (
     <div className="app-toolbar">
       <div className="toolbar-left">
-        <ColumnDropdown
-          columns={columns}
+        <ColumnSelector
           selected={selectedColumns}
           onChange={toggleColumn}
           onToggleGroup={toggleColumnGroup}

@@ -151,12 +151,36 @@ function traceSqlTxMode() {
       COALESCE(kvc.kv_pairs, 0) AS kv_pairs,
       COALESCE(kvc.kv_total, 0) AS kv_total,
 
-      prcc.runtime AS clarity_runtime,
-      prcc.read_count AS clarity_read_count,
-      prcc.read_length AS clarity_read_length,
-      prcc.write_count AS clarity_write_count,
-      prcc.write_length AS clarity_write_length,
-      prcc.input_n AS clarity_input_n,
+      prcc.runtime AS clarity_runtime_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.runtime * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_runtime_avg,
+      prcc.read_count AS clarity_read_count_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.read_count * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_read_count_avg,
+      prcc.read_length AS clarity_read_length_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.read_length * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_read_length_avg,
+      prcc.write_count AS clarity_write_count_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.write_count * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_write_count_avg,
+      prcc.write_length AS clarity_write_length_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.write_length * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_write_length_avg,
+      prcc.input_n AS clarity_input_n_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.input_n * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_input_n_avg,
 
       t.sort_path
     FROM trace_tree t
@@ -244,12 +268,36 @@ function traceSqlRunMode() {
       COALESCE(kvc.kv_pairs, 0) AS kv_pairs,
       COALESCE(kvc.kv_total, 0) AS kv_total,
 
-      prcc.runtime AS clarity_runtime,
-      prcc.read_count AS clarity_read_count,
-      prcc.read_length AS clarity_read_length,
-      prcc.write_count AS clarity_write_count,
-      prcc.write_length AS clarity_write_length,
-      prcc.input_n AS clarity_input_n,
+      prcc.runtime AS clarity_runtime_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.runtime * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_runtime_avg,
+      prcc.read_count AS clarity_read_count_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.read_count * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_read_count_avg,
+      prcc.read_length AS clarity_read_length_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.read_length * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_read_length_avg,
+      prcc.write_count AS clarity_write_count_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.write_count * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_write_count_avg,
+      prcc.write_length AS clarity_write_length_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.write_length * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_write_length_avg,
+      prcc.input_n AS clarity_input_n_total,
+      CASE
+        WHEN t.sample_count > 0 THEN prcc.input_n * 1.0 / t.sample_count
+        ELSE NULL
+      END AS clarity_input_n_avg,
 
       t.sort_path
     FROM trace_tree t
@@ -791,7 +839,7 @@ if (fs.existsSync(distDir)) {
   app.use(express.static(distDir));
 }
 
-app.get("*", (req, res) => {
+app.use((req, res) => {
   if (req.path.startsWith("/api")) {
     return res.status(404).json({ error: "Not found" });
   }

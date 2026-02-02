@@ -20,7 +20,7 @@ export function createHeatHeaderBuilder({
   defaultHeatColor,
 }) {
   return (col) => ({
-    text: col.headerLabel ?? col.label,
+    text: col.level3 || col.headerLabel || col.label,
     cell: (props) => (
       <HeatHeaderCell
         {...props}

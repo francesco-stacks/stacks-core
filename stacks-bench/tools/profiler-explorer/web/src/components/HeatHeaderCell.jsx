@@ -95,7 +95,7 @@ export default function HeatHeaderCell({
   if (!heatKey) {
     return <div className="column-header">{cell.text}</div>;
   }
-  const config = heatConfig[heatKey] || { enabled: true, min: null, max: null };
+  const config = heatConfig[heatKey] || { enabled: false, min: null, max: null };
   return (
     <div className="column-header" ref={containerRef}>
       <span className="column-header-label">{cell.text}</span>
@@ -189,7 +189,7 @@ export default function HeatHeaderCell({
             </div>
           </div>
 
-          {(column.id === "wall_total" || (minWallFilterMs !== undefined && setMinWallFilterMs)) && (
+          {((column.id === "wall_inc_total" || column.heatKey === "wallTotalUs") || (minWallFilterMs !== undefined && setMinWallFilterMs)) && (
             <>
               <div className="column-popover-divider" />
               <div className="column-popover-section">

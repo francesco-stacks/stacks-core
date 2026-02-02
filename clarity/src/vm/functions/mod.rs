@@ -631,6 +631,7 @@ fn native_begin(mut args: Vec<Value>) -> Result<Value, VmExecutionError> {
     }
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_print(
     args: &[SymbolicExpression],
     env: &mut Environment,
@@ -651,6 +652,7 @@ fn special_print(
     Ok(input)
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_if(
     args: &[SymbolicExpression],
     env: &mut Environment,
@@ -677,6 +679,7 @@ fn special_if(
     }
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_asserts(
     args: &[SymbolicExpression],
     env: &mut Environment,
@@ -755,6 +758,7 @@ pub fn parse_eval_bindings(
     Ok(result)
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_let(
     args: &[SymbolicExpression],
     env: &mut Environment,
@@ -808,11 +812,13 @@ fn special_let(
     })
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_as_contract(
     args: &[SymbolicExpression],
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+
     // (as-contract (..))
     // arg0 => body
     check_argument_count(1, args)?;
@@ -835,6 +841,7 @@ fn special_as_contract(
     result
 }
 
+#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_contract_of(
     args: &[SymbolicExpression],
     env: &mut Environment,

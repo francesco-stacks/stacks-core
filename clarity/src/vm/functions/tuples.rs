@@ -58,7 +58,8 @@ pub fn tuple_get(
             match opt_data.data {
                 Some(data) => {
                     if let Value::Tuple(tuple_data) = *data {
-                        runtime_cost(ClarityCostFunction::TupleGet, env, tuple_data.len())?;
+                        let tuple_data_len = tuple_data.len();
+                        runtime_cost(ClarityCostFunction::TupleGet, env, tuple_data_len)?;
                         Ok(Value::some(tuple_data.get_owned(arg_name)?).map_err(|_| {
                             VmInternalError::Expect(
                                 "Tuple contents should *always* fit in a some wrapper".into(),
@@ -75,7 +76,8 @@ pub fn tuple_get(
             }
         }
         Value::Tuple(tuple_data) => {
-            runtime_cost(ClarityCostFunction::TupleGet, env, tuple_data.len())?;
+            let tuple_data_len = tuple_data.len();
+            runtime_cost(ClarityCostFunction::TupleGet, env, tuple_data_len)?;
             tuple_data.get_owned(arg_name)
         }
         _ => Err(CheckErrorKind::ExpectedTuple(Box::new(TypeSignature::type_of(&value)?)).into()),

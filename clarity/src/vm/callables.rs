@@ -147,7 +147,7 @@ impl DefinedFunction {
             arg_types: types,
         }
     }
-
+    
     pub fn execute_apply(
         &self,
         args: &[Value],

@@ -8,7 +8,6 @@ import HeaderBar from "./components/HeaderBar";
 import ToolbarBar from "./components/ToolbarBar";
 import BreadcrumbBar from "./components/BreadcrumbBar";
 import {
-  createGroupHeaderBuilder,
   createHeatHeaderBuilder,
   createSpanHeaderBuilder,
 } from "./columnBuilders";
@@ -35,7 +34,6 @@ import {
   COUNT_DIM_KEYS,
   DEFAULT_COLUMNS,
   NUMERIC_COLUMN_KEYS,
-  SELECTABLE_COLUMNS,
   sanitizeSelectedColumns,
 } from "./columnsConfig.ts";
 import {
@@ -53,6 +51,53 @@ import { getBlocks, getRuns, getTrace, lookupTx } from "./lib/api.ts";
 
 function getNumberFormat(id) {
   return NUMBER_FORMATS.find((format) => format.id === id) || NUMBER_FORMATS[2];
+}
+
+function getHeatKeyForColumn(col) {
+  if (col.heatKey) return col.heatKey;
+  return NUMERIC_COLUMN_KEYS.has(col.key) ? col.key : null;
+}
+
+function buildDefaultHeatConfig() {
+  const defaults = {};
+  for (const col of COLUMN_DEFS) {
+    const heatKey = getHeatKeyForColumn(col);
+    if (!heatKey || defaults[heatKey]) continue;
+    defaults[heatKey] = { enabled: false, min: null, max: null };
+  }
+  return defaults;
+}
+
+function buildDefaultHeatStyleMap() {
+  const legacy = localStorage.getItem("profilerHeatStyle") || DEFAULT_HEAT_STYLE;
+  const defaults = {};
+  for (const col of COLUMN_DEFS) {
+    const heatKey = getHeatKeyForColumn(col);
+    if (!heatKey || defaults[heatKey]) continue;
+    defaults[heatKey] = legacy;
+  }
+  return defaults;
+}
+
+function buildDefaultHeatColorMap() {
+  const defaults = {};
+  for (const col of COLUMN_DEFS) {
+    const heatKey = getHeatKeyForColumn(col);
+    if (!heatKey || defaults[heatKey]) continue;
+    defaults[heatKey] = DEFAULT_HEAT_COLOR;
+  }
+  return defaults;
+}
+
+const DEFAULT_NUMERIC_WIDTH = 100;
+const MIN_NUMERIC_WIDTH = 90;
+
+function getSafeStorage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
 }
 
 export default function App() {
@@ -100,65 +145,47 @@ export default function App() {
     }
   }, []);
   const [heatConfig, setHeatConfig] = useState(() => {
-    const stored = localStorage.getItem("profilerHeatConfig");
+    const defaults = buildDefaultHeatConfig();
+    const storage = getSafeStorage();
+    const stored = storage?.getItem("profilerHeatConfig");
     if (stored) {
       try {
-        return JSON.parse(stored);
+        return { ...defaults, ...JSON.parse(stored) };
       } catch {
-        return {};
+        return defaults;
       }
     }
-    return {
-      wallTotalUs: { enabled: true, min: null, max: null },
-      selfWallUs: { enabled: false, min: null, max: null },
-      busyTotalUs: { enabled: true, min: null, max: null },
-      selfBusyUs: { enabled: false, min: null, max: null },
-      waitTotalUs: { enabled: false, min: null, max: null },
-      selfWaitUs: { enabled: false, min: null, max: null },
-      clarityRuntime: { enabled: false, min: null, max: null },
-    };
+    return defaults;
   });
   const [heatStyleByKey, setHeatStyleByKey] = useState(() => {
-    const stored = localStorage.getItem("profilerHeatStyleByKey");
+    const defaults = buildDefaultHeatStyleMap();
+    const storage = getSafeStorage();
+    const stored = storage?.getItem("profilerHeatStyleByKey");
     if (stored) {
       try {
-        return JSON.parse(stored);
+        return { ...defaults, ...JSON.parse(stored) };
       } catch {
-        return {};
+        return defaults;
       }
     }
-    const legacy = localStorage.getItem("profilerHeatStyle") || DEFAULT_HEAT_STYLE;
-    return {
-      wallTotalUs: legacy,
-      selfWallUs: legacy,
-      busyTotalUs: legacy,
-      selfBusyUs: legacy,
-      waitTotalUs: legacy,
-      selfWaitUs: legacy,
-      clarityRuntime: legacy,
-    };
+    return defaults;
   });
   const [heatColorByKey, setHeatColorByKey] = useState(() => {
-    const stored = localStorage.getItem("profilerHeatColorByKey");
+    const defaults = buildDefaultHeatColorMap();
+    const storage = getSafeStorage();
+    const stored = storage?.getItem("profilerHeatColorByKey");
     if (stored) {
       try {
-        return JSON.parse(stored);
+        return { ...defaults, ...JSON.parse(stored) };
       } catch {
-        return {};
+        return defaults;
       }
     }
-    return {
-      wallTotalUs: DEFAULT_HEAT_COLOR,
-      selfWallUs: DEFAULT_HEAT_COLOR,
-      busyTotalUs: DEFAULT_HEAT_COLOR,
-      selfBusyUs: DEFAULT_HEAT_COLOR,
-      waitTotalUs: DEFAULT_HEAT_COLOR,
-      selfWaitUs: DEFAULT_HEAT_COLOR,
-      clarityRuntime: DEFAULT_HEAT_COLOR,
-    };
+    return defaults;
   });
   const [selectedColumns, setSelectedColumns] = useState(() => {
-    const stored = localStorage.getItem("profilerColumns");
+    const storage = getSafeStorage();
+    const stored = storage?.getItem("profilerColumns");
     if (!stored) return sanitizeSelectedColumns(DEFAULT_COLUMNS);
     try {
       const parsed = JSON.parse(stored);
@@ -168,10 +195,12 @@ export default function App() {
     }
   });
   const [numberFormatId, setNumberFormatId] = useState(() => {
-    return localStorage.getItem("profilerNumberFormat") || DEFAULT_NUMBER_FORMAT_ID;
+    const storage = getSafeStorage();
+    return storage?.getItem("profilerNumberFormat") || DEFAULT_NUMBER_FORMAT_ID;
   });
   const [spanVizConfig, setSpanVizConfig] = useState(() => {
-    const stored = localStorage.getItem("profilerSpanVizConfig");
+    const storage = getSafeStorage();
+    const stored = storage?.getItem("profilerSpanVizConfig");
     if (stored) {
       try {
         return JSON.parse(stored);
@@ -187,19 +216,23 @@ export default function App() {
   const gridApiRef = useRef(null);
 
   useEffect(() => {
-    localStorage.setItem("profilerHeatConfig", JSON.stringify(heatConfig));
+    const storage = getSafeStorage();
+    storage?.setItem("profilerHeatConfig", JSON.stringify(heatConfig));
   }, [heatConfig]);
 
   useEffect(() => {
-    localStorage.setItem("profilerTheme", theme);
+    const storage = getSafeStorage();
+    storage?.setItem("profilerTheme", theme);
   }, [theme]);
 
   useEffect(() => {
-    localStorage.setItem("profilerWallMinFilterMs", minWallFilterMs);
+    const storage = getSafeStorage();
+    storage?.setItem("profilerWallMinFilterMs", minWallFilterMs);
   }, [minWallFilterMs]);
 
   useEffect(() => {
-    localStorage.setItem("profilerThemePreset", themePreset);
+    const storage = getSafeStorage();
+    storage?.setItem("profilerThemePreset", themePreset);
   }, [themePreset]);
 
   useEffect(() => {
@@ -225,19 +258,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem("profilerNumberFormat", numberFormatId);
+    const storage = getSafeStorage();
+    storage?.setItem("profilerNumberFormat", numberFormatId);
   }, [numberFormatId]);
 
   useEffect(() => {
-    localStorage.setItem("profilerHeatStyleByKey", JSON.stringify(heatStyleByKey));
+    const storage = getSafeStorage();
+    storage?.setItem("profilerHeatStyleByKey", JSON.stringify(heatStyleByKey));
   }, [heatStyleByKey]);
 
   useEffect(() => {
-    localStorage.setItem("profilerHeatColorByKey", JSON.stringify(heatColorByKey));
+    const storage = getSafeStorage();
+    storage?.setItem("profilerHeatColorByKey", JSON.stringify(heatColorByKey));
   }, [heatColorByKey]);
 
   useEffect(() => {
-    localStorage.setItem("profilerSpanVizConfig", JSON.stringify(spanVizConfig));
+    const storage = getSafeStorage();
+    storage?.setItem("profilerSpanVizConfig", JSON.stringify(spanVizConfig));
   }, [spanVizConfig]);
 
   useEffect(() => {
@@ -496,48 +533,6 @@ export default function App() {
     [withFlamePercent, openNodes, hotPathMode]
   );
 
-  const heatMax = useMemo(() => {
-    const flat = flattenTree(withFlamePercent);
-    return flat.reduce(
-      (acc, row) => {
-        const wallTotal = getWallUs(row) ?? 0;
-        const busyTotal = row.est_cpu_us ?? row.cpu_time_us ?? 0;
-        const waitTotal = Math.max(0, wallTotal - busyTotal);
-        const selfWall = getSelfWallUs(row) ?? 0;
-        const selfBusy = getSelfCpuUs(row) ?? 0;
-        const selfWait = getSelfWaitUs(row) ?? 0;
-        const clarity = typeof row.clarity_runtime === "number" ? row.clarity_runtime : 0;
-        acc.wallTotalUs = Math.max(acc.wallTotalUs, wallTotal);
-        acc.busyTotalUs = Math.max(acc.busyTotalUs, busyTotal);
-        acc.waitTotalUs = Math.max(acc.waitTotalUs, waitTotal);
-        acc.selfWallUs = Math.max(acc.selfWallUs, selfWall);
-        acc.selfBusyUs = Math.max(acc.selfBusyUs, selfBusy);
-        acc.selfWaitUs = Math.max(acc.selfWaitUs, selfWait);
-        acc.clarityRuntime = Math.max(acc.clarityRuntime, clarity);
-        return acc;
-      },
-      {
-        wallTotalUs: 0,
-        busyTotalUs: 0,
-        waitTotalUs: 0,
-        selfWallUs: 0,
-        selfBusyUs: 0,
-        selfWaitUs: 0,
-        clarityRuntime: 0,
-      }
-    );
-  }, [withFlamePercent]);
-
-  const getHeatBounds = useCallback(
-    (heatKey) => {
-      const config = heatConfig[heatKey] || {};
-      const min = config.min ?? 0;
-      const max = config.max ?? heatMax[heatKey] ?? 0;
-      return { min, max, enabled: config.enabled !== false };
-    },
-    [heatConfig, heatMax]
-  );
-
   const toggleHeat = useCallback((heatKey) => {
     setHeatConfig((prev) => ({
       ...prev,
@@ -604,11 +599,65 @@ export default function App() {
       case "selfWaitUs":
         return getSelfWaitUs(row);
       case "clarityRuntime":
-        return typeof row.clarity_runtime === "number" ? row.clarity_runtime : null;
+        return typeof row.clarity_runtime_total === "number"
+          ? row.clarity_runtime_total
+          : typeof row.clarity_runtime === "number"
+            ? row.clarity_runtime
+            : null;
       default:
         return null;
     }
   }, []);
+
+  const heatColumns = useMemo(() => {
+    return COLUMN_DEFS.map((col) => {
+      const heatKey = getHeatKeyForColumn(col);
+      return heatKey ? { ...col, heatKey } : col;
+    }).filter((col) => Boolean(col.heatKey));
+  }, []);
+
+  const getHeatValueForColumn = useCallback(
+    (col, row) => {
+      if (!col.heatKey) return null;
+      const metricValue = getMetricValue(row, col.heatKey);
+      if (Number.isFinite(metricValue)) return metricValue;
+      const value = col.getter ? col.getter(row) : row[col.key];
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (typeof value === "string") {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+      return null;
+    },
+    [getMetricValue]
+  );
+
+  const heatMax = useMemo(() => {
+    const flat = flattenTree(withFlamePercent);
+    const initial = {};
+    for (const col of heatColumns) {
+      if (col.heatKey && !(col.heatKey in initial)) initial[col.heatKey] = 0;
+    }
+    return flat.reduce((acc, row) => {
+      for (const col of heatColumns) {
+        const raw = getHeatValueForColumn(col, row);
+        if (Number.isFinite(raw)) {
+          acc[col.heatKey] = Math.max(acc[col.heatKey] ?? 0, raw);
+        }
+      }
+      return acc;
+    }, initial);
+  }, [withFlamePercent, heatColumns, getHeatValueForColumn]);
+
+  const getHeatBounds = useCallback(
+    (heatKey) => {
+      const config = heatConfig[heatKey] || {};
+      const min = config.min ?? 0;
+      const max = config.max ?? heatMax[heatKey] ?? 0;
+      return { min, max, enabled: config.enabled === true };
+    },
+    [heatConfig, heatMax]
+  );
 
   // Compute span viz value (level 0-1 and pct 0-100) for a row
   const getSpanVizValue = useCallback(
@@ -735,34 +784,48 @@ export default function App() {
     [spanVizConfig, spanVizMenuOpen]
   );
 
-  const buildGroupHeader = useMemo(
-    () => createGroupHeaderBuilder(buildHeatHeader),
-    [buildHeatHeader]
-  );
-
   const visibleColumns = useMemo(() => {
-    return COLUMN_DEFS.map((col) => ({
+    // Build 3-element header arrays for all columns
+    // [level1Header, level2Header, level3Header]
+    const build3LevelHeader = (col) => {
+      // Level 1: Top group (Wall Time, Clarity, etc.) or empty for standalone
+      const level1 = col.level1Start
+        ? { text: col.level1, colspan: col.level1Span, css: "grid-group-header grid-level1-header" }
+        : col.level1
+          ? { text: "", _hidden: true }
+          : { text: "", css: "grid-level1-empty" };
+      
+      // Level 2: Subgroup (Inclusive, Self, Runtime, etc.) or empty for standalone
+      const level2 = col.level2Start
+        ? { text: col.level2, colspan: col.level2Span, css: "grid-group-header grid-level2-header" }
+        : col.level2
+          ? { text: "", _hidden: true }
+          : { text: "", css: "grid-level2-empty" };
+      
+      // Level 3: Column label (Total, Avg, or standalone label)
+      const level3 = col.key === "span"
+        ? buildSpanHeader(col)
+        : col.heatKey
+          ? buildHeatHeader(col)
+          : { text: col.level3 || col.label };
+      
+      return [level1, level2, level3];
+    };
+
+    return COLUMN_DEFS.map((col) => {
+      const heatKey = getHeatKeyForColumn(col);
+      const columnDef = heatKey ? { ...col, heatKey } : col;
+      const isNumeric = NUMERIC_COLUMN_KEYS.has(col.key);
+      const baseWidth = col.width ?? (isNumeric ? DEFAULT_NUMERIC_WIDTH : undefined);
+      const width = isNumeric && baseWidth != null
+        ? Math.max(MIN_NUMERIC_WIDTH, baseWidth)
+        : baseWidth;
+      return {
       id: col.key,
-      header: col.group
-        ? buildGroupHeader(col)
-        : col.key === "span"
-          ? buildSpanHeader(col)
-          : col.key === "clarity_rw" ||
-              col.key === "clarity_len" ||
-              col.key === "clarity_runtime" ||
-              col.key === "clarity_input_n"
-            ? [
-                col.key === "clarity_rw"
-                  ? { text: "Clarity", colspan: 4, css: "grid-group-header" }
-                  : { text: "", _hidden: true },
-                col.heatKey ? buildHeatHeader(col) : { text: col.label },
-              ]
-            : col.heatKey
-              ? buildHeatHeader(col)
-              : col.label,
-      width: col.width,
+      header: build3LevelHeader(columnDef),
+      width,
       flexgrow: col.flexgrow,
-      heatKey: col.heatKey,
+      heatKey,
       treetoggle: col.treetoggle,
       cell:
         col.key === "span"
@@ -775,30 +838,10 @@ export default function App() {
                 getSpanVizValue={getSpanVizValue}
               />
             )
-          : col.heatKey
+          : heatKey
             ? (props) => {
-                const raw =
-                  col.heatKey === "wallTotalUs"
-                    ? getWallUs(props.row)
-                    : col.heatKey === "busyTotalUs"
-                      ? props.row.est_cpu_us ?? props.row.cpu_time_us ?? null
-                      : col.heatKey === "waitTotalUs"
-                        ? (() => {
-                            const wall = getWallUs(props.row);
-                            const cpu = props.row.est_cpu_us ?? props.row.cpu_time_us ?? null;
-                            if (wall == null || cpu == null) return null;
-                            return Math.max(0, wall - cpu);
-                          })()
-                        : col.heatKey === "selfWallUs"
-                    ? getSelfWallUs(props.row)
-                    : col.heatKey === "selfBusyUs"
-                      ? getSelfCpuUs(props.row)
-                      : col.heatKey === "selfWaitUs"
-                        ? getSelfWaitUs(props.row)
-                        : typeof props.row.clarity_runtime === "number"
-                          ? props.row.clarity_runtime
-                          : null;
-                const bounds = getHeatBounds(col.heatKey);
+                const raw = getHeatValueForColumn(columnDef, props.row);
+                const bounds = getHeatBounds(heatKey);
                 const max = bounds.max;
                 const min = bounds.min;
                 const pct =
@@ -806,8 +849,8 @@ export default function App() {
                     ? ((raw - min) / (max - min)) * 100
                     : 0;
                 const value = col.getter ? col.getter(props.row) : props.row[col.key] ?? "-";
-                const heatStyle = heatStyleByKey[col.heatKey] || DEFAULT_HEAT_STYLE;
-                const heatColor = heatColorByKey[col.heatKey] || DEFAULT_HEAT_COLOR;
+                const heatStyle = heatStyleByKey[heatKey] || DEFAULT_HEAT_STYLE;
+                const heatColor = heatColorByKey[heatKey] || DEFAULT_HEAT_COLOR;
                 return (
                   <HeatCell
                     row={props.row}
@@ -844,20 +887,21 @@ export default function App() {
             ? false
             : true,
       resize: true,
-    }));
+    };
+    });
   }, [
     selectedColumns,
     toggleChain,
     focusNode,
     buildHeatHeader,
     buildSpanHeader,
-    buildGroupHeader,
     getHeatBounds,
     numberFormat,
     spanVizConfig,
     getSpanVizValue,
     heatColorByKey,
     heatStyleByKey,
+    getHeatValueForColumn,
   ]);
 
   const toggleColumn = (key) => {
@@ -946,7 +990,6 @@ export default function App() {
         <>
           {/* Toolbar */}
           <ToolbarBar
-            columns={SELECTABLE_COLUMNS}
             selectedColumns={selectedColumns}
         toggleColumn={toggleColumn}
         toggleColumnGroup={toggleColumnGroup}
