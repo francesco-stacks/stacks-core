@@ -2,13 +2,18 @@ import React from "react";
 import HeatHeaderCell from "./components/HeatHeaderCell";
 import SpanHeaderCell from "./components/SpanHeaderCell";
 
+/**
+ * Creates a heat header builder function.
+ * 
+ * NOTE: The openId/setOpenId props are intentionally NOT included here.
+ * They are managed via HeatHeaderMenuContext to avoid recreating column
+ * definitions every time a menu is opened/closed.
+ */
 export function createHeatHeaderBuilder({
   heatConfig,
   toggleHeat,
   setHeatMin,
   setHeatMax,
-  heatMenuOpenId,
-  setHeatMenuOpenId,
   heatStyleByKey,
   setHeatStyleForKey,
   heatColorByKey,
@@ -28,8 +33,6 @@ export function createHeatHeaderBuilder({
         onToggle={toggleHeat}
         onMinChange={setHeatMin}
         onMaxChange={setHeatMax}
-        openId={heatMenuOpenId}
-        setOpenId={setHeatMenuOpenId}
         heatStyle={heatStyleByKey[col.heatKey] || defaultHeatStyle}
         setHeatStyle={setHeatStyleForKey}
         heatColor={heatColorByKey[col.heatKey] || defaultHeatColor}
@@ -42,11 +45,16 @@ export function createHeatHeaderBuilder({
   });
 }
 
+/**
+ * Creates a span header builder function.
+ * 
+ * NOTE: The isOpen/setIsOpen props are intentionally NOT included here.
+ * They are managed via SpanHeaderMenuContext to avoid recreating column
+ * definitions every time the menu is opened/closed.
+ */
 export function createSpanHeaderBuilder({
   spanVizConfig,
   setSpanVizConfig,
-  spanVizMenuOpen,
-  setSpanVizMenuOpen,
 }) {
   return (col) => ({
     text: col.label,
@@ -55,8 +63,6 @@ export function createSpanHeaderBuilder({
         {...props}
         spanVizConfig={spanVizConfig}
         setSpanVizConfig={setSpanVizConfig}
-        isOpen={spanVizMenuOpen}
-        setIsOpen={setSpanVizMenuOpen}
       />
     ),
   });

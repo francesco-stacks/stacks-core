@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState, useRef, useEffect } from "react";
 
 // Settings cog icon (Heroicons style)
 function SettingsIcon() {
@@ -29,9 +29,28 @@ const SPAN_VIZ_METRICS = [
   { key: "clarityRuntime", label: "Clarity Runtime" },
 ];
 
-export default function SpanHeaderCell({ cell, spanVizConfig, setSpanVizConfig, isOpen, setIsOpen }) {
+export default function SpanHeaderCell({ cell, spanVizConfig, setSpanVizConfig }) {
+  // Use local state for the menu open/close - this avoids recreating columns
+  const [isOpen, setIsOpen] = useState(false);
+  const containerRef = useRef(null);
+
+  // Close menu when clicking outside
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleOutsideClick = (event) => {
+      if (!containerRef.current) return;
+      if (!containerRef.current.contains(event.target)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleOutsideClick);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+    };
+  }, [isOpen]);
+
   return (
-    <div className="column-header">
+    <div className="column-header" ref={containerRef}>
       <span className="column-header-label">{cell.text}</span>
       <button
         type="button"

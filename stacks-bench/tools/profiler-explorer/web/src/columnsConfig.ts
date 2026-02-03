@@ -23,7 +23,6 @@ type ColumnDef = {
   alwaysVisible?: boolean;
   alwaysHidden?: boolean;
   treetoggle?: boolean;
-  heatKey?: string;
   format?: ColumnFormat;
   getter?: (row: Record<string, any>) => any;
   // 3-level header structure
@@ -83,7 +82,6 @@ export const COLUMN_DEFS: ColumnDef[] = [
     level3: "Total",
     width: 100,
     default: true,
-    heatKey: "wallTotalUs",
     format: { decimals: 3 },
     getter: (row) => toMs(row.est_wall_us ?? row.wall_time_us),
   },
@@ -114,7 +112,6 @@ export const COLUMN_DEFS: ColumnDef[] = [
     level3: "Total",
     width: 100,
     default: true,
-    heatKey: "selfWallUs",
     format: { decimals: 3 },
     getter: (row) => toMs(row.est_self_wall_us ?? row.self_wall_time_us),
   },
@@ -148,7 +145,6 @@ export const COLUMN_DEFS: ColumnDef[] = [
     level3: "Total",
     width: 100,
     default: false,
-    heatKey: "busyTotalUs",
     format: { decimals: 3 },
     getter: (row) => toMs(row.est_cpu_us ?? row.cpu_time_us),
   },
@@ -179,7 +175,6 @@ export const COLUMN_DEFS: ColumnDef[] = [
     level3: "Total",
     width: 100,
     default: false,
-    heatKey: "selfBusyUs",
     format: { decimals: 3 },
     getter: (row) => toMs(row.est_self_cpu_us ?? row.self_cpu_time_us),
   },
@@ -213,7 +208,6 @@ export const COLUMN_DEFS: ColumnDef[] = [
     level3: "Total",
     width: 100,
     default: false,
-    heatKey: "waitTotalUs",
     format: { decimals: 3 },
     getter: (row) => {
       const wall = row.est_wall_us ?? row.wall_time_us;
@@ -254,7 +248,6 @@ export const COLUMN_DEFS: ColumnDef[] = [
     level3: "Total",
     width: 100,
     default: false,
-    heatKey: "selfWaitUs",
     format: { decimals: 3 },
     getter: (row) => {
       const wall = row.est_self_wall_us ?? row.self_wall_time_us;
@@ -311,7 +304,6 @@ export const COLUMN_DEFS: ColumnDef[] = [
     level3: "Total",
     width: 120,
     default: true,
-    heatKey: "clarityRuntime",
     format: { decimals: 0 },
     getter: (row) => row.clarity_runtime_total ?? "-",
   },

@@ -1,5 +1,5 @@
-import React from "react";
-import { Grid } from "@svar-ui/react-grid";
+import React, { useCallback, useMemo, useState } from "react";
+import { Grid, ContextMenu } from "@svar-ui/react-grid";
 import { WillowDark } from "@svar-ui/react-core";
 import { Loader2 } from "lucide-react";
 
@@ -16,11 +16,130 @@ export default function ProfilerGrid({
   onCloseRow,
   onSelectRow,
   onInit,
+  // Context menu callbacks
+  onViewDetails,
+  onCollapseSiblings,
+  onFocus,
+  onClearFocus,
+  onExpandChain,
+  // State for menu options
+  focusId,
 }) {
+  // Store grid API in state (per svar-ui's recommended pattern)
+  // This allows ContextMenu to access the grid's API
+  const [gridApi, setGridApi] = useState(null);
+  const [selectedRowId, setSelectedRowId] = useState(null);
+
+  // Close the context menu when a row is selected (clicked inside grid)
+  // We simulate a mousedown on the document body which triggers svar-ui's clickOutside handler
+  const handleSelectRow = useCallback((ev) => {
+    // Dispatch a mousedown event on document to trigger context menu's clickOutside handler
+    // The svar-ui ContextMenu listens for mousedown events to close the menu
+    document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    // Call the parent's onSelectRow handler
+    onSelectRow?.(ev);
+  }, [onSelectRow]);
+
+  // Build context menu options dynamically based on the selected row
+  const menuOptions = useMemo(() => {
+    // Find the selected row to check if it's a compressed chain
+    const findRow = (nodes, id) => {
+      if (!nodes || !id) return null;
+      for (const node of nodes) {
+        if (node.id === id) return node;
+        if (node.data?.length) {
+          const found = findRow(node.data, id);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+
+    const selectedRow = findRow(data, selectedRowId);
+    const isCompressedChain = selectedRow?._chain?.length > 0;
+
+    const options = [
+      { id: "view-details", text: "View Details", icon: "wxi-eye" },
+      { type: "separator" },
+      { id: "collapse-siblings", text: "Collapse Siblings", icon: "wxi-fold" },
+      { type: "separator" },
+      { id: "focus", text: "Focus", icon: "wxi-target" },
+      { 
+        id: "clear-focus", 
+        text: "Clear Focus", 
+        icon: "wxi-close-circle",
+        disabled: !focusId 
+      },
+    ];
+
+    if (isCompressedChain) {
+      options.push(
+        { type: "separator" },
+        { id: "expand-chain", text: "Expand Linear Chain", icon: "wxi-fullscreen" }
+      );
+    }
+
+    return options;
+  }, [data, selectedRowId, focusId]);
+
+  // Handle context menu clicks
+  const handleMenuClick = useCallback((ev) => {
+    const option = ev.action;
+    if (!option || !selectedRowId) return;
+
+    // Find the row object
+    const findRow = (nodes, id) => {
+      if (!nodes || !id) return null;
+      for (const node of nodes) {
+        if (node.id === id) return node;
+        if (node.data?.length) {
+          const found = findRow(node.data, id);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+
+    const row = findRow(data, selectedRowId);
+    if (!row) return;
+
+    switch (option.id) {
+      case "view-details":
+        onViewDetails?.(row);
+        break;
+      case "collapse-siblings":
+        onCollapseSiblings?.(row.id);
+        break;
+      case "focus":
+        onFocus?.(row.id);
+        break;
+      case "clear-focus":
+        onClearFocus?.();
+        break;
+      case "expand-chain":
+        onExpandChain?.(row.id);
+        break;
+    }
+  }, [data, selectedRowId, onViewDetails, onCollapseSiblings, onFocus, onClearFocus, onExpandChain]);
+
+  // Resolver to select the row and return its id for the context menu
+  const resolver = useCallback((id) => {
+    if (id) {
+      // Select the row if not already selected
+      gridApi?.exec("select-row", { id });
+      setSelectedRowId(id);
+    }
+    return id;
+  }, [gridApi]);
+
+  // Handler for init callback - captures API and forwards to parent
+  const handleInit = useCallback((api) => {
+    setGridApi(api);
+    onInit?.(api);
+  }, [onInit]);
+
   return (
-    <section
-      className={`app-grid-container${spanVizEnabled ? ` span-viz-${spanVizStyle}` : ""}`}
-    >
+    <section className={`app-grid-container${spanVizEnabled ? ` span-viz-${spanVizStyle}` : ""}`}>
       {isLoading && (
         <div className="grid-loading-overlay">
           <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -33,19 +152,29 @@ export default function ProfilerGrid({
         </div>
       )}
       <WillowDark>
-        <Grid
-          tree={true}
-          data={data}
-          columns={columns}
-          sizes={{ rowHeight: 36 }}
-          select={true}
-          rowStyle={rowStyle}
-          columnStyle={columnStyle}
-          init={onInit}
-          onOpenRow={onOpenRow}
-          onCloseRow={onCloseRow}
-          onSelectRow={onSelectRow}
-        />
+        <ContextMenu
+          api={gridApi}
+          options={menuOptions}
+          onClick={handleMenuClick}
+          at="point"
+          resolver={resolver}
+          css="profiler-context-menu"
+        >
+          <Grid
+            tree={true}
+            data={data}
+            columns={columns}
+            sizes={{ rowHeight: 36 }}
+            select={true}
+            multiselect={true}
+            rowStyle={rowStyle}
+            columnStyle={columnStyle}
+            init={handleInit}
+            onOpenRow={onOpenRow}
+            onCloseRow={onCloseRow}
+            onSelectRow={handleSelectRow}
+          />
+        </ContextMenu>
       </WillowDark>
     </section>
   );

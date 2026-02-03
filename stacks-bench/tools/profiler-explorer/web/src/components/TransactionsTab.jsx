@@ -3,7 +3,6 @@ import { Grid } from "@svar-ui/react-grid";
 import { WillowDark } from "@svar-ui/react-core";
 import {
   Loader2,
-  ExternalLink,
   Filter,
   X,
 } from "lucide-react";
@@ -14,9 +13,9 @@ import {
   getTransactionsAutocomplete,
   getTransactionsMaxes,
 } from "@/lib/api.ts";
-import { HeatCell } from "./HeatCells";
-import HeatHeaderCell, { HeatHeaderMenuContext } from "./HeatHeaderCell";
-import { DEFAULT_HEAT_COLOR, DEFAULT_HEAT_STYLE, HEAT_COLOR_OPTIONS } from "../profilerConfig.ts";
+import { TxContextHeatCell, TxContextHeatHeaderCell, TxContextActionCell } from "./HeatCells";
+import { TransactionsGridProvider } from "../contexts/TransactionsGridContext";
+import { HEAT_COLOR_OPTIONS } from "../profilerConfig.ts";
 
 // Buffer size - how many rows to fetch beyond visible area
 const FETCH_BUFFER = 100;
@@ -29,42 +28,12 @@ function truncateHash(hash, len = 12) {
   return `${hash.slice(0, len)}…${hash.slice(-len)}`;
 }
 
-function formatNumber(value, format, decimals = 0) {
-  if (value === null || value === undefined) return "-";
-  if (typeof value !== "number" || !Number.isFinite(value)) return String(value);
-  if (value === 0) return "-";
-  const sign = value < 0 ? "-" : "";
-  const abs = Math.abs(value);
-  const fixed = Number.isFinite(decimals) ? abs.toFixed(decimals) : String(abs);
-  const [intPart, fracPart] = fixed.split(".");
-  const grouped = format.group
-    ? intPart.replace(/\B(?=(\d{3})+(?!\d))/g, format.group)
-    : intPart;
-  return `${sign}${grouped}${fracPart ? `${format.decimal}${fracPart}` : ""}`;
-}
-
-// Cell component for transaction hash with click handler
+// Cell component for transaction hash
 function TxHashCell({ row }) {
   return (
     <span className="tx-hash-text numeric-text" title={row.tx_hash_hex}>
       {row.tx_hash_hex || "-"}
     </span>
-  );
-}
-
-// Action cell with view trace button
-function ActionCell({ row, onViewTrace }) {
-  return (
-    <button
-      className="transactions-view-btn"
-      onClick={(e) => {
-        e.stopPropagation();
-        onViewTrace(row);
-      }}
-      title="View trace"
-    >
-      <ExternalLink className="h-4 w-4" />
-    </button>
   );
 }
 
@@ -118,7 +87,6 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
   
   // Heat configuration state (per-column min/max/enabled)
   const [heatConfig, setHeatConfig] = useState({});
-  const [heatMenuOpenId, setHeatMenuOpenId] = useState(null);
   // Per-column heat style and color
   const [heatStyleByKey, setHeatStyleByKey] = useState({});
   const [heatColorByKey, setHeatColorByKey] = useState({});
@@ -129,7 +97,7 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
   const toggleHeat = useCallback((key) => {
     setHeatConfig(prev => ({
       ...prev,
-      [key]: { ...prev[key], enabled: !(prev[key]?.enabled ?? true) }
+      [key]: { ...prev[key], enabled: !(prev[key]?.enabled ?? false) }
     }));
   }, []);
   
@@ -233,63 +201,14 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
     return () => clearTimeout(timer);
   }, [filterSearch.contractFn, requestAutocomplete]);
 
-  // Build columns for svar-ui Grid
+  // Build stable column definitions for svar-ui Grid.
+  // These use context-aware components that fetch their configuration at render time,
+  // allowing the column array to remain stable and preserve column positions/widths.
   const columns = useMemo(() => {
-    const handleView = (row) => onViewTrace(row.tx_hash_hex, row.stacks_tx_id);
-    
-    // Helper to create heat cell for a numeric column
-    const makeHeatCell = (key, decimals = 0) => (props) => {
-      const { row } = props;
-      const value = row[key];
-      const config = heatConfig[key] || { enabled: false, min: null, max: null };
-      const colHeatStyle = heatStyleByKey[key] || DEFAULT_HEAT_STYLE;
-      const colHeatColor = heatColorByKey[key] || DEFAULT_HEAT_COLOR;
-      if (!config.enabled) {
-        // No heat, just show the value
-        return (
-          <span className="numeric-cell">
-            {formatNumber(value, numberFormat, decimals)}
-          </span>
-        );
-      }
-      const minVal = config.min ?? 0;
-      const maxVal = config.max ?? heatMaxes[key] ?? 1;
-      const range = maxVal - minVal || 1;
-      const percent = typeof value === "number" ? Math.max(0, Math.min(100, ((value - minVal) / range) * 100)) : 0;
-      return (
-        <HeatCell
-          row={row}
-          value={value}
-          percent={percent}
-          format={{ decimals }}
-          numberFormat={numberFormat}
-          heatStyle={colHeatStyle}
-          heatColor={colHeatColor}
-        />
-      );
-    };
-    
-    // Helper to create heat header cell with settings popover
-    const makeHeatHeader = (key, text, isWallColumn = false) => ({
+    // Helper to build a heat header with context-aware component
+    const makeHeatHeader = (colKey, text, isWallColumn = false) => ({
       text,
-      cell: (props) => (
-        <HeatHeaderCell
-          {...props}
-          column={{ id: key, heatKey: key }}
-          cell={{ text }}
-          heatConfig={heatConfig}
-          onToggle={toggleHeat}
-          onMinChange={setHeatMin}
-          onMaxChange={setHeatMax}
-          heatStyle={heatStyleByKey[key] || DEFAULT_HEAT_STYLE}
-          setHeatStyle={setHeatStyleForKey}
-          heatColor={heatColorByKey[key] || DEFAULT_HEAT_COLOR}
-          setHeatColor={setHeatColorForKey}
-          heatColorOptions={HEAT_COLOR_OPTIONS}
-          minWallFilterMs={isWallColumn ? minWallFilterMs : undefined}
-          setMinWallFilterMs={isWallColumn ? setMinWallFilterMs : undefined}
-        />
-      ),
+      cell: TxContextHeatHeaderCell,
     });
     
     return [
@@ -313,7 +232,7 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
           { text: "" },
         ],
         width: 50,
-        cell: (props) => <ActionCell {...props} onViewTrace={handleView} />,
+        cell: TxContextActionCell,
       },
       {
         id: "tx_hash_hex",
@@ -326,7 +245,7 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
         flexgrow: 1,
         sort: true,
         resize: true,
-        cell: (props) => <TxHashCell {...props} />,
+        cell: TxHashCell,
       },
       {
         id: "contract_issuer",
@@ -366,7 +285,9 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
       },
       {
         id: "duration_ms",
-        heatKey: "duration_ms",
+        _colKey: "duration_ms",
+        _decimals: 2,
+        _isWallColumn: true,
         header: [
           { text: "", css: "grid-level1-empty" },
           { text: "", css: "grid-level2-empty" },
@@ -376,7 +297,7 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
         sort: true,
         resize: true,
         css: "grid-col-numeric",
-        cell: makeHeatCell("duration_ms", 2),
+        cell: TxContextHeatCell,
       },
       {
         id: "stacks_block_height",
@@ -396,7 +317,8 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
       // ═══════════════════════════════════════════════════════════════════════════
       {
         id: "clarity_runtime",
-        heatKey: "clarity_runtime",
+        _colKey: "clarity_runtime",
+        _decimals: 0,
         header: [
           { text: "Clarity", colspan: 5, css: "grid-group-header grid-level1-header" },
           { text: "", css: "grid-level2-empty" },
@@ -406,11 +328,12 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
         sort: true,
         resize: true,
         css: "grid-col-numeric",
-        cell: makeHeatCell("clarity_runtime", 0),
+        cell: TxContextHeatCell,
       },
       {
         id: "clarity_read_count",
-        heatKey: "clarity_read_count",
+        _colKey: "clarity_read_count",
+        _decimals: 0,
         header: [
           { text: "", _hidden: true },
           { text: "Read", colspan: 2, css: "grid-group-header grid-level2-header" },
@@ -420,11 +343,12 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
         sort: true,
         resize: true,
         css: "grid-col-numeric",
-        cell: makeHeatCell("clarity_read_count", 0),
+        cell: TxContextHeatCell,
       },
       {
         id: "clarity_read_length",
-        heatKey: "clarity_read_length",
+        _colKey: "clarity_read_length",
+        _decimals: 0,
         header: [
           { text: "", _hidden: true },
           { text: "", _hidden: true },
@@ -434,11 +358,12 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
         sort: true,
         resize: true,
         css: "grid-col-numeric",
-        cell: makeHeatCell("clarity_read_length", 0),
+        cell: TxContextHeatCell,
       },
       {
         id: "clarity_write_count",
-        heatKey: "clarity_write_count",
+        _colKey: "clarity_write_count",
+        _decimals: 0,
         header: [
           { text: "", _hidden: true },
           { text: "Write", colspan: 2, css: "grid-group-header grid-level2-header" },
@@ -448,11 +373,12 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
         sort: true,
         resize: true,
         css: "grid-col-numeric",
-        cell: makeHeatCell("clarity_write_count", 0),
+        cell: TxContextHeatCell,
       },
       {
         id: "clarity_write_length",
-        heatKey: "clarity_write_length",
+        _colKey: "clarity_write_length",
+        _decimals: 0,
         header: [
           { text: "", _hidden: true },
           { text: "", _hidden: true },
@@ -462,10 +388,10 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
         sort: true,
         resize: true,
         css: "grid-col-numeric",
-        cell: makeHeatCell("clarity_write_length", 0),
+        cell: TxContextHeatCell,
       },
     ];
-  }, [onViewTrace, heatMaxes, numberFormat, heatConfig, heatStyleByKey, heatColorByKey, toggleHeat, setHeatMin, setHeatMax, setHeatStyleForKey, setHeatColorForKey, minWallFilterMs]);
+  }, []); // No dependencies - columns are now stable!
 
   const heatMaxAbortRef = useRef(null);
   const [heatMaxesLoaded, setHeatMaxesLoaded] = useState(false);
@@ -672,10 +598,28 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
     return dataCache.slice(start, end);
   }, [dataCache, visibleRange]);
 
-  const heatMenuValue = useMemo(
-    () => ({ openId: heatMenuOpenId, setOpenId: setHeatMenuOpenId }),
-    [heatMenuOpenId, setHeatMenuOpenId]
-  );
+  // Build callbacks object for the context provider.
+  // These callbacks are accessed via context to avoid recreating column definitions.
+  const handleViewTrace = useCallback((row) => {
+    onViewTrace(row.tx_hash_hex, row.stacks_tx_id);
+  }, [onViewTrace]);
+
+  const gridCallbacks = {
+    onViewTrace: handleViewTrace,
+    heatConfig,
+    heatMaxes,
+    heatStyleByKey,
+    heatColorByKey,
+    numberFormat,
+    toggleHeat,
+    setHeatMin,
+    setHeatMax,
+    setHeatStyleForKey,
+    setHeatColorForKey,
+    heatColorOptions: HEAT_COLOR_OPTIONS,
+    minWallFilterMs,
+    setMinWallFilterMs,
+  };
 
   return (
     <div className="transactions-tab">
@@ -792,7 +736,7 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
           </div>
         ) : (
           <WillowDark>
-            <HeatHeaderMenuContext.Provider value={heatMenuValue}>
+            <TransactionsGridProvider callbacks={gridCallbacks}>
               <Grid
                 data={visibleData}
                 columns={columns}
@@ -803,7 +747,7 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
                 columnStyle={(column) => column.css || ""}
                 overlay={isLoading && !hasAnyData || !heatMaxesLoaded ? "Loading transactions..." : null}
               />
-            </HeatHeaderMenuContext.Provider>
+            </TransactionsGridProvider>
           </WillowDark>
         )}
       </div>

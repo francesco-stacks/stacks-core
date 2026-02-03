@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef, useContext } from "react";
+import React, { useState, useEffect, useRef } from "react";
 
+// Context kept for backwards compatibility but each cell now uses local state
 export const HeatHeaderMenuContext = React.createContext({
   openId: null,
   setOpenId: () => {},
@@ -62,8 +63,6 @@ export default function HeatHeaderCell({
   onToggle,
   onMinChange,
   onMaxChange,
-  openId,
-  setOpenId,
   heatStyle,
   setHeatStyle,
   heatColor,
@@ -72,26 +71,25 @@ export default function HeatHeaderCell({
   minWallFilterMs,
   setMinWallFilterMs,
 }) {
-  const menuContext = useContext(HeatHeaderMenuContext);
-  const effectiveOpenId = openId ?? menuContext.openId;
-  const effectiveSetOpenId = setOpenId ?? menuContext.setOpenId;
+  // Use local state for menu open/close
+  const [isOpen, setIsOpen] = useState(false);
   const heatKey = column.heatKey;
-  const isOpen = effectiveOpenId === column.id;
   const containerRef = useRef(null);
 
+  // Close menu on outside click
   useEffect(() => {
     if (!isOpen) return;
     const handleOutsideClick = (event) => {
       if (!containerRef.current) return;
       if (!containerRef.current.contains(event.target)) {
-        effectiveSetOpenId(null);
+        setIsOpen(false);
       }
     };
     document.addEventListener("mousedown", handleOutsideClick);
     return () => {
       document.removeEventListener("mousedown", handleOutsideClick);
     };
-  }, [isOpen, effectiveSetOpenId]);
+  }, [isOpen]);
   if (!heatKey) {
     return <div className="column-header">{cell.text}</div>;
   }
@@ -104,7 +102,7 @@ export default function HeatHeaderCell({
         className="column-header-btn"
         onClick={(event) => {
           event.stopPropagation();
-          effectiveSetOpenId(isOpen ? null : column.id);
+          setIsOpen(!isOpen);
         }}
         aria-label="Column settings"
         aria-expanded={isOpen}

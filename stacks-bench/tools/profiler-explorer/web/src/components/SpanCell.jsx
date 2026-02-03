@@ -1,6 +1,8 @@
 import React, { useEffect, useRef } from "react";
+import { useProfilerGridContext } from "../contexts/ProfilerGridContext";
 
-export default function SpanCell({ row, onToggleChain, onFocus, spanVizConfig, getSpanVizValue }) {
+export default function SpanCell({ row }) {
+  const { toggleChain, focusNode, spanVizConfig, getSpanVizValue } = useProfilerGridContext();
   const cellRef = useRef(null);
   const percent = row.flame_percent ?? 0;
   const label = row.chain_label ?? row.span_name ?? "-";
@@ -48,7 +50,7 @@ export default function SpanCell({ row, onToggleChain, onFocus, spanVizConfig, g
             className="span-muted-badge"
             onClick={(event) => {
               event.stopPropagation();
-              onToggleChain?.(row.id);
+              toggleChain?.(row.id);
             }}
           >
             +{chainCount} frames
@@ -64,7 +66,7 @@ export default function SpanCell({ row, onToggleChain, onFocus, spanVizConfig, g
           className="span-focus-btn"
           onClick={(event) => {
             event.stopPropagation();
-            onFocus?.(row.id);
+            focusNode?.(row.id);
           }}
         >
           Focus

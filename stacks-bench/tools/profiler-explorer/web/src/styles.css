@@ -230,7 +230,7 @@
   --wx-table-cell-border: 1px solid var(--border);
   --wx-table-select-background: color-mix(in oklab, var(--primary) 22%, transparent);
   --wx-table-select-color: var(--foreground);
-  --wx-table-select-border: inset 3px 0 var(--primary);
+  --wx-table-select-border: inset 1.5px 0 var(--primary);
   --wx-table-fixed-column-border: 3px solid var(--border);
   --wx-table-editor-dropdown-border: 1px solid var(--border);
   --wx-table-editor-dropdown-shadow: var(--shadow-soft);
@@ -570,11 +570,11 @@
 }
 
 .wx-body .wx-row.wx-selected {
-  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  background: color-mix(in srgb, var(--primary) 7%, transparent);
 }
 
 .wx-body .wx-row.wx-selected .wx-cell {
-  box-shadow: inset 2px 0 0 var(--primary);
+  box-shadow: inset 1px 0 0 color-mix(in srgb, var(--primary) 50%, transparent);
 }
 
 .wx-body .wx-row.wx-selected .heat-fill {
@@ -1478,6 +1478,7 @@
   flex-direction: column;
 }
 
+/* Target WillowDark wrapper */
 .app-grid-container > div {
   flex: 1;
   min-height: 0;
@@ -1493,12 +1494,23 @@
   min-height: 0;
   width: 100%;
   display: flex;
+  flex-direction: column;
+}
+
+/* ContextMenu wrapper span - needs to be flex container for grid to fill */
+.app-grid-container .wx-willow-dark-theme > span {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
 }
 
 .app-grid-container .wx-grid {
   height: 100%;
   width: 100%;
   flex: 1;
+  min-height: 0;
 }
 
 /* Loading overlay for grid */

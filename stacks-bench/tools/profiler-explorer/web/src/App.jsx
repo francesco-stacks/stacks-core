@@ -4,14 +4,11 @@ import SettingsPanel from "./components/SettingsPanel";
 import TransactionsTab from "./components/TransactionsTab";
 import SpanDetailsModal from "./components/SpanDetailsModal";
 import SpanCell from "./components/SpanCell";
-import { HeatCell, NumericCell } from "./components/HeatCells";
+import { ContextHeatCell, ContextNumericCell, ContextHeatHeaderCell, ContextSpanHeaderCell } from "./components/HeatCells";
 import HeaderBar from "./components/HeaderBar";
 import ToolbarBar from "./components/ToolbarBar";
 import BreadcrumbBar from "./components/BreadcrumbBar";
-import {
-  createHeatHeaderBuilder,
-  createSpanHeaderBuilder,
-} from "./columnBuilders";
+import { ProfilerGridProvider } from "./contexts/ProfilerGridContext";
 import {
   applyChainCompression,
   applyFocus,
@@ -54,17 +51,16 @@ function getNumberFormat(id) {
   return NUMBER_FORMATS.find((format) => format.id === id) || NUMBER_FORMATS[2];
 }
 
-function getHeatKeyForColumn(col) {
-  if (col.heatKey) return col.heatKey;
-  return NUMERIC_COLUMN_KEYS.has(col.key) ? col.key : null;
-}
+// Build a map of column key -> column definition for quick lookup
+const COLUMN_BY_KEY = Object.fromEntries(COLUMN_DEFS.map((col) => [col.key, col]));
+
+// Get all numeric columns that can have heatmaps
+const HEAT_CAPABLE_COLUMNS = COLUMN_DEFS.filter((col) => NUMERIC_COLUMN_KEYS.has(col.key));
 
 function buildDefaultHeatConfig() {
   const defaults = {};
-  for (const col of COLUMN_DEFS) {
-    const heatKey = getHeatKeyForColumn(col);
-    if (!heatKey || defaults[heatKey]) continue;
-    defaults[heatKey] = { enabled: false, min: null, max: null };
+  for (const col of HEAT_CAPABLE_COLUMNS) {
+    defaults[col.key] = { enabled: false, min: null, max: null };
   }
   return defaults;
 }
@@ -72,20 +68,16 @@ function buildDefaultHeatConfig() {
 function buildDefaultHeatStyleMap() {
   const legacy = localStorage.getItem("profilerHeatStyle") || DEFAULT_HEAT_STYLE;
   const defaults = {};
-  for (const col of COLUMN_DEFS) {
-    const heatKey = getHeatKeyForColumn(col);
-    if (!heatKey || defaults[heatKey]) continue;
-    defaults[heatKey] = legacy;
+  for (const col of HEAT_CAPABLE_COLUMNS) {
+    defaults[col.key] = legacy;
   }
   return defaults;
 }
 
 function buildDefaultHeatColorMap() {
   const defaults = {};
-  for (const col of COLUMN_DEFS) {
-    const heatKey = getHeatKeyForColumn(col);
-    if (!heatKey || defaults[heatKey]) continue;
-    defaults[heatKey] = DEFAULT_HEAT_COLOR;
+  for (const col of HEAT_CAPABLE_COLUMNS) {
+    defaults[col.key] = DEFAULT_HEAT_COLOR;
   }
   return defaults;
 }
@@ -122,7 +114,6 @@ export default function App() {
   const [spanDetailsOpen, setSpanDetailsOpen] = useState(false);
   const [openNodes, setOpenNodes] = useState(new Set());
   const [expandedChains, setExpandedChains] = useState(new Set());
-  const [heatMenuOpenId, setHeatMenuOpenId] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setTheme] = useState(() => {
     return localStorage.getItem("profilerTheme") || "dark";
@@ -205,14 +196,27 @@ export default function App() {
     const stored = storage?.getItem("profilerSpanVizConfig");
     if (stored) {
       try {
-        return JSON.parse(stored);
+        const parsed = JSON.parse(stored);
+        // Migrate old metric keys to new column keys
+        if (parsed.metric && !NUMERIC_COLUMN_KEYS.has(parsed.metric)) {
+          const metricMigration = {
+            wallTotalUs: "wall_inc_total",
+            selfWallUs: "wall_self_total",
+            busyTotalUs: "busy_inc_total",
+            selfBusyUs: "busy_self_total",
+            waitTotalUs: "wait_inc_total",
+            selfWaitUs: "wait_self_total",
+            clarityRuntime: "clarity_runtime_total",
+          };
+          parsed.metric = metricMigration[parsed.metric] || "wall_inc_total";
+        }
+        return parsed;
       } catch {
-        return { enabled: true, style: "fill", metric: "wallTotalUs" };
+        return { enabled: true, style: "fill", metric: "wall_inc_total" };
       }
     }
-    return { enabled: true, style: "fill", metric: "wallTotalUs" };
+    return { enabled: true, style: "fill", metric: "wall_inc_total" };
   });
-  const [spanVizMenuOpen, setSpanVizMenuOpen] = useState(false);
   const numberFormat = useMemo(() => getNumberFormat(numberFormatId), [numberFormatId]);
 
   const gridApiRef = useRef(null);
@@ -279,14 +283,8 @@ export default function App() {
     storage?.setItem("profilerSpanVizConfig", JSON.stringify(spanVizConfig));
   }, [spanVizConfig]);
 
-  useEffect(() => {
-    const handleClick = () => {
-      setHeatMenuOpenId(null);
-      setSpanVizMenuOpen(false);
-    };
-    document.addEventListener("click", handleClick);
-    return () => document.removeEventListener("click", handleClick);
-  }, []);
+  // Note: Header menu state is now managed locally within each header cell component
+  // (HeatHeaderCell and SpanHeaderCell) to avoid recreating column definitions on every menu open/close
 
   useEffect(() => {
     getRuns()
@@ -540,7 +538,7 @@ export default function App() {
       ...prev,
       [heatKey]: {
         ...(prev[heatKey] || {}),
-        enabled: !(prev[heatKey]?.enabled ?? true),
+        enabled: !(prev[heatKey]?.enabled ?? false),
       },
     }));
   }, []);
@@ -581,81 +579,42 @@ export default function App() {
     }));
   }, []);
 
-  // Get raw value for a given metric key from a row
-  const getMetricValue = useCallback((row, metricKey) => {
-    switch (metricKey) {
-      case "wallTotalUs":
-        return getWallUs(row);
-      case "busyTotalUs":
-        return row.est_cpu_us ?? row.cpu_time_us ?? null;
-      case "waitTotalUs": {
-        const wall = getWallUs(row);
-        const cpu = row.est_cpu_us ?? row.cpu_time_us ?? null;
-        if (wall == null || cpu == null) return null;
-        return Math.max(0, wall - cpu);
-      }
-      case "selfWallUs":
-        return getSelfWallUs(row);
-      case "selfBusyUs":
-        return getSelfCpuUs(row);
-      case "selfWaitUs":
-        return getSelfWaitUs(row);
-      case "clarityRuntime":
-        return typeof row.clarity_runtime_total === "number"
-          ? row.clarity_runtime_total
-          : typeof row.clarity_runtime === "number"
-            ? row.clarity_runtime
-            : null;
-      default:
-        return null;
+  // Get raw numeric value for a column from a row (using column's getter)
+  const getColumnValue = useCallback((colKey, row) => {
+    const col = COLUMN_BY_KEY[colKey];
+    if (!col) return null;
+    const value = col.getter ? col.getter(row) : row[col.key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
     }
+    return null;
   }, []);
 
-  const heatColumns = useMemo(() => {
-    return COLUMN_DEFS.map((col) => {
-      const heatKey = getHeatKeyForColumn(col);
-      return heatKey ? { ...col, heatKey } : col;
-    }).filter((col) => Boolean(col.heatKey));
-  }, []);
-
-  const getHeatValueForColumn = useCallback(
-    (col, row) => {
-      if (!col.heatKey) return null;
-      const metricValue = getMetricValue(row, col.heatKey);
-      if (Number.isFinite(metricValue)) return metricValue;
-      const value = col.getter ? col.getter(row) : row[col.key];
-      if (typeof value === "number" && Number.isFinite(value)) return value;
-      if (typeof value === "string") {
-        const parsed = Number(value);
-        return Number.isFinite(parsed) ? parsed : null;
-      }
-      return null;
-    },
-    [getMetricValue]
-  );
-
+  // Compute max values for all heat-capable columns
   const heatMax = useMemo(() => {
     const flat = flattenTree(withFlamePercent);
     const initial = {};
-    for (const col of heatColumns) {
-      if (col.heatKey && !(col.heatKey in initial)) initial[col.heatKey] = 0;
+    for (const col of HEAT_CAPABLE_COLUMNS) {
+      initial[col.key] = 0;
     }
     return flat.reduce((acc, row) => {
-      for (const col of heatColumns) {
-        const raw = getHeatValueForColumn(col, row);
+      for (const col of HEAT_CAPABLE_COLUMNS) {
+        const raw = getColumnValue(col.key, row);
         if (Number.isFinite(raw)) {
-          acc[col.heatKey] = Math.max(acc[col.heatKey] ?? 0, raw);
+          acc[col.key] = Math.max(acc[col.key] ?? 0, raw);
         }
       }
       return acc;
     }, initial);
-  }, [withFlamePercent, heatColumns, getHeatValueForColumn]);
+  }, [withFlamePercent, getColumnValue]);
 
   const getHeatBounds = useCallback(
-    (heatKey) => {
-      const config = heatConfig[heatKey] || {};
+    (colKey) => {
+      const config = heatConfig[colKey] || {};
       const min = config.min ?? 0;
-      const max = config.max ?? heatMax[heatKey] ?? 0;
+      const max = config.max ?? heatMax[colKey] ?? 0;
       return { min, max, enabled: config.enabled === true };
     },
     [heatConfig, heatMax]
@@ -664,8 +623,8 @@ export default function App() {
   // Compute span viz value (level 0-1 and pct 0-100) for a row
   const getSpanVizValue = useCallback(
     (row) => {
-      const metric = spanVizConfig.metric || "wallTotalUs";
-      const raw = getMetricValue(row, metric);
+      const metric = spanVizConfig.metric || "wall_inc_total";
+      const raw = getColumnValue(metric, row);
       const max = heatMax[metric] ?? 0;
       const min = 0; // Always use 0 as min for span viz (auto scaling)
 
@@ -677,7 +636,7 @@ export default function App() {
       const level = pct / 100;
       return { level, pct };
     },
-    [spanVizConfig.metric, heatMax, getMetricValue]
+    [spanVizConfig.metric, heatMax, getColumnValue]
   );
 
   const breadcrumb = focusedTree.breadcrumb ?? [];
@@ -772,50 +731,18 @@ export default function App() {
     setOpenNodes(next);
   }, [activeId, prunedById, openNodes]);
 
-  const buildHeatHeader = useMemo(
-    () =>
-      createHeatHeaderBuilder({
-        heatConfig,
-        toggleHeat,
-        setHeatMin,
-        setHeatMax,
-        heatMenuOpenId,
-        setHeatMenuOpenId,
-        heatStyleByKey,
-        setHeatStyleForKey,
-        heatColorByKey,
-        setHeatColorForKey,
-        heatColorOptions: HEAT_COLOR_OPTIONS,
-        minWallFilterMs,
-        setMinWallFilterMs,
-        defaultHeatStyle: DEFAULT_HEAT_STYLE,
-        defaultHeatColor: DEFAULT_HEAT_COLOR,
-      }),
-    [
-      heatConfig,
-      heatMenuOpenId,
-      heatStyleByKey,
-      heatColorByKey,
-      minWallFilterMs,
-      setHeatMax,
-      setHeatMin,
-      setHeatStyleForKey,
-      setHeatColorForKey,
-      setHeatMenuOpenId,
-      toggleHeat,
-    ]
-  );
+  // Build a static header function that uses context-aware components.
+  // This function produces stable header objects because the actual configuration
+  // is fetched from context at render time, not embedded in the column definition.
+  const buildHeatHeader = useCallback((col) => ({
+    text: col.level3 || col.headerLabel || col.label,
+    cell: ContextHeatHeaderCell,
+  }), []);
 
-  const buildSpanHeader = useMemo(
-    () =>
-      createSpanHeaderBuilder({
-        spanVizConfig,
-        setSpanVizConfig,
-        spanVizMenuOpen,
-        setSpanVizMenuOpen,
-      }),
-    [spanVizConfig, spanVizMenuOpen]
-  );
+  const buildSpanHeader = useCallback((col) => ({
+    text: col.label,
+    cell: ContextSpanHeaderCell,
+  }), []);
 
   const visibleColumns = useMemo(() => {
     // Build 3-element header arrays for all columns
@@ -836,9 +763,11 @@ export default function App() {
           : { text: "", css: "grid-level2-empty" };
       
       // Level 3: Column label (Total, Avg, or standalone label)
+      // All numeric columns get the heat header (with settings popover)
+      const isNumeric = NUMERIC_COLUMN_KEYS.has(col.key);
       const level3 = col.key === "span"
         ? buildSpanHeader(col)
-        : col.heatKey
+        : isNumeric
           ? buildHeatHeader(col)
           : { text: col.level3 || col.label };
       
@@ -846,95 +775,50 @@ export default function App() {
     };
 
     return COLUMN_DEFS.map((col) => {
-      const heatKey = getHeatKeyForColumn(col);
-      const columnDef = heatKey ? { ...col, heatKey } : col;
       const isNumeric = NUMERIC_COLUMN_KEYS.has(col.key);
       const baseWidth = col.width ?? (isNumeric ? DEFAULT_NUMERIC_WIDTH : undefined);
       const width = isNumeric && baseWidth != null
         ? Math.max(MIN_NUMERIC_WIDTH, baseWidth)
         : baseWidth;
+      
+      // Determine the cell renderer - using context-aware components that
+      // fetch their configuration from ProfilerGridContext at render time.
+      // This allows the column definition to remain stable.
+      let cellRenderer;
+      if (col.key === "span") {
+        // SpanCell gets its callbacks from context
+        cellRenderer = SpanCell;
+      } else if (isNumeric) {
+        // ContextHeatCell gets heat configuration from context
+        cellRenderer = ContextHeatCell;
+      } else {
+        cellRenderer = col.cell;
+      }
+      
       return {
-      id: col.key,
-      header: build3LevelHeader(columnDef),
-      width,
-      flexgrow: col.flexgrow,
-      heatKey,
-      treetoggle: col.treetoggle,
-      cell:
-        col.key === "span"
-          ? (props) => (
-              <SpanCell
-                {...props}
-                onToggleChain={toggleChain}
-                onFocus={focusNode}
-                spanVizConfig={spanVizConfig}
-                getSpanVizValue={getSpanVizValue}
-              />
-            )
-          : heatKey
-            ? (props) => {
-                const raw = getHeatValueForColumn(columnDef, props.row);
-                const bounds = getHeatBounds(heatKey);
-                const max = bounds.max;
-                const min = bounds.min;
-                const pct =
-                  bounds.enabled && raw != null && raw > 0 && max > min
-                    ? ((raw - min) / (max - min)) * 100
-                    : 0;
-                const value = col.getter ? col.getter(props.row) : props.row[col.key] ?? "-";
-                const heatStyle = heatStyleByKey[heatKey] || DEFAULT_HEAT_STYLE;
-                const heatColor = heatColorByKey[heatKey] || DEFAULT_HEAT_COLOR;
-                return (
-                  <HeatCell
-                    row={props.row}
-                    value={value}
-                    percent={pct}
-                    format={col.format}
-                    numberFormat={numberFormat}
-                    dimZero={COUNT_DIM_KEYS.has(col.key)}
-                    heatStyle={heatStyle}
-                    heatColor={heatColor}
-                  />
-                );
-              }
-            : NUMERIC_COLUMN_KEYS.has(col.key)
-              ? (props) => {
-                  const value = col.getter ? col.getter(props.row) : props.row[col.key] ?? "-";
-                  return (
-                    <NumericCell
-                      row={props.row}
-                      value={value}
-                      format={col.format}
-                      numberFormat={numberFormat}
-                      dimZero={COUNT_DIM_KEYS.has(col.key)}
-                    />
-                  );
-                }
-              : col.cell,
-      getter: col.getter,
-      hidden: col.alwaysHidden
-        ? true
-        : col.alwaysVisible
-          ? false
-          : selectedColumns.includes(col.key)
+        id: col.key,
+        header: build3LevelHeader(col),
+        width,
+        flexgrow: col.flexgrow,
+        treetoggle: col.treetoggle,
+        // Store the original column definition for context-aware cells to access
+        _colDef: col,
+        cell: cellRenderer,
+        getter: col.getter,
+        hidden: col.alwaysHidden
+          ? true
+          : col.alwaysVisible
             ? false
-            : true,
-      resize: true,
-    };
+            : selectedColumns.includes(col.key)
+              ? false
+              : true,
+        resize: true,
+      };
     });
   }, [
     selectedColumns,
-    toggleChain,
-    focusNode,
-    buildHeatHeader,
-    buildSpanHeader,
-    getHeatBounds,
-    numberFormat,
-    spanVizConfig,
-    getSpanVizValue,
-    heatColorByKey,
-    heatStyleByKey,
-    getHeatValueForColumn,
+    // buildHeatHeader and buildSpanHeader are now useCallback with no deps,
+    // so they're stable and don't need to be in the dependency array
   ]);
 
   const toggleColumn = (key) => {
@@ -966,6 +850,38 @@ export default function App() {
       localStorage.setItem("profilerColumns", JSON.stringify(sanitized));
       return sanitized;
     });
+  };
+
+  // Callbacks for the grid context - these are accessed via context to avoid
+  // recreating the visibleColumns array when callbacks change.
+  // We use a ref pattern here: the context holds stable wrapper functions
+  // that always call the latest version of these callbacks.
+  const profilerGridCallbacks = {
+    // SpanCell callbacks
+    toggleChain,
+    focusNode,
+    spanVizConfig,
+    getSpanVizValue,
+    // HeatCell callbacks  
+    getHeatBounds,
+    getColumnValue,
+    heatColorByKey,
+    heatStyleByKey,
+    numberFormat,
+    // Heat header configuration
+    heatConfig,
+    toggleHeat,
+    setHeatMin,
+    setHeatMax,
+    setHeatStyleForKey,
+    setHeatColorForKey,
+    heatColorOptions: HEAT_COLOR_OPTIONS,
+    minWallFilterMs,
+    setMinWallFilterMs,
+    defaultHeatStyle: DEFAULT_HEAT_STYLE,
+    defaultHeatColor: DEFAULT_HEAT_COLOR,
+    // Span header configuration
+    setSpanVizConfig,
   };
 
   return (
@@ -1042,41 +958,55 @@ export default function App() {
           <BreadcrumbBar breadcrumb={breadcrumb} />
 
           {/* Grid */}
-          <ProfilerGrid
-            data={roots}
-            columns={visibleColumns}
-            spanVizEnabled={spanVizConfig.enabled}
-            spanVizStyle={spanVizConfig.style}
-            isLoading={isLoading}
-            isEmpty={rows.length === 0 && !isLoading}
-            rowStyle={() => "profiler-row"}
-            columnStyle={(column) =>
-              NUMERIC_COLUMN_KEYS.has(column.id)
-                ? "grid-col-numeric"
-                : column.id === "span"
-                  ? "grid-col-span"
-                  : ""
-            }
-            onInit={(api) => {
-              gridApiRef.current = api;
-            }}
-            onOpenRow={(ev) => {
-              setOpenNodes((prev) => new Set(prev).add(ev.id));
-            }}
-            onCloseRow={(ev) => {
-              setOpenNodes((prev) => {
-                const next = new Set(prev);
-                next.delete(ev.id);
-                return next;
-              });
-            }}
-            onSelectRow={(ev) => {
-              if (ev?.id != null) {
-                setActiveId(ev.id);
-                setSpanDetailsOpen(true);
+          <ProfilerGridProvider callbacks={profilerGridCallbacks}>
+            <ProfilerGrid
+              data={roots}
+              columns={visibleColumns}
+              spanVizEnabled={spanVizConfig.enabled}
+              spanVizStyle={spanVizConfig.style}
+              isLoading={isLoading}
+              isEmpty={rows.length === 0 && !isLoading}
+              rowStyle={() => "profiler-row"}
+              columnStyle={(column) =>
+                NUMERIC_COLUMN_KEYS.has(column.id)
+                  ? "grid-col-numeric"
+                  : column.id === "span"
+                    ? "grid-col-span"
+                    : ""
               }
-            }}
-          />
+              onInit={(api) => {
+                gridApiRef.current = api;
+              }}
+              onOpenRow={(ev) => {
+                setOpenNodes((prev) => new Set(prev).add(ev.id));
+              }}
+              onCloseRow={(ev) => {
+                setOpenNodes((prev) => {
+                  const next = new Set(prev);
+                  next.delete(ev.id);
+                  return next;
+                });
+              }}
+              onSelectRow={(ev) => {
+                if (ev?.id != null) {
+                  setActiveId(ev.id);
+                }
+              }}
+              // Context menu callbacks
+              onViewDetails={(row) => {
+                setActiveId(row.id);
+                setSpanDetailsOpen(true);
+              }}
+              onCollapseSiblings={(rowId) => {
+                setActiveId(rowId);
+                collapseSiblings();
+              }}
+              onFocus={focusNode}
+              onClearFocus={clearFocus}
+              onExpandChain={toggleChain}
+              focusId={focusId}
+            />
+          </ProfilerGridProvider>
         </>
       )}
 
