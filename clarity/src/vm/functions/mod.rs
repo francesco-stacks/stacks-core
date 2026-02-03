@@ -631,12 +631,12 @@ fn native_begin(mut args: Vec<Value>) -> Result<Value, VmExecutionError> {
     }
 }
 
-#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_print(
     args: &[SymbolicExpression],
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:print");
     let arg = args.first().ok_or_else(|| {
         VmInternalError::BadSymbolicRepresentation("Print should have an argument".into())
     })?;
@@ -652,12 +652,12 @@ fn special_print(
     Ok(input)
 }
 
-#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_if(
     args: &[SymbolicExpression],
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:if");
     check_argument_count(3, args)?;
 
     runtime_cost(ClarityCostFunction::If, env, 0)?;
@@ -679,12 +679,12 @@ fn special_if(
     }
 }
 
-#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_asserts(
     args: &[SymbolicExpression],
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:asserts!");
     check_argument_count(2, args)?;
 
     runtime_cost(ClarityCostFunction::Asserts, env, 0)?;
@@ -758,12 +758,12 @@ pub fn parse_eval_bindings(
     Ok(result)
 }
 
-#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_let(
     args: &[SymbolicExpression],
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:let");
     // (let ((x 1) (y 2)) (+ x y)) -> 3
     // arg0 => binding list
     // arg1..n => body
@@ -812,12 +812,12 @@ fn special_let(
     })
 }
 
-#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_as_contract(
     args: &[SymbolicExpression],
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:as-contract");
 
     // (as-contract (..))
     // arg0 => body
@@ -841,7 +841,6 @@ fn special_as_contract(
     result
 }
 
-#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 fn special_contract_of(
     args: &[SymbolicExpression],
     env: &mut Environment,
@@ -857,6 +856,8 @@ fn special_contract_of(
         SymbolicExpressionType::Atom(contract_ref) => contract_ref,
         _ => return Err(CheckErrorKind::ContractOfExpectsTrait.into()),
     };
+
+    let _span = crate::profiler::profile!("clarity:contract-of", contract_ref.to_string());
 
     let contract_identifier = match context.lookup_callable_contract(contract_ref) {
         Some(trait_data) => {

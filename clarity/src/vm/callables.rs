@@ -147,7 +147,7 @@ impl DefinedFunction {
             arg_types: types,
         }
     }
-    
+
     pub fn execute_apply(
         &self,
         args: &[Value],
@@ -437,13 +437,7 @@ impl CallableType {
             CallableType::NativeFunction(_name, function, cost_function) => {
                 runtime_cost(cost_function.clone(), env, evaluated_args.len())
                     .map_err(VmExecutionError::from)?;
-                #[cfg(feature = "profiler")]
-                let _span = stacks_profiler::span_if!(
-                    crate::profiler::capture_costs()
-                        && stacks_profiler::Profiler::is_record_enabled(),
-                    "(native function)",
-                    *_name
-                );
+                let _span = crate::profile!("clarity:native_fn", *_name);
                 function.apply(evaluated_args, env)
             }
             CallableType::NativeFunction205(_name, function, cost_function, cost_input_handle) => {
@@ -454,23 +448,12 @@ impl CallableType {
                 };
                 runtime_cost(cost_function.clone(), env, cost_input)
                     .map_err(VmExecutionError::from)?;
-                #[cfg(feature = "profiler")]
-                let _span = stacks_profiler::span_if!(
-                    crate::profiler::capture_costs()
-                        && stacks_profiler::Profiler::is_record_enabled(),
-                    "(native function 2.05)",
-                    *_name
-                );
+                let _span = crate::profile!("clarity:native_fn_205", *_name);
                 function.apply(evaluated_args, env)
             }
             CallableType::UserFunction(function) => {
-                #[cfg(feature = "profiler")]
-                let _span = stacks_profiler::span_if!(
-                    crate::profiler::capture_costs()
-                        && stacks_profiler::Profiler::is_record_enabled(),
-                    "(user function)",
-                    function.get_identifier().to_string()
-                );
+                let _span =
+                    crate::profile!("clarity:user_fn", function.get_identifier().to_string());
                 function.apply(&evaluated_args, env)
             }
             _ => Err(VmInternalError::Expect("Should be unreachable.".into()).into()),

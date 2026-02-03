@@ -211,6 +211,7 @@ pub fn special_match(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:match");
     check_arguments_at_least(1, args)?;
 
     let input = vm::eval(&args[0], env, context)?;

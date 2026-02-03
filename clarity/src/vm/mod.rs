@@ -172,9 +172,8 @@ fn lookup_variable(
     } else if let Some(value) = variables::lookup_reserved_variable(name, context, env)? {
         Ok(value)
     } else {
-        #[cfg(feature = "profiler")]
-        let _span = stacks_profiler::span!("lookup_variable", name);
-        
+        let _span = crate::profiler::profile!("lookup_variable", name.to_string());
+
         runtime_cost(
             ClarityCostFunction::LookupVariableDepth,
             env,
@@ -201,11 +200,12 @@ fn lookup_variable(
     }
 }
 
-#[cfg_attr(feature = "profiler", stacks_profiler::profile)]
 pub fn lookup_function(
     name: &str,
     env: &mut Environment,
 ) -> Result<CallableType, VmExecutionError> {
+    let _span = crate::profiler::profile!("lookup_function", name.to_string());
+
     runtime_cost(ClarityCostFunction::LookupFunction, env, 0)?;
 
     if let Some(result) =

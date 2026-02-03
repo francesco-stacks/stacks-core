@@ -899,7 +899,8 @@
    ========================================================================== */
 
 .app-container {
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
   background: var(--background);
   color: var(--foreground);
   display: flex;
@@ -1469,6 +1470,7 @@
 
 .app-grid-container {
   flex: 1;
+  min-height: 0;
   padding: 12px 16px 16px;
   overflow: hidden;
   position: relative;
@@ -1597,6 +1599,7 @@
   display: flex;
   flex-direction: column;
   flex: 1;
+  min-height: 0;
   overflow: hidden;
   padding: 0 16px 16px;
 }
@@ -1717,15 +1720,26 @@
 /* New grid container for svar-ui Grid */
 .transactions-grid-container {
   flex: 1;
+  min-height: 0;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--card);
-  min-height: 400px;
+  display: flex;
+  flex-direction: column;
+}
+
+.transactions-grid-container .wx-willow-dark-theme {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
 }
 
 .transactions-grid-container .wx-grid {
   height: 100%;
+  width: 100%;
+  flex: 1;
 }
 
 /* Numeric columns alignment in transactions grid */
@@ -1739,6 +1753,17 @@
 .transactions-grid-container .wx-cell.dimmed-cell {
   color: var(--muted-foreground);
   opacity: 0.5;
+}
+
+/* Dimmed column (# column) - both separator and text */
+.transactions-grid-container .wx-cell.grid-col-dimmed,
+.transactions-grid-container .wx-header .grid-col-dimmed {
+  color: var(--muted-foreground);
+  opacity: 0.5;
+}
+
+.transactions-grid-container .wx-cell.grid-col-dimmed {
+  border-right-color: color-mix(in srgb, var(--border) 40%, transparent);
 }
 
 /* Numeric cell styling */

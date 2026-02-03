@@ -242,6 +242,7 @@ pub fn special_to_ascii(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:to-ascii?");
     check_argument_count(1, args)?;
 
     let value = eval(&args[0], env, context)?;
@@ -311,6 +312,7 @@ pub fn from_consensus_buff(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:from-consensus-buff?");
     check_argument_count(2, args)?;
 
     let type_arg = TypeSignature::parse_type_repr(*env.epoch(), &args[0], env)?;

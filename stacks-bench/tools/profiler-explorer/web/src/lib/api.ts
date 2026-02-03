@@ -54,3 +54,14 @@ export function getTransactionsMaxes<T = unknown>(params: ApiParams, options: Fe
 export function getTransactionsAutocomplete<T = unknown>(params: ApiParams, options: FetchOptions = {}) {
   return fetchJson<T>(buildApiUrl("/api/transactions/autocomplete", params), options);
 }
+
+export type RecordKvItem = {
+  key: string;
+  value: string;
+  value_type: string;
+  count: number;
+};
+
+export function getRecordKv(recordId: string | number, options: FetchOptions = {}) {
+  return fetchJson<RecordKvItem[]>(buildApiUrl(`/api/record/${recordId}/kv`), options);
+}

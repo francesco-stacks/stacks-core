@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import ProfilerGrid from "./components/ProfilerGrid";
 import SettingsPanel from "./components/SettingsPanel";
 import TransactionsTab from "./components/TransactionsTab";
+import SpanDetailsModal from "./components/SpanDetailsModal";
 import SpanCell from "./components/SpanCell";
 import { HeatCell, NumericCell } from "./components/HeatCells";
 import HeaderBar from "./components/HeaderBar";
@@ -118,6 +119,7 @@ export default function App() {
   const [hotPathMode, setHotPathMode] = useState("off");
   const [focusId, setFocusId] = useState(null);
   const [activeId, setActiveId] = useState(null);
+  const [spanDetailsOpen, setSpanDetailsOpen] = useState(false);
   const [openNodes, setOpenNodes] = useState(new Set());
   const [expandedChains, setExpandedChains] = useState(new Set());
   const [heatMenuOpenId, setHeatMenuOpenId] = useState(null);
@@ -680,6 +682,37 @@ export default function App() {
 
   const breadcrumb = focusedTree.breadcrumb ?? [];
 
+  // Flat list of all rows for navigation in span details modal
+  const allRowsFlat = useMemo(() => flattenTree(withFlamePercent), [withFlamePercent]);
+
+  // Get the currently active span for the details modal
+  const activeSpan = useMemo(() => {
+    if (activeId == null) return null;
+    return allRowsFlat.find((row) => row.id === activeId) || null;
+  }, [activeId, allRowsFlat]);
+
+  // Get the index of the active span in the flat list
+  const activeSpanIndex = useMemo(() => {
+    if (activeId == null) return -1;
+    return allRowsFlat.findIndex((row) => row.id === activeId);
+  }, [activeId, allRowsFlat]);
+
+  // Navigation for span details modal
+  const hasPreviousSpan = activeSpanIndex > 0;
+  const hasNextSpan = activeSpanIndex >= 0 && activeSpanIndex < allRowsFlat.length - 1;
+
+  const navigateToPreviousSpan = useCallback(() => {
+    if (activeSpanIndex > 0) {
+      setActiveId(allRowsFlat[activeSpanIndex - 1].id);
+    }
+  }, [activeSpanIndex, allRowsFlat]);
+
+  const navigateToNextSpan = useCallback(() => {
+    if (activeSpanIndex >= 0 && activeSpanIndex < allRowsFlat.length - 1) {
+      setActiveId(allRowsFlat[activeSpanIndex + 1].id);
+    }
+  }, [activeSpanIndex, allRowsFlat]);
+
   useEffect(() => {
     setOpenNodes(computeDefaultOpenSet(focusedTree.roots, DEFAULT_AUTO_EXPAND));
   }, [rows, focusId, minWallFilterMs, focusedTree.roots]);
@@ -1038,7 +1071,10 @@ export default function App() {
               });
             }}
             onSelectRow={(ev) => {
-              if (ev?.id != null) setActiveId(ev.id);
+              if (ev?.id != null) {
+                setActiveId(ev.id);
+                setSpanDetailsOpen(true);
+              }
             }}
           />
         </>
@@ -1049,8 +1085,21 @@ export default function App() {
         <TransactionsTab
           runId={runId}
           onViewTrace={viewTransactionTrace}
+          numberFormat={numberFormat}
         />
       )}
+
+      {/* Span Details Modal */}
+      <SpanDetailsModal
+        open={spanDetailsOpen}
+        onOpenChange={setSpanDetailsOpen}
+        span={activeSpan}
+        onPrevious={navigateToPreviousSpan}
+        onNext={navigateToNextSpan}
+        hasPrevious={hasPreviousSpan}
+        hasNext={hasNextSpan}
+        numberFormat={numberFormat}
+      />
     </div>
   );
 }

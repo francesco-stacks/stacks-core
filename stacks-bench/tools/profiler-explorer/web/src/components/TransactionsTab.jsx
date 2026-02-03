@@ -16,17 +16,12 @@ import {
 } from "@/lib/api.ts";
 import { HeatCell } from "./HeatCells";
 import HeatHeaderCell, { HeatHeaderMenuContext } from "./HeatHeaderCell";
-import { DEFAULT_NUMBER_FORMAT_ID, NUMBER_FORMATS, DEFAULT_HEAT_COLOR, DEFAULT_HEAT_STYLE, HEAT_COLOR_OPTIONS } from "../profilerConfig.ts";
+import { DEFAULT_HEAT_COLOR, DEFAULT_HEAT_STYLE, HEAT_COLOR_OPTIONS } from "../profilerConfig.ts";
 
 // Buffer size - how many rows to fetch beyond visible area
 const FETCH_BUFFER = 100;
 // Minimum rows to fetch per request
 const MIN_FETCH_SIZE = 200;
-
-// Use the same number format as profiler trace grid
-function getNumberFormat(id) {
-  return NUMBER_FORMATS.find((format) => format.id === id) || NUMBER_FORMATS[2];
-}
 
 function truncateHash(hash, len = 12) {
   if (!hash) return "-";
@@ -82,9 +77,11 @@ const DEFAULT_HEAT_MAXES = {
   clarity_write_length: 0,
 };
 
-export default function TransactionsTab({ runId, onViewTrace }) {
+export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
   // Grid data - sparse array indexed by row position
   const [dataCache, setDataCache] = useState([]);
+  // Current visible range for the grid (svar-ui expects only visible slice in data prop)
+  const [visibleRange, setVisibleRange] = useState({ start: 0, end: MIN_FETCH_SIZE });
   const [total, setTotal] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -157,9 +154,6 @@ export default function TransactionsTab({ runId, onViewTrace }) {
   const setHeatColorForKey = useCallback((key, color) => {
     setHeatColorByKey(prev => ({ ...prev, [key]: color }));
   }, []);
-  
-  // Number format (same as profiler trace)
-  const numberFormat = useMemo(() => getNumberFormat(DEFAULT_NUMBER_FORMAT_ID), []);
 
   const [heatMaxes, setHeatMaxes] = useState(DEFAULT_HEAT_MAXES);
 
@@ -247,7 +241,7 @@ export default function TransactionsTab({ runId, onViewTrace }) {
     const makeHeatCell = (key, decimals = 0) => (props) => {
       const { row } = props;
       const value = row[key];
-      const config = heatConfig[key] || { enabled: true, min: null, max: null };
+      const config = heatConfig[key] || { enabled: false, min: null, max: null };
       const colHeatStyle = heatStyleByKey[key] || DEFAULT_HEAT_STYLE;
       const colHeatColor = heatColorByKey[key] || DEFAULT_HEAT_COLOR;
       if (!config.enabled) {
@@ -301,21 +295,33 @@ export default function TransactionsTab({ runId, onViewTrace }) {
     return [
       {
         id: "row_number",
-        header: "#",
+        header: [
+          { text: "", css: "grid-level1-empty" },
+          { text: "", css: "grid-level2-empty" },
+          { text: "#" },
+        ],
         width: 60,
         resize: true,
-        css: "numeric",
+        css: "grid-col-numeric grid-col-dimmed",
         template: (val) => (val == null ? "-" : String(val)),
       },
       {
         id: "_actions",
-        header: "",
+        header: [
+          { text: "", css: "grid-level1-empty" },
+          { text: "", css: "grid-level2-empty" },
+          { text: "" },
+        ],
         width: 50,
         cell: (props) => <ActionCell {...props} onViewTrace={handleView} />,
       },
       {
         id: "tx_hash_hex",
-        header: "Transaction Hash",
+        header: [
+          { text: "", css: "grid-level1-empty" },
+          { text: "", css: "grid-level2-empty" },
+          { text: "Transaction Hash" },
+        ],
         width: 420,
         flexgrow: 1,
         sort: true,
@@ -324,7 +330,11 @@ export default function TransactionsTab({ runId, onViewTrace }) {
       },
       {
         id: "contract_issuer",
-        header: "Issuer",
+        header: [
+          { text: "", css: "grid-level1-empty" },
+          { text: "", css: "grid-level2-empty" },
+          { text: "Issuer" },
+        ],
         width: 140,
         resize: true,
         template: (val) => val ? truncateHash(val, 6) : "-",
@@ -332,7 +342,11 @@ export default function TransactionsTab({ runId, onViewTrace }) {
       },
       {
         id: "contract_name",
-        header: "Contract",
+        header: [
+          { text: "", css: "grid-level1-empty" },
+          { text: "", css: "grid-level2-empty" },
+          { text: "Contract" },
+        ],
         width: 160,
         resize: true,
         template: (val) => val || "-",
@@ -340,7 +354,11 @@ export default function TransactionsTab({ runId, onViewTrace }) {
       },
       {
         id: "contract_fn",
-        header: "Function",
+        header: [
+          { text: "", css: "grid-level1-empty" },
+          { text: "", css: "grid-level2-empty" },
+          { text: "Function" },
+        ],
         width: 140,
         resize: true,
         template: (val) => val || "-",
@@ -349,68 +367,101 @@ export default function TransactionsTab({ runId, onViewTrace }) {
       {
         id: "duration_ms",
         heatKey: "duration_ms",
-        header: makeHeatHeader("duration_ms", "Duration (ms)", true),
+        header: [
+          { text: "", css: "grid-level1-empty" },
+          { text: "", css: "grid-level2-empty" },
+          makeHeatHeader("duration_ms", "Duration (ms)", true),
+        ],
         width: 130,
         sort: true,
         resize: true,
+        css: "grid-col-numeric",
         cell: makeHeatCell("duration_ms", 2),
       },
       {
         id: "stacks_block_height",
-        header: "Block",
+        header: [
+          { text: "", css: "grid-level1-empty" },
+          { text: "", css: "grid-level2-empty" },
+          { text: "Block" },
+        ],
         width: 80,
         sort: true,
         resize: true,
-        css: "numeric",
+        css: "grid-col-numeric",
         template: (val) => (val == null ? "-" : String(val)),
       },
-      // Clarity metrics group
+      // ═══════════════════════════════════════════════════════════════════════════
+      // Clarity - 5 columns: Runtime, Read (Count, Length), Write (Count, Length)
+      // ═══════════════════════════════════════════════════════════════════════════
       {
         id: "clarity_runtime",
         heatKey: "clarity_runtime",
         header: [
-          { text: "Clarity", colspan: 5, css: "grid-group-header" },
+          { text: "Clarity", colspan: 5, css: "grid-group-header grid-level1-header" },
+          { text: "", css: "grid-level2-empty" },
           makeHeatHeader("clarity_runtime", "Runtime"),
         ],
-        width: 100,
+        width: 90,
         sort: true,
         resize: true,
+        css: "grid-col-numeric",
         cell: makeHeatCell("clarity_runtime", 0),
       },
       {
         id: "clarity_read_count",
         heatKey: "clarity_read_count",
-        header: ["", makeHeatHeader("clarity_read_count", "Reads")],
+        header: [
+          { text: "", _hidden: true },
+          { text: "Read", colspan: 2, css: "grid-group-header grid-level2-header" },
+          makeHeatHeader("clarity_read_count", "Count"),
+        ],
         width: 80,
         sort: true,
         resize: true,
+        css: "grid-col-numeric",
         cell: makeHeatCell("clarity_read_count", 0),
       },
       {
         id: "clarity_read_length",
         heatKey: "clarity_read_length",
-        header: ["", makeHeatHeader("clarity_read_length", "Read Len")],
-        width: 100,
+        header: [
+          { text: "", _hidden: true },
+          { text: "", _hidden: true },
+          makeHeatHeader("clarity_read_length", "Length"),
+        ],
+        width: 90,
         sort: true,
         resize: true,
+        css: "grid-col-numeric",
         cell: makeHeatCell("clarity_read_length", 0),
       },
       {
         id: "clarity_write_count",
         heatKey: "clarity_write_count",
-        header: ["", makeHeatHeader("clarity_write_count", "Writes")],
+        header: [
+          { text: "", _hidden: true },
+          { text: "Write", colspan: 2, css: "grid-group-header grid-level2-header" },
+          makeHeatHeader("clarity_write_count", "Count"),
+        ],
         width: 80,
         sort: true,
         resize: true,
+        css: "grid-col-numeric",
         cell: makeHeatCell("clarity_write_count", 0),
       },
       {
         id: "clarity_write_length",
         heatKey: "clarity_write_length",
-        header: ["", makeHeatHeader("clarity_write_length", "Write Len")],
-        width: 100,
+        header: [
+          { text: "", _hidden: true },
+          { text: "", _hidden: true },
+          makeHeatHeader("clarity_write_length", "Length"),
+        ],
+        width: 90,
         sort: true,
         resize: true,
+        css: "grid-col-numeric",
         cell: makeHeatCell("clarity_write_length", 0),
       },
     ];
@@ -542,6 +593,7 @@ export default function TransactionsTab({ runId, onViewTrace }) {
   useEffect(() => {
     setDataCache([]);
     setTotal(0);
+    setVisibleRange({ start: 0, end: MIN_FETCH_SIZE });
     fetchedRangesRef.current = [];
     lastRequestRef.current = { start: 0, end: 0 };
     
@@ -556,6 +608,9 @@ export default function TransactionsTab({ runId, onViewTrace }) {
     const { row } = ev;
     if (row) {
       const { start, end } = row;
+      
+      // Update visible range for rendering the correct slice
+      setVisibleRange({ start, end });
       
       // Avoid duplicate requests for same range
       if (start === lastRequestRef.current.start && end === lastRequestRef.current.end) {
@@ -610,6 +665,12 @@ export default function TransactionsTab({ runId, onViewTrace }) {
   }, []);
 
   const hasAnyData = useMemo(() => dataCache.some(Boolean), [dataCache]);
+
+  // Compute visible data slice for the grid (svar-ui expects only the visible rows)
+  const visibleData = useMemo(() => {
+    const { start, end } = visibleRange;
+    return dataCache.slice(start, end);
+  }, [dataCache, visibleRange]);
 
   const heatMenuValue = useMemo(
     () => ({ openId: heatMenuOpenId, setOpenId: setHeatMenuOpenId }),
@@ -733,12 +794,13 @@ export default function TransactionsTab({ runId, onViewTrace }) {
           <WillowDark>
             <HeatHeaderMenuContext.Provider value={heatMenuValue}>
               <Grid
-                data={dataCache}
+                data={visibleData}
                 columns={columns}
                 sizes={{ rowHeight: 36 }}
                 dynamic={total > 0 ? { rowCount: total } : null}
                 onRequestData={handleRequestData}
                 init={handleInit}
+                columnStyle={(column) => column.css || ""}
                 overlay={isLoading && !hasAnyData || !heatMaxesLoaded ? "Loading transactions..." : null}
               />
             </HeatHeaderMenuContext.Provider>

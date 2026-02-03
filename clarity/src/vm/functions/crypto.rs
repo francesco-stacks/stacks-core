@@ -94,6 +94,7 @@ pub fn special_principal_of(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:principal-of?");
     // (principal-of? (..))
     // arg0 => (buff 33)
     check_argument_count(1, args)?;
@@ -142,6 +143,7 @@ pub fn special_secp256k1_recover(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:secp256k1-recover?");
     // (secp256k1-recover? (..))
     // arg0 => (buff 32), arg1 => (buff 65)
     check_argument_count(2, args)?;
@@ -208,6 +210,7 @@ pub fn special_secp256k1_verify(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:secp256k1-verify");
     // (secp256k1-verify (..))
     // arg0 => (buff 32), arg1 => (buff 65), arg2 => (buff 33)
     check_argument_count(3, args)?;
@@ -293,6 +296,7 @@ pub fn special_secp256r1_verify(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:secp256r1-verify");
     // (secp256r1-verify message-hash signature public-key)
     // message-hash: (buff 32), signature: (buff 64), public-key: (buff 33)
     check_argument_count(3, args)?;

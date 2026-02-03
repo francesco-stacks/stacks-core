@@ -31,7 +31,8 @@ pub mod flags {
     pub const CAPTURE_CONTRACT_CALL_IDENT: u64 = 1 << 2;
 }
 
-const DEFAULT_FLAGS: u64 = flags::CAPTURE_COSTS | flags::CAPTURE_COST_FN;
+const DEFAULT_FLAGS: u64 =
+    flags::CAPTURE_COSTS | flags::CAPTURE_COST_FN | flags::CAPTURE_CONTRACT_CALL_IDENT;
 
 static PROFILER_FLAGS: AtomicU64 = AtomicU64::new(DEFAULT_FLAGS);
 
@@ -74,3 +75,77 @@ pub fn capture_costs() -> bool {
 pub fn capture_contract_call_ident() -> bool {
     is_enabled(flags::CAPTURE_CONTRACT_CALL_IDENT)
 }
+
+/// Create a profiler span when cost capturing is enabled.
+///
+/// Use as: `let _span = crate::profiler::profile!("name")` or
+/// `let _span = crate::profiler::profile!("name", tag_value)`.
+#[macro_export]
+macro_rules! profile {
+    ($name:expr) => {{
+        #[cfg(feature = "profiler")]
+        {
+            if $crate::profiler::capture_costs() && stacks_profiler::Profiler::is_record_enabled() {
+                Some(stacks_profiler::span!($name))
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "profiler"))]
+        {
+            Option::<()>::None
+        }
+    }};
+    ($name:expr, $tag:expr) => {{
+        #[cfg(feature = "profiler")]
+        {
+            if $crate::profiler::capture_costs() && stacks_profiler::Profiler::is_record_enabled() {
+                if $crate::profiler::is_any_enabled(
+                    $crate::profiler::flags::CAPTURE_COST_FN
+                        | $crate::profiler::flags::CAPTURE_CONTRACT_CALL_IDENT,
+                ) {
+                    let __tag = $tag.to_string();
+                    Some(stacks_profiler::span!($name, __tag))
+                } else {
+                    Some(stacks_profiler::span!($name))
+                }
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "profiler"))]
+        {
+            Option::<()>::None
+        }
+    }};
+}
+
+/// Record the active Clarity function name when cost capturing is enabled.
+///
+/// Use as: `crate::profiler::record_name!(name)` where `name` is a Clarity identifier.
+#[macro_export]
+macro_rules! record_name {
+    ($name:expr) => {{
+        #[cfg(feature = "profiler")]
+        {
+            if $crate::profiler::capture_costs()
+                && stacks_profiler::Profiler::is_record_enabled()
+                && $crate::profiler::is_any_enabled(
+                    $crate::profiler::flags::CAPTURE_COST_FN
+                        | $crate::profiler::flags::CAPTURE_CONTRACT_CALL_IDENT,
+                )
+            {
+                stacks_profiler::record!("NAME", $name.to_string());
+            }
+        }
+        #[cfg(not(feature = "profiler"))]
+        {
+            let _ = &$name;
+        }
+    }};
+}
+
+#[doc(hidden)]
+pub use crate::profile;
+#[doc(hidden)]
+pub use crate::record_name;

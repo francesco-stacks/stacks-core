@@ -28,6 +28,7 @@ pub fn tuple_cons(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:tuple");
     //    (tuple (arg-name value)
     //           (arg-name value))
     use super::parse_eval_bindings;
@@ -50,6 +51,7 @@ pub fn tuple_get(
     check_argument_count(2, args)?;
 
     let arg_name = args[0].match_atom().ok_or(CheckErrorKind::ExpectedName)?;
+    let _span = crate::profiler::profile!("clarity:get", arg_name.to_string());
 
     let value = eval(&args[1], env, context)?;
 

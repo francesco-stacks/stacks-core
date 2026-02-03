@@ -49,8 +49,7 @@ pub use stacks_common::{
 /// The Clarity virtual machine
 pub mod vm;
 
-#[cfg(feature = "profiler")]
-pub mod profiler;
+mod profiler;
 
 pub mod boot_util {
 

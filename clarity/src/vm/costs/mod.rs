@@ -1225,6 +1225,15 @@ impl CostTracker for LimitedCostTracker {
                         && stacks_profiler::Profiler::is_record_enabled();
 
                     if capture {
+                        let cost_fn_name = cost_function.get_name();
+                        let cost_fn_input = *input.first().unwrap_or(&0_u64);
+                        let cost_fn_str = format!("{cost_fn_name}({cost_fn_input})");
+                        stacks_profiler::record_if!(capture, "clarity:costs:fn_input", cost_fn_str);
+                        stacks_profiler::record_if!(
+                            capture,
+                            "clarity:costs:fn",
+                            cost_function.get_name()
+                        );
                         stacks_profiler::counter_if!(
                             capture,
                             "CIN",

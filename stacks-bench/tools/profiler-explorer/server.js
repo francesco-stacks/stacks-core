@@ -835,6 +835,35 @@ app.get("/api/trace", (req, res) => {
   }
 });
 
+app.get("/api/record/:recordId/kv", (req, res) => {
+  try {
+    const recordId = parseOptionalInt(req.params.recordId, "recordId");
+    if (recordId == null) {
+      return res.status(400).json({ error: "recordId is required" });
+    }
+
+    const sql = `
+      SELECT
+        k.key,
+        v.value,
+        vt.name AS value_type,
+        prkv.count
+      FROM profiler_record_kv prkv
+      JOIN profiler_kv_key k ON k.id = prkv.profiler_kv_key_id
+      JOIN profiler_kv_value v ON v.id = prkv.profiler_kv_value_id
+      JOIN profiler_kv_value_type vt ON vt.id = v.profiler_kv_value_type_id
+      WHERE prkv.profiler_record_id = :record_id
+      ORDER BY k.key, v.value
+    `;
+
+    const rows = queryAll(db, sql, { record_id: recordId });
+    return res.json(rows);
+  } catch (error) {
+    console.error("Record KV query error:", error);
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
 if (fs.existsSync(distDir)) {
   app.use(express.static(distDir));
 }

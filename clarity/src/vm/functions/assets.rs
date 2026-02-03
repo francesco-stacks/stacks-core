@@ -91,6 +91,7 @@ pub fn special_stx_balance(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:stx-get-balance");
     check_argument_count(1, args)?;
 
     runtime_cost(ClarityCostFunction::StxBalance, env, 0)?;
@@ -124,6 +125,7 @@ pub fn stx_transfer_consolidated(
     amount: u128,
     memo: &BuffData,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("stx_transfer_consolidated");
     if amount == 0 {
         return clarity_ecode!(StxErrorCodes::NON_POSITIVE_AMOUNT);
     }
@@ -162,6 +164,7 @@ pub fn special_stx_transfer(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:stx-transfer?");
     check_argument_count(3, args)?;
 
     runtime_cost(ClarityCostFunction::StxTransfer, env, 0)?;
@@ -189,6 +192,7 @@ pub fn special_stx_transfer_memo(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:stx-transfer-memo?");
     check_argument_count(4, args)?;
     runtime_cost(ClarityCostFunction::StxTransferMemo, env, 0)?;
 
@@ -216,6 +220,7 @@ pub fn special_stx_account(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:stx-account");
     check_argument_count(1, args)?;
 
     runtime_cost(ClarityCostFunction::StxGetAccount, env, 0)?;
@@ -272,6 +277,7 @@ pub fn special_stx_burn(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:stx-burn?");
     check_argument_count(2, args)?;
 
     runtime_cost(ClarityCostFunction::StxTransfer, env, 0)?;
@@ -317,11 +323,13 @@ pub fn special_mint_token(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:ft-mint?");
     check_argument_count(3, args)?;
 
     runtime_cost(ClarityCostFunction::FtMint, env, 0)?;
 
     let token_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    crate::profiler::record_name!(token_name);
 
     let amount = eval(&args[1], env, context)?;
     let to = eval(&args[2], env, context)?;
@@ -385,6 +393,7 @@ pub fn special_mint_asset_v200(
     check_argument_count(3, args)?;
 
     let asset_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    let _span = crate::profiler::profile!("clarity:nft-mint?", asset_name.to_string());
 
     let asset = eval(&args[1], env, context)?;
     let to = eval(&args[2], env, context)?;
@@ -460,6 +469,7 @@ pub fn special_mint_asset_v205(
     check_argument_count(3, args)?;
 
     let asset_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    let _span = crate::profiler::profile!("clarity:nft-mint?", asset_name.to_string());
 
     let asset = eval(&args[1], env, context)?;
     let to = eval(&args[2], env, context)?;
@@ -532,6 +542,7 @@ pub fn special_transfer_asset_v200(
     check_argument_count(4, args)?;
 
     let asset_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    let _span = crate::profiler::profile!("clarity:nft-transfer?", asset_name.to_string());
 
     let asset = eval(&args[1], env, context)?;
     let from = eval(&args[2], env, context)?;
@@ -627,6 +638,7 @@ pub fn special_transfer_asset_v205(
     check_argument_count(4, args)?;
 
     let asset_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    let _span = crate::profiler::profile!("clarity:nft-transfer?", asset_name.to_string());
 
     let asset = eval(&args[1], env, context)?;
     let from = eval(&args[2], env, context)?;
@@ -716,11 +728,13 @@ pub fn special_transfer_token(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:ft-transfer?");
     check_argument_count(4, args)?;
 
     runtime_cost(ClarityCostFunction::FtTransfer, env, 0)?;
 
     let token_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    crate::profiler::record_name!(token_name);
 
     let amount = eval(&args[1], env, context)?;
     let from = eval(&args[2], env, context)?;
@@ -819,11 +833,13 @@ pub fn special_get_balance(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:ft-get-balance");
     check_argument_count(2, args)?;
 
     runtime_cost(ClarityCostFunction::FtBalance, env, 0)?;
 
     let token_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    crate::profiler::record_name!(token_name);
 
     let owner = eval(&args[1], env, context)?;
 
@@ -857,6 +873,7 @@ pub fn special_get_owner_v200(
     check_argument_count(2, args)?;
 
     let asset_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    let _span = crate::profiler::profile!("clarity:nft-get-owner?", asset_name.to_string());
 
     let asset = eval(&args[1], env, context)?;
 
@@ -905,6 +922,7 @@ pub fn special_get_owner_v205(
     check_argument_count(2, args)?;
 
     let asset_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    let _span = crate::profiler::profile!("clarity:nft-get-owner?", asset_name.to_string());
 
     let asset = eval(&args[1], env, context)?;
 
@@ -947,11 +965,13 @@ pub fn special_get_token_supply(
     env: &mut Environment,
     _context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:ft-get-supply");
     check_argument_count(1, args)?;
 
     runtime_cost(ClarityCostFunction::FtSupply, env, 0)?;
 
     let token_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    crate::profiler::record_name!(token_name);
 
     let supply = env
         .global_context
@@ -965,11 +985,13 @@ pub fn special_burn_token(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:ft-burn?");
     check_argument_count(3, args)?;
 
     runtime_cost(ClarityCostFunction::FtBurn, env, 0)?;
 
     let token_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    crate::profiler::record_name!(token_name);
 
     let amount = eval(&args[1], env, context)?;
     let from = eval(&args[2], env, context)?;
@@ -1032,11 +1054,13 @@ pub fn special_burn_asset_v200(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:nft-burn?");
     check_argument_count(3, args)?;
 
     runtime_cost(ClarityCostFunction::NftBurn, env, 0)?;
 
     let asset_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    crate::profiler::record_name!(asset_name);
 
     let asset = eval(&args[1], env, context)?;
     let sender = eval(&args[2], env, context)?;
@@ -1122,11 +1146,13 @@ pub fn special_burn_asset_v205(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:nft-burn?");
     check_argument_count(3, args)?;
 
     runtime_cost(ClarityCostFunction::NftBurn, env, 0)?;
 
     let asset_name = args[0].match_atom().ok_or(CheckErrorKind::BadTokenName)?;
+    crate::profiler::record_name!(asset_name);
 
     let asset = eval(&args[1], env, context)?;
     let sender = eval(&args[2], env, context)?;

@@ -213,6 +213,7 @@ pub fn special_restrict_assets(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:restrict-assets?");
     // (restrict-assets? asset-owner ((with-stx|with-ft|with-nft|with-stacking)*) expr-body1 expr-body2 ... expr-body-last)
     // arg1 => asset owner to protect
     // arg2 => list of asset allowances
@@ -303,6 +304,7 @@ pub fn special_as_contract(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:as-contract?");
     // (as-contract? ((with-stx|with-ft|with-nft|with-stacking)*) expr-body1 expr-body2 ... expr-body-last)
     // arg1 => list of asset allowances
     // arg2..n => body
@@ -339,6 +341,7 @@ pub fn special_as_contract(
         memory_use += cost_constants::AS_CONTRACT_MEMORY;
 
         let contract_principal: PrincipalData = env.contract_context.contract_identifier.clone().into();
+        crate::profiler::record_name!(contract_principal.to_string());
         let mut nested_env = env.nest_as_principal(contract_principal.clone());
 
         // Create a new evaluation context, so that we can rollback if the

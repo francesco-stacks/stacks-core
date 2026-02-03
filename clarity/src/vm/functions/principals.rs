@@ -53,6 +53,7 @@ pub fn special_is_standard(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:is-standard");
     check_argument_count(1, args)?;
     runtime_cost(ClarityCostFunction::IsStandard, env, 0)?;
     let owner = eval(&args[0], env, context)?;
@@ -155,6 +156,7 @@ pub fn special_principal_destruct(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:principal-destruct?");
     check_argument_count(1, args)?;
     runtime_cost(ClarityCostFunction::PrincipalDestruct, env, 0)?;
 
@@ -194,6 +196,7 @@ pub fn special_principal_construct(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:principal-construct?");
     check_arguments_at_least(2, args)?;
     check_arguments_at_most(3, args)?;
     runtime_cost(ClarityCostFunction::PrincipalConstruct, env, 0)?;

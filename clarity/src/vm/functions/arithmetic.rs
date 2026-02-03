@@ -388,6 +388,7 @@ fn special_geq_v1(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:>= (gte)", "v1");
     check_argument_count(2, args)?;
     let a = eval(&args[0], env, context)?;
     let b = eval(&args[1], env, context)?;
@@ -402,6 +403,7 @@ fn special_geq_v2(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:>= (gte)", "v2");
     check_argument_count(2, args)?;
     let a = eval(&args[0], env, context)?;
     let b = eval(&args[1], env, context)?;
@@ -435,6 +437,7 @@ fn special_leq_v1(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:<= (lte)", "v1");
     check_argument_count(2, args)?;
     let a = eval(&args[0], env, context)?;
     let b = eval(&args[1], env, context)?;
@@ -449,6 +452,7 @@ fn special_leq_v2(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:<= (lte)", "v2");
     check_argument_count(2, args)?;
     let a = eval(&args[0], env, context)?;
     let b = eval(&args[1], env, context)?;
@@ -481,6 +485,7 @@ fn special_greater_v1(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:> (gt)", "v1");
     check_argument_count(2, args)?;
     let a = eval(&args[0], env, context)?;
     let b = eval(&args[1], env, context)?;
@@ -495,6 +500,7 @@ fn special_greater_v2(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:> (gt)", "v2");
     check_argument_count(2, args)?;
     let a = eval(&args[0], env, context)?;
     let b = eval(&args[1], env, context)?;
@@ -523,6 +529,7 @@ fn special_less_v1(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:< (lt)", "v1");
     check_argument_count(2, args)?;
     let a = eval(&args[0], env, context)?;
     let b = eval(&args[1], env, context)?;
@@ -537,6 +544,7 @@ fn special_less_v2(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
+    let _span = crate::profiler::profile!("clarity:< (lt)", "v2");
     check_argument_count(2, args)?;
     let a = eval(&args[0], env, context)?;
     let b = eval(&args[1], env, context)?;
