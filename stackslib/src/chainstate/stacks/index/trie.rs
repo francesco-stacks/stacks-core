@@ -20,7 +20,7 @@ use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use stacks_common::util::macros::is_trace;
 
 use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
-use crate::chainstate::stacks::index::marf::MARF;
+use crate::chainstate::stacks::index::marf::{MARF, MARF_SQUASHED_BLOCK_ROOT_HASH_KEY};
 use crate::chainstate::stacks::index::node::{
     clear_backptr, is_backptr, set_backptr, TrieCursor, TrieNode, TrieNode16, TrieNode256,
     TrieNode4, TrieNode48, TrieNodeID, TrieNodeType, TriePtr,
@@ -771,22 +771,42 @@ impl Trie {
 
         let mut log_depth = 0;
         while log_depth < 32 && (1u32 << log_depth) <= cur_block_height {
-            let prev_block_header = MARF::get_block_at_height(
-                storage,
-                cur_block_height - (1u32 << log_depth),
-                &cur_block_header,
-            )?
-            .ok_or_else(|| {
-                Error::CorruptionError(format!(
-                    "Could not obtain block hash at block height {}",
-                    cur_block_height - (1u32 << log_depth)
-                ))
-            })?;
+            let ancestor_height = cur_block_height - (1u32 << log_depth);
+            let prev_block_header =
+                MARF::get_block_at_height(storage, ancestor_height, &cur_block_header)?
+                    .ok_or_else(|| {
+                        Error::CorruptionError(format!(
+                            "Could not obtain block hash at block height {ancestor_height}"
+                        ))
+                    })?;
 
-            storage.open_block(&prev_block_header)?;
-
-            let root_ptr = storage.root_trieptr();
-            let ancestor_hash = storage.read_node_hash_bytes(&root_ptr)?;
+            let ancestor_hash = if let Some(info) = storage.squash_info() {
+                if ancestor_height <= info.height {
+                    let root_hash_key =
+                        format!("{MARF_SQUASHED_BLOCK_ROOT_HASH_KEY}::{ancestor_height}");
+                    let root_hash_value =
+                        MARF::get_by_key(storage, &cur_block_header, &root_hash_key)?
+                            .ok_or_else(|| {
+                                Error::CorruptionError(format!(
+                                    "Could not obtain root hash at height {ancestor_height}"
+                                ))
+                            })?;
+                    let bytes = root_hash_value.as_bytes();
+                    TrieHash::from_bytes(&bytes[..TRIEHASH_ENCODED_SIZE]).ok_or_else(|| {
+                        Error::CorruptionError(format!(
+                            "Invalid root hash bytes from {MARF_SQUASHED_BLOCK_ROOT_HASH_KEY}"
+                        ))
+                    })?
+                } else {
+                    storage.open_block(&prev_block_header)?;
+                    let root_ptr = storage.root_trieptr();
+                    storage.read_node_hash_bytes(&root_ptr)?
+                }
+            } else {
+                storage.open_block(&prev_block_header)?;
+                let root_ptr = storage.root_trieptr();
+                storage.read_node_hash_bytes(&root_ptr)?
+            };
 
             trace!(
                 "Include root hash {} from block {} in ancestor #{}",

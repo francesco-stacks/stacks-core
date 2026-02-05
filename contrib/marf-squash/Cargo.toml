@@ -1,0 +1,9 @@
+[package]
+name = "marf-squash"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+stackslib = { path = "../../stackslib" }
+stacks-common = { path = "../../stacks-common" }
+clap = { version = "4.5.44", features = ["derive"] }
