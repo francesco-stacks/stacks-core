@@ -8,6 +8,7 @@ export default function ProfilerGrid({
   columns,
   spanVizEnabled,
   spanVizStyle,
+  spanVizColor,
   isLoading,
   isEmpty,
   rowStyle,
@@ -139,7 +140,7 @@ export default function ProfilerGrid({
   }, [onInit]);
 
   return (
-    <section className={`app-grid-container${spanVizEnabled ? ` span-viz-${spanVizStyle}` : ""}`}>
+    <section className={`app-grid-container${spanVizEnabled ? ` span-viz-${spanVizStyle}` : ""}${spanVizEnabled && spanVizColor ? ` span-viz-color-${spanVizColor}` : ""}`}>
       {isLoading && (
         <div className="grid-loading-overlay">
           <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />

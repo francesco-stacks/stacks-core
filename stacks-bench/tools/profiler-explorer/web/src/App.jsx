@@ -210,12 +210,16 @@ export default function App() {
           };
           parsed.metric = metricMigration[parsed.metric] || "wall_inc_total";
         }
+        // Add default color if not present
+        if (!parsed.color) {
+          parsed.color = DEFAULT_HEAT_COLOR;
+        }
         return parsed;
       } catch {
-        return { enabled: true, style: "fill", metric: "wall_inc_total" };
+        return { enabled: true, style: "fill", metric: "wall_inc_total", color: DEFAULT_HEAT_COLOR };
       }
     }
-    return { enabled: true, style: "fill", metric: "wall_inc_total" };
+    return { enabled: true, style: "fill", metric: "wall_inc_total", color: DEFAULT_HEAT_COLOR };
   });
   const numberFormat = useMemo(() => getNumberFormat(numberFormatId), [numberFormatId]);
 
@@ -964,6 +968,7 @@ export default function App() {
               columns={visibleColumns}
               spanVizEnabled={spanVizConfig.enabled}
               spanVizStyle={spanVizConfig.style}
+              spanVizColor={spanVizConfig.color}
               isLoading={isLoading}
               isEmpty={rows.length === 0 && !isLoading}
               rowStyle={() => "profiler-row"}

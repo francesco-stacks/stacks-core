@@ -828,7 +828,25 @@
 .wx-cell[data-col-id="span"] {
   --span-viz-width: 0;
   --span-viz-alpha: 0;
+  /* Note: --span-viz-color is inherited from parent .span-viz-color-* class */
 }
+
+/* Default span viz color (on grid container, can be overridden by color classes) */
+.app-grid-container {
+  --span-viz-color: var(--primary);
+}
+
+/* Span viz color classes - applied to the grid container */
+.span-viz-color-red { --span-viz-color: #dc2626; }
+.span-viz-color-orange { --span-viz-color: #ea580c; }
+.span-viz-color-amber { --span-viz-color: #f59e0b; }
+.span-viz-color-green { --span-viz-color: #22c55e; }
+.span-viz-color-teal { --span-viz-color: #14b8a6; }
+.span-viz-color-cyan { --span-viz-color: #06b6d4; }
+.span-viz-color-blue { --span-viz-color: #3b82f6; }
+.span-viz-color-purple { --span-viz-color: #8b5cf6; }
+.span-viz-color-pink { --span-viz-color: #ec4899; }
+.span-viz-color-gray { --span-viz-color: #9ca3af; }
 
 /* Span cell content must be above viz layers */
 .wx-cell[data-col-id="span"] .span-cell {
@@ -844,7 +862,7 @@
   top: 0;
   bottom: 0;
   width: calc(var(--span-viz-width) * 1%);
-  background: color-mix(in oklab, var(--primary) 25%, transparent);
+  background: color-mix(in oklab, var(--span-viz-color) 25%, transparent);
   opacity: var(--span-viz-alpha);
   pointer-events: none;
   z-index: 0;
@@ -858,7 +876,7 @@
   top: 4px;
   bottom: 4px;
   width: 3px;
-  background: var(--primary);
+  background: var(--span-viz-color);
   opacity: min(0.9, calc(var(--span-viz-alpha) * 3));
   pointer-events: none;
   z-index: 0;
@@ -872,7 +890,7 @@
   bottom: 0;
   height: 2px;
   width: calc(var(--span-viz-width) * 1%);
-  background: var(--primary);
+  background: var(--span-viz-color);
   opacity: min(0.9, calc(var(--span-viz-alpha) * 3));
   pointer-events: none;
   z-index: 0;

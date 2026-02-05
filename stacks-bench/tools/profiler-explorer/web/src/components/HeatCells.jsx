@@ -597,6 +597,26 @@ export function ContextSpanHeaderCell({ column, cell }) {
               </select>
             </div>
           </div>
+
+          <div className="column-popover-divider" />
+
+          <div className="column-popover-section">
+            <div className="column-popover-row-start">
+              <label className="column-popover-label">Color</label>
+              <div className="color-swatch-grid">
+                {(ctx.heatColorOptions || []).map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    className={`color-swatch color-swatch-${option.id} ${spanVizConfig.color === option.id ? "color-swatch-selected" : ""}`}
+                    onClick={() => ctx.setSpanVizConfig({ ...spanVizConfig, color: option.id })}
+                    aria-label={option.label}
+                    title={option.label}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>
