@@ -50,6 +50,10 @@ struct SquashArgs {
     /// Skip validation to speed up size measurements.
     #[arg(long = "skip-validate")]
     skip_validate: bool,
+    /// Run full leaf-by-leaf comparison (slow, O(leaf_count)).
+    /// By default, validation uses the fast hash-based check.
+    #[arg(long)]
+    full: bool,
 }
 
 /// Arguments for validating a squashed MARF against a source.
@@ -70,6 +74,10 @@ struct ValidateArgs {
     /// Block height to validate at.
     #[arg(long, value_name = "HEIGHT")]
     height: u32,
+    /// Run full leaf-by-leaf comparison (slow, O(leaf_count)).
+    /// By default, validation uses the fast hash-based check.
+    #[arg(long)]
+    full: bool,
 }
 
 /// Arguments for reporting the latest confirmed height.
@@ -147,6 +155,7 @@ fn run_squash(args: SquashArgs) {
             out_blobs_path.to_str().unwrap(),
             open_opts,
             height,
+            args.full,
         ))
     };
 
@@ -185,22 +194,31 @@ fn run_squash(args: SquashArgs) {
 
 fn print_validation(stats: &SquashValidationStats) {
     println!("Validation:");
-    println!("Source keys checked: {}", stats.source_keys_checked);
-    println!("Squashed keys checked: {}", stats.squashed_keys_checked);
-    println!("Missing in squashed: {}", stats.missing_in_squashed);
-    println!("Missing in source: {}", stats.missing_in_source);
-    println!("Value mismatches: {}", stats.value_mismatches);
+    println!(
+        "Root hash at squash height: match={}",
+        stats.root_hash_matches
+    );
+    println!("  source:   {}", stats.source_root_hash);
+    println!("  squashed: {}", stats.squashed_root_hash);
     println!("Squash root present: {}", stats.squash_root_present);
     println!("Squash root matches: {}", stats.squash_root_matches);
-    println!("Height mappings missing: {}", stats.height_mapping_missing);
+    println!("Per-height root hashes missing: {}", stats.root_hash_missing);
     println!(
-        "Height mapping mismatches: {}",
-        stats.height_mapping_mismatches
+        "Per-height root hash mismatches: {}",
+        stats.root_hash_mismatches
     );
-    println!("Hash mappings missing: {}", stats.hash_mapping_missing);
-    println!("Hash mapping mismatches: {}", stats.hash_mapping_mismatches);
-    println!("Root hash keys missing: {}", stats.root_hash_missing);
-    println!("Root hash key mismatches: {}", stats.root_hash_mismatches);
+    println!(
+        "Blob offset mismatches: {}",
+        stats.blob_offset_mismatches
+    );
+    if stats.source_keys_checked > 0 || stats.squashed_keys_checked > 0 {
+        println!("Full leaf scan:");
+        println!("  Source keys checked: {}", stats.source_keys_checked);
+        println!("  Squashed keys checked: {}", stats.squashed_keys_checked);
+        println!("  Missing in squashed: {}", stats.missing_in_squashed);
+        println!("  Missing in source: {}", stats.missing_in_source);
+        println!("  Value mismatches: {}", stats.value_mismatches);
+    }
 }
 
 fn run_validate(args: ValidateArgs) {
@@ -216,6 +234,7 @@ fn run_validate(args: ValidateArgs) {
         args.squashed_blobs.to_str().unwrap(),
         open_opts,
         args.height,
+        args.full,
     );
     print_validation(&validation);
 }
@@ -268,15 +287,17 @@ fn validate_or_exit(
     squashed_blobs: &str,
     open_opts: MARFOpenOpts,
     height: u32,
+    full_leaf_scan: bool,
 ) -> SquashValidationStats {
     ensure_blobs_match(source_db, source_blobs);
     ensure_blobs_match(squashed_db, squashed_blobs);
 
-    match MARF::<StacksBlockId>::validate_squashed_at_height(
+    match MARF::<StacksBlockId>::validate_squashed_at_height_ex(
         source_db,
         squashed_db,
         open_opts,
         height,
+        full_leaf_scan,
     ) {
         Ok(stats) => stats,
         Err(e) => {

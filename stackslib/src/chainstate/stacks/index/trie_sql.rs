@@ -21,7 +21,7 @@ use std::io::Write;
 
 use rusqlite::blob::Blob;
 use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Transaction};
-use stacks_common::types::chainstate::TrieHash;
+use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use stacks_common::types::sqlite::NO_PARAMS;
 
 #[cfg(test)]
@@ -81,14 +81,142 @@ INSERT OR REPLACE INTO migrated_version (version) VALUES (1);
 
 pub static SQL_MARF_SCHEMA_VERSION: u64 = 2;
 
+/// SQL table for squash metadata (root hash and height).
+/// Stored outside the trie so it does not affect the MARF root hash.
+static SQL_MARF_SQUASH_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS marf_squash_info (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    squash_root BLOB NOT NULL,
+    squash_height INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS marf_squash_root_hashes (
+    height INTEGER PRIMARY KEY,
+    root_hash BLOB NOT NULL
+);
+";
+
 pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
     let tx = tx_begin_immediate(conn)?;
 
     tx.execute_batch(SQL_MARF_DATA_TABLE)?;
     tx.execute_batch(SQL_MARF_MINED_TABLE)?;
     tx.execute_batch(SQL_EXTENSION_LOCKS_TABLE)?;
+    tx.execute_batch(SQL_MARF_SQUASH_TABLES)?;
 
     tx.commit().map_err(|e| e.into())
+}
+
+/// Write squash metadata (root hash and height) to the out-of-trie SQL table.
+pub fn write_squash_info(
+    conn: &Connection,
+    root: &TrieHash,
+    height: u32,
+) -> Result<(), Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO marf_squash_info (id, squash_root, squash_height) VALUES (1, ?1, ?2)",
+        params![root.as_bytes().to_vec(), height as i64],
+    )?;
+    Ok(())
+}
+
+/// Read squash metadata from the out-of-trie SQL table.
+/// Returns `None` for archival (non-squashed) MARFs.
+pub fn read_squash_info(conn: &Connection) -> Result<Option<(TrieHash, u32)>, Error> {
+    let result: Option<(Vec<u8>, i64)> = conn
+        .query_row(
+            "SELECT squash_root, squash_height FROM marf_squash_info WHERE id = 1",
+            NO_PARAMS,
+            |row| {
+                let root_bytes: Vec<u8> = row.get(0)?;
+                let height: i64 = row.get(1)?;
+                Ok((root_bytes, height))
+            },
+        )
+        .optional()?;
+
+    match result {
+        Some((bytes, height)) => {
+            if bytes.len() < TRIEHASH_ENCODED_SIZE {
+                return Err(Error::CorruptionError(
+                    "Invalid squash root hash length".to_string(),
+                ));
+            }
+            let hash_bytes = bytes.get(..TRIEHASH_ENCODED_SIZE).ok_or_else(|| {
+                Error::CorruptionError("Squash root hash bytes too short".to_string())
+            })?;
+            let root = TrieHash::from_bytes(hash_bytes).ok_or_else(|| {
+                Error::CorruptionError("Invalid squash root hash bytes".to_string())
+            })?;
+            Ok(Some((root, height as u32)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Write a single per-height root hash into the out-of-trie SQL table.
+pub fn write_squash_root_hash(
+    conn: &Connection,
+    height: u32,
+    root_hash: &TrieHash,
+) -> Result<(), Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO marf_squash_root_hashes (height, root_hash) VALUES (?1, ?2)",
+        params![height as i64, root_hash.as_bytes().to_vec()],
+    )?;
+    Ok(())
+}
+
+/// Read the stored root hash for a given height from the SQL table.
+/// Returns `None` if the height is not present (archival MARF or height
+/// outside the squashed range).
+pub fn read_squash_root_hash(
+    conn: &Connection,
+    height: u32,
+) -> Result<Option<TrieHash>, Error> {
+    let result: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT root_hash FROM marf_squash_root_hashes WHERE height = ?1",
+            params![height as i64],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match result {
+        Some(bytes) => {
+            if bytes.len() < TRIEHASH_ENCODED_SIZE {
+                return Err(Error::CorruptionError(
+                    "Invalid squash root hash length".to_string(),
+                ));
+            }
+            let hash_bytes = bytes.get(..TRIEHASH_ENCODED_SIZE).ok_or_else(|| {
+                Error::CorruptionError("Squash root hash bytes too short".to_string())
+            })?;
+            Ok(Some(
+                TrieHash::from_bytes(hash_bytes).ok_or_else(|| {
+                    Error::CorruptionError("Invalid squash root hash bytes".to_string())
+                })?,
+            ))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Insert a placeholder `marf_data` entry for a historical block in a squashed MARF.
+///
+/// Used during `squash_to_path` to pre-populate the block → local-ID mapping
+/// that `get_block_hash_caching` relies on.  The returned `block_id` is stored
+/// in the squashed trie's `back_block` annotations so that
+/// `inner_write_children_hashes` can recover the original `StacksBlockId`.
+///
+/// The caller is expected to update `external_offset` / `external_length` to
+/// the shared blob's location after the squash commit.
+pub fn write_placeholder_block_entry<T: MarfTrieId>(
+    conn: &Connection,
+    block_hash: &T,
+    external_offset: u64,
+    external_length: u64,
+) -> Result<u32, Error> {
+    write_external_trie_blob(conn, block_hash, external_offset, external_length)
 }
 
 fn get_schema_version(conn: &Connection) -> u64 {

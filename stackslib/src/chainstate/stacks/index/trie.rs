@@ -20,7 +20,8 @@ use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use stacks_common::util::macros::is_trace;
 
 use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
-use crate::chainstate::stacks::index::marf::{MARF, MARF_SQUASHED_BLOCK_ROOT_HASH_KEY};
+use crate::chainstate::stacks::index::marf::MARF;
+use crate::chainstate::stacks::index::trie_sql;
 use crate::chainstate::stacks::index::node::{
     clear_backptr, is_backptr, set_backptr, TrieCursor, TrieNode, TrieNode16, TrieNode256,
     TrieNode4, TrieNode48, TrieNodeID, TrieNodeType, TriePtr,
@@ -780,28 +781,22 @@ impl Trie {
                         ))
                     })?;
 
-            let ancestor_hash = if let Some(info) = storage.squash_info() {
-                if ancestor_height <= info.height {
-                    let root_hash_key =
-                        format!("{MARF_SQUASHED_BLOCK_ROOT_HASH_KEY}::{ancestor_height}");
-                    let root_hash_value =
-                        MARF::get_by_key(storage, &cur_block_header, &root_hash_key)?
-                            .ok_or_else(|| {
-                                Error::CorruptionError(format!(
-                                    "Could not obtain root hash at height {ancestor_height}"
-                                ))
-                            })?;
-                    let bytes = root_hash_value.as_bytes();
-                    TrieHash::from_bytes(&bytes[..TRIEHASH_ENCODED_SIZE]).ok_or_else(|| {
+            // Use the stored root-hash key for squashed MARFs when the ancestor
+            // height falls within the squashed range, otherwise fall back to
+            // the archival path (open_block).  This eliminates the duplicated
+            // fallback arm that previously existed for the > info.height and
+            // non-squashed cases.
+            let use_stored_root = storage
+                .squash_info()
+                .is_some_and(|info| ancestor_height <= info.height);
+
+            let ancestor_hash = if use_stored_root {
+                trie_sql::read_squash_root_hash(storage.sqlite_conn(), ancestor_height)?
+                    .ok_or_else(|| {
                         Error::CorruptionError(format!(
-                            "Invalid root hash bytes from {MARF_SQUASHED_BLOCK_ROOT_HASH_KEY}"
+                            "Could not obtain squashed root hash at height {ancestor_height}"
                         ))
                     })?
-                } else {
-                    storage.open_block(&prev_block_header)?;
-                    let root_ptr = storage.root_trieptr();
-                    storage.read_node_hash_bytes(&root_ptr)?
-                }
             } else {
                 storage.open_block(&prev_block_header)?;
                 let root_ptr = storage.root_trieptr();

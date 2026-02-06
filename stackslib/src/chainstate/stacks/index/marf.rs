@@ -13,12 +13,10 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
-use std::collections::HashSet;
 use std::ops::DerefMut;
-use std::time::Instant;
 
 use rusqlite::{Connection, Transaction};
-use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
+use stacks_common::types::chainstate::TrieHash;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 use super::storage::ReopenedTrieStorageConnection;
@@ -32,63 +30,24 @@ use crate::chainstate::stacks::index::storage::{
     TrieStorageTransaction,
 };
 use crate::chainstate::stacks::index::trie::Trie;
-use crate::chainstate::stacks::index::{
-    trie_sql, Error, MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof,
-};
+use crate::chainstate::stacks::index::{Error, MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof};
 use crate::util_lib::db::Error as db_error;
+
+// Re-export squash types and constants so downstream consumers (e.g.
+// marf-squash binary) can import from this module without changes.
+pub use super::squash::{
+    SquashStats, SquashValidationStats, MARF_SQUASHED_BLOCK_ROOT_HASH_KEY,
+    MARF_SQUASH_HEIGHT_KEY, MARF_SQUASH_ROOT_KEY,
+};
 
 pub const BLOCK_HASH_TO_HEIGHT_MAPPING_KEY: &str = "__MARF_BLOCK_HASH_TO_HEIGHT";
 pub const BLOCK_HEIGHT_TO_HASH_MAPPING_KEY: &str = "__MARF_BLOCK_HEIGHT_TO_HASH";
 pub const OWN_BLOCK_HEIGHT_KEY: &str = "__MARF_BLOCK_HEIGHT_SELF";
-/// Key that stores the squashed root hash at the snapshot tip.
-pub const MARF_SQUASH_ROOT_KEY: &str = "__MARF_SQUASH_ROOT";
-/// Key that stores the snapshot height for a squashed MARF.
-pub const MARF_SQUASH_HEIGHT_KEY: &str = "__MARF_SQUASH_HEIGHT";
-/// Prefix for per-height root hashes preserved in squashed MARFs.
-pub const MARF_SQUASHED_BLOCK_ROOT_HASH_KEY: &str = "__MARF_SQUASHED_BLOCK_ROOT_HASH";
 
 /// Merklized Adaptive-Radix Forest -- a collection of Merklized Adaptive-Radix Tries.
 pub struct MARF<T: MarfTrieId> {
     storage: TrieFileStorage<T>,
     open_chain_tip: Option<WriteChainTip<T>>,
-}
-
-/// Summary statistics from a squashing run.
-#[derive(Debug, Clone)]
-pub struct SquashStats {
-    /// Total number of leaves copied into the squashed MARF.
-    pub leaf_count: u64,
-}
-
-/// Summary statistics from a validation run.
-#[derive(Debug, Clone)]
-pub struct SquashValidationStats {
-    /// Total keys compared from the source MARF.
-    pub source_keys_checked: u64,
-    /// Total keys compared from the squashed MARF.
-    pub squashed_keys_checked: u64,
-    /// Keys present in source but missing in squashed.
-    pub missing_in_squashed: u64,
-    /// Keys present in squashed but missing in source.
-    pub missing_in_source: u64,
-    /// Keys present in both but with different values.
-    pub value_mismatches: u64,
-    /// Whether the squashed root key was found.
-    pub squash_root_present: bool,
-    /// Whether the squashed root key matched the expected value.
-    pub squash_root_matches: bool,
-    /// Height->hash mappings missing from the squashed MARF.
-    pub height_mapping_missing: u64,
-    /// Height->hash mappings with mismatched values.
-    pub height_mapping_mismatches: u64,
-    /// Hash->height mappings missing from the squashed MARF.
-    pub hash_mapping_missing: u64,
-    /// Hash->height mappings with mismatched values.
-    pub hash_mapping_mismatches: u64,
-    /// Root hash keys missing from the squashed MARF.
-    pub root_hash_missing: u64,
-    /// Root hash keys with mismatched values.
-    pub root_hash_mismatches: u64,
 }
 
 pub struct MarfTransaction<'a, T: MarfTrieId> {
@@ -403,6 +362,28 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
 
     pub fn sqlite_tx_mut(&mut self) -> &mut Transaction<'a> {
         self.storage.sqlite_tx_mut()
+    }
+
+    /// Set squash metadata on the underlying storage connection.
+    ///
+    /// Called during `squash_to_path` so the ancestor-hash computation can
+    /// use stored root hashes instead of opening pruned historical blocks.
+    pub(crate) fn set_squash_info(&mut self, info: Option<SquashInfo<T>>) {
+        self.storage.set_squash_info(info);
+    }
+
+    /// Write a trie node directly to the uncommitted TrieRAM at `slot`.
+    ///
+    /// Used by `squash_to_path` to populate the TrieRAM with a
+    /// structure-preserving deep copy of the source trie, bypassing the
+    /// normal walk-cow insertion path.
+    pub(crate) fn write_node_direct(
+        &mut self,
+        slot: u32,
+        node: &TrieNodeType,
+        hash: TrieHash,
+    ) -> Result<(), Error> {
+        self.storage.write_nodetype(slot, node, hash)
     }
 
     /// Reopen this MARF transaction with readonly storage.
@@ -758,24 +739,40 @@ impl<T: MarfTrieId> MARF<T> {
         }
     }
 
-    fn node_copy_update_ptrs(ptrs: &mut [TriePtr], child_block_id: u32) {
+    /// Convert inline child pointers into back-pointers after a node is
+    /// copied forward from an ancestor trie.
+    ///
+    /// In a squashed MARF, child pointers may carry a non-zero `back_block`
+    /// annotation that records the original block ID from the archival MARF.
+    /// When `is_squashed` is true and the annotation is present, the
+    /// original `back_block` is preserved instead of being overwritten with
+    /// `child_block_id`.  This ensures that the hash computation at
+    /// subsequent heights uses the same `StacksBlockId` as the archival
+    /// MARF, keeping root hashes identical.
+    fn node_copy_update_ptrs(ptrs: &mut [TriePtr], child_block_id: u32, is_squashed: bool) {
         for pointer in ptrs.iter_mut() {
             // if the node is empty, do nothing, if it's a back pointer,
             if pointer.id() == TrieNodeID::Empty as u8 || is_backptr(pointer.id()) {
                 continue;
             } else {
-                // make backptr
-                pointer.back_block = child_block_id;
+                if is_squashed && pointer.back_block != 0 {
+                    // Preserve the annotated original block ID from the
+                    // squash blob.  The hash computation will use the
+                    // StacksBlockId that this local block_id maps to,
+                    // which is the same as in the archival MARF.
+                } else {
+                    pointer.back_block = child_block_id;
+                }
                 pointer.id = set_backptr(pointer.id());
             }
         }
     }
 
-    fn node_copy_update(node: &mut TrieNodeType, child_block_id: u32) -> TrieHash {
+    fn node_copy_update(node: &mut TrieNodeType, child_block_id: u32, is_squashed: bool) -> TrieHash {
         let hash = match node {
             TrieNodeType::Leaf(leaf) => get_leaf_hash(leaf),
             _ => {
-                MARF::<T>::node_copy_update_ptrs(node.ptrs_mut(), child_block_id);
+                MARF::<T>::node_copy_update_ptrs(node.ptrs_mut(), child_block_id, is_squashed);
                 TrieHash::from_data(&[])
             }
         };
@@ -799,6 +796,7 @@ impl<T: MarfTrieId> MARF<T> {
             node
         );
 
+        let is_squashed = storage.is_squashed();
         let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
         let (mut child_node, _, child_ptr, _) = MARF::walk_backptr(storage, node, chr, cursor)?;
         let child_block_hash = storage.get_cur_block();
@@ -806,7 +804,8 @@ impl<T: MarfTrieId> MARF<T> {
 
         // update child_node with new ptrs and hashes
         storage.open_block_maybe_id(&cur_block_hash, cur_block_id)?;
-        let child_hash = MARF::<T>::node_copy_update(&mut child_node, child_block_identifier);
+        let child_hash =
+            MARF::<T>::node_copy_update(&mut child_node, child_block_identifier, is_squashed);
 
         // store it in this trie
         storage.open_block_maybe_id(&cur_block_hash, cur_block_id)?;
@@ -827,6 +826,7 @@ impl<T: MarfTrieId> MARF<T> {
     /// Copy the root node from the previous Trie to this Trie, updating its ptrs.
     /// s must point to the target Trie
     fn root_copy(storage: &mut TrieStorageConnection<T>, prev_block_hash: &T) -> Result<(), Error> {
+        let is_squashed = storage.is_squashed();
         let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
         storage.open_block(prev_block_hash)?;
         let prev_block_identifier = storage.get_cur_block_identifier().unwrap_or_else(|_| {
@@ -837,7 +837,8 @@ impl<T: MarfTrieId> MARF<T> {
         });
 
         let (mut prev_root, _) = Trie::read_root(storage)?;
-        let new_root_hash = MARF::<T>::node_copy_update(&mut prev_root, prev_block_identifier);
+        let new_root_hash =
+            MARF::<T>::node_copy_update(&mut prev_root, prev_block_identifier, is_squashed);
 
         storage.open_block_maybe_id(&cur_block_hash, cur_block_id)?;
 
@@ -1230,446 +1231,6 @@ impl<T: MarfTrieId> MARF<T> {
     pub fn from_path_unconfirmed(path: &str, open_opts: MARFOpenOpts) -> Result<MARF<T>, Error> {
         let file_storage = TrieFileStorage::open_unconfirmed(path, open_opts)?;
         Ok(MARF::from_storage(file_storage))
-    }
-
-    /// Squash the MARF at `height` into a new database at `dst_path`.
-    ///
-    /// The destination DB contains only the canonical state at that height plus
-    /// the metadata needed to preserve historical lookups.
-    /// Steps:
-    /// 1. Resolve the canonical block hash at `height` from the current tip.
-    /// 2. Start a fresh trie at that block hash (new root, no history).
-    /// 3. Store the original root hash at `height` under `__MARF_SQUASH_ROOT`.
-    /// 4. Store the squash height under `__MARF_SQUASH_HEIGHT`.
-    /// 5. Store the squashed tip height under `__MARF_BLOCK_HEIGHT_SELF`.
-    /// 6. Copy every leaf reachable at `height` into the new trie.
-    /// 7. For all heights `0..=height`, preserve:
-    ///    - `__MARF_BLOCK_HEIGHT_TO_HASH::<h>`
-    ///    - `__MARF_BLOCK_HASH_TO_HEIGHT::<hash>`
-    ///    - `__MARF_SQUASHED_BLOCK_ROOT_HASH_KEY::<h>`
-    pub fn squash_to_path(
-        src_path: &str,
-        dst_path: &str,
-        open_opts: MARFOpenOpts,
-        height: u32,
-    ) -> Result<SquashStats, Error> {
-        let src_storage = TrieFileStorage::open_readonly(src_path, open_opts.clone())?;
-        let mut src = MARF::from_storage(src_storage);
-
-        let tip = trie_sql::get_latest_confirmed_block_hash::<T>(src.sqlite_conn())?;
-        let mut block_at_height = None;
-        let mut root_hash_at_height = None;
-        let start_history = Instant::now();
-        for h in 0..=height {
-            let block_hash = src
-                .get_block_at_height(h, &tip)?
-                .ok_or(Error::NotFoundError)?;
-            if h == height {
-                let root_hash = src.with_conn(|conn| conn.get_root_hash_at(&block_hash))?;
-                block_at_height = Some(block_hash);
-                root_hash_at_height = Some(root_hash);
-            }
-            if h % 100_000 == 0 && h > 0 {
-                info!(
-                    "Squash pre-scan: resolved height {h} in {:?}",
-                    start_history.elapsed()
-                );
-            }
-        }
-        let block_at_height = block_at_height.ok_or(Error::NotFoundError)?;
-
-        let mut dst = MARF::from_path(dst_path, open_opts)?;
-        let mut tx = dst.begin_tx()?;
-        tx.begin(&T::sentinel(), &block_at_height)?;
-
-        let source_root_hash = root_hash_at_height.ok_or(Error::NotFoundError)?;
-        let squash_root_path = TrieHash::from_key(MARF_SQUASH_ROOT_KEY);
-        let squash_root_leaf =
-            TrieLeaf::from_value(&[], MARFValue::from_value_hash(&source_root_hash));
-        tx.insert_raw(squash_root_path, squash_root_leaf)?;
-        tx.insert_raw(
-            TrieHash::from_key(MARF_SQUASH_HEIGHT_KEY),
-            TrieLeaf::from_value(&[], MARFValue::from(height)),
-        )?;
-        tx.insert_raw(
-            TrieHash::from_key(OWN_BLOCK_HEIGHT_KEY),
-            TrieLeaf::from_value(&[], MARFValue::from(height)),
-        )?;
-
-        tx.storage.set_squash_info(Some(SquashInfo {
-            root: source_root_hash,
-            height,
-        }));
-
-        // Copy all leaf entries at the target height into a fresh trie.
-        let mut copied = 0u64;
-        let start_copy = Instant::now();
-        let leaf_count = src.with_conn(|conn| {
-            MARF::walk_all_leaves(conn, &block_at_height, |path, value| {
-                if path == TrieHash::from_key(OWN_BLOCK_HEIGHT_KEY) {
-                    // Already set explicitly to the squashed height.
-                    return Ok(());
-                }
-                let leaf = TrieLeaf {
-                    path: Vec::new(),
-                    data: value,
-                };
-                copied += 1;
-                if copied % 100_000 == 0 {
-                    info!(
-                        "Squash copy: inserted {copied} leaves in {:?}",
-                        start_copy.elapsed()
-                    );
-                }
-                tx.insert_raw(path, leaf)
-            })
-        })?;
-
-        // Preserve prior block hashes, height mappings, and historical root hashes.
-        let start_mappings = Instant::now();
-        for h in 0..=height {
-            let block_hash = src
-                .get_block_at_height(h, &tip)?
-                .ok_or(Error::NotFoundError)?;
-            let root_hash = src.with_conn(|conn| conn.get_root_hash_at(&block_hash))?;
-
-            let height_key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{h}");
-            let hash_key = format!("{BLOCK_HASH_TO_HEIGHT_MAPPING_KEY}::{block_hash}");
-            let root_key = format!("{MARF_SQUASHED_BLOCK_ROOT_HASH_KEY}::{h}");
-
-            tx.insert_raw(
-                TrieHash::from_key(&height_key),
-                TrieLeaf::from_value(&[], MARFValue::from(block_hash.clone())),
-            )?;
-            tx.insert_raw(
-                TrieHash::from_key(&hash_key),
-                TrieLeaf::from_value(&[], MARFValue::from(h)),
-            )?;
-            tx.insert_raw(
-                TrieHash::from_key(&root_key),
-                TrieLeaf::from_value(&[], MARFValue::from_value_hash(&root_hash)),
-            )?;
-            if h % 100_000 == 0 && h > 0 {
-                info!(
-                    "Squash mappings: wrote {h} heights in {:?}",
-                    start_mappings.elapsed()
-                );
-            }
-        }
-
-        let start_commit = Instant::now();
-        info!("Squash commit: starting commit");
-        tx.commit()?;
-        info!("Squash commit: finished in {:?}", start_commit.elapsed());
-        Ok(SquashStats { leaf_count })
-    }
-
-    /// Walk all leaves in the trie at `block_hash`, yielding full paths and values.
-    /// This preserves all keys, including MARF metadata such as `__MARF_SQUASHED_BLOCK_ROOT_HASH_KEY::<height>`
-    /// and `__MARF_BLOCK_HEIGHT_TO_HASH::<n>`.
-    fn walk_all_leaves<F>(
-        storage: &mut TrieStorageConnection<T>,
-        block_hash: &T,
-        mut handle_leaf: F,
-    ) -> Result<u64, Error>
-    where
-        F: FnMut(TrieHash, MARFValue) -> Result<(), Error>,
-    {
-        storage.open_block(block_hash)?;
-        let (root_node, _root_hash) = Trie::read_root(storage)?;
-
-        let mut leaf_count = 0u64;
-        let mut stack: Vec<(TriePtr, Vec<u8>, T, Option<u32>)> = Vec::new();
-        let root_prefix = root_node.path_bytes().clone();
-
-        match root_node {
-            TrieNodeType::Leaf(leaf) => {
-                if root_prefix.len() != TRIEHASH_ENCODED_SIZE {
-                    return Err(Error::CorruptionError(
-                        "Root leaf path length invalid".to_string(),
-                    ));
-                }
-                let full_path = TrieHash::from_bytes(&root_prefix).ok_or_else(|| {
-                    Error::CorruptionError("Failed to decode root leaf path".to_string())
-                })?;
-                handle_leaf(full_path, leaf.data)?;
-                leaf_count += 1;
-            }
-            _ => {
-                let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
-                for ptr in root_node.ptrs().iter() {
-                    if ptr.id() == TrieNodeID::Empty as u8 {
-                        continue;
-                    }
-                    let mut prefix = root_prefix.clone();
-                    prefix.push(ptr.chr());
-                    stack.push((*ptr, prefix, cur_block_hash.clone(), cur_block_id));
-                }
-            }
-        }
-
-        while let Some((ptr, prefix, return_block, return_block_id)) = stack.pop() {
-            let (cur_block_hash, _) = storage.get_cur_block_and_id();
-            if cur_block_hash != return_block {
-                storage.open_block_maybe_id(&return_block, return_block_id)?;
-            }
-
-            let (node, node_block_hash, node_block_id) = MARF::read_node_for_ptr(storage, &ptr)?;
-
-            let mut node_prefix = prefix;
-            node_prefix.extend_from_slice(node.path_bytes());
-
-            match node {
-                TrieNodeType::Leaf(leaf) => {
-                    if node_prefix.len() != TRIEHASH_ENCODED_SIZE as usize {
-                        return Err(Error::CorruptionError(
-                            "Leaf path length invalid".to_string(),
-                        ));
-                    }
-                    let full_path = TrieHash::from_bytes(&node_prefix).ok_or_else(|| {
-                        Error::CorruptionError("Failed to decode leaf path".to_string())
-                    })?;
-                    handle_leaf(full_path, leaf.data)?;
-                    leaf_count += 1;
-                }
-                _ => {
-                    for child_ptr in node.ptrs().iter() {
-                        if child_ptr.id() == TrieNodeID::Empty as u8 {
-                            continue;
-                        }
-                        let mut child_prefix = node_prefix.clone();
-                        child_prefix.push(child_ptr.chr());
-                        stack.push((
-                            *child_ptr,
-                            child_prefix,
-                            node_block_hash.clone(),
-                            node_block_id,
-                        ));
-                    }
-                }
-            }
-        }
-
-        Ok(leaf_count)
-    }
-
-    /// Read a node referenced by `ptr`, handling back-pointers by switching blocks.
-    fn read_node_for_ptr(
-        storage: &mut TrieStorageConnection<T>,
-        ptr: &TriePtr,
-    ) -> Result<(TrieNodeType, T, Option<u32>), Error> {
-        if is_backptr(ptr.id()) {
-            let back_block_id = ptr.back_block();
-            let back_block_hash = storage.get_block_from_local_id(back_block_id)?.clone();
-            storage.open_block_known_id(&back_block_hash, back_block_id)?;
-            let backptr = ptr.from_backptr();
-            let (node, _node_hash) = storage.read_nodetype(&backptr)?;
-            Ok((node, back_block_hash, Some(back_block_id)))
-        } else {
-            let (node, _node_hash) = storage.read_nodetype(ptr)?;
-            let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
-            Ok((node, cur_block_hash, cur_block_id))
-        }
-    }
-
-    /// Validate that the squashed MARF contains the same key/value pairs
-    /// as the source MARF at a given `height`.
-    pub fn validate_squashed_at_height(
-        src_path: &str,
-        squashed_path: &str,
-        open_opts: MARFOpenOpts,
-        height: u32,
-    ) -> Result<SquashValidationStats, Error> {
-        let src_storage = TrieFileStorage::open_readonly(src_path, open_opts.clone())?;
-        let mut src = MARF::from_storage(src_storage);
-
-        let squashed_storage = TrieFileStorage::open_readonly(squashed_path, open_opts)?;
-        let mut squashed = MARF::from_storage(squashed_storage);
-
-        // The squashed MARF should contain a single block hash at the target height.
-        let squashed_block_at_height =
-            trie_sql::get_latest_confirmed_block_hash::<T>(squashed.sqlite_conn())?;
-
-        let source_tip = trie_sql::get_latest_confirmed_block_hash::<T>(src.sqlite_conn())?;
-        let height_key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{height}");
-        let source_block_at_height = src
-            .with_conn(|conn| Self::get_by_key(conn, &source_tip, &height_key))?
-            .map(T::from)
-            .unwrap_or_else(|| squashed_block_at_height.clone());
-
-        let mut stats = SquashValidationStats {
-            source_keys_checked: 0,
-            squashed_keys_checked: 0,
-            missing_in_squashed: 0,
-            missing_in_source: 0,
-            value_mismatches: 0,
-            squash_root_present: false,
-            squash_root_matches: false,
-            height_mapping_missing: 0,
-            height_mapping_mismatches: 0,
-            hash_mapping_missing: 0,
-            hash_mapping_mismatches: 0,
-            root_hash_missing: 0,
-            root_hash_mismatches: 0,
-        };
-
-        // First pass: ensure every source key exists in the squashed MARF with the same value.
-        let start_first_pass = Instant::now();
-        let (missing_in_squashed, value_mismatches, source_keys_checked) =
-            src.with_conn(|conn| {
-                let mut missing = 0u64;
-                let mut mismatched = 0u64;
-                let mut checked = 0u64;
-                let result = Self::walk_all_leaves(conn, &source_block_at_height, |path, value| {
-                    let squashed_value = squashed.with_conn(|sconn| {
-                        Self::get_by_hash(sconn, &squashed_block_at_height, &path)
-                    })?;
-                    checked += 1;
-                    if checked % 100_000 == 0 {
-                        info!(
-                            "Validate pass 1: checked {checked} keys in {:?}",
-                            start_first_pass.elapsed()
-                        );
-                    }
-                    match squashed_value {
-                        None => missing += 1,
-                        Some(other) => {
-                            if other != value {
-                                mismatched += 1;
-                            }
-                        }
-                    }
-                    Ok(())
-                });
-                result.map(|_| (missing, mismatched, checked))
-            })?;
-
-        stats.missing_in_squashed = missing_in_squashed;
-        stats.value_mismatches = value_mismatches;
-        stats.source_keys_checked = source_keys_checked;
-
-        // Validate height mappings and root hashes from H down to 0.
-        let start_mappings = Instant::now();
-        for h in 0..=height {
-            let height_key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{h}");
-            let source_height_value =
-                src.with_conn(|conn| Self::get_by_key(conn, &source_block_at_height, &height_key))?;
-            let squashed_height_value = squashed
-                .with_conn(|conn| Self::get_by_key(conn, &squashed_block_at_height, &height_key))?;
-
-            match (source_height_value.clone(), squashed_height_value) {
-                (Some(src_val), Some(sq_val)) => {
-                    if src_val != sq_val {
-                        stats.height_mapping_mismatches += 1;
-                    }
-                }
-                (Some(_), None) => stats.height_mapping_missing += 1,
-                _ => {}
-            }
-
-            if let Some(src_block_hash) = source_height_value.map(T::from) {
-                let hash_key = format!("{BLOCK_HASH_TO_HEIGHT_MAPPING_KEY}::{src_block_hash}");
-                let src_hash_value = src
-                    .with_conn(|conn| Self::get_by_key(conn, &source_block_at_height, &hash_key))?;
-                let squashed_hash_value = squashed.with_conn(|conn| {
-                    Self::get_by_key(conn, &squashed_block_at_height, &hash_key)
-                })?;
-
-                match (src_hash_value, squashed_hash_value) {
-                    (Some(src_val), Some(sq_val)) => {
-                        if src_val != sq_val {
-                            stats.hash_mapping_mismatches += 1;
-                        }
-                    }
-                    (Some(_), None) => stats.hash_mapping_missing += 1,
-                    _ => {}
-                }
-
-                let root_key = format!("{MARF_SQUASHED_BLOCK_ROOT_HASH_KEY}::{h}");
-                let expected_root_value = src.with_conn(|conn| {
-                    conn.get_root_hash_at(&src_block_hash)
-                        .map(|root| MARFValue::from_value_hash(&root))
-                })?;
-                let squashed_root_value = squashed.with_conn(|conn| {
-                    Self::get_by_key(conn, &squashed_block_at_height, &root_key)
-                })?;
-
-                match squashed_root_value {
-                    Some(sq_val) => {
-                        if sq_val != expected_root_value {
-                            stats.root_hash_mismatches += 1;
-                        }
-                    }
-                    None => stats.root_hash_missing += 1,
-                }
-            }
-            if h % 100_000 == 0 && h > 0 {
-                info!(
-                    "Validate mappings: checked {} heights in {:?}",
-                    h,
-                    start_mappings.elapsed()
-                );
-            }
-        }
-
-        // Second pass: ensure squashed MARF does not contain extra keys.
-        let expected_squash_root = src.with_conn(|conn| -> Result<MARFValue, Error> {
-            conn.get_root_hash_at(&source_block_at_height)
-                .map(|h| MARFValue::from_value_hash(&h))
-        })?;
-        let mut allowed_extra_keys = HashSet::new();
-        allowed_extra_keys.insert(TrieHash::from_key(MARF_SQUASH_ROOT_KEY));
-        allowed_extra_keys.insert(TrieHash::from_key(MARF_SQUASH_HEIGHT_KEY));
-        for h in 0..=height {
-            let root_key = format!("{MARF_SQUASHED_BLOCK_ROOT_HASH_KEY}::{h}");
-            allowed_extra_keys.insert(TrieHash::from_key(&root_key));
-        }
-
-        let start_second_pass = Instant::now();
-        let (missing_in_source, squashed_keys_checked, squash_root_present, squash_root_matches) =
-            squashed.with_conn(|sconn| {
-                let mut missing = 0u64;
-                let mut checked = 0u64;
-                let mut saw_squash_root = false;
-                let mut squash_root_matches = false;
-                let result =
-                    Self::walk_all_leaves(sconn, &squashed_block_at_height, |path, value| {
-                        if path == TrieHash::from_key(MARF_SQUASH_ROOT_KEY) {
-                            saw_squash_root = true;
-                            squash_root_matches = value == expected_squash_root;
-                            checked += 1;
-                            return Ok(());
-                        }
-                        if allowed_extra_keys.contains(&path) {
-                            checked += 1;
-                            return Ok(());
-                        }
-
-                        let src_value = src.with_conn(|conn| {
-                            Self::get_by_hash(conn, &source_block_at_height, &path)
-                        })?;
-                        checked += 1;
-                        if checked % 100_000 == 0 {
-                            info!(
-                                "Validate pass 2: checked {} keys in {:?}",
-                                checked,
-                                start_second_pass.elapsed()
-                            );
-                        }
-                        if src_value.is_none() {
-                            missing += 1;
-                        }
-                        Ok(())
-                    });
-                result.map(|_| (missing, checked, saw_squash_root, squash_root_matches))
-            })?;
-
-        stats.missing_in_source = missing_in_source;
-        stats.squashed_keys_checked = squashed_keys_checked;
-        stats.squash_root_present = squash_root_present;
-        stats.squash_root_matches = squash_root_matches;
-
-        Ok(stats)
     }
 
     pub fn get_by_path(
@@ -2171,214 +1732,4 @@ impl<T: MarfTrieId> MARF<T> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-
-    use stacks_common::types::chainstate::StacksBlockId;
-    use tempfile::tempdir;
-
-    use super::*;
-    use crate::chainstate::stacks::index::{trie_sql, ClarityMarfTrieId};
-
-    fn setup_marf(path: &str) -> (MARF<StacksBlockId>, StacksBlockId, StacksBlockId) {
-        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts).unwrap();
-
-        let b1 = StacksBlockId::from_bytes(&[1u8; 32]).unwrap();
-        let b2 = StacksBlockId::from_bytes(&[2u8; 32]).unwrap();
-
-        marf.begin(&StacksBlockId::sentinel(), &b1).unwrap();
-        marf.insert("k1", MARFValue::from_value("v1")).unwrap();
-        marf.commit().unwrap();
-
-        marf.begin(&b1, &b2).unwrap();
-        marf.insert("k1", MARFValue::from_value("v2")).unwrap();
-        marf.insert("k2", MARFValue::from_value("v3")).unwrap();
-        marf.commit().unwrap();
-
-        (marf, b1, b2)
-    }
-
-    #[test]
-    fn test_latest_confirmed_block_hash_and_walk_leaves() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("index.sqlite");
-        let (mut marf, _b1, b2) = setup_marf(db_path.to_str().unwrap());
-
-        let tip =
-            trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn()).unwrap();
-        assert_eq!(tip, b2);
-
-        let block_at_height = marf.get_block_at_height(1, &tip).unwrap().unwrap();
-        assert_eq!(block_at_height, b2);
-
-        let mut seen: HashMap<TrieHash, MARFValue> = HashMap::new();
-        let leaf_count = marf
-            .with_conn(|conn| {
-                MARF::walk_all_leaves(conn, &block_at_height, |path, value| {
-                    seen.insert(path, value);
-                    Ok(())
-                })
-            })
-            .unwrap();
-
-        assert!(leaf_count > 0);
-        assert_eq!(
-            seen.get(&TrieHash::from_key("k1")).cloned().unwrap(),
-            MARFValue::from_value("v2")
-        );
-        assert_eq!(
-            seen.get(&TrieHash::from_key("k2")).cloned().unwrap(),
-            MARFValue::from_value("v3")
-        );
-    }
-
-    #[test]
-    fn test_squash_to_path_outputs_data() {
-        let dir = tempdir().unwrap();
-        let src_db_path = dir.path().join("index.sqlite");
-        let _ = setup_marf(src_db_path.to_str().unwrap());
-
-        let out_dir = dir.path().join("squashed");
-        std::fs::create_dir_all(&out_dir).unwrap();
-        let dst_db_path = out_dir.join("index.sqlite");
-
-        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-
-        let stats = MARF::<StacksBlockId>::squash_to_path(
-            src_db_path.to_str().unwrap(),
-            dst_db_path.to_str().unwrap(),
-            open_opts,
-            1,
-        )
-        .unwrap();
-        assert!(stats.leaf_count > 0);
-        assert!(dst_db_path.exists());
-        assert!(PathBuf::from(format!("{}.blobs", dst_db_path.display())).exists());
-
-        let mut dst = MARF::<StacksBlockId>::from_path(
-            dst_db_path.to_str().unwrap(),
-            MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true),
-        )
-        .unwrap();
-        let b2 = StacksBlockId::from_bytes(&[2u8; 32]).unwrap();
-        let k1 = dst.get(&b2, "k1").unwrap().unwrap();
-        assert_eq!(k1, MARFValue::from_value("v2"));
-        let own_height = dst.get(&b2, OWN_BLOCK_HEIGHT_KEY).unwrap().unwrap();
-        assert_eq!(own_height, MARFValue::from(1u32));
-    }
-
-    #[test]
-    fn test_squash_info_detected_on_open() {
-        let dir = tempdir().unwrap();
-        let src_db_path = dir.path().join("index.sqlite");
-        let _ = setup_marf(src_db_path.to_str().unwrap());
-
-        let out_dir = dir.path().join("squashed");
-        std::fs::create_dir_all(&out_dir).unwrap();
-        let dst_db_path = out_dir.join("index.sqlite");
-
-        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-        MARF::<StacksBlockId>::squash_to_path(
-            src_db_path.to_str().unwrap(),
-            dst_db_path.to_str().unwrap(),
-            open_opts.clone(),
-            1,
-        )
-        .unwrap();
-
-        let mut squashed =
-            MARF::<StacksBlockId>::from_path(dst_db_path.to_str().unwrap(), open_opts).unwrap();
-        let tip =
-            trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(squashed.sqlite_conn())
-                .unwrap();
-
-        let (is_squashed, info_root, info_height, expected_root, expected_height) = squashed
-            .with_conn(
-                |conn| -> Result<(bool, TrieHash, u32, TrieHash, u32), Error> {
-                    let root_value = MARF::get_by_key(conn, &tip, MARF_SQUASH_ROOT_KEY)?
-                        .expect("missing squash root key");
-                    let height_value = MARF::get_by_key(conn, &tip, MARF_SQUASH_HEIGHT_KEY)?
-                        .expect("missing squash height key");
-                    let info = conn.squash_info().expect("missing squash info");
-
-                    let bytes = root_value.as_bytes();
-                    let expected_root = TrieHash::from_bytes(&bytes[..TRIEHASH_ENCODED_SIZE])
-                        .expect("invalid squash root hash bytes");
-                    let expected_height = u32::from(height_value);
-
-                    Ok((
-                        conn.is_squashed(),
-                        info.root,
-                        info.height,
-                        expected_root,
-                        expected_height,
-                    ))
-                },
-            )
-            .unwrap();
-
-        assert!(is_squashed);
-        assert_eq!(info_root, expected_root);
-        assert_eq!(info_height, expected_height);
-    }
-
-    #[test]
-    fn test_squash_info_absent_on_archival_open() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("index.sqlite");
-        let (mut marf, _b1, _b2) = setup_marf(db_path.to_str().unwrap());
-
-        let (is_squashed, has_info) = marf
-            .with_conn(|conn| -> Result<(bool, bool), Error> {
-                Ok((conn.is_squashed(), conn.squash_info().is_some()))
-            })
-            .unwrap();
-
-        assert!(!is_squashed);
-        assert!(!has_info);
-    }
-
-    #[test]
-    fn test_squashed_marf_can_extend_past_snapshot_height() {
-        let dir = tempdir().unwrap();
-        let src_db_path = dir.path().join("index.sqlite");
-        let _ = setup_marf(src_db_path.to_str().unwrap());
-
-        let out_dir = dir.path().join("squashed");
-        std::fs::create_dir_all(&out_dir).unwrap();
-        let dst_db_path = out_dir.join("index.sqlite");
-
-        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-        MARF::<StacksBlockId>::squash_to_path(
-            src_db_path.to_str().unwrap(),
-            dst_db_path.to_str().unwrap(),
-            open_opts.clone(),
-            1,
-        )
-        .unwrap();
-
-        let mut squashed =
-            MARF::<StacksBlockId>::from_path(dst_db_path.to_str().unwrap(), open_opts).unwrap();
-
-        let b2 = StacksBlockId::from_bytes(&[2u8; 32]).unwrap();
-        let b3 = StacksBlockId::from_bytes(&[3u8; 32]).unwrap();
-        let b4 = StacksBlockId::from_bytes(&[4u8; 32]).unwrap();
-
-        squashed.begin(&b2, &b3).unwrap();
-        squashed.insert("k3", MARFValue::from_value("v4")).unwrap();
-        squashed.commit().unwrap();
-
-        squashed.begin(&b3, &b4).unwrap();
-        squashed.insert("k4", MARFValue::from_value("v5")).unwrap();
-        squashed.commit().unwrap();
-
-        let v4 = squashed.get(&b4, "k4").unwrap().unwrap();
-        assert_eq!(v4, MARFValue::from_value("v5"));
-        let own_height = squashed.get(&b4, OWN_BLOCK_HEIGHT_KEY).unwrap().unwrap();
-        assert_eq!(own_height, MARFValue::from(3u32));
-    }
-}
+// Tests for squash functionality are in the `squash` module.
