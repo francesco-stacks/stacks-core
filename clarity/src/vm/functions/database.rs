@@ -62,7 +62,6 @@ pub fn special_contract_call(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:contract-call?");
     check_arguments_at_least(2, args)?;
 
     // the second part of the contract_call cost (i.e., the load contract cost)
@@ -237,7 +236,6 @@ pub fn special_fetch_variable_v200(
     check_argument_count(1, args)?;
 
     let var_name = args[0].match_atom().ok_or(CheckErrorKind::ExpectedName)?;
-    let _span = crate::profiler::profile!("clarity:var-get", var_name.to_string());
 
     let contract = &env.contract_context.contract_identifier;
 
@@ -269,7 +267,6 @@ pub fn special_fetch_variable_v205(
     check_argument_count(1, args)?;
 
     let var_name = args[0].match_atom().ok_or(CheckErrorKind::ExpectedName)?;
-    let _span = crate::profiler::profile!("clarity:var-get", var_name.to_string());
 
     let contract = &env.contract_context.contract_identifier;
 
@@ -309,7 +306,6 @@ pub fn special_set_variable_v200(
     let value = eval(&args[1], env, context)?;
 
     let var_name = args[0].match_atom().ok_or(CheckErrorKind::ExpectedName)?;
-    let _span = crate::profiler::profile!("clarity:var-set", var_name.to_string());
 
     let contract = &env.contract_context.contract_identifier;
 
@@ -350,7 +346,6 @@ pub fn special_set_variable_v205(
     let value = eval(&args[1], env, context)?;
 
     let var_name = args[0].match_atom().ok_or(CheckErrorKind::ExpectedName)?;
-    let _span = crate::profiler::profile!("clarity:var-set", var_name.to_string());
 
     let contract = &env.contract_context.contract_identifier;
 
@@ -386,7 +381,6 @@ pub fn special_fetch_entry_v200(
     check_argument_count(2, args)?;
 
     let map_name = args[0].match_atom().ok_or(CheckErrorKind::ExpectedName)?;
-    let _span = crate::profiler::profile!("clarity:map-get?", map_name.to_string());
 
     let key = eval(&args[1], env, context)?;
 
@@ -420,7 +414,6 @@ pub fn special_fetch_entry_v205(
     check_argument_count(2, args)?;
 
     let map_name = args[0].match_atom().ok_or(CheckErrorKind::ExpectedName)?;
-    let _span = crate::profiler::profile!("clarity:map-get?", map_name.to_string());
 
     let key = eval(&args[1], env, context)?;
 
@@ -453,7 +446,6 @@ pub fn special_at_block(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:at-block");
     check_argument_count(2, args)?;
 
     runtime_cost(ClarityCostFunction::AtBlock, env, 0)?;
@@ -487,7 +479,6 @@ pub fn special_set_entry_v200(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:map-set");
     if env.global_context.is_read_only() {
         return Err(CheckErrorKind::WriteAttemptedInReadOnly.into());
     }
@@ -532,7 +523,6 @@ pub fn special_set_entry_v205(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:map-set");
     if env.global_context.is_read_only() {
         return Err(CheckErrorKind::WriteAttemptedInReadOnly.into());
     }
@@ -577,7 +567,6 @@ pub fn special_insert_entry_v200(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:map-insert");
     if env.global_context.is_read_only() {
         return Err(CheckErrorKind::WriteAttemptedInReadOnly.into());
     }
@@ -623,7 +612,6 @@ pub fn special_insert_entry_v205(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:map-insert");
     if env.global_context.is_read_only() {
         return Err(CheckErrorKind::WriteAttemptedInReadOnly.into());
     }
@@ -668,7 +656,6 @@ pub fn special_delete_entry_v200(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:map-delete");
     if env.global_context.is_read_only() {
         return Err(CheckErrorKind::WriteAttemptedInReadOnly.into());
     }
@@ -710,7 +697,6 @@ pub fn special_delete_entry_v205(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:map-delete");
     if env.global_context.is_read_only() {
         return Err(CheckErrorKind::WriteAttemptedInReadOnly.into());
     }
@@ -771,7 +757,6 @@ pub fn special_get_block_info(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:get-block-info?");
     // (get-block-info? property-name block-height-uint)
     runtime_cost(ClarityCostFunction::BlockInfo, env, 0)?;
 
@@ -925,7 +910,6 @@ pub fn special_get_burn_block_info(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:get-burn-block-info?");
     runtime_cost(ClarityCostFunction::GetBurnBlockInfo, env, 0)?;
 
     check_argument_count(2, args)?;
@@ -1028,7 +1012,6 @@ pub fn special_get_stacks_block_info(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:get-stacks-block-info?");
     // (get-stacks-block-info? property-name block-height-uint)
     runtime_cost(ClarityCostFunction::BlockInfo, env, 0)?;
 
@@ -1112,7 +1095,6 @@ pub fn special_get_tenure_info(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:get-tenure-info?");
     // (get-tenure-info? property-name block-height-uint)
     runtime_cost(ClarityCostFunction::BlockInfo, env, 0)?;
 
@@ -1212,7 +1194,6 @@ pub fn special_contract_hash(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:contract-hash?");
     check_argument_count(1, args)?;
     let contract_expr = args
         .first()

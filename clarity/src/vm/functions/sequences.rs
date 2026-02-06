@@ -34,7 +34,6 @@ pub fn list_cons(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:list");
     let eval_tried: Result<Vec<Value>, VmExecutionError> =
         args.iter().map(|x| eval(x, env, context)).collect();
     let args = eval_tried?;
@@ -54,7 +53,6 @@ pub fn special_filter(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:filter");
     check_argument_count(2, args)?;
 
     runtime_cost(ClarityCostFunction::Filter, env, 0)?;
@@ -95,7 +93,6 @@ pub fn special_fold(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:fold");
     check_argument_count(3, args)?;
 
     runtime_cost(ClarityCostFunction::Fold, env, 0)?;
@@ -130,7 +127,6 @@ pub fn special_map(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:map");
     check_arguments_at_least(2, args)?;
 
     runtime_cost(ClarityCostFunction::Map, env, args.len())?;
@@ -193,7 +189,6 @@ pub fn special_append(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:append");
     check_argument_count(2, args)?;
 
     let sequence = eval(&args[0], env, context)?;
@@ -242,7 +237,6 @@ pub fn special_concat_v200(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:concat");
     check_argument_count(2, args)?;
 
     let mut wrapped_seq = eval(&args[0], env, context)?;
@@ -269,7 +263,6 @@ pub fn special_concat_v205(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:concat");
     check_argument_count(2, args)?;
 
     let mut wrapped_seq = eval(&args[0], env, context)?;
@@ -299,7 +292,6 @@ pub fn special_as_max_len(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:as-max-len?");
     check_argument_count(2, args)?;
 
     let mut sequence = eval(&args[0], env, context)?;
@@ -390,7 +382,6 @@ pub fn special_slice(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:slice?");
     check_argument_count(3, args)?;
 
     let seq = eval(&args[0], env, context)?;
@@ -441,7 +432,6 @@ pub fn special_replace_at(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:replace-at?");
     check_argument_count(3, args)?;
 
     let seq = eval(&args[0], env, context)?;

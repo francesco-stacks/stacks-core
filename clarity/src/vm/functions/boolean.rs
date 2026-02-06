@@ -38,7 +38,6 @@ pub fn special_or(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:or");
     check_arguments_at_least(1, args)?;
 
     runtime_cost(ClarityCostFunction::Or, env, args.len())?;
@@ -59,7 +58,6 @@ pub fn special_and(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:and");
     check_arguments_at_least(1, args)?;
 
     runtime_cost(ClarityCostFunction::And, env, args.len())?;

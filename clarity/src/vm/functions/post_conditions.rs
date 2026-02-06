@@ -213,7 +213,6 @@ pub fn special_restrict_assets(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:restrict-assets?");
     // (restrict-assets? asset-owner ((with-stx|with-ft|with-nft|with-stacking)*) expr-body1 expr-body2 ... expr-body-last)
     // arg1 => asset owner to protect
     // arg2 => list of asset allowances
@@ -304,7 +303,6 @@ pub fn special_as_contract(
     env: &mut Environment,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    let _span = crate::profiler::profile!("clarity:as-contract?");
     // (as-contract? ((with-stx|with-ft|with-nft|with-stacking)*) expr-body1 expr-body2 ... expr-body-last)
     // arg1 => list of asset allowances
     // arg2..n => body

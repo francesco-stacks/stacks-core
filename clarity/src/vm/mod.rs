@@ -159,6 +159,7 @@ pub trait EvalHook {
     // Called upon completion of the execution
     fn did_complete(&mut self, _result: core::result::Result<&mut ExecutionResult, String>);
 }
+
 fn lookup_variable(
     name: &str,
     context: &LocalContext,
@@ -249,7 +250,7 @@ pub fn apply(
         return Err(RuntimeError::MaxStackDepthReached.into());
     }
 
-    if matches!(function, CallableType::SpecialFunction(_, _)) {
+    if matches!(function, CallableType::SpecialFunction(..)) {
         env.call_stack.insert(&identifier, track_recursion);
         let mut resp = function.apply_special(args, env, context);
         add_stack_trace(&mut resp, env);

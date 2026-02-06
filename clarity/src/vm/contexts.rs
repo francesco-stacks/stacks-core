@@ -1153,7 +1153,6 @@ impl<'a, 'b, 'hooks> Environment<'a, 'b, 'hooks> {
     ///  this ensures that only `define-public` and `define-read-only` methods can
     ///  be invoked. The `allow_private` mode should only be used by
     ///  `Environment::execute_contract_allow_private`.
-    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     fn inner_execute_contract(
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
@@ -1162,6 +1161,9 @@ impl<'a, 'b, 'hooks> Environment<'a, 'b, 'hooks> {
         read_only: bool,
         allow_private: bool,
     ) -> Result<Value, VmExecutionError> {
+        let _profiler_span =
+            crate::profiler::begin_contract_call_span(contract_identifier, tx_name);
+
         let contract_size = self
             .global_context
             .database
@@ -1239,16 +1241,9 @@ impl<'a, 'b, 'hooks> Environment<'a, 'b, 'hooks> {
         next_contract_context: Option<&ContractContext>,
         allow_private: bool,
     ) -> Result<Value, VmExecutionError> {
-        let _profiler_span = if crate::profiler::capture_contract_call_ident() {
-            crate::profiler::profile!(
-                "execute_function_as_transaction",
-                function.get_identifier().to_string()
-            )
-        } else {
-            crate::profiler::profile!("execute_function_as_transaction")
-        };
-
         let make_read_only = function.is_read_only();
+        let _profiler_span =
+            crate::profiler::begin_exec_tx_span(make_read_only, &function.get_identifier());
 
         if make_read_only {
             self.global_context.begin_read_only();

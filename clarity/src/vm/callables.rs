@@ -39,7 +39,13 @@ use crate::vm::{eval, Environment, LocalContext, Value};
 #[allow(clippy::type_complexity, clippy::large_enum_variant)]
 pub enum CallableType {
     UserFunction(DefinedFunction),
-    NativeFunction(&'static str, NativeHandle, ClarityCostFunction),
+    NativeFunction(
+        &'static str,
+        NativeHandle,
+        ClarityCostFunction,
+        /// The Clarity-facing function name (e.g. `"+"`, `"len"`).
+        &'static str,
+    ),
     /// These native functions have a new method for calculating input size in 2.05
     /// If the global context's epoch is >= 2.05, the fn field is applied to obtain
     /// the input to the cost function.
@@ -48,6 +54,8 @@ pub enum CallableType {
         NativeHandle,
         ClarityCostFunction,
         &'static dyn Fn(&[Value]) -> Result<u64, VmExecutionError>,
+        /// The Clarity-facing function name.
+        &'static str,
     ),
     SpecialFunction(
         &'static str,
@@ -56,6 +64,8 @@ pub enum CallableType {
             &mut Environment,
             &LocalContext,
         ) -> Result<Value, VmExecutionError>,
+        /// The Clarity-facing function name.
+        &'static str,
     ),
 }
 
@@ -399,9 +409,9 @@ impl CallableType {
     pub fn get_identifier(&self) -> FunctionIdentifier {
         match self {
             CallableType::UserFunction(f) => f.get_identifier(),
-            CallableType::NativeFunction(s, _, _) => FunctionIdentifier::new_native_function(s),
-            CallableType::SpecialFunction(s, _) => FunctionIdentifier::new_native_function(s),
-            CallableType::NativeFunction205(s, _, _, _) => {
+            CallableType::NativeFunction(s, _, _, _) => FunctionIdentifier::new_native_function(s),
+            CallableType::SpecialFunction(s, _, _) => FunctionIdentifier::new_native_function(s),
+            CallableType::NativeFunction205(s, _, _, _, _) => {
                 FunctionIdentifier::new_native_function(s)
             }
         }
@@ -414,14 +424,8 @@ impl CallableType {
         context: &LocalContext,
     ) -> Result<Value, VmExecutionError> {
         match self {
-            CallableType::SpecialFunction(_name, function) => {
-                #[cfg(feature = "profiler")]
-                let _span = stacks_profiler::span_if!(
-                    crate::profiler::capture_costs()
-                        && stacks_profiler::Profiler::is_record_enabled(),
-                    "(special function)",
-                    *_name
-                );
+            CallableType::SpecialFunction(rust_name, function, clarity_name) => {
+                let _span = crate::profiler::begin_builtin_span(clarity_name, rust_name);
                 function(args, env, context)
             }
             _ => Err(VmInternalError::Expect("Should be unreachable.".into()).into()),
@@ -434,13 +438,20 @@ impl CallableType {
         env: &mut Environment,
     ) -> Result<Value, VmExecutionError> {
         match self {
-            CallableType::NativeFunction(_name, function, cost_function) => {
+            CallableType::NativeFunction(rust_name, function, cost_function, clarity_name) => {
+                let _span = crate::profiler::begin_builtin_span(clarity_name, rust_name);
                 runtime_cost(cost_function.clone(), env, evaluated_args.len())
                     .map_err(VmExecutionError::from)?;
-                let _span = crate::profile!("clarity:native_fn", *_name);
                 function.apply(evaluated_args, env)
             }
-            CallableType::NativeFunction205(_name, function, cost_function, cost_input_handle) => {
+            CallableType::NativeFunction205(
+                rust_name,
+                function,
+                cost_function,
+                cost_input_handle,
+                clarity_name,
+            ) => {
+                let _span = crate::profiler::begin_builtin_span(clarity_name, rust_name);
                 let cost_input = if env.epoch() >= &StacksEpochId::Epoch2_05 {
                     cost_input_handle(evaluated_args.as_slice())?
                 } else {
@@ -448,12 +459,14 @@ impl CallableType {
                 };
                 runtime_cost(cost_function.clone(), env, cost_input)
                     .map_err(VmExecutionError::from)?;
-                let _span = crate::profile!("clarity:native_fn_205", *_name);
                 function.apply(evaluated_args, env)
             }
             CallableType::UserFunction(function) => {
-                let _span =
-                    crate::profile!("clarity:user_fn", function.get_identifier().to_string());
+                let _span = crate::profiler::begin_user_fn_span(
+                    function.name.as_str(),
+                    &function.define_type,
+                    function.get_identifier().to_string(),
+                );
                 function.apply(&evaluated_args, env)
             }
             _ => Err(VmInternalError::Expect("Should be unreachable.".into()).into()),
