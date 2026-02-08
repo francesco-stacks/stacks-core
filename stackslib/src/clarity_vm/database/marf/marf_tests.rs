@@ -185,16 +185,16 @@ fn test_copy_clarity_side_tables_round_trip() {
 
     assert!(
         validation.data_table_rows_match,
-        "data_table row count mismatch: src={}, dst={}",
-        validation.src_data_table_rows, validation.dst_data_table_rows
+        "missing required data_table keys"
     );
     assert!(
         validation.metadata_table_rows_match,
-        "metadata_table row count mismatch: src={}, dst={}",
-        validation.src_metadata_table_rows, validation.dst_metadata_table_rows
+        "missing required metadata rows"
     );
     assert_eq!(validation.sample_contracts_missing_in_trie, 0);
     assert_eq!(validation.sample_contracts_missing_in_data_table, 0);
+    assert_eq!(validation.missing_required_data_table_keys, 0);
+    assert_eq!(validation.missing_required_metadata_rows, 0);
 }
 
 #[test]
@@ -391,8 +391,8 @@ fn test_validate_clarity_side_tables_detects_mismatch() {
         validate_clarity_side_tables(src_db.to_str().unwrap(), dst_db.to_str().unwrap()).unwrap();
 
     assert!(
-        validation.sample_contracts_missing_in_data_table > 0
-            || validation.sample_contracts_missing_in_trie > 0,
+        validation.missing_required_data_table_keys > 0
+            || validation.missing_required_metadata_rows > 0,
         "expected validation to detect mismatch between trie and data_table"
     );
 }

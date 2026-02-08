@@ -1303,30 +1303,123 @@ pub fn copy_clarity_side_tables(
 ) -> Result<ClaritySideTableStats, Error> {
     let conn = Connection::open(dst_db_path).map_err(Error::SQLError)?;
 
-    // Step 1 — Clarity schema (tables + index + WAL).
+    // Step 1 - Clarity schema (tables + index + WAL).
     // `initialize_conn` is idempotent (`CREATE TABLE IF NOT EXISTS`).
     SqliteConnection::initialize_conn(&conn).map_err(|e| {
         Error::CorruptionError(format!("Failed to initialize Clarity schema: {e:?}"))
     })?;
 
-    // Step 2 — Attach source DB.
+    // Step 2 - Attach source DB.
     conn.execute("ATTACH DATABASE ?1 AS src", [src_db_path])
         .map_err(Error::SQLError)?;
 
-    // Step 3 — Transactional bulk copy.
+    // Step 3 - Transactional, minimal copy.
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(Error::SQLError)?;
 
-    let copy_result = (|| -> Result<ClaritySideTableStats, rusqlite::Error> {
-        let data_rows: u64 = conn.execute(
-            "INSERT OR IGNORE INTO data_table SELECT * FROM src.data_table",
-            [],
-        )? as u64;
+    let copy_result = (|| -> Result<ClaritySideTableStats, Error> {
+        // Collect required value hashes from the squashed trie.
+        let (_tip, needed_keys) = collect_trie_value_hashes(dst_db_path)?;
 
-        let metadata_rows: u64 = conn.execute(
-            "INSERT OR IGNORE INTO metadata_table SELECT * FROM src.metadata_table",
-            [],
-        )? as u64;
+        // Insert required keys into a temp table.
+        conn.execute_batch("CREATE TEMP TABLE needed_keys (key TEXT PRIMARY KEY)")
+            .map_err(Error::SQLError)?;
+        {
+            let mut stmt = conn
+                .prepare("INSERT OR IGNORE INTO needed_keys (key) VALUES (?1)")
+                .map_err(Error::SQLError)?;
+            for key in needed_keys.iter() {
+                stmt.execute([key]).map_err(Error::SQLError)?;
+            }
+        }
+
+        // Copy only required data_table rows.
+        let data_rows: u64 = conn
+            .execute(
+                "INSERT OR IGNORE INTO data_table \
+                 SELECT key, value FROM src.data_table \
+                 WHERE key IN (SELECT key FROM needed_keys)",
+                [],
+            )
+            .map_err(Error::SQLError)? as u64;
+
+        // Metadata rows: copy only rows whose contract commitment exists in trie.
+        let mut contract_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let src_conn = Connection::open(src_db_path).map_err(Error::SQLError)?;
+            let mut stmt = src_conn
+                .prepare("SELECT key FROM metadata_table")
+                .map_err(Error::SQLError)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(Error::SQLError)?;
+            for row in rows {
+                if let Ok(key) = row {
+                    if let Some(rest) = key.strip_prefix("clr-meta::") {
+                        if let Some((contract_id, _meta_key)) = rest.rsplit_once("::") {
+                            contract_ids.insert(contract_id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut required_contract_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        {
+            let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+            let mut marf = MARF::<StacksBlockId>::from_path(dst_db_path, open_opts)?;
+            let tip =
+                trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())?;
+            for contract_id in contract_ids.iter() {
+                let contract = clarity::vm::types::QualifiedContractIdentifier::parse(contract_id)
+                    .map_err(|e| {
+                        Error::CorruptionError(format!(
+                            "Failed to parse contract identifier '{contract_id}': {e:?}"
+                        ))
+                    })?;
+                let key = make_contract_hash_key(&contract);
+                if marf.get(&tip, &key)?.is_some() {
+                    required_contract_ids.insert(contract_id.clone());
+                }
+            }
+        }
+
+        let mut metadata_rows: u64 = 0;
+        {
+            let src_conn = Connection::open(src_db_path).map_err(Error::SQLError)?;
+            let mut stmt = src_conn
+                .prepare("SELECT key, blockhash, value FROM metadata_table")
+                .map_err(Error::SQLError)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(Error::SQLError)?;
+            let mut insert = conn
+                .prepare(
+                    "INSERT OR IGNORE INTO metadata_table (key, blockhash, value) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(Error::SQLError)?;
+            for row in rows {
+                let (key, blockhash, value) = row.map_err(Error::SQLError)?;
+                if let Some(rest) = key.strip_prefix("clr-meta::") {
+                    if let Some((contract_id, _meta_key)) = rest.rsplit_once("::") {
+                        if !required_contract_ids.contains(contract_id) {
+                            continue;
+                        }
+                        insert
+                            .execute([key, blockhash, value])
+                            .map_err(Error::SQLError)?;
+                        metadata_rows += 1;
+                    }
+                }
+            }
+        }
 
         Ok(ClaritySideTableStats {
             data_table_rows: data_rows,
@@ -1337,15 +1430,14 @@ pub fn copy_clarity_side_tables(
     match copy_result {
         Ok(stats) => {
             conn.execute_batch("COMMIT").map_err(Error::SQLError)?;
-            // Step 4 — Detach.
-            conn.execute_batch("DETACH src")
-                .map_err(Error::SQLError)?;
+            // Step 4 - Detach.
+            conn.execute_batch("DETACH src").map_err(Error::SQLError)?;
             Ok(stats)
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             let _ = conn.execute_batch("DETACH src");
-            Err(Error::SQLError(e))
+            Err(e)
         }
     }
 }
@@ -1357,6 +1449,24 @@ pub struct ClaritySideTableStats {
     pub data_table_rows: u64,
     /// Number of rows copied into `metadata_table`.
     pub metadata_table_rows: u64,
+}
+
+fn collect_trie_value_hashes(
+    db_path: &str,
+) -> Result<(StacksBlockId, std::collections::HashSet<String>), Error> {
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(db_path, open_opts)?;
+    let tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())?;
+
+    let mut keys = std::collections::HashSet::new();
+    marf.with_conn(|conn| {
+        MARF::walk_all_leaves(conn, &tip, |_path, value| {
+            keys.insert(value.to_hex());
+            Ok(())
+        })
+    })?;
+
+    Ok((tip, keys))
 }
 
 /// Validate that a squashed Clarity MARF's side tables match the source.
@@ -1384,19 +1494,15 @@ pub fn validate_clarity_side_tables(
     )
     .map_err(Error::SQLError)?;
 
-    let src_data_rows: u64 = src_conn
-        .query_row("SELECT COUNT(*) FROM data_table", [], |row| row.get(0))
-        .map_err(Error::SQLError)?;
-    let dst_data_rows: u64 = dst_conn
-        .query_row("SELECT COUNT(*) FROM data_table", [], |row| row.get(0))
-        .map_err(Error::SQLError)?;
+    let src_data_rows: u64 =
+        src_conn.query_row("SELECT COUNT(*) FROM data_table", [], |row| row.get(0))?;
+    let dst_data_rows: u64 =
+        dst_conn.query_row("SELECT COUNT(*) FROM data_table", [], |row| row.get(0))?;
 
-    let src_meta_rows: u64 = src_conn
-        .query_row("SELECT COUNT(*) FROM metadata_table", [], |row| row.get(0))
-        .map_err(Error::SQLError)?;
-    let dst_meta_rows: u64 = dst_conn
-        .query_row("SELECT COUNT(*) FROM metadata_table", [], |row| row.get(0))
-        .map_err(Error::SQLError)?;
+    let src_meta_rows: u64 =
+        src_conn.query_row("SELECT COUNT(*) FROM metadata_table", [], |row| row.get(0))?;
+    let dst_meta_rows: u64 =
+        dst_conn.query_row("SELECT COUNT(*) FROM metadata_table", [], |row| row.get(0))?;
 
     // Sample check: take up to N contract identifiers from metadata_table,
     // derive their contract-hash keys, then ensure the trie values exist
@@ -1462,16 +1568,102 @@ pub fn validate_clarity_side_tables(
         }
     }
 
+    // Required data_table keys from the squashed trie that exist in src.
+    let (_tip, needed_keys) = collect_trie_value_hashes(dst_db_path)?;
+    dst_conn
+        .execute("ATTACH DATABASE ?1 AS src", [src_db_path])
+        .map_err(Error::SQLError)?;
+    dst_conn
+        .execute_batch("CREATE TEMP TABLE trie_values (key TEXT PRIMARY KEY)")
+        .map_err(Error::SQLError)?;
+    {
+        let mut stmt = dst_conn
+            .prepare("INSERT OR IGNORE INTO trie_values (key) VALUES (?1)")
+            .map_err(Error::SQLError)?;
+        for key in needed_keys.iter() {
+            stmt.execute([key]).map_err(Error::SQLError)?;
+        }
+    }
+    let missing_required_data_table_keys: u64 = dst_conn
+        .query_row(
+            "SELECT COUNT(*) FROM src.data_table \
+         WHERE key IN (SELECT key FROM trie_values) \
+           AND key NOT IN (SELECT key FROM data_table)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    dst_conn
+        .execute_batch("DETACH src")
+        .map_err(Error::SQLError)?;
+
+    // Required metadata rows: those whose contract commitment exists in the trie.
+    let mut required_contract_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    {
+        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+        let mut marf = MARF::<StacksBlockId>::from_path(dst_db_path, open_opts)?;
+        let tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())?;
+        for contract_id in contract_ids.iter() {
+            let contract = clarity::vm::types::QualifiedContractIdentifier::parse(contract_id)
+                .map_err(|e| {
+                    Error::CorruptionError(format!(
+                        "Failed to parse contract identifier '{contract_id}': {e:?}"
+                    ))
+                })?;
+            let key = make_contract_hash_key(&contract);
+            if marf.get(&tip, &key)?.is_some() {
+                required_contract_ids.insert(contract_id.clone());
+            }
+        }
+    }
+
+    let mut missing_required_metadata_rows: u64 = 0;
+    {
+        let mut stmt = src_conn
+            .prepare("SELECT key, blockhash, value FROM metadata_table")
+            .map_err(Error::SQLError)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(Error::SQLError)?;
+        for row in rows {
+            let (key, blockhash, value) = row.map_err(Error::SQLError)?;
+            if let Some(rest) = key.strip_prefix("clr-meta::") {
+                if let Some((contract_id, _meta_key)) = rest.rsplit_once("::") {
+                    if !required_contract_ids.contains(contract_id) {
+                        continue;
+                    }
+                    let exists: bool = dst_conn.query_row(
+                        "SELECT COUNT(*) > 0 FROM metadata_table WHERE key = ?1 AND blockhash = ?2 AND value = ?3",
+                        [key, blockhash, value],
+                        |row| row.get(0),
+                    )?;
+                    if !exists {
+                        missing_required_metadata_rows += 1;
+                    }
+                }
+            }
+        }
+    }
+
     Ok(ClaritySideTableValidation {
-        data_table_rows_match: src_data_rows == dst_data_rows,
+        data_table_rows_match: missing_required_data_table_keys == 0,
         src_data_table_rows: src_data_rows,
         dst_data_table_rows: dst_data_rows,
-        metadata_table_rows_match: src_meta_rows == dst_meta_rows,
+        metadata_table_rows_match: missing_required_metadata_rows == 0,
         src_metadata_table_rows: src_meta_rows,
         dst_metadata_table_rows: dst_meta_rows,
         sample_contracts_checked,
         sample_contracts_missing_in_trie,
         sample_contracts_missing_in_data_table,
+        missing_required_data_table_keys,
+        missing_required_metadata_rows,
     })
 }
 
@@ -1496,6 +1688,10 @@ pub struct ClaritySideTableValidation {
     pub sample_contracts_missing_in_trie: u64,
     /// Sampled contracts whose trie values are missing from data_table (should be 0).
     pub sample_contracts_missing_in_data_table: u64,
+    /// Required data_table keys missing from destination (should be 0).
+    pub missing_required_data_table_keys: u64,
+    /// Required metadata rows missing from destination (should be 0).
+    pub missing_required_metadata_rows: u64,
 }
 
 #[cfg(test)]
