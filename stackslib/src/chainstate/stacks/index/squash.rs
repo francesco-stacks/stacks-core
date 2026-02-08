@@ -174,7 +174,7 @@ impl<T: MarfTrieId> MARF<T> {
         // partially warm the OS page cache for the subsequent BFS.
         let start_meta = Instant::now();
         let source_tip = trie_sql::get_latest_confirmed_block_hash::<T>(src.sqlite_conn())?;
-        let blobs_path = format!("{}.blobs", src_path);
+        let blobs_path = format!("{src_path}.blobs");
         let root_ptr_offset = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
         let blobs_file = File::open(&blobs_path).map_err(Error::IOError)?;
         let mut blobs_reader = BufReader::with_capacity(64 * 1024, blobs_file);
@@ -184,7 +184,7 @@ impl<T: MarfTrieId> MARF<T> {
         let mut last_log = Instant::now();
 
         for h in 0..=height {
-            let h_key = format!("{}::{}", BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, h);
+            let h_key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{h}");
             let val = src
                 .with_conn(|conn| Self::get_by_key(conn, &source_tip, &h_key))?
                 .ok_or_else(|| {
@@ -192,7 +192,7 @@ impl<T: MarfTrieId> MARF<T> {
                 })?;
             let bh = T::from(val);
 
-            // Direct blob seek for root hash — fast (no SQL overhead).
+            // Direct blob seek for root hash - fast (no SQL overhead).
             let rh = if let Some(&(_, blob_offset)) = block_map.get(&bh) {
                 blobs_reader.seek(SeekFrom::Start(blob_offset + root_ptr_offset))?;
                 let mut hash_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
@@ -225,14 +225,13 @@ impl<T: MarfTrieId> MARF<T> {
         // Step 3: BFS deep copy (warm cache from Step 2)
         //
         // The per-height walks above warmed the cache with trie nodes
-        // and blob sections. BFS now runs ~3x faster (~7.5 min vs ~23 min).
+        // and blob sections.
         let start_bfs = Instant::now();
         let (mut nodes, source_to_idx) =
             src.with_conn(|conn| MARF::<T>::deep_copy_bfs_nodes(conn, &block_at_height))?;
         let node_count = nodes.len() as u64;
         info!(
-            "Squash step 3 (BFS): {} nodes in {:?}",
-            node_count,
+            "Squash step 3 (BFS): {node_count} nodes in {:?}",
             start_bfs.elapsed()
         );
 
@@ -261,8 +260,7 @@ impl<T: MarfTrieId> MARF<T> {
                 archival_to_squashed.insert(archival_id, squashed_id);
                 if *h % 100_000 == 0 && *h > 0 {
                     info!(
-                        "Squash placeholders: inserted {} entries in {:?}",
-                        h,
+                        "Squash placeholders: inserted {h} entries in {:?}",
                         start_placeholders.elapsed()
                     );
                 }
@@ -278,8 +276,7 @@ impl<T: MarfTrieId> MARF<T> {
         let start_remap = Instant::now();
         Self::deep_copy_remap(&mut nodes, &source_to_idx, &archival_to_squashed)?;
         info!(
-            "Squash step 5 (remap): {} nodes in {:?}",
-            node_count,
+            "Squash step 5 (remap): {node_count} nodes in {:?}",
             start_remap.elapsed()
         );
 
@@ -331,19 +328,17 @@ impl<T: MarfTrieId> MARF<T> {
         let (offset, length) = trie_sql::get_external_trie_offset_length(conn, bh_id)?;
 
         conn.execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| Error::CorruptionError(format!("BEGIN: {}", e)))?;
+            .map_err(|e| Error::CorruptionError(format!("BEGIN: {e}")))?;
         let updated = trie_sql::bulk_update_blob_offsets(conn, offset, length, &block_at_height)?;
         conn.execute_batch("COMMIT")
-            .map_err(|e| Error::CorruptionError(format!("COMMIT: {}", e)))?;
+            .map_err(|e| Error::CorruptionError(format!("COMMIT: {e}")))?;
         info!(
-            "Squash step 8 (blob update): {} rows in {:?}",
-            updated,
+            "Squash step 8 (blob update): {updated} rows in {:?}",
             start_blob_update.elapsed()
         );
 
         info!(
-            "Squash complete: {} nodes, total time {:?}",
-            node_count,
+            "Squash complete: {node_count} nodes, total time {:?}",
             overall_start.elapsed()
         );
 
@@ -405,9 +400,7 @@ impl<T: MarfTrieId> MARF<T> {
             nodes_visited += 1;
             if last_walk_log.elapsed().as_secs() >= 30 {
                 info!(
-                    "walk_all_leaves: {} nodes visited, {} leaves found, stack {}, {:?} elapsed",
-                    nodes_visited,
-                    leaf_count,
+                    "walk_all_leaves: {nodes_visited} nodes visited, {leaf_count} leaves found, stack {}, {:?} elapsed",
                     stack.len(),
                     walk_start.elapsed()
                 );
@@ -480,7 +473,7 @@ impl<T: MarfTrieId> MARF<T> {
     /// BFS collection pass: gather all trie nodes reachable from `block_hash`.
     ///
     /// Returns:
-    /// - `nodes`: `Vec<(TrieNodeType, TrieHash, origin_block_id)>` — raw
+    /// - `nodes`: `Vec<(TrieNodeType, TrieHash, origin_block_id)>` - raw
     ///   un-remapped nodes.  Index 0 is the root.
     /// - `source_to_idx`: `(source_block_id, byte_offset) -> Vec index` map
     ///   needed by the remap pass.
@@ -510,7 +503,7 @@ impl<T: MarfTrieId> MARF<T> {
         source_to_idx.insert((root_block_id, root_disk_ptr), 0);
         nodes.push((root_node, root_hash, root_block_id));
 
-        // Simple index-only queue — no path vectors needed since we
+        // Simple index-only queue - no path vectors needed since we
         // don't track height mapping leaves here.
         let mut queue: VecDeque<usize> = VecDeque::new();
         queue.push_back(0);
@@ -522,8 +515,7 @@ impl<T: MarfTrieId> MARF<T> {
             bfs_processed += 1;
             if last_log.elapsed().as_secs() >= 30 || bfs_processed % 500_000 == 0 {
                 info!(
-                    "Deep copy BFS: dequeued {} nodes, collected {} total, queue {}, {:?} elapsed",
-                    bfs_processed,
+                    "Deep copy BFS: dequeued {bfs_processed} nodes, collected {} total, queue {}, {:?} elapsed",
                     nodes.len(),
                     queue.len(),
                     bfs_start.elapsed()
@@ -604,9 +596,7 @@ impl<T: MarfTrieId> MARF<T> {
         for idx in 0..node_count {
             if idx > 0 && idx % 500_000 == 0 {
                 info!(
-                    "Deep copy remap: processed {}/{} nodes in {:?}",
-                    idx,
-                    node_count,
+                    "Deep copy remap: processed {idx}/{node_count} nodes in {:?}",
                     remap_start.elapsed()
                 );
             }
@@ -645,8 +635,7 @@ impl<T: MarfTrieId> MARF<T> {
                 let source_key = (child_block_id, read_ptr.ptr());
                 let child_idx = *source_to_idx.get(&source_key).ok_or_else(|| {
                     Error::CorruptionError(format!(
-                        "deep_copy: child {:?} not in source_to_idx",
-                        source_key
+                        "deep_copy: child {source_key:?} not in source_to_idx"
                     ))
                 })?;
 
@@ -665,8 +654,7 @@ impl<T: MarfTrieId> MARF<T> {
                 if was_backptr {
                     let squashed_id = block_id_map.get(&child_block_id).ok_or_else(|| {
                         Error::CorruptionError(format!(
-                            "deep_copy: block_id {} not in block_id_map",
-                            child_block_id
+                            "deep_copy: block_id {child_block_id} not in block_id_map"
                         ))
                     })?;
                     p.back_block = *squashed_id;
@@ -764,8 +752,8 @@ impl<T: MarfTrieId> MARF<T> {
         stats.root_hash_matches = source_root == squashed_root;
 
         info!(
-            "Root hash comparison: source={}, squashed={}, match={}",
-            source_root, squashed_root, stats.root_hash_matches
+            "Root hash comparison: source={source_root}, squashed={squashed_root}, match={}",
+            stats.root_hash_matches
         );
 
         // === Check 2: Per-height root hashes ===
@@ -777,9 +765,8 @@ impl<T: MarfTrieId> MARF<T> {
         let expected_squash_root;
         if stats.root_hash_matches {
             info!(
-                "Validate Check 2: SKIPPED — root hash match at height {} \
-                 cryptographically guarantees per-height root hashes are identical",
-                height
+                "Validate Check 2: SKIPPED - root hash match at height {height} \
+                 cryptographically guarantees per-height root hashes are identical"
             );
             expected_squash_root = source_root;
         } else {
@@ -791,7 +778,7 @@ impl<T: MarfTrieId> MARF<T> {
                 .into_iter()
                 .map(|(id, bh, offset)| (bh, (id, offset)))
                 .collect();
-            let source_blobs_path = format!("{}.blobs", src_path);
+            let source_blobs_path = format!("{src_path}.blobs");
             let root_ptr_offset = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
             let blobs_file = File::open(&source_blobs_path).map_err(Error::IOError)?;
             let mut blobs_reader = BufReader::with_capacity(64 * 1024, blobs_file);
@@ -803,7 +790,7 @@ impl<T: MarfTrieId> MARF<T> {
                 HashMap::with_capacity((height + 1) as usize);
             let mut last_log = Instant::now();
             for h in 0..=height {
-                let h_key = format!("{}::{}", BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, h);
+                let h_key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{h}");
                 if let Some(val) =
                     src.with_conn(|conn| Self::get_by_key(conn, &source_tip, &h_key))?
                 {
@@ -938,8 +925,7 @@ impl<T: MarfTrieId> MARF<T> {
                         checked += 1;
                         if checked % 100_000 == 0 {
                             info!(
-                                "Validate leaf scan (squashed->source): checked {} keys in {:?}",
-                                checked,
+                                "Validate leaf scan (squashed->source): checked {checked} keys in {:?}",
                                 start_pass_b.elapsed()
                             );
                         }
@@ -1015,7 +1001,7 @@ mod tests {
             let key = format!("k{}", i + 1);
             let val = format!("v{}_at_{}", i + 1, i);
             marf.insert(&key, MARFValue::from_value(&val)).unwrap();
-            marf.insert("k1", MARFValue::from_value(&format!("v1_at_{}", i)))
+            marf.insert("k1", MARFValue::from_value(&format!("v1_at_{i}")))
                 .unwrap();
             marf.commit().unwrap();
         }
@@ -1299,8 +1285,7 @@ mod tests {
         // Source at height 0 has a different root hash than squashed (at height 1).
         assert!(
             !stats.root_hash_matches,
-            "Expected root hash mismatch: {:?}",
-            stats
+            "Expected root hash mismatch: {stats:?}"
         );
     }
 
@@ -1327,18 +1312,14 @@ mod tests {
             .unwrap();
 
         // We expect k1..k10 plus MARF metadata keys.
-        assert!(
-            leaf_count >= 10,
-            "expected >= 10 leaves, got {}",
-            leaf_count
-        );
+        assert!(leaf_count >= 10, "expected >= 10 leaves, got {leaf_count}");
         assert_eq!(
             seen.get(&TrieHash::from_key("k1")).cloned().unwrap(),
             MARFValue::from_value("v1_at_9"),
             "k1 should have latest value"
         );
         for i in 2..=10 {
-            let key = format!("k{}", i);
+            let key = format!("k{i}");
             assert!(
                 seen.contains_key(&TrieHash::from_key(&key)),
                 "missing key {key} from walk"
@@ -1470,8 +1451,8 @@ mod tests {
         let mut new_blocks: Vec<StacksBlockId> = Vec::new();
         for i in 0..10u8 {
             let new_bh = StacksBlockId::from_bytes(&[200 + i; 32]).unwrap();
-            let key = format!("ext_k{}", i);
-            let val = format!("ext_v{}", i);
+            let key = format!("ext_k{i}");
+            let val = format!("ext_v{i}");
 
             archival.begin(&prev_block, &new_bh).unwrap();
             archival.insert(&key, MARFValue::from_value(&val)).unwrap();
@@ -1536,8 +1517,8 @@ mod tests {
         for i in 0..8 {
             let blk_id = trie_sql::get_block_identifier(conn, &blocks[i]).unwrap();
             let (offset, length) = trie_sql::get_external_trie_offset_length(conn, blk_id).unwrap();
-            assert_eq!(offset, tip_offset, "block {} offset mismatch", i);
-            assert_eq!(length, tip_length, "block {} length mismatch", i);
+            assert_eq!(offset, tip_offset, "block {i} offset mismatch");
+            assert_eq!(length, tip_length, "block {i} length mismatch");
         }
     }
 
@@ -1575,9 +1556,9 @@ mod tests {
 
         // All historical keys should still be readable.
         for i in 2..=10 {
-            let key = format!("k{}", i);
+            let key = format!("k{i}");
             let result = squashed.get(&b_new, &key).unwrap();
-            assert!(result.is_some(), "missing key {} after extend", key);
+            assert!(result.is_some(), "missing key {key} after extend");
         }
 
         // Verify the updated key.

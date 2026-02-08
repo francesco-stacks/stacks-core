@@ -381,14 +381,12 @@ fn squash_one(
     println!("Squash complete ({label}) at height {height}");
     println!("Leaf count: {}", stats.leaf_count);
     println!(
-        "Original: db={} bytes, blobs={} bytes, total={} bytes",
-        original_db_size, original_blobs_size, original_total
+        "Original: db={original_db_size} bytes, blobs={original_blobs_size} bytes, total={original_total} bytes"
     );
     println!(
-        "Squashed: db={} bytes, blobs={} bytes, total={} bytes",
-        squashed_db_size, squashed_blobs_size, squashed_total
+        "Squashed: db={squashed_db_size} bytes, blobs={squashed_blobs_size} bytes, total={squashed_total} bytes"
     );
-    println!("Savings: {} bytes ({:.2}%)", savings, savings_pct);
+    println!("Savings: {savings} bytes ({savings_pct:.2}%)");
     println!("Output db: {}", out.db.display());
     println!("Output blobs: {}", out.blobs.display());
     match validation {
@@ -529,8 +527,7 @@ fn ensure_blobs_match(db_path: &str, blobs_path: &str) {
     let expected_blobs = PathBuf::from(format!("{db_path}.blobs"));
     if expected_blobs != PathBuf::from(blobs_path) {
         eprintln!(
-            "Expected blobs path '{}' to match '{}'",
-            blobs_path,
+            "Expected blobs path '{blobs_path}' to match '{}'",
             expected_blobs.display()
         );
         std::process::exit(1);
