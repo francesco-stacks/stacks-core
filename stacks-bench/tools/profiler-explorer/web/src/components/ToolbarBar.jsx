@@ -4,6 +4,7 @@ import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
@@ -26,26 +27,28 @@ function HotPathDropdown({ hotPathMode, setHotPathMode }) {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
-        <DropdownMenuLabel>Hot Path Mode</DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        <DropdownMenuCheckboxItem
-          checked={hotPathMode === "off"}
-          onCheckedChange={() => setHotPathMode("off")}
-        >
-          Off
-        </DropdownMenuCheckboxItem>
-        <DropdownMenuCheckboxItem
-          checked={hotPathMode === "inclusive"}
-          onCheckedChange={() => setHotPathMode("inclusive")}
-        >
-          Inclusive Time
-        </DropdownMenuCheckboxItem>
-        <DropdownMenuCheckboxItem
-          checked={hotPathMode === "self"}
-          onCheckedChange={() => setHotPathMode("self")}
-        >
-          Self Time
-        </DropdownMenuCheckboxItem>
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>Hot Path Mode</DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          <DropdownMenuCheckboxItem
+            checked={hotPathMode === "off"}
+            onCheckedChange={() => setHotPathMode("off")}
+          >
+            Off
+          </DropdownMenuCheckboxItem>
+          <DropdownMenuCheckboxItem
+            checked={hotPathMode === "inclusive"}
+            onCheckedChange={() => setHotPathMode("inclusive")}
+          >
+            Inclusive Time
+          </DropdownMenuCheckboxItem>
+          <DropdownMenuCheckboxItem
+            checked={hotPathMode === "self"}
+            onCheckedChange={() => setHotPathMode("self")}
+          >
+            Self Time
+          </DropdownMenuCheckboxItem>
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );

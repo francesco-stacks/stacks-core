@@ -1,4 +1,4 @@
-export type ApiParams = Record<string, string | number | Array<string | number> | undefined | null>;
+export type ApiParams = Record<string, string | number | boolean | object | Array<string | number> | undefined | null>;
 
 export interface FetchOptions {
   signal?: AbortSignal;
@@ -11,6 +11,10 @@ export function buildApiUrl(path: string, params: ApiParams = {}): URL {
     if (Array.isArray(value)) {
       if (value.length === 0) return;
       url.searchParams.set(key, value.map((item) => String(item)).join(","));
+      return;
+    }
+    if (typeof value === "object") {
+      url.searchParams.set(key, JSON.stringify(value));
       return;
     }
     url.searchParams.set(key, String(value));
@@ -53,6 +57,10 @@ export function getTransactionsMaxes<T = unknown>(params: ApiParams, options: Fe
 
 export function getTransactionsAutocomplete<T = unknown>(params: ApiParams, options: FetchOptions = {}) {
   return fetchJson<T>(buildApiUrl("/api/transactions/autocomplete", params), options);
+}
+
+export function getTxTypes<T = unknown>(options: FetchOptions = {}) {
+  return fetchJson<T>(buildApiUrl("/api/tx-types"), options);
 }
 
 export type RecordKvItem = {

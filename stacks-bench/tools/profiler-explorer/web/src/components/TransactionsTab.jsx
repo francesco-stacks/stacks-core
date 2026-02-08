@@ -7,11 +7,12 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Combobox } from "@/components/ui/combobox";
+import { FilterBuilder } from "@/components/ui/filter-builder";
 import {
   getTransactions,
   getTransactionsAutocomplete,
   getTransactionsMaxes,
+  getTxTypes,
 } from "@/lib/api.ts";
 import { TxContextHeatCell, TxContextHeatHeaderCell, TxContextActionCell } from "./HeatCells";
 import { TransactionsGridProvider } from "../contexts/TransactionsGridContext";
@@ -46,52 +47,234 @@ const DEFAULT_HEAT_MAXES = {
   clarity_write_length: 0,
 };
 
-export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
+/** FilterBuilder field definitions — all filterable columns. */
+const FILTER_FIELDS = [
+  { id: "tx_type_name", label: "Transaction Type", type: "enum", enumValues: [] },
+  { id: "contract_issuer", label: "Issuer / Principal", type: "text" },
+  { id: "contract_name", label: "Contract", type: "text" },
+  { id: "contract_fn", label: "Function", type: "text" },
+  { id: "tx_hash_hex", label: "Transaction Hash", type: "text" },
+  { id: "stacks_block_height", label: "Block Height", type: "number" },
+  { id: "duration_ms", label: "Duration", type: "number", modifier: "duration" },
+  { id: "clarity_runtime", label: "Clarity Runtime", type: "number" },
+  { id: "clarity_read_count", label: "Read Count", type: "number" },
+  { id: "clarity_read_length", label: "Read Length", type: "number" },
+  { id: "clarity_write_count", label: "Write Count", type: "number" },
+  { id: "clarity_write_length", label: "Write Length", type: "number" },
+];
+
+// ---------------------------------------------------------------------------
+// Convert FilterBuilder state → MongoDB-style filter DSL sent to the server
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a single FilterBuilder operator id to its MongoDB-style DSL operator key.
+ * Returns null for operators that need special per-value handling (multi-select).
+ */
+function opToDSL(operator) {
+  switch (operator) {
+    case "contains":      return "$contains";
+    case "notContains":   return "$ncontains";
+    case "equal":         return "$eq";
+    case "notEqual":      return "$ne";
+    case "beginsWith":    return "$startsWith";
+    case "endsWith":      return "$endsWith";
+    case "greater":       return "$gt";
+    case "greaterOrEqual":return "$gte";
+    case "less":          return "$lt";
+    case "lessOrEqual":   return "$lte";
+    default:              return "$eq";
+  }
+}
+
+/** Map FilterBuilder operator ids to MongoDB-style DSL operators. */
+function ruleToDSL(rule) {
+  const { field, operator, value, values, modifier } = rule;
+
+  // Multi-select: generate per-value clauses preserving operator semantics.
+  // "equals" / enum "is" with multiple values → $in (efficient SQL IN(…)).
+  // Enum "isNot" with multiple values → $nin (SQL NOT IN(…)).
+  // Pattern ops (contains/beginsWith/endsWith) → $or of individual clauses.
+  if (values?.length > 0) {
+    if (operator === "equal" || operator === "is") {
+      return { [field]: { $in: values } };
+    }
+    if (operator === "isNot") {
+      return { [field]: { $nin: values } };
+    }
+    const dslOp = opToDSL(operator);
+    // notContains with multiple values → all must NOT match → $and
+    const combinator = operator === "notContains" ? "$and" : "$or";
+    const clauses = values.map((v) => ({ [field]: { [dslOp]: v } }));
+    return clauses.length === 1 ? clauses[0] : { [combinator]: clauses };
+  }
+
+  if (value == null || value === "") return null;
+
+  /** Apply duration modifier to convert the user-entered value to ms. */
+  const applyDurationMod = (v) => {
+    const n = Number(v);
+    if (modifier === "s") return n * 1000;
+    if (modifier === "us") return n / 1000;
+    return n; // ms (default)
+  };
+
+  // Determine the right MongoDB-style operator + value
+  let dslOp, dslVal;
+  switch (operator) {
+    case "contains":
+      dslOp = "$contains";
+      dslVal = value;
+      break;
+    case "notContains":
+      dslOp = "$ncontains";
+      dslVal = value;
+      break;
+    case "equal":
+      dslOp = "$eq";
+      dslVal = value;
+      break;
+    case "notEqual":
+      dslOp = "$ne";
+      dslVal = value;
+      break;
+    case "beginsWith":
+      dslOp = "$startsWith";
+      dslVal = value;
+      break;
+    case "endsWith":
+      dslOp = "$endsWith";
+      dslVal = value;
+      break;
+    case "greater":
+      dslOp = "$gt";
+      dslVal = applyDurationMod(value);
+      break;
+    case "greaterOrEqual":
+      dslOp = "$gte";
+      dslVal = applyDurationMod(value);
+      break;
+    case "less":
+      dslOp = "$lt";
+      dslVal = applyDurationMod(value);
+      break;
+    case "lessOrEqual":
+      dslOp = "$lte";
+      dslVal = applyDurationMod(value);
+      break;
+    default:
+      dslOp = "$eq";
+      dslVal = value;
+  }
+
+  return { [field]: { [dslOp]: dslVal } };
+}
+
+/**
+ * Recursively convert FilterBuilder `{ glue, rules }` into the MongoDB-style
+ * DSL accepted by the backend `parseFilterParam()`.
+ *
+ * Returns `null` when there are no meaningful conditions.
+ */
+function filterStateToDSL(state) {
+  if (!state?.rules?.length) return null;
+
+  const clauses = [];
+  for (const rule of state.rules) {
+    if (Array.isArray(rule.rules)) {
+      // Nested group
+      const nested = filterStateToDSL(rule);
+      if (nested) clauses.push(nested);
+    } else {
+      const dsl = ruleToDSL(rule);
+      if (dsl) clauses.push(dsl);
+    }
+  }
+
+  if (clauses.length === 0) return null;
+  if (clauses.length === 1) return clauses[0];
+
+  const combinator = state.glue === "or" ? "$or" : "$and";
+  return { [combinator]: clauses };
+}
+
+export default function TransactionsTab({ runId, onViewTrace, numberFormat, savedState }) {
+  // Restore state from savedState ref (survives unmount/remount across tab switches)
+  const restored = savedState?.current;
+
   // Grid data - sparse array indexed by row position
-  const [dataCache, setDataCache] = useState([]);
+  const [dataCache, setDataCache] = useState(() => {
+    if (restored?.cachedRows) {
+      const arr = [];
+      for (const [idx, row] of restored.cachedRows) arr[idx] = row;
+      return arr;
+    }
+    return [];
+  });
   // Current visible range for the grid (svar-ui expects only visible slice in data prop)
-  const [visibleRange, setVisibleRange] = useState({ start: 0, end: MIN_FETCH_SIZE });
-  const [total, setTotal] = useState(0);
+  const [visibleRange, setVisibleRange] = useState(() => {
+    if (restored?.activeRowIndex != null && restored?.cachedTotal > 0) {
+      // Center the view around the row we navigated from
+      const center = restored.activeRowIndex;
+      const start = Math.max(0, center - 25);
+      const end = Math.min(restored.cachedTotal, center + 25);
+      return { start, end };
+    }
+    return { start: 0, end: MIN_FETCH_SIZE };
+  });
+  const [total, setTotal] = useState(restored?.cachedTotal ?? 0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [sortBy, setSortBy] = useState("duration_ms");
-  const [sortDir, setSortDir] = useState("desc");
-  const [filters, setFilters] = useState({
-    principal: [],
-    contract: [],
-    contractFn: [],
-    minDurationMs: "",
-  });
-  const [filterSearch, setFilterSearch] = useState({
-    principal: "",
-    contract: "",
-    contractFn: "",
-  });
-  const [autocomplete, setAutocomplete] = useState({
-    principal: [],
-    contract: [],
-    contractFn: [],
-  });
-  const [autocompleteLoading, setAutocompleteLoading] = useState({
-    principal: false,
-    contract: false,
-    contractFn: false,
-  });
-  const autocompleteAbortRef = useRef({});
-  const [showFilters, setShowFilters] = useState(true);
+  const [sortBy, setSortBy] = useState(restored?.sortBy ?? "duration_ms");
+  const [sortDir, setSortDir] = useState(restored?.sortDir ?? "desc");
+  const [filterValue, setFilterValue] = useState(restored?.filterValue ?? { glue: "and", rules: [] });
+  const [showFilters, setShowFilters] = useState(restored?.showFilters ?? true);
   const abortControllerRef = useRef(null);
-  const fetchedRangesRef = useRef([]);
+  const fetchedRangesRef = useRef(
+    restored?.cachedRows
+      ? (() => {
+          const indices = restored.cachedRows.map(([i]) => i);
+          return [{ start: Math.min(...indices), end: Math.max(...indices) + 1 }];
+        })()
+      : []
+  );
   const gridApiRef = useRef(null);
   // Track last request to avoid duplicates
   const lastRequestRef = useRef({ start: 0, end: 0 });
+  // Row index to scroll to and select after remount
+  const pendingScrollRef = useRef(restored?.activeRowIndex ?? null);
+  const pendingSelectIdRef = useRef(restored?.activeRowId ?? null);
+
+  // Transaction type enum values (fetched once)
+  const [txTypes, setTxTypes] = useState([]);
+
+  // Fetch transaction types on mount
+  useEffect(() => {
+    let cancelled = false;
+    getTxTypes().then((data) => {
+      if (!cancelled && Array.isArray(data)) {
+        setTxTypes(data.map((t) => t.name));
+      }
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  // Enrich FILTER_FIELDS with fetched enum values
+  const filterFields = useMemo(
+    () =>
+      FILTER_FIELDS.map((f) =>
+        f.id === "tx_type_name" ? { ...f, enumValues: txTypes } : f
+      ),
+    [txTypes]
+  );
   
   // Heat configuration state (per-column min/max/enabled)
-  const [heatConfig, setHeatConfig] = useState({});
+  const [heatConfig, setHeatConfig] = useState(restored?.heatConfig ?? {});
   // Per-column heat style and color
-  const [heatStyleByKey, setHeatStyleByKey] = useState({});
-  const [heatColorByKey, setHeatColorByKey] = useState({});
+  const [heatStyleByKey, setHeatStyleByKey] = useState(restored?.heatStyleByKey ?? {});
+  const [heatColorByKey, setHeatColorByKey] = useState(restored?.heatColorByKey ?? {});
   // Min wall (duration) filter - shown in duration_ms header settings
-  const [minWallFilterMs, setMinWallFilterMs] = useState("");
+  const [minWallFilterMs, setMinWallFilterMs] = useState(restored?.minWallFilterMs ?? "");
   
   // Heat config handlers
   const toggleHeat = useCallback((key) => {
@@ -123,83 +306,41 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
     setHeatColorByKey(prev => ({ ...prev, [key]: color }));
   }, []);
 
-  const [heatMaxes, setHeatMaxes] = useState(DEFAULT_HEAT_MAXES);
+  const [heatMaxes, setHeatMaxes] = useState(restored?.cachedHeatMaxes ?? DEFAULT_HEAT_MAXES);
 
-  const effectiveMinDuration = useMemo(() => {
-    return Math.max(
-      filters.minDurationMs ? Number(filters.minDurationMs) : 0,
-      minWallFilterMs ? Number(minWallFilterMs) : 0
-    );
-  }, [filters.minDurationMs, minWallFilterMs]);
-
-  const requestAutocomplete = useCallback((type, query) => {
-    if (!runId || !query) {
-      setAutocomplete((prev) => ({ ...prev, [type]: [] }));
-      setAutocompleteLoading((prev) => ({ ...prev, [type]: false }));
-      return;
-    }
-    if (autocompleteAbortRef.current[type]) {
-      autocompleteAbortRef.current[type].abort();
-    }
-    const controller = new AbortController();
-    autocompleteAbortRef.current[type] = controller;
-    setAutocompleteLoading((prev) => ({ ...prev, [type]: true }));
-
-    getTransactionsAutocomplete(
-      {
-        run_id: runId,
-        type: type === "contractFn" ? "function" : type,
-        q: query,
-        principal: filters.principal,
-        contract: filters.contract,
-        contract_fn: filters.contractFn,
-      },
-      { signal: controller.signal }
-    )
-      .then((data) => {
-        setAutocomplete((prev) => ({ ...prev, [type]: data.values || [] }));
-        setAutocompleteLoading((prev) => ({ ...prev, [type]: false }));
-      })
-      .catch((err) => {
-        if (err.name !== "AbortError") {
-          setAutocomplete((prev) => ({ ...prev, [type]: [] }));
-          setAutocompleteLoading((prev) => ({ ...prev, [type]: false }));
-        }
-      });
-  }, [runId, filters.principal, filters.contract, filters.contractFn]);
-
+  // ── Persist restorable state to the parent ref on unmount ──────────────
+  // We use refs to avoid re-running the effect on every state change.
+  const stateSnapshotRef = useRef({});
   useEffect(() => {
-    const query = filterSearch.principal.trim();
-    if (query.length < 2) {
-      setAutocomplete((prev) => ({ ...prev, principal: [] }));
-      setAutocompleteLoading((prev) => ({ ...prev, principal: false }));
-      return;
-    }
-    const timer = setTimeout(() => requestAutocomplete("principal", query), 200);
-    return () => clearTimeout(timer);
-  }, [filterSearch.principal, requestAutocomplete]);
-
+    stateSnapshotRef.current = {
+      sortBy, sortDir, filterValue, showFilters,
+      heatConfig, heatStyleByKey, heatColorByKey, minWallFilterMs,
+    };
+  });
   useEffect(() => {
-    const query = filterSearch.contract.trim();
-    if (query.length < 2) {
-      setAutocomplete((prev) => ({ ...prev, contract: [] }));
-      setAutocompleteLoading((prev) => ({ ...prev, contract: false }));
-      return;
-    }
-    const timer = setTimeout(() => requestAutocomplete("contract", query), 200);
-    return () => clearTimeout(timer);
-  }, [filterSearch.contract, requestAutocomplete]);
+    return () => {
+      // On unmount, write the latest snapshot into the parent-owned ref
+      if (savedState) {
+        savedState.current = stateSnapshotRef.current;
+      }
+    };
+  }, [savedState]);
 
-  useEffect(() => {
-    const query = filterSearch.contractFn.trim();
-    if (query.length < 2) {
-      setAutocomplete((prev) => ({ ...prev, contractFn: [] }));
-      setAutocompleteLoading((prev) => ({ ...prev, contractFn: false }));
-      return;
-    }
-    const timer = setTimeout(() => requestAutocomplete("contractFn", query), 200);
-    return () => clearTimeout(timer);
-  }, [filterSearch.contractFn, requestAutocomplete]);
+  /**
+   * Combine the FilterBuilder state + the heat-header min-duration into a
+   * single MongoDB-style DSL object that is sent as `?filter=…` to the API.
+   */
+  const filterDSL = useMemo(() => {
+    const base = filterStateToDSL(filterValue);
+    const minMs = minWallFilterMs ? Number(minWallFilterMs) : 0;
+    if (minMs <= 0) return base;
+
+    // Extra clause: duration_ms >= minWallFilterMs
+    const extra = { duration_ms: { $gte: minMs } };
+    if (!base) return extra;
+    // Wrap both under $and
+    return { $and: [base, extra] };
+  }, [filterValue, minWallFilterMs]);
 
   // Build stable column definitions for svar-ui Grid.
   // These use context-aware components that fetch their configuration at render time,
@@ -242,7 +383,6 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
           { text: "Transaction Hash" },
         ],
         width: 420,
-        flexgrow: 1,
         sort: true,
         resize: true,
         cell: TxHashCell,
@@ -282,6 +422,19 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
         resize: true,
         template: (val) => val || "-",
         css: (row) => row.contract_fn ? "" : "dimmed-cell",
+      },
+      {
+        id: "tx_type_name",
+        header: [
+          { text: "", css: "grid-level1-empty" },
+          { text: "", css: "grid-level2-empty" },
+          { text: "Type" },
+        ],
+        width: 160,
+        sort: true,
+        resize: true,
+        template: (val) => val || "-",
+        css: (row) => row.tx_type_name ? "" : "dimmed-cell",
       },
       {
         id: "duration_ms",
@@ -412,16 +565,9 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
     const fetchHeatMaxes = async () => {
       try {
         setHeatMaxesLoaded(false);
-        const data = await getTransactionsMaxes(
-          {
-            run_id: runId,
-            principal: filters.principal,
-            contract: filters.contract,
-            contract_fn: filters.contractFn,
-            min_duration_ms: effectiveMinDuration > 0 ? effectiveMinDuration : undefined,
-          },
-          { signal: controller.signal }
-        );
+        const params = { run_id: runId };
+        if (filterDSL) params.filter = filterDSL;
+        const data = await getTransactionsMaxes(params, { signal: controller.signal });
         setHeatMaxes({ ...DEFAULT_HEAT_MAXES, ...(data.maxes || {}) });
       } catch (err) {
         if (err.name !== "AbortError") {
@@ -437,7 +583,7 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
     return () => {
       controller.abort();
     };
-  }, [runId, filters.principal, filters.contract, filters.contractFn, effectiveMinDuration]);
+  }, [runId, filterDSL]);
 
   // Fetch a range of data from the server
   const fetchRange = useCallback(async (start, end) => {
@@ -468,20 +614,16 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
     setIsLoading(true);
 
     try {
-      const data = await getTransactions(
-        {
-          run_id: runId,
-          offset: fetchStart,
-          limit: fetchSize,
-          sort_by: sortBy,
-          sort_dir: sortDir,
-          principal: filters.principal,
-          contract: filters.contract,
-          contract_fn: filters.contractFn,
-          min_duration_ms: effectiveMinDuration > 0 ? effectiveMinDuration : undefined,
-        },
-        { signal: controller.signal }
-      );
+      const params = {
+        run_id: runId,
+        offset: fetchStart,
+        limit: fetchSize,
+        sort_by: sortBy,
+        sort_dir: sortDir,
+      };
+      if (filterDSL) params.filter = filterDSL;
+
+      const data = await getTransactions(params, { signal: controller.signal });
       
       // Update total count
       setTotal(data.total);
@@ -513,10 +655,16 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
       setIsLoading(false);
       abortControllerRef.current = null;
     }
-  }, [runId, sortBy, sortDir, filters, effectiveMinDuration]);
+  }, [runId, sortBy, sortDir, filterDSL]);
 
   // Reset cache when filters/sort/run changes
+  const isRestoringRef = useRef(!!restored?.cachedRows);
   useEffect(() => {
+    // Skip the first reset if we're restoring from saved state
+    if (isRestoringRef.current) {
+      isRestoringRef.current = false;
+      return;
+    }
     setDataCache([]);
     setTotal(0);
     setVisibleRange({ start: 0, end: MIN_FETCH_SIZE });
@@ -527,7 +675,7 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
       // Fetch initial data
       fetchRange(0, MIN_FETCH_SIZE);
     }
-  }, [runId, sortBy, sortDir, filters, effectiveMinDuration, fetchRange]);
+  }, [runId, sortBy, sortDir, filterDSL, fetchRange]);
 
   // Handle dynamic data request from grid during scroll
   const handleRequestData = useCallback((ev) => {
@@ -536,7 +684,10 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
       const { start, end } = row;
       
       // Update visible range for rendering the correct slice
-      setVisibleRange({ start, end });
+      // (functional update avoids a re-render when only horizontal scroll fires)
+      setVisibleRange((prev) =>
+        prev.start === start && prev.end === end ? prev : { start, end }
+      );
       
       // Avoid duplicate requests for same range
       if (start === lastRequestRef.current.start && end === lastRequestRef.current.end) {
@@ -553,41 +704,61 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
     }
   }, [fetchRange]);
 
-  const [pendingMinDuration, setPendingMinDuration] = useState("");
-
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setFilters((prev) => ({ ...prev, minDurationMs: pendingMinDuration }));
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [pendingMinDuration]);
-
-  const updateFilterValues = useCallback((key, values) => {
-    setFilters((prev) => ({ ...prev, [key]: values }));
-  }, []);
-
-  const removeFilterValue = useCallback((key, value) => {
-    setFilters((prev) => ({ ...prev, [key]: prev[key].filter((item) => item !== value) }));
-  }, []);
-
   const clearFilters = useCallback(() => {
-    setFilters({ principal: [], contract: [], contractFn: [], minDurationMs: "" });
-    setFilterSearch({ principal: "", contract: "", contractFn: "" });
-    setPendingMinDuration("");
+    setFilterValue({ glue: "and", rules: [] });
   }, []);
 
   const hasActiveFilters = useMemo(() => {
-    return (
-      filters.principal.length ||
-      filters.contract.length ||
-      filters.contractFn.length ||
-      filters.minDurationMs
-    );
-  }, [filters]);
+    return filterValue.rules?.length > 0;
+  }, [filterValue]);
 
-  // Grid init callback
+  const handleFilterChange = useCallback((newValue) => {
+    setFilterValue(newValue);
+  }, []);
+
+  // Async autocomplete provider — called on every keystroke (debounced
+  // inside the FilterBuilder) with the current search text and an
+  // AbortSignal so in-flight requests are cancelled automatically.
+  const filterOptions = useCallback(async (field, query, signal) => {
+    if (!runId) return [];
+    try {
+      const params = {
+        run_id: runId,
+        field,
+        q: query || "",
+        limit: 50,
+      };
+      // Intentionally NOT passing filterDSL — autocomplete should show all
+      // possible values regardless of other active filters, since the user
+      // may still add/remove those filters.
+      const data = await getTransactionsAutocomplete(params, { signal });
+      return data.values || [];
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+      return [];
+    }
+  }, [runId]);
+
+  // Grid init callback — schedules scroll + select restoration if returning to this tab
   const handleInit = useCallback((api) => {
     gridApiRef.current = api;
+
+    // Scroll to the row we navigated from and select it
+    if (pendingScrollRef.current != null && pendingScrollRef.current > 0) {
+      const targetRow = pendingScrollRef.current;
+      const selectId = pendingSelectIdRef.current;
+      pendingScrollRef.current = null;
+      pendingSelectIdRef.current = null;
+      requestAnimationFrame(() => {
+        const el = document.querySelector(".transactions-grid-container .wx-scroll");
+        if (el) {
+          el.scrollTop = targetRow * 36; // row height = 36px
+        }
+        if (selectId) {
+          api.exec("select-row", { id: selectId });
+        }
+      });
+    }
   }, []);
 
   const hasAnyData = useMemo(() => dataCache.some(Boolean), [dataCache]);
@@ -601,8 +772,30 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
   // Build callbacks object for the context provider.
   // These callbacks are accessed via context to avoid recreating column definitions.
   const handleViewTrace = useCallback((row) => {
+    // Snapshot the row's neighborhood into savedState so we can restore on return
+    if (savedState) {
+      const rowIndex = dataCache.indexOf(row);
+      const idx = rowIndex >= 0 ? rowIndex : dataCache.findIndex(r => r && r.id === row.id);
+      if (idx >= 0) {
+        const lo = Math.max(0, idx - 50);
+        const hi = Math.min(dataCache.length, idx + 51);
+        const entries = [];
+        for (let i = lo; i < hi; i++) {
+          if (dataCache[i]) entries.push([i, dataCache[i]]);
+        }
+        // Merge into the current snapshot (filters/sort/heat already tracked)
+        Object.assign(stateSnapshotRef.current, {
+          cachedRows: entries,
+          cachedTotal: total,
+          cachedHeatMaxes: heatMaxes,
+          activeRowIndex: idx,
+          activeRowId: row.id,
+        });
+        savedState.current = stateSnapshotRef.current;
+      }
+    }
     onViewTrace(row.tx_hash_hex, row.stacks_tx_id);
-  }, [onViewTrace]);
+  }, [onViewTrace, dataCache, total, heatMaxes, savedState]);
 
   const gridCallbacks = {
     onViewTrace: handleViewTrace,
@@ -664,64 +857,12 @@ export default function TransactionsTab({ runId, onViewTrace, numberFormat }) {
       {/* Filters Panel */}
       {showFilters && (
         <div className="transactions-filters">
-          <div className="transactions-filter-field">
-            <label>Issuer/Principal</label>
-            <Combobox
-              options={autocomplete.principal.map((value) => ({ label: value, value }))}
-              value={filters.principal}
-              onChange={(values) => updateFilterValues("principal", values)}
-              multiple
-              showClear
-              placeholder="Select principals"
-              searchPlaceholder="Filter by address..."
-              loading={autocompleteLoading.principal}
-              onSearch={(value) =>
-                setFilterSearch((prev) => ({ ...prev, principal: value }))
-              }
-            />
-          </div>
-          <div className="transactions-filter-field">
-            <label>Contract</label>
-            <Combobox
-              options={autocomplete.contract.map((value) => ({ label: value, value }))}
-              value={filters.contract}
-              onChange={(values) => updateFilterValues("contract", values)}
-              multiple
-              showClear
-              placeholder="Select contracts"
-              searchPlaceholder="Filter by contract name..."
-              loading={autocompleteLoading.contract}
-              onSearch={(value) =>
-                setFilterSearch((prev) => ({ ...prev, contract: value }))
-              }
-            />
-          </div>
-          <div className="transactions-filter-field">
-            <label>Function</label>
-            <Combobox
-              options={autocomplete.contractFn.map((value) => ({ label: value, value }))}
-              value={filters.contractFn}
-              onChange={(values) => updateFilterValues("contractFn", values)}
-              multiple
-              showClear
-              placeholder="Select functions"
-              searchPlaceholder="Filter by function name..."
-              loading={autocompleteLoading.contractFn}
-              onSearch={(value) =>
-                setFilterSearch((prev) => ({ ...prev, contractFn: value }))
-              }
-            />
-          </div>
-          <div className="transactions-filter-field">
-            <label>Min Duration (ms)</label>
-            <input
-              type="number"
-              placeholder="0"
-              value={pendingMinDuration}
-              onChange={(e) => setPendingMinDuration(e.target.value)}
-              className="transactions-filter-number"
-            />
-          </div>
+          <FilterBuilder
+            fields={filterFields}
+            options={filterOptions}
+            value={filterValue}
+            onChange={handleFilterChange}
+          />
         </div>
       )}
 

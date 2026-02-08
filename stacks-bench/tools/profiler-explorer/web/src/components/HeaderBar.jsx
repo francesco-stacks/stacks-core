@@ -1,4 +1,5 @@
 import React from "react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -139,7 +140,9 @@ export default function HeaderBar({
       <div className="header-right">
         {activeTab === "trace" && (
           <div className="header-stats">
-            <span className="stat-badge">{rowsLength.toLocaleString()} rows</span>
+            <Badge variant="secondary" className="text-xs font-medium">
+              {rowsLength.toLocaleString()} rows
+            </Badge>
           </div>
         )}
         <TooltipProvider delayDuration={300}>

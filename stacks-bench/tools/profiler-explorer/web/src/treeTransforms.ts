@@ -192,8 +192,17 @@ export function applyChainCompression(nodes: TreeNode[], { enabled, expandedChai
       new Set(chain.map((item) => item.tag).filter((tag) => tag && String(tag).trim().length > 0))
     );
     const chainSegments = chain.map((item) => ({
+      id: item.id,
       name: item.span_name ?? "-",
       tag: item.tag ?? null,
+      span_context: item.span_context ?? null,
+      // Per-segment metrics for hover cards
+      call_count: item.call_count ?? null,
+      sample_count: item.sample_count ?? null,
+      wall_us: getWallUs(item),
+      self_wall_us: getSelfWallUs(item),
+      cpu_us: item.est_cpu_us ?? item.cpu_time_us ?? null,
+      self_cpu_us: getSelfCpuUs(item),
     }));
     const aggregated = aggregateNumeric(chain);
     return {

@@ -126,11 +126,18 @@ export default function App() {
   });
   const [isLoading, setIsLoading] = useState(false);
   const abortControllerRef = useRef(null);
+  // Persisted TransactionsTab state — survives tab switches (unmount/remount)
+  const txTabStateRef = useRef(null);
   const [lastLoadedQuery, setLastLoadedQuery] = useState(null);
-  const setTab = useCallback((tab, { replace = false } = {}) => {
+  const setTab = useCallback((tab, { replace = false, search = undefined } = {}) => {
     setActiveTab(tab);
     const url = new URL(window.location.href);
     url.hash = tab === "trace" ? "trace" : "transactions";
+    if (tab === "trace" && search != null) {
+      url.searchParams.set("search", search);
+    } else if (tab !== "trace") {
+      url.searchParams.delete("search");
+    }
     if (replace) {
       window.history.replaceState({ tab }, "", url);
     } else {
@@ -309,11 +316,25 @@ export default function App() {
   useEffect(() => {
     const initialTab = window.location.hash === "#trace" ? "trace" : "transactions";
     setActiveTab(initialTab);
+
+    // Parse ?search= query parameter for the trace view
+    const params = new URLSearchParams(window.location.search);
+    const searchParam = params.get("search");
+    if (searchParam && initialTab === "trace") {
+      setTxQuery(searchParam);
+    }
+
     window.history.replaceState({ tab: initialTab }, "", window.location.href);
 
     const handlePopState = (event) => {
       const tab = event.state?.tab || (window.location.hash === "#trace" ? "trace" : "transactions");
       setActiveTab(tab);
+      // Restore search param from URL
+      const urlParams = new URLSearchParams(window.location.search);
+      const searchVal = urlParams.get("search");
+      if (tab === "trace" && searchVal) {
+        setTxQuery(searchVal);
+      }
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
@@ -337,8 +358,8 @@ export default function App() {
   const loadTrace = useCallback(async () => {
     if (!runId) return;
     
-    // Switch to trace tab when loading trace
-    setTab("trace");
+    // Switch to trace tab when loading trace, include search param if in tx mode
+    setTab("trace", { search: mode === "tx" && txQuery ? txQuery : undefined });
     
     // Cancel any existing request
     if (abortControllerRef.current) {
@@ -431,7 +452,7 @@ export default function App() {
   const viewTransactionTrace = useCallback((txHashHex, stacksTxIdValue) => {
     setTxQuery(txHashHex);
     setStacksTxId(String(stacksTxIdValue));
-    setTab("trace");
+    setTab("trace", { search: txHashHex });
     // Trigger load after switching to trace tab
     setTimeout(() => {
       const params = {
@@ -692,6 +713,22 @@ export default function App() {
     });
   }, []);
 
+  /** Expand a compressed chain down to a specific segment index.
+   *  Adds the IDs of all segments from 0..segmentIndex-1 to expandedChains
+   *  so the chain re-compresses into two pieces: before the clicked segment
+   *  (now expanded) and after (still compressed). */
+  const expandChainTo = useCallback((segments, segmentIndex) => {
+    if (!Array.isArray(segments) || segmentIndex <= 0) return;
+    setExpandedChains((prev) => {
+      const next = new Set(prev);
+      // Mark each node up to (but not including) the target segment as expanded
+      for (let i = 0; i < segmentIndex; i++) {
+        if (segments[i]?.id != null) next.add(segments[i].id);
+      }
+      return next;
+    });
+  }, []);
+
   const focusNode = useCallback((rowId) => {
     setFocusId(rowId);
     setActiveId(rowId);
@@ -863,6 +900,7 @@ export default function App() {
   const profilerGridCallbacks = {
     // SpanCell callbacks
     toggleChain,
+    expandChainTo,
     focusNode,
     spanVizConfig,
     getSpanVizValue,
@@ -1021,6 +1059,7 @@ export default function App() {
           runId={runId}
           onViewTrace={viewTransactionTrace}
           numberFormat={numberFormat}
+          savedState={txTabStateRef}
         />
       )}
 

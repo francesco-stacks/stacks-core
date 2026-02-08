@@ -1,261 +1,269 @@
 import * as React from "react";
-import { Check, ChevronsUpDown, Loader2, X } from "lucide-react";
+import { Combobox as ComboboxPrimitive } from "@base-ui/react";
+import { CheckIcon, ChevronDownIcon, XIcon } from "lucide-react";
 import { cn } from "@/lib/utils.ts";
 import { Button } from "@/components/ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
-  Command,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+} from "@/components/ui/input-group";
 
-export function Combobox({
-  options = [],
-  value,
-  onChange,
-  multiple = false,
-  showClear = false,
-  placeholder = "Select...",
-  searchPlaceholder = "Search...",
-  onSearch,
-  disabled = false,
-  loading = false,
+const Combobox = ComboboxPrimitive.Root;
+
+function ComboboxValue({ ...props }) {
+  return <ComboboxPrimitive.Value data-slot="combobox-value" {...props} />;
+}
+
+function ComboboxTrigger({ className, children, ...props }) {
+  return (
+    <ComboboxPrimitive.Trigger
+      data-slot="combobox-trigger"
+      className={cn("[&_svg:not([class*='size-'])]:size-4", className)}
+      {...props}
+    >
+      {children}
+      <ChevronDownIcon
+        data-slot="combobox-trigger-icon"
+        className="text-muted-foreground pointer-events-none size-4"
+      />
+    </ComboboxPrimitive.Trigger>
+  );
+}
+
+function ComboboxClear({ className, ...props }) {
+  return (
+    <ComboboxPrimitive.Clear
+      data-slot="combobox-clear"
+      render={<InputGroupButton variant="ghost" size="icon-xs" />}
+      className={cn(className)}
+      {...props}
+    >
+      <XIcon className="pointer-events-none" />
+    </ComboboxPrimitive.Clear>
+  );
+}
+
+function ComboboxInput({
   className,
-  contentClassName,
-  buttonClassName,
+  children,
+  disabled = false,
+  showTrigger = true,
+  showClear = false,
+  ...props
 }) {
-  const [open, setOpen] = React.useState(false);
-  const [search, setSearch] = React.useState("");
-  const inlineInputRef = React.useRef(null);
-  const inlinePointerDownRef = React.useRef(false);
-  const onSearchRef = React.useRef(onSearch);
-  const searchTimerRef = React.useRef(null);
-
-  const selectedValues = React.useMemo(() => {
-    return multiple ? (Array.isArray(value) ? value : []) : value ? [value] : [];
-  }, [multiple, value]);
-
-  const selectedLabel = React.useMemo(() => {
-    if (selectedValues.length === 0) return placeholder;
-    if (multiple) return `${selectedValues.length} selected`;
-    const option = options.find((item) => item.value === selectedValues[0]);
-    return option?.label || selectedValues[0];
-  }, [selectedValues, options, multiple, placeholder]);
-
-  React.useEffect(() => {
-    onSearchRef.current = onSearch;
-  }, [onSearch]);
-
-  React.useEffect(() => {
-    if (!onSearchRef.current) return undefined;
-    if (searchTimerRef.current) {
-      clearTimeout(searchTimerRef.current);
-    }
-    searchTimerRef.current = setTimeout(() => {
-      onSearchRef.current?.(search);
-    }, 200);
-    return () => {
-      if (searchTimerRef.current) {
-        clearTimeout(searchTimerRef.current);
-      }
-    };
-  }, [search]);
-
-  const toggleValue = (val) => {
-    if (!multiple) {
-      onChange?.(val);
-      setSearch("");
-      setOpen(false);
-      return;
-    }
-    const next = selectedValues.includes(val)
-      ? selectedValues.filter((item) => item !== val)
-      : [...selectedValues, val];
-    onChange?.(next);
-    setSearch("");
-  };
-
-  const removeValue = (val, event) => {
-    event.stopPropagation();
-    if (multiple) {
-      onChange?.(selectedValues.filter((item) => item !== val));
-    }
-  };
-
-  const commitSearchValue = () => {
-    const trimmed = search.trim();
-    if (!multiple || !trimmed) return;
-    if (!selectedValues.includes(trimmed)) {
-      onChange?.([...selectedValues, trimmed]);
-    }
-    setSearch("");
-  };
-
-  const clearSelection = (event) => {
-    event.stopPropagation();
-    if (multiple) {
-      onChange?.([]);
-    } else {
-      onChange?.("");
-    }
-  };
-
-  const hasOptions = options.length > 0;
-
-  const handleOpenChange = (nextOpen) => {
-    if (multiple && !nextOpen) {
-      const active = document.activeElement;
-      if (active === inlineInputRef.current || inlinePointerDownRef.current) {
-        inlinePointerDownRef.current = false;
-        return;
-      }
-    }
-    setOpen(nextOpen);
-    if (!nextOpen) {
-      setSearch("");
-    }
-  };
-
   return (
-    <Popover open={open} onOpenChange={handleOpenChange}>
-      <PopoverTrigger asChild>
-        <Button
-          variant="outline"
-          role="combobox"
-          aria-expanded={open}
-          disabled={disabled}
+    <InputGroup className={cn("w-auto", className)}>
+      <ComboboxPrimitive.Input
+        render={<InputGroupInput disabled={disabled} />}
+        {...props}
+      />
+      <InputGroupAddon align="inline-end">
+        {showTrigger && (
+          <InputGroupButton
+            size="icon-xs"
+            variant="ghost"
+            asChild
+            data-slot="input-group-button"
+            className="group-has-data-[slot=combobox-clear]/input-group:hidden data-pressed:bg-transparent"
+            disabled={disabled}
+          >
+            <ComboboxTrigger />
+          </InputGroupButton>
+        )}
+        {showClear && <ComboboxClear disabled={disabled} />}
+      </InputGroupAddon>
+      {children}
+    </InputGroup>
+  );
+}
+
+function ComboboxContent({
+  className,
+  side = "bottom",
+  sideOffset = 6,
+  align = "start",
+  alignOffset = 0,
+  anchor,
+  ...props
+}) {
+  return (
+    <ComboboxPrimitive.Portal>
+      <ComboboxPrimitive.Positioner
+        side={side}
+        sideOffset={sideOffset}
+        align={align}
+        alignOffset={alignOffset}
+        anchor={anchor}
+        className="isolate z-50"
+      >
+        <ComboboxPrimitive.Popup
+          data-slot="combobox-content"
+          data-chips={!!anchor}
           className={cn(
-            "w-full justify-between gap-2 text-sm font-normal h-auto min-h-9",
-            selectedValues.length === 0 && "text-muted-foreground",
-            buttonClassName
+            "bg-popover text-popover-foreground data-open:animate-in data-closed:animate-out data-closed:fade-out-0 data-open:fade-in-0 data-closed:zoom-out-95 data-open:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 ring-foreground/10 *:data-[slot=input-group]:bg-input/30 *:data-[slot=input-group]:border-input/30 group/combobox-content relative max-h-96 w-(--anchor-width) max-w-(--available-width) min-w-[calc(var(--anchor-width)+--spacing(7))] origin-(--transform-origin) overflow-hidden rounded-md shadow-md ring-1 duration-100 data-[chips=true]:min-w-(--anchor-width) *:data-[slot=input-group]:m-1 *:data-[slot=input-group]:mb-0 *:data-[slot=input-group]:h-8 *:data-[slot=input-group]:shadow-none",
+            className
           )}
-        >
-          <span className="flex flex-1 flex-wrap items-center gap-1">
-            {multiple ? (
-              selectedValues.map((val) => (
-                <span
-                  key={val}
-                  className="inline-flex items-center gap-1 rounded-md bg-secondary px-1.5 py-0.5 text-xs"
-                >
-                  <span className="max-w-[120px] truncate">{val}</span>
-                  <span
-                    role="button"
-                    tabIndex={0}
-                    className="rounded-sm hover:bg-muted-foreground/20"
-                    onClick={(e) => removeValue(val, e)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") removeValue(val, e);
-                    }}
-                  >
-                    <X className="h-3 w-3" />
-                  </span>
-                </span>
-              ))
-            ) : (
-              <span className="truncate">{selectedLabel}</span>
-            )}
-            {multiple && (
-              <input
-                ref={inlineInputRef}
-                className="min-w-[80px] flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-                placeholder={selectedValues.length === 0 ? placeholder : ""}
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                onPointerDown={() => {
-                  inlinePointerDownRef.current = true;
-                  setOpen(true);
-                }}
-                onFocus={() => setOpen(true)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    commitSearchValue();
-                  }
-                }}
-              />
-            )}
-          </span>
-          <span className="flex shrink-0 items-center gap-1">
-            {showClear && selectedValues.length > 0 && !multiple && (
-              <span
-                role="button"
-                tabIndex={0}
-                className="rounded-sm p-1 hover:bg-muted"
-                onClick={clearSelection}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") clearSelection(event);
-                }}
-              >
-                <X className="h-3 w-3" />
-              </span>
-            )}
-            <ChevronsUpDown className="h-4 w-4 opacity-50" />
-          </span>
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent className={cn("w-[300px] p-0", contentClassName)} align="start">
-        <Command shouldFilter={false}>
-          <CommandInput
-            placeholder={searchPlaceholder}
-            value={search}
-            onValueChange={setSearch}
-          />
-          <CommandList>
-            {loading ? (
-              <div className="flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Loading...
-              </div>
-            ) : !hasOptions && search.length > 0 ? (
-              <div className="py-6 text-center text-sm text-muted-foreground">
-                No results found.
-              </div>
-            ) : !hasOptions ? (
-              <div className="py-6 text-center text-sm text-muted-foreground">
-                Type to search...
-              </div>
-            ) : (
-              <CommandGroup>
-                {options.map((option) => {
-                  const selected = selectedValues.includes(option.value);
-                  return (
-                    <CommandItem
-                      key={option.value}
-                      value={option.value}
-                      onSelect={() => toggleValue(option.value)}
-                    >
-                      <Check className={cn("mr-2 h-4 w-4", selected ? "opacity-100" : "opacity-0")} />
-                      {option.label}
-                    </CommandItem>
-                  );
-                })}
-              </CommandGroup>
-            )}
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
+          {...props}
+        />
+      </ComboboxPrimitive.Positioner>
+    </ComboboxPrimitive.Portal>
   );
 }
 
-// Legacy export for backwards compatibility - no longer needed with inline chips
-export function ComboboxChips({ values = [], onRemove, className }) {
-  if (!values.length) return null;
+function ComboboxList({ className, ...props }) {
   return (
-    <div className={cn("mt-2 flex flex-wrap gap-2", className)}>
-      {values.map((value) => (
-        <button
-          key={value}
-          type="button"
-          className="inline-flex items-center gap-1 rounded-full border border-border bg-secondary px-2 py-1 text-xs"
-          onClick={() => onRemove?.(value)}
-        >
-          <span className="max-w-[180px] truncate">{value}</span>
-          <X className="h-3 w-3" />
-        </button>
-      ))}
-    </div>
+    <ComboboxPrimitive.List
+      data-slot="combobox-list"
+      className={cn(
+        "max-h-[min(calc(--spacing(96)---spacing(9)),calc(var(--available-height)---spacing(9)))] scroll-py-1 overflow-y-auto p-1 data-empty:p-0",
+        className
+      )}
+      {...props}
+    />
   );
 }
+
+function ComboboxItem({ className, children, ...props }) {
+  return (
+    <ComboboxPrimitive.Item
+      data-slot="combobox-item"
+      className={cn(
+        "data-highlighted:bg-accent data-highlighted:text-accent-foreground relative flex w-full cursor-default items-center gap-2 rounded-sm py-1.5 pr-8 pl-2 text-sm outline-hidden select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        className
+      )}
+      {...props}
+    >
+      {children}
+      <ComboboxPrimitive.ItemIndicator
+        data-slot="combobox-item-indicator"
+        render={
+          <span className="pointer-events-none absolute right-2 flex size-4 items-center justify-center" />
+        }
+      >
+        <CheckIcon className="pointer-events-none size-4" />
+      </ComboboxPrimitive.ItemIndicator>
+    </ComboboxPrimitive.Item>
+  );
+}
+
+function ComboboxGroup({ className, ...props }) {
+  return (
+    <ComboboxPrimitive.Group
+      data-slot="combobox-group"
+      className={cn(className)}
+      {...props}
+    />
+  );
+}
+
+function ComboboxLabel({ className, ...props }) {
+  return (
+    <ComboboxPrimitive.GroupLabel
+      data-slot="combobox-label"
+      className={cn(
+        "text-muted-foreground px-2 py-1.5 text-xs",
+        className
+      )}
+      {...props}
+    />
+  );
+}
+
+function ComboboxCollection({ ...props }) {
+  return <ComboboxPrimitive.Collection data-slot="combobox-collection" {...props} />;
+}
+
+function ComboboxEmpty({ className, ...props }) {
+  return (
+    <ComboboxPrimitive.Empty
+      data-slot="combobox-empty"
+      className={cn(
+        "text-muted-foreground hidden w-full justify-center py-2 text-center text-sm group-data-empty/combobox-content:flex",
+        className
+      )}
+      {...props}
+    />
+  );
+}
+
+function ComboboxSeparator({ className, ...props }) {
+  return (
+    <ComboboxPrimitive.Separator
+      data-slot="combobox-separator"
+      className={cn("bg-border -mx-1 my-1 h-px", className)}
+      {...props}
+    />
+  );
+}
+
+function ComboboxChips({ className, ...props }) {
+  return (
+    <ComboboxPrimitive.Chips
+      data-slot="combobox-chips"
+      className={cn(
+        "dark:bg-input/30 border-input focus-within:border-ring focus-within:ring-ring/50 has-aria-invalid:ring-destructive/20 dark:has-aria-invalid:ring-destructive/40 has-aria-invalid:border-destructive dark:has-aria-invalid:border-destructive/50 flex min-h-9 flex-wrap items-center gap-1.5 rounded-md border bg-transparent bg-clip-padding px-2.5 py-1.5 text-sm shadow-xs transition-[color,box-shadow] focus-within:ring-[3px] has-aria-invalid:ring-[3px] has-data-[slot=combobox-chip]:px-1.5",
+        className
+      )}
+      {...props}
+    />
+  );
+}
+
+function ComboboxChip({ className, children, showRemove = true, ...props }) {
+  return (
+    <ComboboxPrimitive.Chip
+      data-slot="combobox-chip"
+      className={cn(
+        "bg-muted text-foreground flex h-[calc(--spacing(5.5))] w-fit items-center justify-center gap-1 rounded-sm px-1.5 text-xs font-medium whitespace-nowrap has-disabled:pointer-events-none has-disabled:cursor-not-allowed has-disabled:opacity-50 has-data-[slot=combobox-chip-remove]:pr-0",
+        className
+      )}
+      {...props}
+    >
+      {children}
+      {showRemove && (
+        <ComboboxPrimitive.ChipRemove
+          render={<Button variant="ghost" size="icon-xs" />}
+          className="-ml-1 opacity-50 hover:opacity-100"
+          data-slot="combobox-chip-remove"
+        >
+          <XIcon className="pointer-events-none" />
+        </ComboboxPrimitive.ChipRemove>
+      )}
+    </ComboboxPrimitive.Chip>
+  );
+}
+
+function ComboboxChipsInput({ className, children, ...props }) {
+  return (
+    <ComboboxPrimitive.Input
+      data-slot="combobox-chip-input"
+      className={cn("min-w-16 flex-1 outline-none", className)}
+      {...props}
+    />
+  );
+}
+
+function useComboboxAnchor() {
+  return React.useRef(null);
+}
+
+export {
+  Combobox,
+  ComboboxInput,
+  ComboboxContent,
+  ComboboxList,
+  ComboboxItem,
+  ComboboxGroup,
+  ComboboxLabel,
+  ComboboxCollection,
+  ComboboxEmpty,
+  ComboboxSeparator,
+  ComboboxChips,
+  ComboboxChip,
+  ComboboxChipsInput,
+  ComboboxTrigger,
+  ComboboxValue,
+  useComboboxAnchor,
+};

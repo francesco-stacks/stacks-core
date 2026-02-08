@@ -39,6 +39,13 @@
   --heat-danger: #b91c1c;
   --heat-danger-strong: #dc2626;
 
+  /* Span-kind chip colors (builtin, user-public, user-private, user-readonly, dispatch) */
+  --span-builtin: #6b7280;
+  --span-public: #16a34a;
+  --span-private: #d97706;
+  --span-readonly: #2563eb;
+  --span-dispatch: #8b5cf6;
+
   --grid-background: var(--card);
   --grid-header-background: var(--secondary);
   --grid-row-hover: color-mix(in srgb, var(--foreground) 6%, transparent);
@@ -82,6 +89,13 @@
   --sidebar-ring: #3794ff;
   --heat-danger: #b91c1c;
   --heat-danger-strong: #ef4444;
+
+  /* Span-kind chip colors (dark mode) */
+  --span-builtin: #9ca3af;
+  --span-public: #4ade80;
+  --span-private: #fbbf24;
+  --span-readonly: #60a5fa;
+  --span-dispatch: #a78bfa;
 }
 
 :root[data-theme="ocean"] {
@@ -295,16 +309,7 @@
   font-size: 11px;
 }
 
-.span-muted-badge {
-  display: inline-flex;
-  align-items: center;
-  border-radius: 999px;
-  padding: 1px 6px;
-  font-size: 10px;
-  color: var(--muted-foreground);
-  background: color-mix(in srgb, var(--muted) 70%, transparent);
-  border: 1px solid transparent;
-}
+/* Span-kind colouring is now handled by shadcn Badge + Tailwind in SpanCell */
 
 .span-focus-btn {
   border: 1px solid var(--border);
@@ -1035,7 +1040,7 @@
   justify-content: center;
   justify-self: center;
   width: 100%;
-  max-width: 500px;
+  max-width: 660px;
 }
 
 .search-container {
@@ -1069,7 +1074,9 @@
   border: none;
   background: transparent;
   color: var(--foreground);
-  font-size: 13px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  letter-spacing: -0.01em;
 }
 
 .search-input::placeholder {
@@ -1112,15 +1119,6 @@
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.stat-badge {
-  padding: 4px 10px;
-  border-radius: 6px;
-  background: var(--secondary);
-  color: var(--muted-foreground);
-  font-size: 12px;
-  font-weight: 500;
 }
 
 .header-btn {
@@ -1631,15 +1629,16 @@
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  padding: 0 16px 16px;
 }
 
 .transactions-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 0;
-  gap: 12px;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
 }
 
 .transactions-toolbar-left {
@@ -1668,14 +1667,383 @@
 }
 
 .transactions-filters {
+  padding: 8px 16px;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+
+/* ------------------------------------------------------------------ */
+/* FilterBuilder                                                       */
+/* ------------------------------------------------------------------ */
+
+.fb-bar {
   display: flex;
-  align-items: flex-end;
-  gap: 16px;
-  padding: 12px 16px;
-  margin-bottom: 12px;
-  background: var(--muted);
-  border-radius: 10px;
+  align-items: center;
+  gap: 8px;
   flex-wrap: wrap;
+}
+
+/* --- Chips -------------------------------------------------------- */
+
+.fb-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 6px 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.12s;
+  max-width: 420px;
+}
+.fb-chip:hover {
+  background: var(--accent);
+}
+
+.fb-chip-field {
+  color: var(--muted-foreground);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.fb-chip-op {
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+.fb-chip-value {
+  color: var(--primary);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fb-chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.12s, color 0.12s;
+}
+.fb-chip-x:hover {
+  background: var(--destructive);
+  color: var(--destructive-foreground);
+}
+
+/* --- Glue toggle -------------------------------------------------- */
+
+.fb-glue {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
+  min-width: 32px;
+  padding: 0 8px;
+  border-radius: 9999px;
+  border: none;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: lowercase;
+  cursor: pointer;
+  user-select: none;
+  background: hsl(142 71% 45% / 0.2);
+  color: hsl(142 71% 60%);
+  transition: background 0.12s;
+}
+.fb-glue:hover {
+  background: hsl(142 71% 45% / 0.35);
+}
+.fb-glue-or {
+  background: hsl(38 92% 50% / 0.2);
+  color: hsl(38 92% 65%);
+}
+.fb-glue-or:hover {
+  background: hsl(38 92% 50% / 0.35);
+}
+
+/* --- Add button --------------------------------------------------- */
+
+.fb-add-btn {
+  flex-shrink: 0;
+}
+
+/* --- Editor popover ----------------------------------------------- */
+
+.fb-popover {
+  width: 480px;
+  max-width: calc(100vw - 32px);
+  padding: 12px;
+}
+
+.fb-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Row 1: field selector (flex) + condition type (fixed) */
+.fb-editor-row1 {
+  display: flex;
+  gap: 8px;
+  align-items: start;
+}
+
+.fb-editor-row1 .fb-editor-field-select {
+  flex: 1;
+  min-width: 0;
+}
+
+.fb-editor-row1 .fb-editor-op-select {
+  width: 160px;
+  flex-shrink: 0;
+}
+
+/* Row 2: value input (flex) + optional modifier (fixed) */
+.fb-editor-row2 {
+  display: flex;
+  gap: 8px;
+  align-items: start;
+}
+
+.fb-editor-row2 .fb-autocomplete {
+  flex: 1;
+  min-width: 0;
+}
+
+.fb-editor-row2 .fb-value-input-numeric {
+  width: 160px;
+  flex-shrink: 0;
+}
+
+.fb-editor-modifier-select {
+  width: 100px;
+  flex-shrink: 0;
+}
+
+/* Row 3: multi-select chips area */
+.fb-editor-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+  min-height: 0;
+}
+
+.fb-editor-chips:empty {
+  display: none;
+}
+
+.fb-selected-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 4px 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--foreground);
+  max-width: 260px;
+}
+
+.fb-selected-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fb-selected-chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  border: none;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.12s, color 0.12s;
+}
+
+.fb-selected-chip-x:hover {
+  background: var(--destructive);
+  color: var(--destructive-foreground);
+}
+
+/* Enum checkbox list (for type filters) */
+.fb-enum-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.fb-enum-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8125rem;
+  transition: background 0.1s;
+}
+
+.fb-enum-option:hover {
+  background: var(--accent);
+}
+
+.fb-enum-checkbox {
+  accent-color: var(--primary);
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.fb-enum-label {
+  color: var(--foreground);
+  user-select: none;
+}
+
+.fb-enum-empty {
+  padding: 8px;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  font-style: italic;
+}
+
+/* Legacy single-row (keep for compat) */
+.fb-editor-row {
+  display: flex;
+  gap: 8px;
+  align-items: start;
+}
+
+.fb-editor-select {
+  flex-shrink: 0;
+}
+.fb-editor-select--op {
+  width: 150px;
+  flex-shrink: 0;
+}
+
+.fb-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+/* --- Autocomplete ------------------------------------------------- */
+
+.fb-autocomplete {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+}
+
+.fb-autocomplete-input-row {
+  position: relative;
+}
+
+.fb-value-input {
+  width: 100%;
+}
+
+.fb-autocomplete-spinner {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--muted-foreground);
+  pointer-events: none;
+}
+
+.fb-autocomplete-list {
+  position: absolute;
+  z-index: 60;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: 0 4px 16px hsl(0 0% 0% / 0.35);
+  padding: 4px;
+}
+
+.fb-autocomplete-item {
+  padding: 6px 8px;
+  font-size: 13px;
+  border-radius: 4px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fb-autocomplete-item:hover,
+.fb-autocomplete-item.fb-hl {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+/* --- Group (nested AND/OR container) -------------------------------- */
+
+.fb-group {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 4px 8px 6px;
+  background: hsl(0 0% 100% / 0.03);
+}
+
+.fb-group-header {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.fb-group-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.12s, color 0.12s;
+}
+.fb-group-x:hover {
+  background: var(--destructive);
+  color: var(--destructive-foreground);
 }
 
 .transactions-filter-field {
@@ -1752,8 +2120,8 @@
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  border-top: none;
+  border-radius: 0;
   background: var(--card);
   display: flex;
   flex-direction: column;
@@ -1785,14 +2153,10 @@
   opacity: 0.5;
 }
 
-/* Dimmed column (# column) - both separator and text */
-.transactions-grid-container .wx-cell.grid-col-dimmed,
-.transactions-grid-container .wx-header .grid-col-dimmed {
+/* Dimmed column (# column) - cells only, not headers */
+.transactions-grid-container .wx-cell.grid-col-dimmed {
   color: var(--muted-foreground);
   opacity: 0.5;
-}
-
-.transactions-grid-container .wx-cell.grid-col-dimmed {
   border-right-color: color-mix(in srgb, var(--border) 40%, transparent);
 }
 

@@ -123,7 +123,7 @@ pub fn begin_builtin_span(
         // First time seeing this clarity_name on this thread — allocate a SpanId.
         let id: &'static stacks_profiler::SpanId = Box::leak(Box::new(stacks_profiler::SpanId {
             name: clarity_name,
-            context: Some("clarity::vm"),
+            context: Some("clarity::builtin"),
             file: caller.file(),
             line: caller.line(),
         }));
@@ -216,11 +216,12 @@ pub fn begin_user_fn_span(
     None
 }
 
-/// Begin a profiler span for a cross-contract call (`contract-call?`).
+/// Begin a profiler span for contract function execution.
 ///
-/// Emits `clarity:contract-call` with the target `contract.function` as tag.
-/// Uses a static [`OnceLock`]-backed [`SpanId`](stacks_profiler::SpanId) since
-/// the span name is fixed.
+/// Emits `execute-contract` with the target `contract.function` as tag.
+/// Used by both transaction entry points and `contract-call?` cross-contract
+/// calls.  Uses a static [`OnceLock`]-backed [`SpanId`](stacks_profiler::SpanId)
+/// since the span name is fixed.
 #[cfg(feature = "profiler")]
 #[track_caller]
 pub fn begin_contract_call_span(
@@ -240,8 +241,8 @@ pub fn begin_contract_call_span(
 
     static SPAN: OnceLock<stacks_profiler::SpanId> = OnceLock::new();
     let span_id = SPAN.get_or_init(|| stacks_profiler::SpanId {
-        name: "clarity:contract-call?",
-        context: Some("clarity::vm"),
+        name: "execute-contract",
+        context: Some("clarity::dispatch"),
         file: caller.file(),
         line: caller.line(),
     });
@@ -269,7 +270,7 @@ pub fn begin_contract_call_span(
 
 /// Begin a profiler span for a function-as-transaction execution.
 ///
-/// Emits `clarity:exec-read-only-tx` or `clarity:exec-public-tx` depending on
+/// Emits `begin-read-only-tx` or `begin-public-tx` depending on
 /// whether the function is read-only.  The function identifier is attached as
 /// tag when [`CAPTURE_CONTRACT_CALL_IDENT`](flags::CAPTURE_CONTRACT_CALL_IDENT)
 /// is enabled.
@@ -295,15 +296,15 @@ pub fn begin_exec_tx_span(
 
     let span_id = if is_read_only {
         RO_SPAN.get_or_init(|| stacks_profiler::SpanId {
-            name: "clarity:exec-read-only-tx",
-            context: Some("clarity::vm"),
+            name: "begin-read-only-tx",
+            context: Some("clarity::dispatch"),
             file: caller.file(),
             line: caller.line(),
         })
     } else {
         PUB_SPAN.get_or_init(|| stacks_profiler::SpanId {
-            name: "clarity:exec-public-tx",
-            context: Some("clarity::vm"),
+            name: "begin-public-tx",
+            context: Some("clarity::dispatch"),
             file: caller.file(),
             line: caller.line(),
         })

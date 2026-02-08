@@ -22,6 +22,7 @@ export function ProfilerGridProvider({ children, callbacks }) {
   const stableApi = useRef({
     // SpanCell callbacks
     toggleChain: (rowId) => callbacksRef.current.toggleChain?.(rowId),
+    expandChainTo: (segments, segmentIndex) => callbacksRef.current.expandChainTo?.(segments, segmentIndex),
     focusNode: (rowId) => callbacksRef.current.focusNode?.(rowId),
     getSpanVizValue: (row) => callbacksRef.current.getSpanVizValue?.(row),
     get spanVizConfig() {

@@ -44,6 +44,16 @@ function queryAll(db, sql, params) {
   return db.prepare(sql).all(params);
 }
 
+// ---------------------------------------------------------------------------
+// MongoDB-style filter DSL → parameterized SQL translator
+// ---------------------------------------------------------------------------
+
+import {
+  FILTER_FIELD_MAP,
+  ALLOWED_FIELDS,
+  parseFilterParam,
+} from "./filter-dsl.js";
+
 function traceSqlTxMode() {
   return `
     WITH RECURSIVE
@@ -457,10 +467,6 @@ app.get("/api/transactions", (req, res) => {
     const runId = parseOptionalInt(req.query.run_id, "run_id");
     const offset = parseOptionalInt(req.query.offset, "offset") || 0;
     const limit = parseOptionalInt(req.query.limit, "limit") || 100;
-    const minDurationMs = parseOptionalInt(req.query.min_duration_ms, "min_duration_ms");
-    const principalFilters = parseCsvList(req.query.principal);
-    const contractFilters = parseCsvList(req.query.contract);
-    const contractFnFilters = parseCsvList(req.query.contract_fn);
     const sortBy = req.query.sort_by || "duration_ms";
     const sortDir = req.query.sort_dir === "asc" ? "ASC" : "DESC";
 
@@ -478,40 +484,20 @@ app.get("/api/transactions", (req, res) => {
       "clarity_write_length",
       "stacks_block_height",
       "tx_hash_hex",
+      "contract_issuer",
+      "contract_name",
+      "contract_fn",
     ];
     const safeSortBy = validSortColumns.includes(sortBy) ? sortBy : "duration_ms";
 
-    // Build dynamic WHERE clauses
+    // Build WHERE from filter DSL
     const conditions = ["sts.benchmark_run_id = :run_id"];
-    const params = { run_id: runId, limit, offset };
+    const params = { run_id: runId, _limit: limit, _offset: offset };
 
-    if (minDurationMs != null) {
-      conditions.push("sts.duration_us >= :min_duration_us");
-      params.min_duration_us = minDurationMs * 1000;
-    }
-    if (principalFilters.length) {
-      const clauses = principalFilters.map((value, index) => {
-        const key = `principal_filter_${index}`;
-        params[key] = `%${value}%`;
-        return `p.address LIKE :${key}`;
-      });
-      conditions.push(`(${clauses.join(" OR ")})`);
-    }
-    if (contractFilters.length) {
-      const clauses = contractFilters.map((value, index) => {
-        const key = `contract_filter_${index}`;
-        params[key] = `%${value}%`;
-        return `c.name LIKE :${key}`;
-      });
-      conditions.push(`(${clauses.join(" OR ")})`);
-    }
-    if (contractFnFilters.length) {
-      const clauses = contractFnFilters.map((value, index) => {
-        const key = `contract_fn_filter_${index}`;
-        params[key] = `%${value}%`;
-        return `cf.name LIKE :${key}`;
-      });
-      conditions.push(`(${clauses.join(" OR ")})`);
+    const filterResult = parseFilterParam(req.query.filter);
+    if (filterResult) {
+      conditions.push(filterResult.sql);
+      Object.assign(params, filterResult.params);
     }
 
     const whereClause = conditions.join(" AND ");
@@ -524,10 +510,30 @@ app.get("/api/transactions", (req, res) => {
       LEFT JOIN contract c ON c.id = tx.contract_id
       LEFT JOIN principal p ON p.id = c.issuer_principal_id
       LEFT JOIN contract_fn cf ON cf.id = tx.contract_fn_id
+      LEFT JOIN stacks_tx_type ttype ON ttype.id = tx.stacks_tx_type_id
+      JOIN synthetic_block synth ON synth.id = sts.synthetic_block_id
+      JOIN stacks_block sb ON sb.id = synth.stacks_block_id
       WHERE ${whereClause}
     `;
     const countResult = queryAll(db, countSql, params);
     const total = countResult[0]?.total || 0;
+
+    // Sort field mapping (user-facing name → SQL expression)
+    const sortFieldMap = {
+      duration_ms: "duration_ms",
+      clarity_runtime: "clarity_runtime",
+      clarity_read_count: "clarity_read_count",
+      clarity_read_length: "clarity_read_length",
+      clarity_write_count: "clarity_write_count",
+      clarity_write_length: "clarity_write_length",
+      stacks_block_height: "stacks_block_height",
+      tx_hash_hex: "tx_hash_hex",
+      contract_issuer: "contract_issuer",
+      contract_name: "contract_name",
+      contract_fn: "contract_fn",
+      tx_type_name: "tx_type_name",
+    };
+    const sortExpr = sortFieldMap[safeSortBy] || "duration_ms";
 
     // Main query
     const sql = `
@@ -541,6 +547,7 @@ app.get("/api/transactions", (req, res) => {
         p.address AS contract_issuer,
         c.name AS contract_name,
         cf.name AS contract_fn,
+        ttype.name AS tx_type_name,
         sts.duration_us / 1000.0 AS duration_ms,
         sts.clarity_runtime,
         sts.clarity_read_count,
@@ -554,9 +561,10 @@ app.get("/api/transactions", (req, res) => {
       LEFT JOIN contract c ON c.id = tx.contract_id
       LEFT JOIN principal p ON p.id = c.issuer_principal_id
       LEFT JOIN contract_fn cf ON cf.id = tx.contract_fn_id
+      LEFT JOIN stacks_tx_type ttype ON ttype.id = tx.stacks_tx_type_id
       WHERE ${whereClause}
-      ORDER BY ${safeSortBy} ${sortDir}
-      LIMIT :limit OFFSET :offset
+      ORDER BY ${sortExpr} ${sortDir}
+      LIMIT :_limit OFFSET :_offset
     `;
 
     const rows = queryAll(db, sql, params);
@@ -571,10 +579,6 @@ app.get("/api/transactions", (req, res) => {
 app.get("/api/transactions/maxes", (req, res) => {
   try {
     const runId = parseOptionalInt(req.query.run_id, "run_id");
-    const minDurationMs = parseOptionalInt(req.query.min_duration_ms, "min_duration_ms");
-    const principalFilters = parseCsvList(req.query.principal);
-    const contractFilters = parseCsvList(req.query.contract);
-    const contractFnFilters = parseCsvList(req.query.contract_fn);
 
     if (runId == null) {
       return res.status(400).json({ error: "run_id is required" });
@@ -583,33 +587,10 @@ app.get("/api/transactions/maxes", (req, res) => {
     const conditions = ["sts.benchmark_run_id = :run_id"];
     const params = { run_id: runId };
 
-    if (minDurationMs != null) {
-      conditions.push("sts.duration_us >= :min_duration_us");
-      params.min_duration_us = minDurationMs * 1000;
-    }
-    if (principalFilters.length) {
-      const clauses = principalFilters.map((value, index) => {
-        const key = `principal_filter_${index}`;
-        params[key] = `%${value}%`;
-        return `p.address LIKE :${key}`;
-      });
-      conditions.push(`(${clauses.join(" OR ")})`);
-    }
-    if (contractFilters.length) {
-      const clauses = contractFilters.map((value, index) => {
-        const key = `contract_filter_${index}`;
-        params[key] = `%${value}%`;
-        return `c.name LIKE :${key}`;
-      });
-      conditions.push(`(${clauses.join(" OR ")})`);
-    }
-    if (contractFnFilters.length) {
-      const clauses = contractFnFilters.map((value, index) => {
-        const key = `contract_fn_filter_${index}`;
-        params[key] = `%${value}%`;
-        return `cf.name LIKE :${key}`;
-      });
-      conditions.push(`(${clauses.join(" OR ")})`);
+    const filterResult = parseFilterParam(req.query.filter);
+    if (filterResult) {
+      conditions.push(filterResult.sql);
+      Object.assign(params, filterResult.params);
     }
 
     const whereClause = conditions.join(" AND ");
@@ -627,6 +608,9 @@ app.get("/api/transactions/maxes", (req, res) => {
       LEFT JOIN contract c ON c.id = tx.contract_id
       LEFT JOIN principal p ON p.id = c.issuer_principal_id
       LEFT JOIN contract_fn cf ON cf.id = tx.contract_fn_id
+      LEFT JOIN stacks_tx_type ttype ON ttype.id = tx.stacks_tx_type_id
+      JOIN synthetic_block synth ON synth.id = sts.synthetic_block_id
+      JOIN stacks_block sb ON sb.id = synth.stacks_block_id
       WHERE ${whereClause}
     `;
 
@@ -639,87 +623,57 @@ app.get("/api/transactions/maxes", (req, res) => {
 });
 
 // Autocomplete for transactions filters
+// Accepts: run_id, field (one of FILTER_FIELD_MAP keys), q (search text), limit, filter (JSON DSL)
 app.get("/api/transactions/autocomplete", (req, res) => {
   try {
     const runId = parseOptionalInt(req.query.run_id, "run_id");
-    const type = req.query.type;
+    const field = req.query.field;
     const query = String(req.query.q || "").trim();
-    const limit = parseOptionalInt(req.query.limit, "limit") || 20;
-    const principalFilters = parseCsvList(req.query.principal);
-    const contractFilters = parseCsvList(req.query.contract);
-    const contractFnFilters = parseCsvList(req.query.contract_fn);
+    const limit = parseOptionalInt(req.query.limit, "limit") || 30;
 
     if (runId == null) {
       return res.status(400).json({ error: "run_id is required" });
     }
-    if (!type || !["principal", "contract", "function"].includes(type)) {
-      return res.status(400).json({ error: "type must be principal, contract, or function" });
-    }
-    if (!query) {
-      return res.json({ values: [] });
+    if (!field || !ALLOWED_FIELDS.has(field)) {
+      return res.status(400).json({ error: `field must be one of: ${[...ALLOWED_FIELDS].join(", ")}` });
     }
 
-    const params = {
-      run_id: runId,
-      query: `%${query}%`,
-      limit,
-    };
+    const sqlField = FILTER_FIELD_MAP[field];
     const conditions = ["sts.benchmark_run_id = :run_id"];
+    const params = { run_id: runId, _limit: limit };
 
-    if (type !== "principal" && principalFilters.length) {
-      const clauses = principalFilters.map((value, index) => {
-        const key = `principal_filter_${index}`;
-        params[key] = `%${value}%`;
-        return `p.address LIKE :${key}`;
-      });
-      conditions.push(`(${clauses.join(" OR ")})`);
-    }
-    if (type !== "contract" && contractFilters.length) {
-      const clauses = contractFilters.map((value, index) => {
-        const key = `contract_filter_${index}`;
-        params[key] = `%${value}%`;
-        return `c.name LIKE :${key}`;
-      });
-      conditions.push(`(${clauses.join(" OR ")})`);
-    }
-    if (type !== "function" && contractFnFilters.length) {
-      const clauses = contractFnFilters.map((value, index) => {
-        const key = `contract_fn_filter_${index}`;
-        params[key] = `%${value}%`;
-        return `cf.name LIKE :${key}`;
-      });
-      conditions.push(`(${clauses.join(" OR ")})`);
+    // Apply existing filter DSL (so autocomplete narrows with other active filters)
+    const filterResult = parseFilterParam(req.query.filter);
+    if (filterResult) {
+      conditions.push(filterResult.sql);
+      Object.assign(params, filterResult.params);
     }
 
-    let selectField = "";
-    let orderField = "";
-    if (type === "principal") {
-      selectField = "p.address";
-      orderField = "p.address";
-      conditions.push("p.address LIKE :query");
-    } else if (type === "contract") {
-      selectField = "c.name";
-      orderField = "c.name";
-      conditions.push("c.name LIKE :query");
-    } else {
-      selectField = "cf.name";
-      orderField = "cf.name";
-      conditions.push("cf.name LIKE :query");
+    // Apply search text
+    if (query) {
+      params._acq = `%${query}%`;
+      conditions.push(`${sqlField} LIKE :_acq`);
     }
+
+    // Only return non-null values
+    conditions.push(`${sqlField} IS NOT NULL`);
 
     const sql = `
-      SELECT DISTINCT ${selectField} AS value
+      SELECT DISTINCT ${sqlField} AS value
       FROM stacks_tx_stats sts
       JOIN stacks_tx tx ON tx.id = sts.stacks_tx_id
       LEFT JOIN contract c ON c.id = tx.contract_id
       LEFT JOIN principal p ON p.id = c.issuer_principal_id
       LEFT JOIN contract_fn cf ON cf.id = tx.contract_fn_id
+      LEFT JOIN stacks_tx_type ttype ON ttype.id = tx.stacks_tx_type_id
+      JOIN synthetic_block synth ON synth.id = sts.synthetic_block_id
+      JOIN stacks_block sb ON sb.id = synth.stacks_block_id
       WHERE ${conditions.join(" AND ")}
-      ORDER BY ${orderField}
-      LIMIT :limit
+      ORDER BY ${sqlField}
+      LIMIT :_limit
     `;
 
-    const rows = queryAll(db, sql, params).filter((row) => row.value);
+    const rows = queryAll(db, sql, params);
     return res.json({ values: rows.map((row) => row.value) });
   } catch (error) {
     console.error("Transactions autocomplete error:", error);
@@ -748,6 +702,20 @@ app.get("/api/contracts", (req, res) => {
         LIMIT 1000
       `,
       { run_id: runId }
+    );
+    return res.json(rows);
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// Get available transaction types (enum values for filters)
+app.get("/api/tx-types", (_req, res) => {
+  try {
+    const rows = queryAll(
+      db,
+      `SELECT id, name FROM stacks_tx_type ORDER BY name`,
+      {}
     );
     return res.json(rows);
   } catch (error) {
