@@ -14,11 +14,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::HashSet;
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use clarity::util::hash::Sha512Trunc256Sum;
+use clarity::vm::database::clarity_store::make_contract_hash_key;
 use clarity::vm::database::sqlite::{
     sqlite_get_contract_hash, sqlite_get_metadata, sqlite_get_metadata_manual,
     sqlite_insert_metadata,
@@ -33,7 +35,7 @@ use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash}
 
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MarfTransaction, MARF};
 use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
-use crate::chainstate::stacks::index::{ClarityMarfTrieId, Error, MARFValue};
+use crate::chainstate::stacks::index::{trie_sql, ClarityMarfTrieId, Error, MARFValue};
 use crate::clarity_vm::clarity::{
     ClarityMarfStore, ClarityMarfStoreTransaction, WritableMarfStore,
 };
@@ -1245,3 +1247,256 @@ impl<'a> ClarityBackingStore for Box<dyn WritableMarfStore + 'a> {
 
 impl<'a> ClarityMarfStore for Box<dyn WritableMarfStore + 'a> {}
 impl<'a> WritableMarfStore for Box<dyn WritableMarfStore + 'a> {}
+
+// ---------------------------------------------------------------------------
+// Clarity MARF squash helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the MARF database at `db_path` contains Clarity
+/// side-storage tables (`data_table` and `metadata_table`).
+///
+/// Used by the squash tooling to auto-detect whether the source MARF is a
+/// Clarity MARF (as opposed to an Index MARF or Sortition MARF) and decide
+/// whether to run the side-table copy step.
+pub fn has_clarity_side_tables(db_path: &str) -> Result<bool, Error> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(Error::SQLError)?;
+
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='data_table'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+
+    Ok(exists)
+}
+
+/// Copy Clarity side-storage tables (`data_table`, `metadata_table`) from a
+/// source MARF database to a squashed MARF database.
+///
+/// **Must be called after [`MARF::squash_to_path`]** has created the squashed
+/// trie in `dst_db_path`.
+///
+/// This function:
+/// 1. Initialises the Clarity schema on the destination (tables + indices +
+///    WAL journal mode) via [`SqliteConnection::initialize_conn`].
+/// 2. Attaches the source database.
+/// 3. Within a single transaction, bulk-copies every row from `data_table`
+///    and `metadata_table`.
+/// 4. Detaches the source database.
+///
+/// The copy is **transactional**: if any step inside the transaction fails the
+/// entire copy is rolled back, leaving the destination with empty Clarity
+/// tables (which will be caught by validation or at runtime).
+///
+/// # Returns
+///
+/// A [`ClaritySideTableStats`] on success, or an [`Error`] on failure.
+pub fn copy_clarity_side_tables(
+    src_db_path: &str,
+    dst_db_path: &str,
+) -> Result<ClaritySideTableStats, Error> {
+    let conn = Connection::open(dst_db_path).map_err(Error::SQLError)?;
+
+    // Step 1 — Clarity schema (tables + index + WAL).
+    // `initialize_conn` is idempotent (`CREATE TABLE IF NOT EXISTS`).
+    SqliteConnection::initialize_conn(&conn).map_err(|e| {
+        Error::CorruptionError(format!("Failed to initialize Clarity schema: {e:?}"))
+    })?;
+
+    // Step 2 — Attach source DB.
+    conn.execute("ATTACH DATABASE ?1 AS src", [src_db_path])
+        .map_err(Error::SQLError)?;
+
+    // Step 3 — Transactional bulk copy.
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(Error::SQLError)?;
+
+    let copy_result = (|| -> Result<ClaritySideTableStats, rusqlite::Error> {
+        let data_rows: u64 = conn.execute(
+            "INSERT OR IGNORE INTO data_table SELECT * FROM src.data_table",
+            [],
+        )? as u64;
+
+        let metadata_rows: u64 = conn.execute(
+            "INSERT OR IGNORE INTO metadata_table SELECT * FROM src.metadata_table",
+            [],
+        )? as u64;
+
+        Ok(ClaritySideTableStats {
+            data_table_rows: data_rows,
+            metadata_table_rows: metadata_rows,
+        })
+    })();
+
+    match copy_result {
+        Ok(stats) => {
+            conn.execute_batch("COMMIT").map_err(Error::SQLError)?;
+            // Step 4 — Detach.
+            conn.execute_batch("DETACH src")
+                .map_err(Error::SQLError)?;
+            Ok(stats)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch("DETACH src");
+            Err(Error::SQLError(e))
+        }
+    }
+}
+
+/// Row-count statistics returned by [`copy_clarity_side_tables`].
+#[derive(Debug, Clone)]
+pub struct ClaritySideTableStats {
+    /// Number of rows copied into `data_table`.
+    pub data_table_rows: u64,
+    /// Number of rows copied into `metadata_table`.
+    pub metadata_table_rows: u64,
+}
+
+/// Validate that a squashed Clarity MARF's side tables match the source.
+///
+/// Checks:
+/// - `data_table` row count matches.
+/// - `metadata_table` row count matches.
+/// - A sample of `MARFValue` hashes from squashed trie leaves resolve in the
+///   squashed `data_table`.
+///
+/// Returns [`ClaritySideTableValidation`] with detailed results.
+pub fn validate_clarity_side_tables(
+    src_db_path: &str,
+    dst_db_path: &str,
+) -> Result<ClaritySideTableValidation, Error> {
+    let src_conn = Connection::open_with_flags(
+        src_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(Error::SQLError)?;
+
+    let dst_conn = Connection::open_with_flags(
+        dst_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(Error::SQLError)?;
+
+    let src_data_rows: u64 = src_conn
+        .query_row("SELECT COUNT(*) FROM data_table", [], |row| row.get(0))
+        .map_err(Error::SQLError)?;
+    let dst_data_rows: u64 = dst_conn
+        .query_row("SELECT COUNT(*) FROM data_table", [], |row| row.get(0))
+        .map_err(Error::SQLError)?;
+
+    let src_meta_rows: u64 = src_conn
+        .query_row("SELECT COUNT(*) FROM metadata_table", [], |row| row.get(0))
+        .map_err(Error::SQLError)?;
+    let dst_meta_rows: u64 = dst_conn
+        .query_row("SELECT COUNT(*) FROM metadata_table", [], |row| row.get(0))
+        .map_err(Error::SQLError)?;
+
+    // Sample check: take up to N contract identifiers from metadata_table,
+    // derive their contract-hash keys, then ensure the trie values exist
+    // and their hashed values are present in the destination data_table.
+    const SAMPLE_CONTRACT_LIMIT: usize = 20;
+    let mut contract_ids: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = src_conn
+            .prepare("SELECT key FROM metadata_table")
+            .map_err(Error::SQLError)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(Error::SQLError)?;
+        for row in rows {
+            if contract_ids.len() >= SAMPLE_CONTRACT_LIMIT {
+                break;
+            }
+            if let Ok(key) = row {
+                if let Some(rest) = key.strip_prefix("clr-meta::") {
+                    if let Some((contract_id, _meta_key)) = rest.rsplit_once("::") {
+                        contract_ids.insert(contract_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut sample_contracts_checked: u64 = 0;
+    let mut sample_contracts_missing_in_trie: u64 = 0;
+    let mut sample_contracts_missing_in_data_table: u64 = 0;
+
+    if !contract_ids.is_empty() {
+        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+        let mut marf = MARF::<StacksBlockId>::from_path(dst_db_path, open_opts)?;
+        let tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())?;
+
+        for contract_id in contract_ids.iter() {
+            sample_contracts_checked += 1;
+            let contract = clarity::vm::types::QualifiedContractIdentifier::parse(contract_id)
+                .map_err(|e| {
+                    Error::CorruptionError(format!(
+                        "Failed to parse contract identifier '{contract_id}': {e:?}"
+                    ))
+                })?;
+            let key = make_contract_hash_key(&contract);
+            let trie_value = marf.get(&tip, &key)?;
+            let Some(trie_value) = trie_value else {
+                sample_contracts_missing_in_trie += 1;
+                continue;
+            };
+
+            let side_key = trie_value.to_hex();
+            let exists: bool = dst_conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM data_table WHERE key = ?1",
+                    [side_key],
+                    |row| row.get(0),
+                )
+                .map_err(Error::SQLError)?;
+            if !exists {
+                sample_contracts_missing_in_data_table += 1;
+            }
+        }
+    }
+
+    Ok(ClaritySideTableValidation {
+        data_table_rows_match: src_data_rows == dst_data_rows,
+        src_data_table_rows: src_data_rows,
+        dst_data_table_rows: dst_data_rows,
+        metadata_table_rows_match: src_meta_rows == dst_meta_rows,
+        src_metadata_table_rows: src_meta_rows,
+        dst_metadata_table_rows: dst_meta_rows,
+        sample_contracts_checked,
+        sample_contracts_missing_in_trie,
+        sample_contracts_missing_in_data_table,
+    })
+}
+
+/// Validation results for Clarity side tables.
+#[derive(Debug, Clone)]
+pub struct ClaritySideTableValidation {
+    /// Whether `data_table` row counts match.
+    pub data_table_rows_match: bool,
+    /// Source `data_table` row count.
+    pub src_data_table_rows: u64,
+    /// Destination `data_table` row count.
+    pub dst_data_table_rows: u64,
+    /// Whether `metadata_table` row counts match.
+    pub metadata_table_rows_match: bool,
+    /// Source `metadata_table` row count.
+    pub src_metadata_table_rows: u64,
+    /// Destination `metadata_table` row count.
+    pub dst_metadata_table_rows: u64,
+    /// Number of contract identifiers sampled from metadata_table.
+    pub sample_contracts_checked: u64,
+    /// Sampled contracts missing from the trie (should be 0).
+    pub sample_contracts_missing_in_trie: u64,
+    /// Sampled contracts whose trie values are missing from data_table (should be 0).
+    pub sample_contracts_missing_in_data_table: u64,
+}
+
+#[cfg(test)]
+mod marf_tests;
