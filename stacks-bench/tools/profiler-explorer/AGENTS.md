@@ -35,17 +35,26 @@ The Profiler Explorer is a web-based tool for visualizing and analyzing profiler
 
 ```text
 profiler-explorer/
-├── server.js                 # Node/Express REST API backend
-├── package.json              # Node dependencies/scripts
-├── static/                   # Vanilla JS fallback UI
-│   ├── index.html
-│   ├── app.js
-│   └── styles.css
-└── web/                      # Primary React/Vite frontend
+├── server.ts                 # Node/Express REST API backend (TypeScript, run via node --experimental-strip-types)
+├── filter-dsl.ts             # MongoDB-style filter DSL → SQL compiler
+├── filter-dsl.test.ts        # 71 backend unit tests (node --test)
+├── types.ts                  # Shared backend types (FilterNode, RunRow, TraceRecord, etc.)
+├── package.json              # Node dependencies/scripts (type: "module")
+└── web/                      # Primary React/Vite frontend (TypeScript)
     ├── src/
-    │   ├── App.jsx           # Main component (1600+ lines)
-    │   ├── main.jsx          # Entry point
-    │   └── styles.css        # Tailwind + custom CSS
+    │   ├── App.tsx           # Main component (~1086 lines)
+    │   ├── main.tsx          # Entry point
+    │   ├── columnsConfig.ts  # Column definitions, selectable/visible helpers
+    │   ├── profilerConfig.ts # Shared defaults (themes, heat colors, number formats)
+    │   ├── treeTransforms.ts # Tree transforms + metric helpers
+    │   ├── columnBuilders.tsx # Header builder helpers
+    │   ├── styles.css        # Tailwind + custom CSS
+    │   ├── contexts/         # React context providers
+    │   │   ├── ProfilerGridContext.tsx
+    │   │   └── TransactionsGridContext.tsx
+    │   ├── components/       # Extracted UI components (.tsx)
+    │   └── ui/               # UI primitives (.tsx)
+    ├── tsconfig.json         # strict: true, paths: @/* → ./src/*
     ├── package.json
     ├── vite.config.js
     └── tailwind.config.js
@@ -53,11 +62,12 @@ profiler-explorer/
 
 ### Technology Stack
 
-- **Backend**: Node.js, Express, better-sqlite3
-- **Frontend**: React 18, Vite 5, Tailwind CSS 3.4, shadcn/ui, @svar-ui/react-grid
+- **Backend**: Node.js 24+ (native TypeScript via `--experimental-strip-types`), Express 5, better-sqlite3
+- **Frontend**: React 19, Vite 7, Tailwind CSS 4, @base-ui/react, @svar-ui/react-grid
+- **Type checking**: TypeScript 5.9 (strict mode, `tsc --noEmit` for frontend)
 - **Database**: SQLite (located at `~/.stacks-bench/appdata/stacks-bench.db` or via `STACKS_BENCH_DB` env var)
 
-## Backend API (`server.js`)
+## Backend API (`server.ts`)
 
 ### Endpoints
 
@@ -98,16 +108,20 @@ The backend uses recursive CTEs to build ancestor/descendant trees:
 - `profiler_record_kv` - Key-value store operations
 - `profiler_record_clarity_costs` - Clarity VM cost tracking
 
-## Frontend (`web/src/App.jsx`)
+## Frontend (`web/src/App.tsx`)
 
 ### Frontend Module Map
 
-- `columnsConfig.js`: column definitions, selectable/visible helpers
-- `profilerConfig.js`: shared defaults (themes, heat colors, number formats, auto-expand)
-- `treeTransforms.js`: tree transforms + metric helpers
-- `columnBuilders.jsx`: header builder helpers
+- `columnsConfig.ts`: column definitions (`ColumnDef`), selectable/visible helpers, `NUMERIC_COLUMN_KEYS`
+- `profilerConfig.ts`: shared defaults (themes, heat colors, number formats, auto-expand)
+- `treeTransforms.ts`: tree transforms (`TreeNode` type) + metric helpers
+- `columnBuilders.tsx`: header builder helpers (`createHeatHeaderBuilder`, `createSpanHeaderBuilder`)
+- `contexts/ProfilerGridContext.tsx`: profiler grid context (`ProfilerGridCallbacks`, `HeatConfigEntry`, `SpanVizConfig`)
+- `contexts/TransactionsGridContext.tsx`: transactions grid context (`TransactionsGridCallbacks`)
+- `components/filter-builder.tsx`: MongoDB-style filter DSL UI (`FilterBuilder`, `FilterRule`, `FilterFieldDef`)
 - `components/`: extracted UI pieces (`HeaderBar`, `ToolbarBar`, `BreadcrumbBar`, `HeatCells`,
-  `SpanCell`, `HeatHeaderCell`, `SpanHeaderCell`, `SettingsPanel`, `ProfilerGrid`)
+  `SpanCell`, `HeatHeaderCell`, `SpanHeaderCell`, `SettingsPanel`, `ProfilerGrid`, `TransactionsTab`, `SpanDetailsModal`)
+- `ui/`: UI primitives (button, input, select, popover, dialog, tooltip, etc.)
 
 ### State Structure
 
@@ -174,12 +188,18 @@ Heat keys: `wallTotalUs`, `selfWallUs`, `busyTotalUs`, `selfBusyUs`, `waitTotalU
 # Backend
 cd stacks-bench/tools/profiler-explorer
 npm install
-node server.js  # Starts on port 8800
+node --experimental-strip-types server.ts  # Starts on port 8800
+
+# Backend tests
+node --test filter-dsl.test.ts  # 71 tests
 
 # Frontend (development)
 cd web
 npm install
 npm run dev  # Starts on port 5173 with API proxy
+
+# Frontend type checking
+npx tsc --noEmit  # Strict mode, zero errors expected
 
 # Frontend (production build)
 npm run build  # Outputs to dist/
@@ -194,16 +214,17 @@ npm run build  # Outputs to dist/
 
 ### Adding a New Column
 
-1. Add entry to `COLUMN_DEFS` array in `columnsConfig.js`
+1. Add entry to `COLUMN_DEFS` array in `columnsConfig.ts`
 2. Define `key`, `label`, `width`, `getter` function
 3. Optionally add `heatKey` for heat map support
-4. Add custom `render` function if needed
+4. Add custom `cell` function if needed
 
 ### Adding a New API Endpoint
 
-1. Add route in `server.js` with `app.get()`
+1. Add route in `server.ts` with `app.get()`
 2. Use parameterized SQL queries (never string interpolation)
-3. Return JSON with appropriate error handling
+3. Add types to `types.ts` for request/response shapes
+4. Return JSON with appropriate error handling
 
 ### Modifying Tree Transformation
 
@@ -217,8 +238,11 @@ Tree transforms are in the pipeline between data fetch and render. Each function
 
 ## Code Style Notes
 
+- All code is TypeScript (strict mode for frontend, `--experimental-strip-types` for backend)
 - React functional components with hooks
 - Tailwind CSS utility classes for styling
+- @base-ui/react for accessible UI primitives
 - Custom CSS variables use oklch color space
 - Dark theme is the default/only theme
 - Number formatting supports international locales
+- Types are co-located: `types.ts` (backend), context files (frontend shared types), component files (component-local types)

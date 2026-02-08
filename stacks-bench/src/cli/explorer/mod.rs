@@ -9,7 +9,7 @@ use clap::{Args, Subcommand};
 use crate::cli::common::CliContext;
 
 const EXPLORER_REL_PATH: &str = "tools/profiler-explorer";
-const SERVER_FILE: &str = "server.js";
+const SERVER_FILE: &str = "server.ts";
 const DIST_DIR_NAME: &str = "dist";
 const NODE_MODULES_DIR_NAME: &str = "node_modules";
 const PID_FILE_NAME: &str = "profiler-explorer.pid";
@@ -104,6 +104,7 @@ async fn start_explorer(ctx: &CliContext, args: &ExplorerStartArgs) -> Result<()
         .with_context(|| format!("Failed to open log file at {log_path:?}"))?;
 
     let child = Command::new("node")
+        .arg("--experimental-strip-types")
         .arg(SERVER_FILE)
         .arg("--db")
         .arg(&db_path)

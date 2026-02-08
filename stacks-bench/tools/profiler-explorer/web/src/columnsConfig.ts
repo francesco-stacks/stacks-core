@@ -13,7 +13,7 @@ type ColumnFormat = {
  * For columns with level1/level2, use colspan to span multiple columns.
  * Columns that start a group/subgroup have `level1Start: true` / `level2Start: true`.
  */
-type ColumnDef = {
+export type ColumnDef = {
   key: string;
   label: string;
   width?: number;
@@ -25,6 +25,9 @@ type ColumnDef = {
   treetoggle?: boolean;
   format?: ColumnFormat;
   getter?: (row: Record<string, any>) => any;
+  cell?: (props: any) => any;
+  heatKey?: string;
+  headerLabel?: string;
   // 3-level header structure
   level1?: string;
   level1Span?: number;
