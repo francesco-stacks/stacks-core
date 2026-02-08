@@ -35,10 +35,10 @@ function ContextMenuSubTrigger({ className, inset, children, ...props }: React.C
 function ContextMenuSubContent({ className, ...props }: React.ComponentProps<typeof ContextMenuPrimitive.Popup> & { className?: string }) {
   return (
     <ContextMenuPrimitive.Portal>
-      <ContextMenuPrimitive.Positioner>
+      <ContextMenuPrimitive.Positioner style={{ zIndex: 200 }}>
         <ContextMenuPrimitive.Popup
           className={cn(
-            "z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md data-open:animate-in data-closed:animate-out data-closed:fade-out-0 data-open:fade-in-0 data-closed:zoom-out-95 data-open:zoom-in-95",
+            "min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md data-open:animate-in data-closed:animate-out data-closed:fade-out-0 data-open:fade-in-0 data-closed:zoom-out-95 data-open:zoom-in-95",
             className
           )}
           {...props}
@@ -51,10 +51,10 @@ function ContextMenuSubContent({ className, ...props }: React.ComponentProps<typ
 function ContextMenuContent({ className, ...props }: React.ComponentProps<typeof ContextMenuPrimitive.Popup> & { className?: string }) {
   return (
     <ContextMenuPrimitive.Portal>
-      <ContextMenuPrimitive.Positioner>
+      <ContextMenuPrimitive.Positioner style={{ zIndex: 200 }}>
         <ContextMenuPrimitive.Popup
           className={cn(
-            "z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md data-open:animate-in data-closed:animate-out data-closed:fade-out-0 data-open:fade-in-0 data-closed:zoom-out-95 data-open:zoom-in-95",
+            "min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md data-open:animate-in data-closed:animate-out data-closed:fade-out-0 data-open:fade-in-0 data-closed:zoom-out-95 data-open:zoom-in-95",
             className
           )}
           {...props}

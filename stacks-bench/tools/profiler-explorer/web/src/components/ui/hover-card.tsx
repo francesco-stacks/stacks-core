@@ -39,10 +39,10 @@ function HoverCardTrigger({ asChild, children, delay: delayProp, closeDelay: clo
 function HoverCardContent({ className, align = "center", side, sideOffset = 4, style, ...props }: React.ComponentProps<typeof HoverCardPrimitive.Popup> & { align?: string; side?: "top" | "right" | "bottom" | "left"; sideOffset?: number; className?: string; style?: React.CSSProperties }) {
   return (
     <HoverCardPrimitive.Portal>
-      <HoverCardPrimitive.Positioner align={align as "start" | "center" | "end"} side={side} sideOffset={sideOffset}>
+      <HoverCardPrimitive.Positioner align={align as "start" | "center" | "end"} side={side} sideOffset={sideOffset} style={{ zIndex: 200 }}>
         <HoverCardPrimitive.Popup
           className={cn(
-            "z-50 w-64 rounded-[10px] border border-border p-4 text-popover-foreground shadow-md outline-none data-open:animate-in data-closed:animate-out data-closed:fade-out-0 data-open:fade-in-0 data-closed:zoom-out-95 data-open:zoom-in-95",
+            "w-64 rounded-[10px] border border-border p-4 text-popover-foreground shadow-md outline-none data-open:animate-in data-closed:animate-out data-closed:fade-out-0 data-open:fade-in-0 data-closed:zoom-out-95 data-open:zoom-in-95",
             className
           )}
           style={{ backgroundColor: 'var(--popover)', ...style }}

@@ -42,10 +42,10 @@ function DropdownMenuSubTrigger({ className, inset, children, ...props }: React.
 function DropdownMenuSubContent({ className, ...props }: React.ComponentProps<typeof MenuPrimitive.Popup> & { className?: string }) {
   return (
     <MenuPrimitive.Portal>
-      <MenuPrimitive.Positioner>
+      <MenuPrimitive.Positioner style={{ zIndex: 200 }}>
         <MenuPrimitive.Popup
           className={cn(
-            "z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-lg data-open:animate-in data-closed:animate-out data-closed:fade-out-0 data-open:fade-in-0 data-closed:zoom-out-95 data-open:zoom-in-95 origin-[--transform-origin]",
+            "min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-lg data-open:animate-in data-closed:animate-out data-closed:fade-out-0 data-open:fade-in-0 data-closed:zoom-out-95 data-open:zoom-in-95 origin-[--transform-origin]",
             className
           )}
           {...props}
@@ -58,10 +58,10 @@ function DropdownMenuSubContent({ className, ...props }: React.ComponentProps<ty
 function DropdownMenuContent({ className, sideOffset = 4, align, side, ...props }: React.ComponentProps<typeof MenuPrimitive.Popup> & { sideOffset?: number; align?: string; side?: "top" | "right" | "bottom" | "left"; className?: string }) {
   return (
     <MenuPrimitive.Portal>
-      <MenuPrimitive.Positioner sideOffset={sideOffset} align={align as "start" | "center" | "end"} side={side}>
+      <MenuPrimitive.Positioner sideOffset={sideOffset} align={align as "start" | "center" | "end"} side={side} style={{ zIndex: 200 }}>
         <MenuPrimitive.Popup
           className={cn(
-            "z-50 max-h-[var(--available-height)] min-w-[8rem] overflow-y-auto overflow-x-hidden rounded-[10px] border text-popover-foreground dropdown-popover-enhanced",
+            "max-h-[var(--available-height)] min-w-[8rem] overflow-y-auto overflow-x-hidden rounded-[10px] border text-popover-foreground dropdown-popover-enhanced",
             "data-open:animate-in data-closed:animate-out data-closed:fade-out-0 data-open:fade-in-0 data-closed:zoom-out-95 data-open:zoom-in-95 origin-[--transform-origin]",
             className
           )}
