@@ -325,7 +325,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, Command, LatestHeightArgs, SquashArgs, ValidateArgs};
+    use super::{Cli, Command, LatestHeightArgs, ValidateArgs};
 
     #[test]
     fn test_parse_squash_args_ok() {
@@ -383,6 +383,7 @@ mod tests {
                 squashed_db,
                 squashed_blobs,
                 height,
+                ..
             }) => {
                 assert_eq!(source_db, PathBuf::from("/tmp/source.sqlite"));
                 assert_eq!(source_blobs, PathBuf::from("/tmp/source.sqlite.blobs"));

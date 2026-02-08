@@ -219,6 +219,103 @@ pub fn write_placeholder_block_entry<T: MarfTrieId>(
     write_external_trie_blob(conn, block_hash, external_offset, external_length)
 }
 
+/// Bulk-read all confirmed block entries from `marf_data`.
+///
+/// Returns `(block_id, block_hash, external_offset)` for every confirmed row,
+/// ordered by `block_id`.  Used by the squash pipeline to avoid per-row SQL
+/// lookups for block IDs and blob offsets.
+pub fn bulk_read_block_entries<T: MarfTrieId>(
+    conn: &Connection,
+) -> Result<Vec<(u32, T, u64)>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT block_id, block_hash, external_offset FROM marf_data \
+         WHERE unconfirmed = 0 ORDER BY block_id",
+    )?;
+    let rows = stmt.query_map(NO_PARAMS, |row| {
+        let block_id: u32 = row.get(0)?;
+        let block_hash: T = row.get(1)?;
+        let offset_i64: i64 = row.get(2)?;
+        Ok((block_id, block_hash, offset_i64 as u64))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// Bulk-read all per-height root hashes from `marf_squash_root_hashes`.
+///
+/// Returns `(height, root_hash)` for every row.  Used by validation to avoid
+/// per-height SQL lookups.
+pub fn bulk_read_squash_root_hashes(
+    conn: &Connection,
+) -> Result<Vec<(u32, TrieHash)>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT height, root_hash FROM marf_squash_root_hashes ORDER BY height",
+    )?;
+    let rows = stmt.query_map(NO_PARAMS, |row| {
+        let height: i64 = row.get(0)?;
+        let root_bytes: Vec<u8> = row.get(1)?;
+        Ok((height as u32, root_bytes))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (h, bytes) = row?;
+        let hash_bytes = bytes.get(..TRIEHASH_ENCODED_SIZE).ok_or_else(|| {
+            Error::CorruptionError("Squash root hash bytes too short".to_string())
+        })?;
+        let root = TrieHash::from_bytes(hash_bytes).ok_or_else(|| {
+            Error::CorruptionError("Invalid squash root hash bytes".to_string())
+        })?;
+        result.push((h, root));
+    }
+    Ok(result)
+}
+
+/// Count how many `marf_data` rows have a blob offset/length that differs
+/// from the expected values.  Used by validation to check that all
+/// historical entries share the same shared blob.
+///
+/// Returns the number of mismatched rows (should be 0 for a correct squash).
+pub fn count_blob_offset_mismatches<T: MarfTrieId>(
+    conn: &Connection,
+    expected_offset: u64,
+    expected_length: u64,
+    tip_block_hash: &T,
+) -> Result<u64, Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM marf_data \
+         WHERE (external_offset != ?1 OR external_length != ?2) \
+         AND block_hash != ?3 \
+         AND unconfirmed = 0",
+        params![
+            u64_to_sql(expected_offset)?,
+            u64_to_sql(expected_length)?,
+            tip_block_hash
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
+/// Bulk-update all `marf_data` entries to share the same blob offset/length,
+/// except for the tip block.  Used post-commit in the squash pipeline to
+/// point all historical placeholder entries at the shared blob.
+pub fn bulk_update_blob_offsets<T: MarfTrieId>(
+    conn: &Connection,
+    offset: u64,
+    length: u64,
+    tip_block_hash: &T,
+) -> Result<u64, Error> {
+    let affected = conn.execute(
+        "UPDATE marf_data SET external_offset = ?1, external_length = ?2 \
+         WHERE block_hash != ?3 AND unconfirmed = 0",
+        params![u64_to_sql(offset)?, u64_to_sql(length)?, tip_block_hash],
+    )?;
+    Ok(affected as u64)
+}
+
 fn get_schema_version(conn: &Connection) -> u64 {
     // if the table doesn't exist, then the version is 1.
     let sql = "SELECT version FROM schema_version";
