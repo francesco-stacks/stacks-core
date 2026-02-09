@@ -170,13 +170,22 @@ impl<T: MarfTrieId> MARF<T> {
         //   b) direct blob seek -> reads 32-byte root hash at known offset
         //
         // This collects all height -> (block_hash, root_hash) mappings
-        // needed for placeholders and SQL metadata.  The trie walks also
-        // partially warm the OS page cache for the subsequent BFS.
+        // needed for placeholders and SQL metadata.
         let start_meta = Instant::now();
         let source_tip = trie_sql::get_latest_confirmed_block_hash::<T>(src.sqlite_conn())?;
         let blobs_path = format!("{src_path}.blobs");
+
+        // Each trie blob on disk is laid out as:
+        //   [0..32)  parent block hash  (BLOCK_HEADER_HASH_ENCODED_SIZE = 32 bytes)
+        //   [32..36) block identifier   (u32 LE, 4 bytes)
+        //   [36..)   root node hash     (TRIEHASH_ENCODED_SIZE = 32 bytes), then node data
+        //
+        // So the root node's hash starts at byte 36.  This matches the canonical
+        // `TrieFileStorage::root_ptr_disk()` calculation in storage.rs.
         let root_ptr_offset = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
+
         let blobs_file = File::open(&blobs_path).map_err(Error::IOError)?;
+        // Use a 64 KiB buffer to amortise syscalls over many small reads.
         let mut blobs_reader = BufReader::with_capacity(64 * 1024, blobs_file);
 
         let mut block_info: Vec<(u32, T, TrieHash)> = Vec::with_capacity((height + 1) as usize);
@@ -223,10 +232,7 @@ impl<T: MarfTrieId> MARF<T> {
             start_meta.elapsed()
         );
 
-        // Step 3: BFS deep copy (warm cache from Step 2)
-        //
-        // The per-height walks above warmed the cache with trie nodes
-        // and blob sections.
+        // Step 3: BFS deep copy
         let start_bfs = Instant::now();
         let (mut nodes, source_to_idx) =
             src.with_conn(|conn| MARF::<T>::deep_copy_bfs_nodes(conn, &block_at_height))?;
@@ -476,13 +482,11 @@ impl<T: MarfTrieId> MARF<T> {
     /// Returns:
     /// - `nodes`: `Vec<(TrieNodeType, TrieHash, origin_block_id)>` - raw
     ///   un-remapped nodes.  Index 0 is the root.
-    /// - `source_to_idx`: `(source_block_id, byte_offset) -> Vec index` map
+    /// - `source_to_idx`: `(source_block_id, byte_offset) -> Vec index map
     ///   needed by the remap pass.
     ///
     /// This function does pure node collection with no path tracking,
-    /// height mapping, or blob reads.  It is designed to run AFTER a
-    /// cache-warming phase (e.g. per-height walks) so the OS page cache
-    /// already contains the blob sections it needs to read.
+    /// height mapping, or blob reads.
     fn deep_copy_bfs_nodes(
         source: &mut TrieStorageConnection<T>,
         block_hash: &T,
@@ -504,8 +508,6 @@ impl<T: MarfTrieId> MARF<T> {
         source_to_idx.insert((root_block_id, root_disk_ptr), 0);
         nodes.push((root_node, root_hash, root_block_id));
 
-        // Simple index-only queue - no path vectors needed since we
-        // don't track height mapping leaves here.
         let mut queue: VecDeque<usize> = VecDeque::new();
         queue.push_back(0);
         let bfs_start = Instant::now();
@@ -780,8 +782,11 @@ impl<T: MarfTrieId> MARF<T> {
                 .map(|(id, bh, offset)| (bh, (id, offset)))
                 .collect();
             let source_blobs_path = format!("{src_path}.blobs");
+            // Byte offset of the root node hash within each trie blob.
+            // See blob layout comment in `squash_to_path` step 2.
             let root_ptr_offset = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
             let blobs_file = File::open(&source_blobs_path).map_err(Error::IOError)?;
+            // 64 KiB buffer to amortise syscalls over many small reads.
             let mut blobs_reader = BufReader::with_capacity(64 * 1024, blobs_file);
 
             // (b) Per-height walks + inline blob reads for source root hashes.
