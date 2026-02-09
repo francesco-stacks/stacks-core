@@ -1694,5 +1694,3 @@ pub struct ClaritySideTableValidation {
     pub missing_required_metadata_rows: u64,
 }
 
-#[cfg(test)]
-mod marf_tests;

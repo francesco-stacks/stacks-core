@@ -21,10 +21,12 @@ use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use tempfile::tempdir;
 
-use super::*;
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue};
+use crate::clarity_vm::database::marf::{
+    copy_clarity_side_tables, has_clarity_side_tables, validate_clarity_side_tables, MarfedKV,
+};
 
 /// Build a Clarity MARF with N blocks of data and a single contract.
 /// Returns the block hashes for each height.

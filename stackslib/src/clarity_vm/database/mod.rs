@@ -38,6 +38,9 @@ use crate::util_lib::db::{DBConn, Error as DBError, FromColumn, FromRow};
 pub mod ephemeral;
 pub mod marf;
 
+#[cfg(test)]
+mod tests;
+
 pub trait GetTenureStartId {
     fn get_tenure_block_id(
         &self,
