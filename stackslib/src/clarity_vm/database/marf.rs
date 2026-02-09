@@ -1321,16 +1321,33 @@ pub fn copy_clarity_side_tables(
         // Collect required value hashes from the squashed trie.
         let (_tip, needed_keys) = collect_trie_value_hashes(dst_db_path)?;
 
-        // Insert required keys into a temp table.
+        let src_data_count: u64 = conn
+            .query_row("SELECT COUNT(*) FROM src.data_table", [], |row| row.get(0))
+            .map_err(Error::SQLError)?;
+        let needed_count = needed_keys.len() as u64;
+        let pruned_count = src_data_count.saturating_sub(needed_count);
+        info!(
+            "Clarity side-table copy: copying {} of {} data_table values (pruning {})",
+            needed_count, src_data_count, pruned_count
+        );
+
+        // Insert required keys into a temp table in batches.
         conn.execute_batch("CREATE TEMP TABLE needed_keys (key TEXT PRIMARY KEY)")
             .map_err(Error::SQLError)?;
-        {
-            let mut stmt = conn
-                .prepare("INSERT OR IGNORE INTO needed_keys (key) VALUES (?1)")
-                .map_err(Error::SQLError)?;
-            for key in needed_keys.iter() {
-                stmt.execute([key]).map_err(Error::SQLError)?;
+        const NEEDED_KEYS_BATCH_SIZE: usize = 500;
+        for chunk in needed_keys.iter().collect::<Vec<_>>().chunks(NEEDED_KEYS_BATCH_SIZE) {
+            let mut placeholders = Vec::with_capacity(chunk.len());
+            let mut params = Vec::with_capacity(chunk.len());
+            for (idx, key) in chunk.iter().enumerate() {
+                placeholders.push(format!("(?{})", idx + 1));
+                params.push(*key);
             }
+            let sql = format!(
+                "INSERT OR IGNORE INTO needed_keys (key) VALUES {}",
+                placeholders.join(", ")
+            );
+            conn.execute(&sql, rusqlite::params_from_iter(params))
+                .map_err(Error::SQLError)?;
         }
 
         // Copy only required data_table rows.
