@@ -192,17 +192,18 @@ impl<T: MarfTrieId> MARF<T> {
                 })?;
             let bh = T::from(val);
 
-            // Direct blob seek for root hash - fast (no SQL overhead).
-            let rh = if let Some(&(_, blob_offset)) = block_map.get(&bh) {
-                blobs_reader.seek(SeekFrom::Start(blob_offset + root_ptr_offset))?;
-                let mut hash_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
-                blobs_reader.read_exact(&mut hash_bytes)?;
-                TrieHash(hash_bytes)
-            } else {
-                TrieHash([0u8; 32])
-            };
+            let &(block_id, blob_offset) = block_map.get(&bh).ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "Missing block map entry for block hash at height {h}"
+                ))
+            })?;
 
-            let (block_id, _blob_offset) = *block_map.get(&bh).ok_or(Error::NotFoundError)?;
+            // Direct blob seek for root hash.
+            blobs_reader.seek(SeekFrom::Start(blob_offset + root_ptr_offset))?;
+            let mut hash_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
+            blobs_reader.read_exact(&mut hash_bytes)?;
+            let rh = TrieHash(hash_bytes);
+
             archival_ids.insert(bh.clone(), block_id);
             block_info.push((h, bh, rh));
 
