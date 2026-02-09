@@ -15,6 +15,7 @@ import {
   applyFocus,
   applyHotPath,
   applyOpenState,
+  applyTreeFilter,
   buildTreeIndex,
   collectSubtreeIds,
   computeDefaultOpenSet,
@@ -23,10 +24,11 @@ import {
   getSelfWaitUs,
   getSelfWallUs,
   getWallUs,
+  isClarityPseudoContext,
   indexTree,
   pruneTree,
 } from "./treeTransforms.ts";
-import type { TreeNode } from "./treeTransforms.ts";
+import type { TreeNode, TreeFilterGroup } from "./treeTransforms.ts";
 import {
   ALWAYS_HIDDEN_KEYS,
   ALWAYS_VISIBLE_KEYS,
@@ -47,6 +49,81 @@ import {
   THEME_PRESETS,
 } from "./profilerConfig.ts";
 import { getBlocks, getRuns, getTrace, lookupTx } from "./lib/api.ts";
+import { FilterBuilder } from "./components/ui/filter-builder";
+import type { FilterFieldDef, FilterGroupValue, RichOption } from "./components/ui/filter-builder";
+
+// ---------------------------------------------------------------------------
+// Trace grid filter field definitions (client-side filtering)
+// ---------------------------------------------------------------------------
+
+// Trace grid filter field definitions — static fields (don't depend on loaded data)
+const TRACE_FILTER_FIELDS_STATIC: FilterFieldDef[] = [
+  { id: "tag", label: "Tag", type: "text" },
+  {
+    id: "clarity_fn_type",
+    label: "Function Type",
+    type: "enum",
+    enumValues: ["Built-In", "Public", "Private", "Read-Only"],
+    group: "Clarity",
+  },
+  { id: "call_count", label: "Calls", type: "number" },
+
+  // ── Wall Time ──
+  { id: "wall_inc_total",  label: "Wall Inc. Total",  type: "number", modifier: "duration", group: "Wall Time" },
+  { id: "wall_inc_avg",    label: "Wall Inc. Avg.",    type: "number", modifier: "duration", group: "Wall Time" },
+  { id: "wall_self_total", label: "Wall Self Total",   type: "number", modifier: "duration", group: "Wall Time" },
+  { id: "wall_self_avg",   label: "Wall Self Avg.",    type: "number", modifier: "duration", group: "Wall Time" },
+
+  // ── Busy Time ──
+  { id: "busy_inc_total",  label: "Busy Inc. Total",  type: "number", modifier: "duration", group: "Busy Time" },
+  { id: "busy_inc_avg",    label: "Busy Inc. Avg.",    type: "number", modifier: "duration", group: "Busy Time" },
+  { id: "busy_self_total", label: "Busy Self Total",   type: "number", modifier: "duration", group: "Busy Time" },
+  { id: "busy_self_avg",   label: "Busy Self Avg.",    type: "number", modifier: "duration", group: "Busy Time" },
+
+  // ── Wait Time ──
+  { id: "wait_inc_total",  label: "Wait Inc. Total",  type: "number", modifier: "duration", group: "Wait Time" },
+  { id: "wait_inc_avg",    label: "Wait Inc. Avg.",    type: "number", modifier: "duration", group: "Wait Time" },
+  { id: "wait_self_total", label: "Wait Self Total",   type: "number", modifier: "duration", group: "Wait Time" },
+  { id: "wait_self_avg",   label: "Wait Self Avg.",    type: "number", modifier: "duration", group: "Wait Time" },
+
+  // ── Clarity numeric metrics ──
+  { id: "clarity_runtime_total",      label: "Runtime Total",      type: "number", group: "Clarity" },
+  { id: "clarity_runtime_avg",        label: "Runtime Avg.",       type: "number", group: "Clarity" },
+  { id: "clarity_input_n_total",      label: "Cost Input (n) Total", type: "number", group: "Clarity" },
+  { id: "clarity_input_n_avg",        label: "Cost Input (n) Avg.", type: "number", group: "Clarity" },
+  { id: "clarity_read_count_total",   label: "Read Count Total",   type: "number", group: "Clarity" },
+  { id: "clarity_read_count_avg",     label: "Read Count Avg.",    type: "number", group: "Clarity" },
+  { id: "clarity_read_length_total",  label: "Read Length Total",  type: "number", group: "Clarity" },
+  { id: "clarity_read_length_avg",    label: "Read Length Avg.",   type: "number", group: "Clarity" },
+  { id: "clarity_write_count_total",  label: "Write Count Total",  type: "number", group: "Clarity" },
+  { id: "clarity_write_count_avg",    label: "Write Count Avg.",   type: "number", group: "Clarity" },
+  { id: "clarity_write_length_total", label: "Write Length Total", type: "number", group: "Clarity" },
+  { id: "clarity_write_length_avg",   label: "Write Length Avg.",  type: "number", group: "Clarity" },
+];
+
+/** Operators available for Span Name: text ops + is/isNot. */
+const SPAN_NAME_OPERATORS = [
+  { id: "contains", label: "contains" },
+  { id: "notContains", label: "does not contain" },
+  { id: "equal", label: "equals" },
+  { id: "notEqual", label: "does not equal" },
+  { id: "beginsWith", label: "begins with" },
+  { id: "endsWith", label: "ends with" },
+  { id: "is", label: "is" },
+  { id: "isNot", label: "is not" },
+];
+
+/** Operators available for Context: text ops + is/isNot. */
+const CONTEXT_OPERATORS = [
+  { id: "contains", label: "contains" },
+  { id: "notContains", label: "does not contain" },
+  { id: "equal", label: "equals" },
+  { id: "notEqual", label: "does not equal" },
+  { id: "beginsWith", label: "begins with" },
+  { id: "endsWith", label: "ends with" },
+  { id: "is", label: "is" },
+  { id: "isNot", label: "is not" },
+];
 
 
 
@@ -117,6 +194,8 @@ export default function App() {
   const [spanDetailsOpen, setSpanDetailsOpen] = useState(false);
   const [openNodes, setOpenNodes] = useState<Set<string | number>>(new Set());
   const [expandedChains, setExpandedChains] = useState<Set<string | number>>(new Set());
+  const [traceFilter, setTraceFilter] = useState<TreeFilterGroup>({ glue: "and", rules: [] });
+  const [traceFilterEnabled, setTraceFilterEnabled] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setTheme] = useState(() => {
     return localStorage.getItem("profilerTheme") || "dark";
@@ -234,6 +313,7 @@ export default function App() {
   const numberFormat = useMemo(() => getNumberFormat(numberFormatId), [numberFormatId]);
 
   const gridApiRef = useRef<Record<string, any> | null>(null);
+  const autoLoadPendingRef = useRef(false);
 
   useEffect(() => {
     const storage = getSafeStorage();
@@ -326,6 +406,10 @@ export default function App() {
     const searchParam = params.get("search");
     if (searchParam && initialTab === "trace") {
       setTxQuery(searchParam);
+      // If the search param looks like a valid 64-char hex hash, auto-load once resolved
+      if (/^[0-9a-fA-F]{64}$/.test(searchParam.trim())) {
+        autoLoadPendingRef.current = true;
+      }
     }
 
     window.history.replaceState({ tab: initialTab }, "", window.location.href);
@@ -418,6 +502,15 @@ export default function App() {
       abortControllerRef.current = null;
     }
   }, [runId, mode, limit, stacksTxId, stacksBlockId, segmentRootId, minWallMs, txQuery, hotPathMode, setTab]);
+
+  // Auto-load trace when a valid ?search= param was present on page load
+  // and the tx lookup has resolved a stacksTxId.
+  useEffect(() => {
+    if (autoLoadPendingRef.current && stacksTxId) {
+      autoLoadPendingRef.current = false;
+      loadTrace();
+    }
+  }, [stacksTxId, loadTrace]);
 
   const cancelLoad = useCallback(() => {
     if (abortControllerRef.current) {
@@ -514,6 +607,162 @@ export default function App() {
 
   const baseTree = useMemo(() => buildTreeIndex(baseRows), [baseRows]);
 
+  // Compute dynamic filter fields from loaded data
+  const traceFilterFields: FilterFieldDef[] = useMemo(() => {
+    // Collect distinct spans (name + context + id) and contexts
+    const spanMap = new Map<number, { name: string; context: string | null }>();
+    const contextSet = new Set<string>();
+    const dispatchNames = new Set<string>();
+    const builtinNames = new Set<string>();
+    // user fn: tag → { name, visibilities }
+    const userFnMap = new Map<string, { name: string; visSet: Set<string> }>();
+
+    for (const row of rows) {
+      if (row.profiler_span_id != null && row.span_name) {
+        spanMap.set(row.profiler_span_id, {
+          name: row.span_name,
+          context: row.span_context ?? null,
+        });
+      }
+      if (row.span_context) {
+        contextSet.add(row.span_context);
+        if (row.span_context === "clarity::dispatch" && row.span_name) {
+          dispatchNames.add(row.span_name);
+        }
+        if (row.span_context === "clarity::builtin" && row.span_name) {
+          builtinNames.add(row.span_name);
+        }
+        if (row.span_context.startsWith("clarity::user::") && row.span_name) {
+          const vis = row.span_context.slice("clarity::user::".length);
+          const label = vis === "read-only" || vis === "read_only" ? "read-only" : vis;
+          const key = row.tag ?? row.span_name; // tag uniquely identifies fn per contract
+          let entry = userFnMap.get(key);
+          if (!entry) { entry = { name: row.span_name, visSet: new Set() }; userFnMap.set(key, entry); }
+          entry.visSet.add(label);
+        }
+      }
+    }
+
+    // Build rich options for span name — exclude pseudo-context spans, use profiler_span_id as value
+    const spanRichOptions: RichOption[] = Array.from(spanMap.entries())
+      .filter(([, s]) => !isClarityPseudoContext(s.context))
+      .map(([id, s]) => ({
+        value: String(id),
+        label: s.name,
+        description: s.context ?? undefined,
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+
+    // Build a profiler_span_id → display label map for chip labels
+    const spanIdToLabel = new Map<string, string>();
+    for (const [id, s] of spanMap) {
+      spanIdToLabel.set(String(id), s.name);
+    }
+
+    // Build context enum values — exclude pseudo-contexts (sorted)
+    const contextValues = Array.from(contextSet)
+      .filter((c) => !isClarityPseudoContext(c))
+      .sort();
+
+    // Build dispatch type enum values (sorted)
+    const dispatchValues = Array.from(dispatchNames).sort();
+
+    // Build builtin function enum values (sorted)
+    const builtinValues = Array.from(builtinNames).sort();
+
+    // Build user function rich options keyed by tag for contract disambiguation
+    const userFnRichOptions: RichOption[] = Array.from(userFnMap.entries())
+      .map(([tag, { name, visSet }]) => {
+        const vis = Array.from(visSet).sort().join(", ");
+        // If tag differs from name, show "visibility — contract.fn" for disambiguation
+        const desc = tag !== name ? `${vis} — ${tag}` : vis;
+        return { value: tag, label: name, description: desc };
+      })
+      .sort((a, b) => a.label.localeCompare(b.label));
+
+    // Map tag → display name for chip labels
+    const userFnTagToLabel = new Map<string, string>();
+    for (const [tag, { name }] of userFnMap) {
+      userFnTagToLabel.set(tag, name);
+    }
+
+    // Dynamic fields
+    const dynamicFields: FilterFieldDef[] = [
+      {
+        id: "span_name",
+        label: "Span Name",
+        type: "text",
+        operators: SPAN_NAME_OPERATORS,
+        richOptions: spanRichOptions.length > 0 ? spanRichOptions : undefined,
+        chipLabel: (v: string) => spanIdToLabel.get(v) ?? v,
+      },
+      {
+        id: "span_context",
+        label: "Context",
+        type: "text",
+        operators: CONTEXT_OPERATORS,
+        enumValues: contextValues.length > 0 ? contextValues : undefined,
+      },
+    ];
+
+    // Clarity-specific filters (only if data exists)
+    const clarityFields: FilterFieldDef[] = [];
+    if (builtinValues.length > 0) {
+      clarityFields.push({
+        id: "clarity_builtin_fn",
+        label: "Built-in Function",
+        type: "enum",
+        enumValues: builtinValues,
+        group: "Clarity",
+      });
+    }
+    if (userFnRichOptions.length > 0) {
+      clarityFields.push({
+        id: "clarity_user_fn",
+        label: "User Function",
+        type: "enum",
+        richOptions: userFnRichOptions,
+        chipLabel: (v: string) => userFnTagToLabel.get(v) ?? v,
+        group: "Clarity",
+      });
+    }
+    if (dispatchValues.length > 0) {
+      clarityFields.push({
+        id: "clarity_dispatch_type",
+        label: "Dispatch Type",
+        type: "enum",
+        enumValues: dispatchValues,
+        group: "Clarity",
+      });
+    }
+
+    return [...dynamicFields, ...clarityFields, ...TRACE_FILTER_FIELDS_STATIC];
+  }, [rows]);
+
+  // Client-side autocomplete for trace filter text fields
+  const traceFilterOptions = useCallback(
+    async (fieldId: string, query: string, _signal: AbortSignal): Promise<string[]> => {
+      if (!query) return [];
+      const q = query.toLowerCase();
+      const seen = new Set<string>();
+      const results: string[] = [];
+      for (const row of rows) {
+        const val =
+          fieldId === "span_name" ? row.span_name :
+          fieldId === "span_context" ? row.span_context :
+          fieldId === "tag" ? row.tag :
+          null;
+        if (val && !seen.has(val) && val.toLowerCase().includes(q)) {
+          seen.add(val);
+          results.push(val);
+          if (results.length >= 50) break;
+        }
+      }
+      return results.sort();
+    },
+    [rows]
+  );
+
   const minWallFilterUs = useMemo(
     () => (minWallFilterMs ? Number(minWallFilterMs) * 1000 : null),
     [minWallFilterMs]
@@ -536,14 +785,19 @@ export default function App() {
     [focusedTree.roots, hotPathMode]
   );
 
+  const { roots: filteredRoots, totalFiltered: traceFilteredCount } = useMemo(
+    () => traceFilterEnabled ? applyTreeFilter(hotPathRoots, traceFilter) : { roots: hotPathRoots, totalFiltered: 0 },
+    [hotPathRoots, traceFilter, traceFilterEnabled]
+  );
+
   const compressedRoots = useMemo(
     () =>
-      applyChainCompression(hotPathRoots, {
+      applyChainCompression(filteredRoots, {
         enabled: chainCompression,
         expandedChains,
         significantSelfUs: DEFAULT_AUTO_EXPAND.selfMs * 1000,
       }),
-    [hotPathRoots, chainCompression, expandedChains]
+    [filteredRoots, chainCompression, expandedChains]
   );
 
   const withFlamePercent = useMemo(() => {
@@ -733,6 +987,26 @@ export default function App() {
       }
       return next;
     });
+    // Ensure the tree is open down to the target so it's visible
+    setOpenNodes((prev) => {
+      const next = new Set(prev);
+      for (let i = 0; i < segmentIndex; i++) {
+        if (segments[i]?.id != null) next.add(segments[i].id!);
+      }
+      return next;
+    });
+    // Select the target segment (the one the user clicked / expanded to).
+    // We need to update both activeId (App-level selection for details panel)
+    // and the SVAR Grid's visual row selection via gridApi.
+    // The grid selection is deferred with requestAnimationFrame so it runs
+    // after React re-renders the tree with the newly expanded rows.
+    const targetId = segments[segmentIndex - 1]?.id;
+    if (targetId != null) {
+      setActiveId(targetId);
+      requestAnimationFrame(() => {
+        gridApiRef.current?.exec("select-row", { id: targetId });
+      });
+    }
   }, []);
 
   const focusNode = useCallback((rowId: string | number) => {
@@ -1001,6 +1275,24 @@ export default function App() {
         clearFocus={clearFocus}
         summary={summary}
       />
+
+          {/* Trace Filter */}
+          <div className="trace-filter-bar">
+            <FilterBuilder
+              fields={traceFilterFields}
+              value={traceFilter as FilterGroupValue}
+              onChange={(v) => setTraceFilter(v as TreeFilterGroup)}
+              options={traceFilterOptions}
+              filtersEnabled={traceFilterEnabled}
+              onToggleEnabled={() => setTraceFilterEnabled((p) => !p)}
+              onClear={() => { setTraceFilter({ glue: "and", rules: [] }); setTraceFilterEnabled(true); }}
+            />
+            {traceFilteredCount > 0 && (
+              <span className="trace-filter-count">
+                {traceFilteredCount} span{traceFilteredCount !== 1 ? "s" : ""} filtered
+              </span>
+            )}
+          </div>
 
           {/* Breadcrumb */}
           <BreadcrumbBar breadcrumb={breadcrumb} />

@@ -89,8 +89,9 @@ function ComboboxContent({
   align = "start",
   alignOffset = 0,
   anchor,
+  zIndex = "z-50",
   ...props
-}: React.ComponentProps<typeof ComboboxPrimitive.Popup> & { className?: string; side?: Side; sideOffset?: number; align?: Align; alignOffset?: number; anchor?: React.RefObject<HTMLElement | null> | null }) {
+}: React.ComponentProps<typeof ComboboxPrimitive.Popup> & { className?: string; side?: Side; sideOffset?: number; align?: Align; alignOffset?: number; anchor?: React.RefObject<HTMLElement | null> | null; zIndex?: string }) {
   return (
     <ComboboxPrimitive.Portal>
       <ComboboxPrimitive.Positioner
@@ -99,7 +100,7 @@ function ComboboxContent({
         align={align}
         alignOffset={alignOffset}
         anchor={anchor}
-        className="isolate z-50"
+        className={`isolate ${zIndex}`}
       >
         <ComboboxPrimitive.Popup
           data-slot="combobox-content"

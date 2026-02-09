@@ -164,7 +164,7 @@ export function buildWhere(node: FilterNode): WhereClause {
   // Direct comparison operators
   return {
     sql: `${sqlField} ${COMPARISON_OP_MAP[op]} :${paramName}`,
-    params: { [paramName]: value },
+    params: { [paramName]: value as string | number },
   };
 }
 
@@ -181,10 +181,10 @@ export function parseFilterParam(filterStr: string | undefined | null): WhereCla
     throw Object.assign(new Error("Invalid filter JSON"), { status: 400 });
   }
   // Depth / complexity guard
-  const depth = (n, d) => {
+  const depth = (n: Record<string, unknown[]>, d: number): void => {
     if (d > 6) throw Object.assign(new Error("Filter too deeply nested (max 6)"), { status: 400 });
-    if (n.$and) n.$and.forEach((c) => depth(c, d + 1));
-    if (n.$or) n.$or.forEach((c) => depth(c, d + 1));
+    if (n.$and) (n.$and as Record<string, unknown[]>[]).forEach((c) => depth(c, d + 1));
+    if (n.$or) (n.$or as Record<string, unknown[]>[]).forEach((c) => depth(c, d + 1));
   };
   depth(parsed, 0);
   return buildWhere(parsed);

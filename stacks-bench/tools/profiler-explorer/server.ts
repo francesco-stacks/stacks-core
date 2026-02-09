@@ -477,7 +477,7 @@ app.get("/api/transactions", (req: Request, res: Response) => {
     const runId = parseOptionalInt(req.query.run_id, "run_id");
     const offset = parseOptionalInt(req.query.offset, "offset") || 0;
     const limit = parseOptionalInt(req.query.limit, "limit") || 100;
-    const sortBy = req.query.sort_by || "duration_ms";
+    const sortBy = String(req.query.sort_by || "duration_ms");
     const sortDir = req.query.sort_dir === "asc" ? "ASC" : "DESC";
 
     if (runId == null) {
@@ -504,7 +504,7 @@ app.get("/api/transactions", (req: Request, res: Response) => {
     const conditions: string[] = ["sts.benchmark_run_id = :run_id"];
     const params: Record<string, unknown> = { run_id: runId, _limit: limit, _offset: offset };
 
-    const filterResult = parseFilterParam(req.query.filter);
+    const filterResult = parseFilterParam(req.query.filter as string | undefined);
     if (filterResult) {
       conditions.push(filterResult.sql);
       Object.assign(params, filterResult.params);
@@ -598,7 +598,7 @@ app.get("/api/transactions/maxes", (req: Request, res: Response) => {
     const conditions: string[] = ["sts.benchmark_run_id = :run_id"];
     const params: Record<string, unknown> = { run_id: runId };
 
-    const filterResult = parseFilterParam(req.query.filter);
+    const filterResult = parseFilterParam(req.query.filter as string | undefined);
     if (filterResult) {
       conditions.push(filterResult.sql);
       Object.assign(params, filterResult.params);
@@ -655,7 +655,7 @@ app.get("/api/transactions/autocomplete", (req: Request, res: Response) => {
     const params: Record<string, unknown> = { run_id: runId, _limit: limit };
 
     // Apply existing filter DSL (so autocomplete narrows with other active filters)
-    const filterResult = parseFilterParam(req.query.filter);
+    const filterResult = parseFilterParam(req.query.filter as string | undefined);
     if (filterResult) {
       conditions.push(filterResult.sql);
       Object.assign(params, filterResult.params);

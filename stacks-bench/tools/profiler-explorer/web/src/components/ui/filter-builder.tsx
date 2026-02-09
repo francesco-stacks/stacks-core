@@ -2,12 +2,43 @@ import React, {
   Fragment,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
-import { Loader2, Plus, X } from "lucide-react";
+import { ChevronDown, Loader2, Plus, X } from "lucide-react";
 import { Button } from "./button";
 import { Input } from "./input";
+import {
+  Autocomplete,
+  AutocompleteContent,
+  AutocompleteInput,
+  AutocompleteItem,
+  AutocompleteList,
+} from "./autocomplete";
+import {
+  Combobox,
+  ComboboxCollection,
+  ComboboxContent,
+  ComboboxEmpty,
+  ComboboxGroup,
+  ComboboxInput,
+  ComboboxItem,
+  ComboboxLabel,
+  ComboboxList,
+  ComboboxSeparator,
+} from "./combobox";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "./tooltip";
 import { Popover, PopoverTrigger, PopoverContent } from "./popover";
 import {
   Select,
@@ -25,6 +56,12 @@ export interface OperatorDef {
   label: string;
 }
 
+export interface RichOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
 export interface FilterFieldDef {
   id: string;
   label: string;
@@ -32,6 +69,12 @@ export interface FilterFieldDef {
   operators?: OperatorDef[];
   enumValues?: string[];
   modifier?: string;
+  /** Rich options for searchable checkbox combobox (used with is/isNot). */
+  richOptions?: RichOption[];
+  /** Map a stored value back to a display label for chips. */
+  chipLabel?: (value: string) => string;
+  /** Optional group label for categorizing fields in the selector dropdown. */
+  group?: string;
 }
 
 export interface FilterRule {
@@ -94,15 +137,26 @@ function getOperatorLabel(field: FilterFieldDef | undefined | null, opId: string
 }
 
 function getFieldLabel(fields: FilterFieldDef[], fieldId: string): string {
-  return fields.find((f: FilterFieldDef) => f.id === fieldId)?.label || fieldId;
+  const f = fields.find((f: FilterFieldDef) => f.id === fieldId);
+  if (!f) return fieldId;
+  return f.group ? `${f.group}: ${f.label}` : f.label;
 }
 
 /** Whether a field supports multi-value (chip) selection. */
 function supportsMultiValue(field: FilterFieldDef | undefined | null, operator: string): boolean {
   if (field?.type === "enum") return true;
+  if ((operator === "is" || operator === "isNot") && field?.richOptions) return true;
   return field?.type !== "number" && MULTI_VALUE_OPS.has(operator);
 }
 
+/** Whether to show the rich searchable checkbox list (richOptions + is/isNot or enumValues + is/isNot on text fields). */
+function useRichCombo(field: FilterFieldDef | undefined | null, operator: string): boolean {
+  if (operator !== "is" && operator !== "isNot") return false;
+  if (field?.richOptions?.length) return true;
+  // Text field with enumValues + is/isNot → show checkbox list
+  if (field?.type === "text" && field?.enumValues?.length) return true;
+  return false;
+}
 // ---------------------------------------------------------------------------
 // Stable unique IDs
 // ---------------------------------------------------------------------------
@@ -111,11 +165,12 @@ let _nextId = 1;
 const uid = () => `_fr${_nextId++}`;
 
 // ---------------------------------------------------------------------------
-// AutocompleteInput – text input with debounced async suggestion list
+// AutocompleteValueInput – text input with async suggestion list using
+// the official @base-ui/react Autocomplete component.
 // Re-mount via `key` prop when the field changes to clear stale results.
 // ---------------------------------------------------------------------------
 
-interface AutocompleteInputProps {
+interface AutocompleteValueInputProps {
   value: string;
   onChange: (v: string) => void;
   onCommit?: (v: string) => void;
@@ -125,7 +180,7 @@ interface AutocompleteInputProps {
   placeholder?: string;
 }
 
-function AutocompleteInput({
+function AutocompleteValueInput({
   value,
   onChange,
   onCommit,
@@ -133,158 +188,113 @@ function AutocompleteInput({
   fieldType,
   options,
   placeholder,
-}: AutocompleteInputProps) {
-  const [query, setQuery] = useState(value ?? "");
-  const [results, setResults] = useState<string[]>([]);
+}: AutocompleteValueInputProps) {
+  const [items, setItems] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
-  const [open, setOpen] = useState(false);
-  const [hlIndex, setHlIndex] = useState(-1);
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const listRef = useRef<HTMLDivElement>(null);
-  // Flag: suppress the next autocomplete fetch (set after selecting an item)
+  // Suppress next fetch cycle after an item is selected
   const suppressRef = useRef(false);
 
-  // Sync external value
-  useEffect(() => setQuery(value ?? ""), [value]);
+  // Debounced fetch whenever the input value changes
+  const fetchItems = useCallback(
+    (query: string) => {
+      if (!options || !fieldId || fieldType === "number") return;
+      if (!query || query.length === 0) {
+        setItems([]);
+        return;
+      }
+      if (suppressRef.current) {
+        suppressRef.current = false;
+        return;
+      }
 
-  // Debounced fetch whenever the query changes (only after ≥1 char typed)
-  useEffect(() => {
-    if (!options || !fieldId || fieldType === "number") return;
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
 
-    // Don't trigger autocomplete on empty input
-    if (!query || query.length === 0) {
-      setResults([]);
-      setOpen(false);
-      return;
-    }
-
-    // If just selected an item, skip this fetch cycle
-    if (suppressRef.current) {
-      suppressRef.current = false;
-      return;
-    }
-
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    const delay = 150;
-    const timer = setTimeout(async () => {
       setLoading(true);
-      try {
-        const items = await options(fieldId, query ?? "", controller.signal);
-        if (!controller.signal.aborted) {
-          setResults(items || []);
-          setOpen(true);
-          setHlIndex(-1);
+      const timer = setTimeout(async () => {
+        try {
+          const results = await options(fieldId, query, controller.signal);
+          if (!controller.signal.aborted) {
+            setItems(results || []);
+          }
+        } catch {
+          if (!controller.signal.aborted) setItems([]);
+        } finally {
+          if (!controller.signal.aborted) setLoading(false);
         }
-      } catch {
-        if (!controller.signal.aborted) setResults([]);
-      } finally {
-        if (!controller.signal.aborted) setLoading(false);
-      }
-    }, delay);
+      }, 150);
 
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [fieldId, query, options, fieldType]);
+      // Cleanup on next call
+      return () => {
+        clearTimeout(timer);
+        controller.abort();
+      };
+    },
+    [fieldId, options, fieldType]
+  );
 
-  const handleInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const v = e.target.value;
-    setQuery(v);
-    onChange(v);
-  };
-
-  const select = (item: string) => {
-    suppressRef.current = true;
-    setQuery(item);
-    onChange(item);
-    setOpen(false);
-    setResults([]);
-    // Notify the parent that user committed a value (for multi-select chip add)
-    onCommit?.(item);
-    inputRef.current?.focus();
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (!open || results.length === 0) {
-      if (e.key === "Escape") setOpen(false);
-      // Enter without dropdown open = commit typed value
-      if (e.key === "Enter" && query.trim()) {
-        e.preventDefault();
-        onCommit?.(query.trim());
-      }
-      return;
-    }
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setHlIndex((i) => Math.min(i + 1, results.length - 1));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setHlIndex((i) => Math.max(i - 1, -1));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      if (hlIndex >= 0) {
-        select(results[hlIndex]);
-      } else if (query.trim()) {
-        // Nothing highlighted — commit the raw typed text
-        suppressRef.current = true;
-        setOpen(false);
-        setResults([]);
-        onCommit?.(query.trim());
-      }
-    } else if (e.key === "Escape") {
-      setOpen(false);
-    }
-  };
-
-  // Keep highlighted item in view
-  useEffect(() => {
-    if (hlIndex >= 0 && listRef.current) {
-      listRef.current.children[hlIndex]?.scrollIntoView({ block: "nearest" });
-    }
-  }, [hlIndex]);
+  // Memoize items for Autocomplete (must be referentially stable when unchanged)
+  const stableItems = useMemo(() => items, [items]);
 
   return (
-    <div className="fb-autocomplete">
-      <div className="fb-autocomplete-input-row">
-        <Input
-          ref={inputRef}
-          type={fieldType === "number" ? "number" : "text"}
-          value={query}
-          onChange={handleInput}
-          onKeyDown={handleKeyDown}
-          onFocus={() => query && results.length && setOpen(true)}
-          onBlur={() => setTimeout(() => setOpen(false), 200)}
-          placeholder={placeholder || "Enter value…"}
-          className="fb-value-input"
-          autoFocus
-        />
-        {loading && (
-          <Loader2 className="fb-autocomplete-spinner h-4 w-4 animate-spin" />
-        )}
-      </div>
-      {open && results.length > 0 && (
-        <div className="fb-autocomplete-list" ref={listRef}>
-          {results.map((item, i) => (
-            <div
-              key={item}
-              className={`fb-autocomplete-item${i === hlIndex ? " fb-hl" : ""}`}
-              onMouseDown={(e) => {
-                e.preventDefault();
-                select(item);
-              }}
-              onMouseEnter={() => setHlIndex(i)}
-            >
-              {item}
-            </div>
-          ))}
+    <Autocomplete
+      value={value}
+      onValueChange={(newValue) => {
+        if (newValue != null) {
+          suppressRef.current = true;
+          onChange(String(newValue));
+          onCommit?.(String(newValue));
+          inputRef.current?.focus();
+        }
+      }}
+      items={stableItems}
+      filter={null}
+    >
+      <AutocompleteInput
+        ref={inputRef}
+        placeholder={placeholder || "Enter value…"}
+        autoFocus
+        className="h-9"
+        onInput={(e: React.FormEvent<HTMLInputElement>) => {
+          const v = (e.target as HTMLInputElement).value;
+          onChange(v);
+          fetchItems(v);
+        }}
+        onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+          if (e.key === "Enter") {
+            const curValue = (e.target as HTMLInputElement).value.trim();
+            if (curValue) {
+              // Let the Autocomplete handle Enter when an item is highlighted;
+              // only commit raw text when nothing is highlighted.
+              // We use a 0ms timeout so the Autocomplete's own Enter handler fires first.
+              setTimeout(() => {
+                if (inputRef.current && inputRef.current.value.trim() === curValue) {
+                  suppressRef.current = true;
+                  onCommit?.(curValue);
+                }
+              }, 0);
+            }
+          }
+        }}
+      />
+      {loading && (
+        <div className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2">
+          <Loader2 className="text-muted-foreground h-4 w-4 animate-spin" />
         </div>
       )}
-    </div>
+      <AutocompleteContent zIndex="z-[210]">
+        <AutocompleteList>
+          {(item: string) => (
+            <AutocompleteItem key={item} value={item}>
+              {item}
+            </AutocompleteItem>
+          )}
+        </AutocompleteList>
+      </AutocompleteContent>
+    </Autocomplete>
   );
 }
 
@@ -303,26 +313,184 @@ function CheckboxList({ enumValues, selected, onChange }: { enumValues: string[]
   );
 
   if (!enumValues?.length) {
-    return <div className="fb-enum-empty">No options available</div>;
+    return <div className="px-2 py-2 text-[0.8125rem] italic text-muted-foreground">No options available</div>;
   }
 
   return (
-    <div className="fb-enum-list">
+    <div className="flex max-h-[200px] flex-col gap-0.5 overflow-y-auto py-1">
       {enumValues.map((item: string) => {
         const checked = selected.includes(item);
         return (
-          <label key={item} className="fb-enum-option">
+          <label key={item} className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-[0.8125rem] transition-colors hover:bg-accent">
             <input
               type="checkbox"
               checked={checked}
               onChange={() => toggle(item)}
-              className="fb-enum-checkbox"
+              className="h-3.5 w-3.5 flex-shrink-0 cursor-pointer accent-primary"
             />
-            <span className="fb-enum-label">{item}</span>
+            <span className="text-foreground select-none">{item}</span>
           </label>
         );
       })}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SearchableCheckboxList – searchable combobox with rich two-line items
+// ---------------------------------------------------------------------------
+
+function SearchableCheckboxList({
+  options,
+  selected,
+  onChange,
+}: {
+  options: RichOption[];
+  selected: string[];
+  onChange: (updater: (prev: string[]) => string[]) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const filtered = query
+    ? options.filter((o) => {
+        const q = query.toLowerCase();
+        return (
+          o.label.toLowerCase().includes(q) ||
+          (o.description?.toLowerCase().includes(q) ?? false)
+        );
+      })
+    : options;
+
+  const toggle = useCallback(
+    (val: string) => {
+      onChange((prev: string[]) =>
+        prev.includes(val) ? prev.filter((v: string) => v !== val) : [...prev, val]
+      );
+    },
+    [onChange]
+  );
+
+  if (!options?.length) {
+    return <div className="px-2 py-2 text-[0.8125rem] italic text-muted-foreground">No options available</div>;
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      <Input
+        ref={inputRef}
+        type="text"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Search…"
+        className="text-[0.8125rem]"
+        autoFocus
+      />
+      <div className="flex max-h-60 flex-col gap-0.5 overflow-y-auto py-1">
+        {filtered.length === 0 && (
+          <div className="px-2 py-2 text-[0.8125rem] italic text-muted-foreground">No matches</div>
+        )}
+        {filtered.map((opt) => {
+          const checked = selected.includes(opt.value);
+          return (
+            <label key={opt.value} className="flex cursor-pointer items-start gap-2 rounded px-2 py-[5px] transition-colors hover:bg-accent">
+              <input
+                type="checkbox"
+                checked={checked}
+                onChange={() => toggle(opt.value)}
+                className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 cursor-pointer accent-primary"
+              />
+              <span className="flex min-w-0 flex-col gap-px">
+                <span className="truncate text-[0.8125rem] font-semibold text-foreground select-none">{opt.label}</span>
+                {opt.description && (
+                  <span className="truncate text-[0.6875rem] text-muted-foreground select-none">{opt.description}</span>
+                )}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// FieldCombobox – searchable field selector using the official Combobox
+// with grouped items (e.g. "Clarity" group).
+// ---------------------------------------------------------------------------
+
+interface FieldGroup {
+  value: string;
+  items: string[];
+}
+
+function FieldCombobox({
+  fields,
+  value,
+  onValueChange,
+}: {
+  fields: FilterFieldDef[];
+  value: string;
+  onValueChange: (v: string) => void;
+}) {
+  // Build grouped items structure for the Combobox
+  const groups = useMemo(() => {
+    const ungrouped: string[] = [];
+    const groupMap = new Map<string, string[]>();
+    for (const f of fields) {
+      if (f.group) {
+        let arr = groupMap.get(f.group);
+        if (!arr) { arr = []; groupMap.set(f.group, arr); }
+        arr.push(f.id);
+      } else {
+        ungrouped.push(f.id);
+      }
+    }
+    const result: FieldGroup[] = [];
+    if (ungrouped.length) result.push({ value: "", items: ungrouped });
+    for (const [groupLabel, ids] of groupMap) {
+      result.push({ value: groupLabel, items: ids });
+    }
+    return result;
+  }, [fields]);
+
+  // Map field ID → label for display and filtering
+  const labelMap = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const f of fields) map.set(f.id, f.label);
+    return map;
+  }, [fields]);
+
+  return (
+    <Combobox
+      value={value}
+      onValueChange={(v) => { if (v != null) onValueChange(String(v)); }}
+      items={groups}
+      itemToStringValue={(id) => labelMap.get(String(id)) ?? String(id)}
+    >
+      <ComboboxInput
+        placeholder="Select field…"
+        className="fb-editor-field-select h-9"
+      />
+      <ComboboxContent zIndex="z-[210]">
+        <ComboboxEmpty>No fields found.</ComboboxEmpty>
+        <ComboboxList>
+          {(group: FieldGroup, index: number) => (
+            <ComboboxGroup key={group.value || "__ungrouped__"} items={group.items}>
+              {group.value && <ComboboxLabel>{group.value}</ComboboxLabel>}
+              <ComboboxCollection>
+                {(fieldId: string) => (
+                  <ComboboxItem key={fieldId} value={fieldId}>
+                    {labelMap.get(fieldId) ?? fieldId}
+                  </ComboboxItem>
+                )}
+              </ComboboxCollection>
+              {index < groups.length - 1 && <ComboboxSeparator />}
+            </ComboboxGroup>
+          )}
+        </ComboboxList>
+      </ComboboxContent>
+    </Combobox>
   );
 }
 
@@ -366,6 +534,7 @@ function FilterEditor({ rule, fields, options, onApply, onCancel }: FilterEditor
   const isEnum = selectedField?.type === "enum";
   const hasDurationModifier = selectedField?.modifier === "duration";
   const isMulti = supportsMultiValue(selectedField, operator);
+  const isRichCombo = useRichCombo(selectedField, operator);
 
   // Reset operator + value + chips + autocomplete when field changes
   // (skip on initial mount so we don't wipe restored values from rule prop)
@@ -411,12 +580,18 @@ function FilterEditor({ rule, fields, options, onApply, onCancel }: FilterEditor
 
   const apply = () => {
     if (!field || !operator) return;
-    // Enum fields require at least one checkbox selected
-    if (isEnum && values.length === 0) return;
+    // Enum and rich-combo fields require at least one selection
+    if ((isEnum || isRichCombo) && values.length === 0) return;
     const result: Record<string, unknown> = { field, operator };
     if (isMulti && values.length > 0) {
       result.values = values;
-      result.value = values.join(", ");
+      // For rich combobox, show labels instead of raw values in the chip summary
+      if (isRichCombo && selectedField?.richOptions) {
+        const labelMap = new Map(selectedField.richOptions.map((o) => [o.value, o.label]));
+        result.value = values.map((v) => labelMap.get(v) ?? v).join(", ");
+      } else {
+        result.value = values.join(", ");
+      }
     } else {
       result.value = value;
     }
@@ -435,20 +610,11 @@ function FilterEditor({ rule, fields, options, onApply, onCancel }: FilterEditor
     >
       {/* Row 1: Field selector + Operator selector */}
       <div className="fb-editor-row1">
-        <Select value={field} onValueChange={(v) => { if (v !== null) setField(v); }}>
-          <SelectTrigger className="fb-editor-field-select">
-            <span className="truncate">
-              {getFieldLabel(fields, field)}
-            </span>
-          </SelectTrigger>
-          <SelectContent>
-            {fields.map((f: FilterFieldDef) => (
-              <SelectItem key={f.id} value={f.id}>
-                {f.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <FieldCombobox
+          fields={fields}
+          value={field}
+          onValueChange={(v) => { if (v !== null) setField(v); }}
+        />
 
         <Select value={operator} onValueChange={(v) => { if (v !== null) setOperator(v); }}>
           <SelectTrigger className="fb-editor-op-select">
@@ -466,8 +632,17 @@ function FilterEditor({ rule, fields, options, onApply, onCancel }: FilterEditor
         </Select>
       </div>
 
-      {/* Row 2: Value input + optional modifier (or checkbox list for enum) */}
-      {isEnum ? (
+      {/* Row 2: Value input (enum checkbox / rich combobox / numeric / text) */}
+      {isRichCombo ? (
+        <SearchableCheckboxList
+          options={
+            selectedField?.richOptions ??
+            (selectedField?.enumValues ?? []).map((v) => ({ value: v, label: v }))
+          }
+          selected={values}
+          onChange={setValues}
+        />
+      ) : isEnum ? (
         <CheckboxList
           enumValues={selectedField?.enumValues ?? []}
           selected={values}
@@ -482,11 +657,11 @@ function FilterEditor({ rule, fields, options, onApply, onCancel }: FilterEditor
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); apply(); } }}
             placeholder="Enter value…"
-            className="fb-value-input-numeric"
+            className="w-40 flex-shrink-0"
             autoFocus
           />
         ) : (
-          <AutocompleteInput
+          <AutocompleteValueInput
             key={acKey}
             value={value}
             onChange={setValue}
@@ -517,15 +692,15 @@ function FilterEditor({ rule, fields, options, onApply, onCancel }: FilterEditor
       </div>
       )}
 
-      {/* Row 3: Multi-select chips (text fields only, not enum) */}
-      {!isEnum && isMulti && values.length > 0 && (
+      {/* Row 3: Multi-select chips (text fields only, not enum/richCombo) */}
+      {!isEnum && !isRichCombo && isMulti && values.length > 0 && (
         <div className="fb-editor-chips">
           {values.map((v: string) => (
-            <span key={v} className="fb-selected-chip">
-              <span className="fb-selected-chip-label" title={v}>{v}</span>
+            <span key={v} className="inline-flex h-[26px] max-w-[260px] items-center gap-1 rounded-md border border-border bg-muted px-1 pl-2 text-xs leading-none text-foreground">
+              <span className="truncate" title={v}>{v}</span>
               <button
                 type="button"
-                className="fb-selected-chip-x"
+                className="inline-flex h-[18px] w-[18px] flex-shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent p-0 text-muted-foreground transition-colors hover:bg-destructive hover:text-destructive-foreground"
                 onClick={() => removeChip(v)}
                 aria-label={`Remove ${v}`}
               >
@@ -572,10 +747,20 @@ function GlueToggle({ glue, onClick }: { glue: string; onClick: () => void }) {
 function FilterChip({ rule, fields, onEdit, onDelete }: { rule: FilterRule; fields: FilterFieldDef[]; onEdit: () => void; onDelete: () => void }) {
   const field = fields.find((f: FilterFieldDef) => f.id === rule.field);
   const opLabel = getOperatorLabel(field, rule.operator);
-  const displayValue = rule.values?.length
-    ? `${rule.values.length} value${rule.values.length > 1 ? "s" : ""}`
-    : String(rule.value);
-  const displaySuffix = rule.modifier && rule.modifier !== "ms"
+  let displayValue: string;
+  if (rule.values?.length) {
+    if (field?.chipLabel) {
+      // Show mapped labels for up to 2 values, then "N values" for the rest
+      const labels = rule.values.map((v) => field.chipLabel!(v));
+      displayValue = labels.length <= 2 ? labels.join(", ") : `${labels.length} values`;
+    } else {
+      displayValue = `${rule.values.length} value${rule.values.length > 1 ? "s" : ""}`;
+    }
+  } else {
+    displayValue = String(rule.value);
+  }
+  const isDuration = field?.modifier === "duration";
+  const displaySuffix = isDuration && rule.modifier && rule.modifier !== "ms"
     ? ` (${rule.modifier})`
     : "";
   return (
@@ -750,47 +935,53 @@ function FilterGroup({ value, fields, onChange, options, depth = 0 }: { value: F
         );
       })}
 
-      {/* Add filter button */}
-      <Popover
-        open={editingId === "__new__"}
-        onOpenChange={(open) => {
-          if (open) setEditingId("__new__");
-          else setEditingId(null);
-        }}
-      >
-        <PopoverTrigger asChild>
-          <Button variant="default" size="sm" className="fb-add-btn">
-            Add filter
-          </Button>
-        </PopoverTrigger>
-        <PopoverContent
-          side="bottom"
-          align="start"
-          sideOffset={6}
-          className="fb-popover"
+      {/* Split button: + Filter (primary) with dropdown for + Group */}
+      <div className="fb-split-btn">
+        <Popover
+          open={editingId === "__new__"}
+          onOpenChange={(open) => {
+            if (open) setEditingId("__new__");
+            else setEditingId(null);
+          }}
         >
-          <FilterEditor
-            rule={null}
-            fields={fields}
-            options={options}
-            onApply={handleApply}
-            onCancel={closeEditor}
-          />
-        </PopoverContent>
-      </Popover>
+          <PopoverTrigger asChild>
+            <Button variant="default" size="sm" className="fb-split-primary">
+              <Plus size={14} className="mr-1" />
+              Filter
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent
+            side="bottom"
+            align="start"
+            sideOffset={6}
+            className="fb-popover"
+          >
+            <FilterEditor
+              rule={null}
+              fields={fields}
+              options={options}
+              onApply={handleApply}
+              onCancel={closeEditor}
+            />
+          </PopoverContent>
+        </Popover>
 
-      {/* Add Group button – only at top level */}
-      {depth === 0 && (
-        <Button
-          variant="outline"
-          size="sm"
-          className="fb-add-btn"
-          onClick={addGroup}
-        >
-          <Plus size={14} className="mr-1" />
-          Group
-        </Button>
-      )}
+        {depth === 0 && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="default" size="sm" className="fb-split-chevron" aria-label="More filter options">
+                <ChevronDown size={14} />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent side="bottom" align="start">
+              <DropdownMenuItem onClick={addGroup}>
+                <Plus size={14} className="mr-2" />
+                Add Group
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+      </div>
     </div>
   );
 }
@@ -809,15 +1000,76 @@ function FilterGroup({ value, fields, onChange, options, depth = 0 }: { value: F
  *        group = `{ id, glue, rules: [rule|group] }`
  * @param {Function} props.onChange – called with the updated filter-state object
  * @param {Function} [props.options] – async autocomplete `(fieldId, query, signal) => Promise<string[]>`
+ * @param {boolean}  [props.filtersEnabled] – whether filters are active (true) or bypassed (false)
+ * @param {Function} [props.onToggleEnabled] – toggle enabled/disabled
+ * @param {Function} [props.onClear] – clear all filters
  */
-export function FilterBuilder({ fields, value, onChange, options }: { fields: FilterFieldDef[]; value: FilterGroupValue; onChange: (v: FilterGroupValue) => void; options?: FilterOptionsCallback }) {
+export function FilterBuilder({
+  fields,
+  value,
+  onChange,
+  options,
+  filtersEnabled,
+  onToggleEnabled,
+  onClear,
+}: {
+  fields: FilterFieldDef[];
+  value: FilterGroupValue;
+  onChange: (v: FilterGroupValue) => void;
+  options?: FilterOptionsCallback;
+  filtersEnabled?: boolean;
+  onToggleEnabled?: () => void;
+  onClear?: () => void;
+}) {
+  const hasRules = value?.rules?.length > 0;
+
   return (
-    <FilterGroup
-      value={value}
-      fields={fields}
-      onChange={onChange}
-      options={options}
-      depth={0}
-    />
+    <div className={`fb-outer${hasRules && filtersEnabled === false ? " fb-disabled" : ""}`}>
+      {/* Enable/disable toggle – only visible when there are filters */}
+      {hasRules && onToggleEnabled && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className={`fb-toggle${filtersEnabled === false ? " fb-toggle-off" : ""}`}
+              onClick={onToggleEnabled}
+              aria-label={filtersEnabled === false ? "Enable filters" : "Disable filters"}
+            >
+              <span className="fb-toggle-track">
+                <span className="fb-toggle-thumb" />
+              </span>
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            {filtersEnabled === false ? "Enable filters" : "Disable filters"}
+          </TooltipContent>
+        </Tooltip>
+      )}
+
+      <FilterGroup
+        value={value}
+        fields={fields}
+        onChange={onChange}
+        options={options}
+        depth={0}
+      />
+
+      {/* Clear filters button */}
+      {hasRules && onClear && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className="fb-clear-btn"
+              onClick={onClear}
+              aria-label="Clear all filters"
+            >
+              <X size={14} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Clear all filters</TooltipContent>
+        </Tooltip>
+      )}
+    </div>
   );
 }

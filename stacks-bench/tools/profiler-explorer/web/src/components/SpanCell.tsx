@@ -423,7 +423,7 @@ export default function SpanCell({ row }: { row: Record<string, any> }) {
 
         {/* ── Chain breadcrumb rendering ── */}
         {isChain ? (
-          <Breadcrumb className="min-w-0 overflow-hidden">
+          <Breadcrumb className="min-w-0 flex-1 overflow-hidden">
             <BreadcrumbList ref={breadcrumbListRef} className="flex-nowrap gap-1 text-xs sm:gap-1">
               {segments.map((seg, i) => {
                 const kind = classifySpan(seg.span_context);
@@ -578,6 +578,16 @@ export default function SpanCell({ row }: { row: Record<string, any> }) {
             className="px-1.5 py-0 text-[10px] leading-relaxed font-normal rounded-full text-muted-foreground"
           >
             +{hiddenSiblings} siblings
+          </Badge>
+        )}
+
+        {/* Filtered children indicator */}
+        {(row._filtered_children ?? 0) > 0 && (
+          <Badge
+            variant="secondary"
+            className="px-1.5 py-0 text-[10px] leading-relaxed font-normal rounded-full text-muted-foreground"
+          >
+            {row._filtered_children} filtered
           </Badge>
         )}
 
