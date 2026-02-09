@@ -24,6 +24,7 @@ use tempfile::tempdir;
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue};
+use crate::clarity_vm::clarity::ClarityMarfStoreTransaction;
 use crate::clarity_vm::database::marf::{
     copy_clarity_side_tables, has_clarity_side_tables, validate_clarity_side_tables, MarfedKV,
 };
@@ -73,9 +74,7 @@ fn build_clarity_marf(
             .insert_metadata(&contract_id, "source", "contract source code v0")
             .unwrap();
 
-        let chain_tip = store.chain_tip.clone();
-        store.commit_metadata_for_trie(&chain_tip).unwrap();
-        store.marf.commit().unwrap();
+        store.commit_to_processed_block(&blocks[0]).unwrap();
     }
 
     // Heights 1..N-1
@@ -94,9 +93,7 @@ fn build_clarity_marf(
             )])
             .unwrap();
 
-        let chain_tip = store.chain_tip.clone();
-        store.commit_metadata_for_trie(&chain_tip).unwrap();
-        store.marf.commit().unwrap();
+        store.commit_to_processed_block(&blocks[i]).unwrap();
     }
 
     drop(kv);

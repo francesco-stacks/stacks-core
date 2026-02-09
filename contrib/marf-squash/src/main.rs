@@ -496,12 +496,6 @@ fn validate_or_exit(
 
 fn print_validation(stats: &SquashValidationStats) {
     println!("Validation:");
-    println!(
-        "Root hash at squash height: match={}",
-        stats.root_hash_matches
-    );
-    println!("  source:   {}", stats.source_root_hash);
-    println!("  squashed: {}", stats.squashed_root_hash);
     println!("Squash root present: {}", stats.squash_root_present);
     println!("Squash root matches: {}", stats.squash_root_matches);
     println!(

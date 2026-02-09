@@ -58,11 +58,12 @@ pub struct SquashStats {
 
 /// Summary statistics from a validation run.
 ///
-/// The default (fast) validation compares the MARF root hash at the squash
-/// height - since the MARF is a Merkle trie, a matching root hash
-/// cryptographically guarantees that every leaf and intermediate node is
-/// identical.  Only out-of-trie SQL metadata and structural properties
-/// (shared blob offsets) need explicit checking.
+/// The default validation checks:
+/// - Per-height root hashes stored in `marf_squash_root_hashes` match the
+///   archival source (guarantees correct ancestor hash computation for the
+///   skip-list at blocks > H).
+/// - Squash metadata (`marf_squash_info`) is present and correct.
+/// - All historical `marf_data` entries share the tip block's blob offset.
 ///
 /// When `full_leaf_scan` is enabled, the validator additionally walks every
 /// leaf in both MARFs and cross-checks them, which is O(leaf_count) and much
@@ -70,17 +71,10 @@ pub struct SquashStats {
 #[derive(Debug, Clone)]
 pub struct SquashValidationStats {
     // --- Fast-path (always populated) ---
-    /// Whether the MARF root hash at the squash height matches between
-    /// source and squashed.  If true, all trie content (leaves, height
-    /// mappings, hash mappings) is cryptographically guaranteed identical.
-    pub root_hash_matches: bool,
-    /// The source MARF root hash at the squash height.
-    pub source_root_hash: TrieHash,
-    /// The squashed MARF root hash at the squash height.
-    pub squashed_root_hash: TrieHash,
     /// Whether the squashed root key was found in the SQL metadata.
     pub squash_root_present: bool,
-    /// Whether the squashed root key matched the expected value.
+    /// Whether the stored archival root hash at the squash height
+    /// matches the source MARF's root hash at that height.
     pub squash_root_matches: bool,
     /// Per-height root hashes missing from the SQL table.
     pub root_hash_missing: u64,
@@ -730,9 +724,6 @@ impl<T: MarfTrieId> MARF<T> {
             .unwrap_or_else(|| squashed_block_at_height.clone());
 
         let mut stats = SquashValidationStats {
-            root_hash_matches: false,
-            source_root_hash: TrieHash([0u8; 32]),
-            squashed_root_hash: TrieHash([0u8; 32]),
             squash_root_present: false,
             squash_root_matches: false,
             root_hash_missing: 0,
@@ -745,115 +736,94 @@ impl<T: MarfTrieId> MARF<T> {
             value_mismatches: 0,
         };
 
-        // === Check 1: MARF root hash at block_H (O(1)) ===
-        // A match here cryptographically guarantees all trie content
-        // (leaves, height mappings, hash mappings) is identical.
-        let source_root = src.get_root_hash_at(&source_block_at_height)?;
-        let squashed_root = squashed.get_root_hash_at(&squashed_block_at_height)?;
-        stats.source_root_hash = source_root;
-        stats.squashed_root_hash = squashed_root;
-        stats.root_hash_matches = source_root == squashed_root;
+        // Check 1: Per-height root hashes
+        //
+        // Compare archival root hashes from the source blobs against the
+        // squashed MARF's `marf_squash_root_hashes` SQL table. These
+        // values are used by the skip-list for blocks > H.
+        //
+        // Note: we do NOT compare the trie root hashes of block H between
+        // source and squashed. They are structurally different by design
+        // (all-inline vs mixed-backpointer). Hash identity is restored
+        // at H+1 via back_block annotations.
+        let start_root_hashes = Instant::now();
 
+        // (a) Bulk SQL for source block entries + offsets.
+        let source_blocks = trie_sql::bulk_read_block_entries::<T>(src.sqlite_conn())?;
+        let source_block_map: HashMap<T, (u32, u64)> = source_blocks
+            .into_iter()
+            .map(|(id, bh, offset)| (bh, (id, offset)))
+            .collect();
+        let source_blobs_path = format!("{src_path}.blobs");
+        let root_ptr_offset = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
+        let blobs_file = File::open(&source_blobs_path).map_err(Error::IOError)?;
+        let mut blobs_reader = BufReader::with_capacity(64 * 1024, blobs_file);
+
+        // (b) Per-height walks + inline blob reads for source root hashes.
+        info!("Validate: per-height walks for source root hashes ...");
+        let source_tip = trie_sql::get_latest_confirmed_block_hash::<T>(src.sqlite_conn())?;
+        let mut source_root_hashes: HashMap<u32, TrieHash> =
+            HashMap::with_capacity((height + 1) as usize);
+        let mut last_log = Instant::now();
+        for h in 0..=height {
+            let h_key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{h}");
+            if let Some(val) = src.with_conn(|conn| Self::get_by_key(conn, &source_tip, &h_key))? {
+                let bh = T::from(val);
+                if let Some(&(_, blob_offset)) = source_block_map.get(&bh) {
+                    blobs_reader.seek(SeekFrom::Start(blob_offset + root_ptr_offset))?;
+                    let mut hash_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
+                    blobs_reader.read_exact(&mut hash_bytes)?;
+                    source_root_hashes.insert(h, TrieHash(hash_bytes));
+                }
+            }
+            if last_log.elapsed().as_secs() >= 30 || (h > 0 && h % 100_000 == 0) {
+                info!(
+                    "Validate per-height: {}/{} heights in {:?}",
+                    h + 1,
+                    height + 1,
+                    start_root_hashes.elapsed()
+                );
+                last_log = Instant::now();
+            }
+        }
         info!(
-            "Root hash comparison: source={source_root}, squashed={squashed_root}, match={}",
-            stats.root_hash_matches
+            "Validate: collected {} source root hashes in {:?}",
+            source_root_hashes.len(),
+            start_root_hashes.elapsed()
         );
 
-        // === Check 2: Per-height root hashes ===
-        //
-        // If Check 1 matched (root hash at block_H is identical),
-        // per-height root hashes are cryptographically guaranteed to be
-        // identical (trie content hasn't changed).  Skip the expensive
-        // walk + blob reads in that case.
-        let expected_squash_root;
-        if stats.root_hash_matches {
-            info!(
-                "Validate Check 2: SKIPPED - root hash match at height {height} \
-                 cryptographically guarantees per-height root hashes are identical"
-            );
-            expected_squash_root = source_root;
-        } else {
-            let start_root_hashes = Instant::now();
-
-            // (a) Bulk SQL for source block entries + offsets.
-            let source_blocks = trie_sql::bulk_read_block_entries::<T>(src.sqlite_conn())?;
-            let source_block_map: HashMap<T, (u32, u64)> = source_blocks
+        // (c) Squashed side: single SQL query for all stored root hashes.
+        let squashed_root_hashes: HashMap<u32, TrieHash> =
+            trie_sql::bulk_read_squash_root_hashes(squashed.sqlite_conn())?
                 .into_iter()
-                .map(|(id, bh, offset)| (bh, (id, offset)))
                 .collect();
-            let source_blobs_path = format!("{src_path}.blobs");
-            // Byte offset of the root node hash within each trie blob.
-            // See blob layout comment in `squash_to_path` step 2.
-            let root_ptr_offset = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
-            let blobs_file = File::open(&source_blobs_path).map_err(Error::IOError)?;
-            // 64 KiB buffer to amortise syscalls over many small reads.
-            let mut blobs_reader = BufReader::with_capacity(64 * 1024, blobs_file);
 
-            // (b) Per-height walks + inline blob reads for source root hashes.
-            info!("Validate: per-height walks for source root hashes ...");
-            let source_tip = trie_sql::get_latest_confirmed_block_hash::<T>(src.sqlite_conn())?;
-            let mut source_root_hashes: HashMap<u32, TrieHash> =
-                HashMap::with_capacity((height + 1) as usize);
-            let mut last_log = Instant::now();
-            for h in 0..=height {
-                let h_key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{h}");
-                if let Some(val) =
-                    src.with_conn(|conn| Self::get_by_key(conn, &source_tip, &h_key))?
-                {
-                    let bh = T::from(val);
-                    if let Some(&(_, blob_offset)) = source_block_map.get(&bh) {
-                        blobs_reader.seek(SeekFrom::Start(blob_offset + root_ptr_offset))?;
-                        let mut hash_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
-                        blobs_reader.read_exact(&mut hash_bytes)?;
-                        source_root_hashes.insert(h, TrieHash(hash_bytes));
+        // (d) In-memory root hash comparison.
+        for h in 0..=height {
+            if let Some(expected) = source_root_hashes.get(&h) {
+                match squashed_root_hashes.get(&h) {
+                    Some(actual) if expected != actual => {
+                        stats.root_hash_mismatches += 1;
                     }
-                }
-                if last_log.elapsed().as_secs() >= 30 || (h > 0 && h % 100_000 == 0) {
-                    info!(
-                        "Validate per-height: {}/{} heights in {:?}",
-                        h + 1,
-                        height + 1,
-                        start_root_hashes.elapsed()
-                    );
-                    last_log = Instant::now();
+                    None => stats.root_hash_missing += 1,
+                    _ => {}
                 }
             }
-            info!(
-                "Validate: collected {} source root hashes in {:?}",
-                source_root_hashes.len(),
-                start_root_hashes.elapsed()
-            );
-
-            // (c) Squashed side: single SQL query for all stored root hashes.
-            let squashed_root_hashes: HashMap<u32, TrieHash> =
-                trie_sql::bulk_read_squash_root_hashes(squashed.sqlite_conn())?
-                    .into_iter()
-                    .collect();
-
-            // (d) In-memory root hash comparison.
-            for h in 0..=height {
-                if let Some(expected) = source_root_hashes.get(&h) {
-                    match squashed_root_hashes.get(&h) {
-                        Some(actual) if expected != actual => {
-                            stats.root_hash_mismatches += 1;
-                        }
-                        None => stats.root_hash_missing += 1,
-                        _ => {}
-                    }
-                }
-            }
-            info!(
-                "Validate root hashes: total {:?}",
-                start_root_hashes.elapsed()
-            );
-
-            expected_squash_root = source_root_hashes
-                .get(&height)
-                .copied()
-                .unwrap_or(source_root);
         }
+        info!(
+            "Validate per-height root hashes: {} checked, {} missing, {} mismatched in {:?}",
+            source_root_hashes.len(),
+            stats.root_hash_missing,
+            stats.root_hash_mismatches,
+            start_root_hashes.elapsed()
+        );
 
-        // === Check 3: Squash metadata in SQL (O(1)) ===
+        let expected_squash_root = match source_root_hashes.get(&height).copied() {
+            Some(h) => h,
+            None => src.get_root_hash_at(&source_block_at_height)?,
+        };
+
+        // Check 2: Squash metadata in SQL (O(1))
         let sql_squash_info = trie_sql::read_squash_info(squashed.sqlite_conn())?;
         match sql_squash_info {
             Some((root, _height)) => {
@@ -866,7 +836,7 @@ impl<T: MarfTrieId> MARF<T> {
             }
         }
 
-        // === Check 4: marf_data blob offsets (single SQL query) ===
+        // Check 3: marf_data blob offsets
         let tip_block_id =
             trie_sql::get_block_identifier(squashed.sqlite_conn(), &squashed_block_at_height)?;
         let (tip_offset, tip_length) =
@@ -878,7 +848,7 @@ impl<T: MarfTrieId> MARF<T> {
             &squashed_block_at_height,
         )?;
 
-        // === Optional: Full leaf scan (O(leaf_count)) ===
+        // Optional: Full leaf scan (O(leaf_count))
         if full_leaf_scan {
             info!("Full leaf scan enabled - walking all leaves in both MARFs");
 
@@ -1215,7 +1185,6 @@ mod tests {
         )
         .unwrap();
 
-        assert!(stats.root_hash_matches, "root hash should match");
         assert!(stats.squash_root_present, "squash root present");
         assert!(stats.squash_root_matches, "squash root matches");
         assert_eq!(stats.root_hash_missing, 0);
@@ -1249,7 +1218,6 @@ mod tests {
         )
         .unwrap();
 
-        assert!(stats.root_hash_matches, "root hash should match");
         assert!(stats.squash_root_present, "squash root present");
         assert!(stats.squash_root_matches, "squash root matches");
         assert_eq!(stats.root_hash_missing, 0);
@@ -1290,8 +1258,8 @@ mod tests {
 
         // Source at height 0 has a different root hash than squashed (at height 1).
         assert!(
-            !stats.root_hash_matches,
-            "Expected root hash mismatch: {stats:?}"
+            !stats.squash_root_matches,
+            "Expected squash root mismatch when validating at wrong height: {stats:?}"
         );
     }
 
