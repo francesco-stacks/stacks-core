@@ -1335,7 +1335,11 @@ pub fn copy_clarity_side_tables(
         conn.execute_batch("CREATE TEMP TABLE needed_keys (key TEXT PRIMARY KEY)")
             .map_err(Error::SQLError)?;
         const NEEDED_KEYS_BATCH_SIZE: usize = 500;
-        for chunk in needed_keys.iter().collect::<Vec<_>>().chunks(NEEDED_KEYS_BATCH_SIZE) {
+        for chunk in needed_keys
+            .iter()
+            .collect::<Vec<_>>()
+            .chunks(NEEDED_KEYS_BATCH_SIZE)
+        {
             let mut placeholders = Vec::with_capacity(chunk.len());
             let mut params = Vec::with_capacity(chunk.len());
             for (idx, key) in chunk.iter().enumerate() {
@@ -1477,7 +1481,7 @@ fn collect_trie_value_hashes(
 
     let mut keys = std::collections::HashSet::new();
     marf.with_conn(|conn| {
-        MARF::walk_all_leaves(conn, &tip, |_path, value| {
+        MARF::for_each_leaf(conn, &tip, |_path, value| {
             keys.insert(value.to_hex());
             Ok(())
         })
@@ -1710,4 +1714,3 @@ pub struct ClaritySideTableValidation {
     /// Required metadata rows missing from destination (should be 0).
     pub missing_required_metadata_rows: u64,
 }
-

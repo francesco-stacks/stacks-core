@@ -21,13 +21,12 @@ use stacks_common::util::macros::is_trace;
 
 use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
 use crate::chainstate::stacks::index::marf::MARF;
-use crate::chainstate::stacks::index::trie_sql;
 use crate::chainstate::stacks::index::node::{
     clear_backptr, is_backptr, set_backptr, TrieCursor, TrieNode, TrieNode16, TrieNode256,
     TrieNode4, TrieNode48, TrieNodeID, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::storage::{TrieHashCalculationMode, TrieStorageConnection};
-use crate::chainstate::stacks::index::{Error, MarfTrieId, TrieHasher, TrieLeaf};
+use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId, TrieHasher, TrieLeaf};
 
 /// We don't actually instantiate a Trie, but we still need to pass a type parameter for the
 /// storage implementation.

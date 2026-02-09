@@ -107,11 +107,7 @@ pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
 }
 
 /// Write squash metadata (root hash and height) to the out-of-trie SQL table.
-pub fn write_squash_info(
-    conn: &Connection,
-    root: &TrieHash,
-    height: u32,
-) -> Result<(), Error> {
+pub fn write_squash_info(conn: &Connection, root: &TrieHash, height: u32) -> Result<(), Error> {
     conn.execute(
         "INSERT OR REPLACE INTO marf_squash_info (id, squash_root, squash_height) VALUES (1, ?1, ?2)",
         params![root.as_bytes().to_vec(), height as i64],
@@ -169,10 +165,7 @@ pub fn write_squash_root_hash(
 /// Read the stored root hash for a given height from the SQL table.
 /// Returns `None` if the height is not present (archival MARF or height
 /// outside the squashed range).
-pub fn read_squash_root_hash(
-    conn: &Connection,
-    height: u32,
-) -> Result<Option<TrieHash>, Error> {
+pub fn read_squash_root_hash(conn: &Connection, height: u32) -> Result<Option<TrieHash>, Error> {
     let result: Option<Vec<u8>> = conn
         .query_row(
             "SELECT root_hash FROM marf_squash_root_hashes WHERE height = ?1",
@@ -191,11 +184,9 @@ pub fn read_squash_root_hash(
             let hash_bytes = bytes.get(..TRIEHASH_ENCODED_SIZE).ok_or_else(|| {
                 Error::CorruptionError("Squash root hash bytes too short".to_string())
             })?;
-            Ok(Some(
-                TrieHash::from_bytes(hash_bytes).ok_or_else(|| {
-                    Error::CorruptionError("Invalid squash root hash bytes".to_string())
-                })?,
-            ))
+            Ok(Some(TrieHash::from_bytes(hash_bytes).ok_or_else(|| {
+                Error::CorruptionError("Invalid squash root hash bytes".to_string())
+            })?))
         }
         None => Ok(None),
     }
@@ -248,12 +239,9 @@ pub fn bulk_read_block_entries<T: MarfTrieId>(
 ///
 /// Returns `(height, root_hash)` for every row.  Used by validation to avoid
 /// per-height SQL lookups.
-pub fn bulk_read_squash_root_hashes(
-    conn: &Connection,
-) -> Result<Vec<(u32, TrieHash)>, Error> {
-    let mut stmt = conn.prepare(
-        "SELECT height, root_hash FROM marf_squash_root_hashes ORDER BY height",
-    )?;
+pub fn bulk_read_squash_root_hashes(conn: &Connection) -> Result<Vec<(u32, TrieHash)>, Error> {
+    let mut stmt =
+        conn.prepare("SELECT height, root_hash FROM marf_squash_root_hashes ORDER BY height")?;
     let rows = stmt.query_map(NO_PARAMS, |row| {
         let height: i64 = row.get(0)?;
         let root_bytes: Vec<u8> = row.get(1)?;
@@ -265,9 +253,8 @@ pub fn bulk_read_squash_root_hashes(
         let hash_bytes = bytes.get(..TRIEHASH_ENCODED_SIZE).ok_or_else(|| {
             Error::CorruptionError("Squash root hash bytes too short".to_string())
         })?;
-        let root = TrieHash::from_bytes(hash_bytes).ok_or_else(|| {
-            Error::CorruptionError("Invalid squash root hash bytes".to_string())
-        })?;
+        let root = TrieHash::from_bytes(hash_bytes)
+            .ok_or_else(|| Error::CorruptionError("Invalid squash root hash bytes".to_string()))?;
         result.push((h, root));
     }
     Ok(result)
