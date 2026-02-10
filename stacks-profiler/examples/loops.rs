@@ -1,5 +1,7 @@
 use stacks_profiler::Profiler;
 
+// ── Helper Functions ─────────────────────────────────────────────────────────
+
 fn sub_task() {
     let _span = stacks_profiler::span!("Sub Task");
     // Do a little work
@@ -8,6 +10,8 @@ fn sub_task() {
         _x += 1;
     }
 }
+
+// ── Main Entrypoint ──────────────────────────────────────────────────────────
 
 fn main() {
     println!("Running Loop Benchmark...");

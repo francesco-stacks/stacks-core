@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
-use stacks_profiler::{Profiler, counter, measure, record, span};
+use stacks_profiler::{Profiler, counter_add, measure, record, span};
 
 fn make_unique_tag(i: u64) -> String {
     // Unique each iteration -> always a miss in interner
@@ -412,7 +412,7 @@ fn bench_counter(c: &mut Criterion) {
     // Counter overhead: no span (should be near-zero due to early return)
     group.bench_function("counter_no_span", |b| {
         b.iter(|| {
-            counter!("k", 1u64);
+            counter_add!("k", 1u64);
             black_box(());
         });
     });
@@ -421,7 +421,7 @@ fn bench_counter(c: &mut Criterion) {
         let mut c = 0u64;
         b.iter(|| {
             let _g = span!("counter_u64_span");
-            counter!("k", 1u64);
+            counter_add!("k", 1u64);
             clear_every(&mut c, 1_000);
             black_box(());
         });
@@ -433,7 +433,7 @@ fn bench_counter(c: &mut Criterion) {
         b.iter(|| {
             let _g = span!("counter_1k_u64_span");
             for _ in 0..1000u64 {
-                counter!("k", 1u64);
+                counter_add!("k", 1u64);
             }
             clear_every(&mut c, 50);
             black_box(());

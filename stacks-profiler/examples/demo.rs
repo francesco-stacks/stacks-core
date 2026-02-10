@@ -3,9 +3,7 @@ use std::time::{Duration, Instant};
 
 use stacks_profiler::{Profiler, profile};
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
+// ── Helper Functions ─────────────────────────────────────────────────────────
 
 /// Simulates pure CPU load (active work).
 /// We use a busy loop instead of sleep to force the CPU time counter to tick.
@@ -23,9 +21,7 @@ fn simulate_io(ms: u64) {
     thread::sleep(Duration::from_millis(ms));
 }
 
-// ============================================================================
-// Profiled Functions
-// ============================================================================
+// ── Profiled Functions ───────────────────────────────────────────────────────
 
 #[profile(name = "Fetch Data (I/O Bound)")]
 fn fetch_data_from_network() {
@@ -80,12 +76,10 @@ fn run_pipeline() {
     save_results();
 }
 
-// ============================================================================
-// Main Entry Point
-// ============================================================================
+// ── Main Entrypoint ──────────────────────────────────────────────────────────
 
 fn main() {
-    println!("Starting Profiler Demo...\n");
+    println!("\n================ PROFILER DEMO ===================");
 
     // 1. Run the actual code
     run_pipeline();
@@ -101,5 +95,5 @@ fn main() {
     for root_node in results {
         root_node.print_tree();
     }
-    println!("==================================================");
+    println!("====================================================\n");
 }

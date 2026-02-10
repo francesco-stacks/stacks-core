@@ -127,7 +127,6 @@ macro_rules! measure {
         $block
     }};
 
-    // ...existing code...
     // Name, Tag, Rate, Block
     ($name:literal, $tag:expr, rate: $rate:literal, $block:block) => {{
         let _guard = $crate::span!($name, $tag, rate: $rate);
@@ -448,6 +447,20 @@ macro_rules! span_if {
 }
 
 /// Attach a key/value record to the current span (if any).
+///
+/// Records are stored per-occurrence (not aggregated). The value is converted
+/// via `Into<RecordValue>`, which accepts `&'static str`, `u64`, `i64`, and `bool`.
+///
+/// ## Examples
+///
+/// ```rust
+/// use stacks_profiler::{measure, record};
+///
+/// measure!("load_contract", {
+///     record!("contract_id", "SP000000000000000000002Q6VF78.pox-4");
+///     record!("deploy_height", 100u64);
+/// });
+/// ```
 #[macro_export]
 macro_rules! record {
     ($key:literal, $val:expr) => {{
@@ -456,6 +469,20 @@ macro_rules! record {
 }
 
 /// Attach a key/value record to the current span (if any), when a predicate is true.
+///
+/// Equivalent to `if pred { record!(key, val) }`, but reads more naturally at callsites
+/// that are gated on a runtime flag.
+///
+/// ## Examples
+///
+/// ```rust
+/// use stacks_profiler::{measure, record_if};
+///
+/// let verbose = true;
+/// measure!("process", {
+///     record_if!(verbose, "debug_info", "extra detail");
+/// });
+/// ```
 #[macro_export]
 macro_rules! record_if {
     ($pred:expr, $key:literal, $val:expr) => {{
@@ -465,20 +492,50 @@ macro_rules! record_if {
     }};
 }
 
-/// Add a numeric counter to the current span (aggregated by key).
+/// Increment a named counter on the current span (aggregated by key).
+///
+/// If a counter with this key already exists on the span, `delta` is added
+/// to it (saturating). Otherwise a new counter is created with the given value.
+///
+/// ## Examples
+///
+/// ```rust
+/// use stacks_profiler::{measure, counter_add};
+///
+/// measure!("process_block", {
+///     for chunk in [1024u64, 2048, 512] {
+///         counter_add!("bytes_read", chunk);
+///     }
+///     // The span will show a single counter: bytes_read = 3584
+/// });
+/// ```
 #[macro_export]
-macro_rules! counter {
+macro_rules! counter_add {
     ($key:literal, $delta:expr) => {{
-        $crate::Profiler::counter($key, $delta);
+        $crate::Profiler::counter_add($key, $delta);
     }};
 }
 
-/// Add a numeric counter to the current span (aggregated by key), when a predicate is true.
+/// Increment a named counter on the current span (aggregated by key), when a predicate is true.
+///
+/// Equivalent to `if pred { counter_add!(key, delta) }`, but reads more naturally
+/// at callsites gated on a runtime flag.
+///
+/// ## Examples
+///
+/// ```rust
+/// use stacks_profiler::{measure, counter_add_if};
+///
+/// let capture = true;
+/// measure!("execute", {
+///     counter_add_if!(capture, "runtime_cost", 500u64);
+/// });
+/// ```
 #[macro_export]
-macro_rules! counter_if {
+macro_rules! counter_add_if {
     ($pred:expr, $key:literal, $delta:expr) => {{
         if $pred {
-            $crate::Profiler::counter($key, $delta);
+            $crate::Profiler::counter_add($key, $delta);
         }
     }};
 }

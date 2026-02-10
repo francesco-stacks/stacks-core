@@ -3,11 +3,8 @@ use std::time::Duration;
 
 use stacks_profiler::Profiler;
 
-// ============================================================================
-// 1. Simulation Types
-// ============================================================================
+// ── Simulation Types ─────────────────────────────────────────────────────────
 
-#[allow(unused)]
 struct Transaction {
     id: usize,
     is_complex_contract: bool, // Simulates CPU heavy
@@ -19,9 +16,7 @@ struct Block {
     txs: Vec<Transaction>,
 }
 
-// ============================================================================
-// 3. Processing Logic
-// ============================================================================
+// ── Processing Logic ─────────────────────────────────────────────────────────
 
 fn process_transaction(tx: &Transaction) {
     stacks_profiler::measure!("Execute Logic", {
@@ -48,9 +43,7 @@ fn process_block(block: &Block) {
     }
 }
 
-// ============================================================================
-// 4. Main Scenario
-// ============================================================================
+// ── Main Entrypoint ──────────────────────────────────────────────────────────
 
 fn main() {
     // Setup dummy data
@@ -98,6 +91,8 @@ fn main() {
 
     // Root scope
     {
+        // RAII guard will be dropped at the end of the Root scope, marking the
+        // end of the "Chain Processing" span.
         let _guard = stacks_profiler::span!("Chain Processing");
 
         for block in &blocks {

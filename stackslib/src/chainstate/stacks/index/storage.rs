@@ -2575,7 +2575,7 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
                 if let Some(node_hash) = self.cache.load_node_hash(block_id, ptr) {
                     let res = node_hash;
                     #[cfg(feature = "profiler")]
-                    stacks_profiler::counter_if!(
+                    stacks_profiler::counter_add_if!(
                         crate::profiler::capture_marf_cache_counts(),
                         "MARF_NODE_HASH_CACHE_HIT",
                         1u64
@@ -2584,7 +2584,7 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
                     Ok(res)
                 } else {
                     #[cfg(feature = "profiler")]
-                    stacks_profiler::counter_if!(
+                    stacks_profiler::counter_add_if!(
                         crate::profiler::capture_marf_cache_counts(),
                         "MARF_NODE_HASH_CACHE_MISS",
                         1u64

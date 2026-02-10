@@ -1,7 +1,15 @@
+//! Tree-formatted output for [`ProfileStats`].
+//!
+//! The module provides a [`TreeFormatter`] trait and a built-in
+//! [`PrettyPrinter`] implementation that renders an ANSI-coloured tree
+//! to any `fmt::Write` sink.  Custom formatters can be plugged in via
+//! [`ProfileStats::print_with`].
+
 use std::fmt::Write;
 
 use crate::{ProfileStats, Tag};
 
+/// ANSI escape sequences for terminal colouring.
 struct Style;
 
 #[allow(unused)]
@@ -49,7 +57,8 @@ pub trait TreeFormatter {
     fn format_node<W: Write>(&self, ctx: &NodeContext, writer: &mut W) -> std::fmt::Result;
 }
 
-/// The default "Pretty" printer that mimics the original implementation.
+/// Default formatter — produces an ANSI-coloured tree with wall, CPU, and
+/// wait times in milliseconds, call counts, and source locations.
 pub struct PrettyPrinter;
 
 impl TreeFormatter for PrettyPrinter {
@@ -117,7 +126,7 @@ impl TreeFormatter for PrettyPrinter {
     }
 }
 
-/// Helper to drive the printing process using a specific formatter.
+/// Render a [`ProfileStats`] tree to stdout using the given formatter.
 pub fn print_tree<F: TreeFormatter>(stats: &ProfileStats, formatter: &F) {
     let mut buffer = String::new();
     // We ignore write errors to stdout/string buffer usually

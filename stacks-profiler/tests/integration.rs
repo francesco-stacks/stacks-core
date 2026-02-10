@@ -37,17 +37,17 @@ fn test_basic_nesting() {
 fn test_macro_variations() {
     Profiler::clear();
 
-    // 1. Statement style (wrapped in block to force drop)
+    // Statement style (wrapped in block to force drop)
     {
         stacks_profiler::span!("Statement");
     }
 
-    // 2. Block style
+    // Block style
     stacks_profiler::measure! {
         let _x = 1 + 1;
     };
 
-    // 3. Expression style
+    // Expression style
     let res = stacks_profiler::measure!("Expression", { 5 + 5 });
     assert_eq!(res, 10);
 
@@ -64,7 +64,7 @@ fn test_multi_threading_isolation() {
 
     // Spawn a thread that does profiling
     let t = thread::spawn(|| {
-        // Wrap in block so guard drops BEFORE take_results
+        // Wrap in block so guard drops before take_results
         {
             let _span = stacks_profiler::span!("ThreadWork");
             thread::sleep(Duration::from_millis(10));
@@ -77,16 +77,16 @@ fn test_multi_threading_isolation() {
     {
         let _span = stacks_profiler::span!("MainWork");
         thread::sleep(Duration::from_millis(10));
-    } // Drops here, finishing the span
+    } // Guard drops here, finishing the span
 
     let thread_results = t.join().expect("Thread failed");
     let main_results = Profiler::take_results();
 
-    // Verify Thread Results
+    // Verify thread results
     assert_eq!(thread_results.len(), 1, "Thread should have 1 result");
     assert_eq!(thread_results[0].name(), "ThreadWork");
 
-    // Verify Main Results
+    // Verify main results
     assert_eq!(main_results.len(), 1, "Main thread should have 1 result");
     assert_eq!(main_results[0].name(), "MainWork");
 
@@ -107,7 +107,7 @@ fn test_panic_safety() {
     // Run a normal profile to prove the stack recovered
     {
         let _span = stacks_profiler::span!("Recovered");
-    } // Drops here
+    } // Guard drops here, finishing the span
 
     let results = Profiler::take_results();
 
@@ -209,7 +209,7 @@ fn test_suppression_prevents_wrong_parent_attachment() {
 
     // With rate=2, the first callsite execution samples (n=0), the second does not (n=1).
     // In suppress mode, the unsampled parent becomes a suppression guard, and nested spans
-    // must become no-ops (so they do NOT attach to the wrong parent).
+    // must become no-ops (so they don't attach to the wrong parent).
     stacks_profiler::measure!("RootSuppress", {
         for _ in 0..2 {
             let _parent = span!("ParentSuppress", rate: 2, suppress);
@@ -241,7 +241,7 @@ fn test_suppression_prevents_wrong_parent_attachment() {
         "Child should only be recorded on sampled iterations"
     );
 
-    // Critically: Child must NOT attach to root when parent is unsampled.
+    // Child must NOT attach to root when parent is unsampled.
     assert!(
         find_child(root, "ChildSuppress").is_none(),
         "Child must not attach to Root when Parent is unsampled (suppression should drop it)"

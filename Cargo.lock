@@ -4236,7 +4236,6 @@ name = "stacks-profiler-macros"
 version = "0.0.1"
 dependencies = [
  "darling 0.23.0",
- "libc",
  "proc-macro2",
  "quote",
  "syn 2.0.114",

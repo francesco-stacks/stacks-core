@@ -1234,16 +1234,16 @@ impl CostTracker for LimitedCostTracker {
                             "clarity:costs:fn",
                             cost_function.get_name()
                         );
-                        stacks_profiler::counter_if!(
+                        stacks_profiler::counter_add_if!(
                             capture,
                             "CIN",
                             *input.first().unwrap_or(&0_u64)
                         );
-                        stacks_profiler::counter_if!(capture, "CR", cost.runtime);
-                        stacks_profiler::counter_if!(capture, "CRC", cost.read_count);
-                        stacks_profiler::counter_if!(capture, "CRL", cost.read_length);
-                        stacks_profiler::counter_if!(capture, "CWC", cost.write_count);
-                        stacks_profiler::counter_if!(capture, "CWL", cost.write_length);
+                        stacks_profiler::counter_add_if!(capture, "CR", cost.runtime);
+                        stacks_profiler::counter_add_if!(capture, "CRC", cost.read_count);
+                        stacks_profiler::counter_add_if!(capture, "CRL", cost.read_length);
+                        stacks_profiler::counter_add_if!(capture, "CWC", cost.write_count);
+                        stacks_profiler::counter_add_if!(capture, "CWL", cost.write_length);
                     }
                 }
 
