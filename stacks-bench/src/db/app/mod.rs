@@ -455,6 +455,68 @@ impl AppDb {
         Ok(())
     }
 
+    /// Looks up a benchmark run by its ID, returning `None` if it doesn't exist.
+    pub async fn get_benchmark_run(&self, run_id: i32) -> Result<Option<BenchmarkRun>> {
+        benchmark_run::table
+            .find(run_id)
+            .first::<BenchmarkRun>(&mut self.get_conn().await?)
+            .await
+            .optional()
+            .context("Failed to look up benchmark run")
+    }
+
+    /// Lists all benchmark runs, most recent first.
+    pub async fn list_benchmark_runs(&self) -> Result<Vec<BenchmarkRun>> {
+        benchmark_run::table
+            .order(benchmark_run::start_time.desc())
+            .load::<BenchmarkRun>(&mut self.get_conn().await?)
+            .await
+            .context("Failed to list benchmark runs")
+    }
+
+    /// Deletes a benchmark run and all of its dependent data.
+    ///
+    /// Tables with `ON DELETE CASCADE` (block_processing_baseline, profiler_record,
+    /// profiler_record_kv, profiler_record_clarity_costs, profiler_span_block_summary,
+    /// profiler_span_summary) are cleaned up automatically by SQLite.
+    ///
+    /// Tables without cascade (stacks_block_stats, stacks_tx_stats) are deleted
+    /// explicitly before the benchmark_run row itself.
+    pub async fn delete_benchmark_run(&mut self, run_id: i32) -> Result<()> {
+        self.get_conn()
+            .await?
+            .transaction::<_, anyhow::Error, _>(|conn| {
+                Box::pin(async move {
+                    // Delete non-cascading dependents first
+                    diesel::delete(
+                        stacks_tx_stats::table.filter(stacks_tx_stats::benchmark_run_id.eq(run_id)),
+                    )
+                    .execute(conn)
+                    .await?;
+
+                    diesel::delete(
+                        stacks_block_stats::table
+                            .filter(stacks_block_stats::benchmark_run_id.eq(run_id)),
+                    )
+                    .execute(conn)
+                    .await?;
+
+                    // Delete the run itself (cascades handle the rest)
+                    let deleted = diesel::delete(benchmark_run::table.find(run_id))
+                        .execute(conn)
+                        .await?;
+
+                    if deleted == 0 {
+                        return Err(anyhow!("Benchmark run {} not found", run_id));
+                    }
+
+                    Ok(())
+                })
+            })
+            .await
+            .context("Failed to delete benchmark run")
+    }
+
     /// Retrieves the internal DB ID for a Stacks block by its hash.
     pub async fn get_stacks_block_id(&self, block_id: &StacksBlockId) -> Result<i64> {
         let id_opt = schema::stacks_block::table

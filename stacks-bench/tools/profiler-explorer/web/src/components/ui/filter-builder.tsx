@@ -239,17 +239,20 @@ function AutocompleteValueInput({
   // Memoize items for Autocomplete (must be referentially stable when unchanged)
   const stableItems = useMemo(() => items, [items]);
 
+  // Handle selecting an item from the autocomplete dropdown
+  const handleItemSelect = useCallback(
+    (item: string) => {
+      suppressRef.current = true;
+      onChange(String(item));
+      onCommit?.(String(item));
+      // Refocus after the autocomplete closes
+      setTimeout(() => inputRef.current?.focus(), 0);
+    },
+    [onChange, onCommit],
+  );
+
   return (
     <Autocomplete
-      value={value}
-      onValueChange={(newValue) => {
-        if (newValue != null) {
-          suppressRef.current = true;
-          onChange(String(newValue));
-          onCommit?.(String(newValue));
-          inputRef.current?.focus();
-        }
-      }}
       items={stableItems}
       filter={null}
     >
@@ -257,7 +260,8 @@ function AutocompleteValueInput({
         ref={inputRef}
         placeholder={placeholder || "Enter value…"}
         autoFocus
-        className="h-9"
+        defaultValue={value}
+        className="h-9 flex-1 min-w-0"
         onInput={(e: React.FormEvent<HTMLInputElement>) => {
           const v = (e.target as HTMLInputElement).value;
           onChange(v);
@@ -288,7 +292,7 @@ function AutocompleteValueInput({
       <AutocompleteContent zIndex="z-[210]">
         <AutocompleteList>
           {(item: string) => (
-            <AutocompleteItem key={item} value={item}>
+            <AutocompleteItem key={item} value={item} onClick={() => handleItemSelect(item)}>
               {item}
             </AutocompleteItem>
           )}
@@ -467,6 +471,7 @@ function FieldCombobox({
       onValueChange={(v) => { if (v != null) onValueChange(String(v)); }}
       items={groups}
       itemToStringValue={(id) => labelMap.get(String(id)) ?? String(id)}
+      itemToStringLabel={(id) => labelMap.get(String(id)) ?? String(id)}
     >
       <ComboboxInput
         placeholder="Select field…"

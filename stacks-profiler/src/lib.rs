@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Stacks Open Internet Foundation
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 //! # Stacks Profiler
 //!
 //! A lightweight, low-overhead profiler built on thread-local storage.
@@ -47,87 +62,50 @@ use std::panic::Location;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use rapidhash::{HashMapExt, RapidHashMap};
 /// Re-exported procedural macro — see [`stacks_profiler_macros::profile`].
 pub use stacks_profiler_macros::profile;
 
 mod macros;
 mod platform;
+mod state;
+mod types;
 
 pub mod print;
 
-/// A dynamically-typed value that can be attached to a span via [`record!`].
-#[derive(Debug, Clone)]
-pub enum RecordValue {
-    U64(u64),
-    I64(i64),
-    Str(Box<str>),
-    Bytes(Box<[u8]>),
-}
+use state::*;
+pub use types::*;
 
-impl From<u64> for RecordValue {
-    #[inline(always)]
-    fn from(v: u64) -> Self {
-        RecordValue::U64(v)
-    }
-}
-impl From<i64> for RecordValue {
-    #[inline(always)]
-    fn from(v: i64) -> Self {
-        RecordValue::I64(v)
-    }
-}
-impl From<&str> for RecordValue {
-    #[inline(always)]
-    fn from(v: &str) -> Self {
-        RecordValue::Str(v.into())
-    }
-}
-impl From<String> for RecordValue {
-    #[inline(always)]
-    fn from(v: String) -> Self {
-        RecordValue::Str(v.into_boxed_str())
-    }
-}
-impl From<&[u8]> for RecordValue {
-    #[inline(always)]
-    fn from(v: &[u8]) -> Self {
-        RecordValue::Bytes(v.into())
-    }
-}
-
-/// A key/value record attached to a span via [`record!`] or [`Profiler::record`].
+/// Process-global toggle for record/counter attachment.
 ///
-/// Records are per-occurrence: each call appends a new entry (they are not
-/// aggregated).  Use [`Counter`] for additive metrics.
-#[derive(Debug, Clone)]
-pub struct Record {
-    pub key: &'static str,
-    pub value: RecordValue,
-}
+/// This is intentionally *not* thread-local: it acts as a single kill-switch that any thread can
+/// flip (e.g., to disable verbose recording during a low-overhead warm-up phase).  Span entry,
+/// timing, and hierarchy are **unaffected** by this flag.
+static RECORD_ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// An aggregated counter attached to a span via [`counter_add!`] or [`Profiler::counter_add`].
-///
-/// Counters with the same key on the same node are summed (saturating).
-#[derive(Debug, Clone)]
-pub struct Counter {
-    pub key: &'static str,
-    pub value: u64,
+thread_local! {
+    /// Per-thread profiler state (arena + stack).  Accessed via `RefCell` so that `begin_span` /
+    /// `end_span` can borrow mutably.
+    static STATE: RefCell<ThreadState> = RefCell::new(ThreadState::new());
 }
 
 thread_local! {
-    /// Thread-local string interner for [`Tag::Str`] values created from owned
-    /// `String`s.  Strings are leaked once and then reused for the thread's
-    /// lifetime, keeping [`Tag`] `Copy` without per-use allocation.
-    static TAG_INTERNER: RefCell<RapidHashMap<Box<str>, &'static str>> =
-        RefCell::new(RapidHashMap::with_capacity(64));
+    /// Suppression nesting depth.  Kept separate from [`STATE`] so that `is_suppressed()` can be
+    /// checked without borrowing the `RefCell`.
+    static SUPPRESS_DEPTH: Cell<u32> = Cell::new(0);
+}
+
+thread_local! {
+    /// Thread-local string interner for [`Tag::Str`] values created from owned `String`s.  Strings
+    /// are leaked once and then reused for the thread's lifetime, keeping [`Tag`] `Copy` without
+    /// per-use allocation.
+    static TAG_INTERNER: RefCell<rapidhash::RapidHashMap<Box<str>, &'static str>> =
+        RefCell::new(rapidhash::HashMapExt::with_capacity(64));
 }
 
 /// Intern a `String` into a `&'static str` via the thread-local interner.
 ///
-/// Repeated calls with the same string content return the same pointer.
-/// The leaked memory is bounded by the number of **distinct** strings
-/// interned on a given thread.
+/// Repeated calls with the same string content return the same pointer. The leaked memory is
+/// bounded by the number of **distinct** strings interned on a given thread.
 #[inline]
 fn intern_tag_str(s: String) -> &'static str {
     TAG_INTERNER.with(|cell| {
@@ -142,328 +120,14 @@ fn intern_tag_str(s: String) -> &'static str {
     })
 }
 
-/// A lightweight, `Copy` discriminator for spans that share the same
-/// [`SpanId`] but represent distinct logical instances (e.g., different
-/// transaction indices within a block).
-///
-/// Spans with the same `SpanId` but different tags are stored as separate
-/// nodes in the profile tree.  Avoid very-high-cardinality tags at hot
-/// callsites, as each distinct `(SpanId, Tag)` pair allocates its own node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Tag {
-    U64(u64),
-    I64(i64),
-    Usize(usize),
-    Str(&'static str),
-}
-
-impl From<u64> for Tag {
-    #[inline(always)]
-    fn from(v: u64) -> Self {
-        Tag::U64(v)
-    }
-}
-
-impl From<i64> for Tag {
-    #[inline(always)]
-    fn from(v: i64) -> Self {
-        Tag::I64(v)
-    }
-}
-
-impl From<u32> for Tag {
-    #[inline(always)]
-    fn from(v: u32) -> Self {
-        Tag::U64(v as u64)
-    }
-}
-
-impl From<i32> for Tag {
-    #[inline(always)]
-    fn from(v: i32) -> Self {
-        Tag::I64(v as i64)
-    }
-}
-
-impl From<usize> for Tag {
-    #[inline(always)]
-    fn from(v: usize) -> Self {
-        Tag::Usize(v)
-    }
-}
-
-impl From<&'static str> for Tag {
-    #[inline(always)]
-    fn from(v: &'static str) -> Self {
-        Tag::Str(v)
-    }
-}
-
-impl From<String> for Tag {
-    #[inline(always)]
-    fn from(v: String) -> Self {
-        Tag::Str(intern_tag_str(v))
-    }
-}
-
-/// Index into the per-thread node arena (`ThreadState::nodes`).
-type NodeId = u32;
-
-/// Process-global toggle for record/counter attachment.
-///
-/// This is intentionally *not* thread-local: it acts as a single
-/// kill-switch that any thread can flip (e.g., to disable verbose
-/// recording during a low-overhead warm-up phase).  Span entry, timing,
-/// and hierarchy are **unaffected** by this flag.
-static RECORD_ENABLED: AtomicBool = AtomicBool::new(true);
-
-/// A single node in the per-thread profile arena.
-///
-/// Nodes are keyed by `(SpanId pointer, Tag)`.  Multiple entries of the
-/// same span under the same parent **share** a node; timing is accumulated.
-#[derive(Debug)]
-struct Node {
-    id: &'static SpanId,
-    tag: Option<Tag>,
-
-    wall_time_ns: u64,
-    cpu_time_ns: u64,
-    entered_count: usize,
-    sampled_count: usize,
-
-    children: Vec<NodeId>,
-    last_child: Option<NodeId>,
-
-    records: Vec<Record>,
-    counters: Vec<Counter>,
-}
-
-impl Node {
-    /// Returns `true` if this node matches the given `(SpanId, Tag)` key.
-    #[inline(always)]
-    fn key_eq(&self, id: &'static SpanId, tag: Option<Tag>) -> bool {
-        // Fast path: callsite SpanIds are typically pointer-unique.
-        std::ptr::eq(self.id, id) && self.tag == tag
-    }
-}
-
-/// Discriminates timed vs count-only entries on the active stack.
-#[derive(Debug)]
-enum ActiveKind {
-    Timed {
-        start_wall: Instant,
-        start_cpu_ns: u64,
-    },
-    CountOnly,
-}
-
-/// One frame on the per-thread active-span stack.
-#[derive(Debug)]
-struct ActiveFrame {
-    node: NodeId,
-    kind: ActiveKind,
-}
-
-/// Per-thread profiler state: a flat node arena plus an active-span stack.
-#[derive(Debug)]
-struct ThreadState {
-    /// Active-span stack (LIFO).  The top frame is the current parent.
-    stack: Vec<ActiveFrame>,
-    /// Flat arena — nodes are addressed by [`NodeId`] (index).
-    nodes: Vec<Node>,
-    /// Top-level root node ids (spans entered with no parent).
-    roots: Vec<NodeId>,
-    /// Last-seen root, for fast consecutive-root deduplication.
-    roots_last_child: Option<NodeId>,
-}
-
-impl ThreadState {
-    /// Create an empty thread state with pre-allocated capacity.
-    fn new() -> Self {
-        Self {
-            stack: Vec::with_capacity(64),
-            nodes: Vec::with_capacity(256),
-            roots: Vec::with_capacity(16),
-            roots_last_child: None,
-        }
-    }
-
-    /// Append a fresh zero-initialised node to the arena and return its id.
-    #[inline(always)]
-    fn alloc_node(&mut self, id: &'static SpanId, tag: Option<Tag>) -> NodeId {
-        let idx = self.nodes.len();
-        self.nodes.push(Node {
-            id,
-            tag,
-            wall_time_ns: 0,
-            cpu_time_ns: 0,
-            entered_count: 0,
-            sampled_count: 0,
-            children: Vec::new(),
-            last_child: None,
-            records: Vec::with_capacity(4),
-            counters: Vec::with_capacity(4),
-        });
-        idx as NodeId
-    }
-
-    /// Shared reference to a node by arena index.
-    #[inline(always)]
-    fn node(&self, id: NodeId) -> &Node {
-        &self.nodes[id as usize]
-    }
-
-    /// Mutable reference to a node by arena index.
-    #[inline(always)]
-    fn node_mut(&mut self, id: NodeId) -> &mut Node {
-        &mut self.nodes[id as usize]
-    }
-
-    /// Look up or allocate a root-level node for the given `(SpanId, Tag)`.
-    #[inline]
-    fn find_or_create_root(&mut self, id: &'static SpanId, tag: Option<Tag>) -> NodeId {
-        if let Some(last) = self.roots_last_child {
-            if self.node(last).key_eq(id, tag) {
-                return last;
-            }
-        }
-
-        for &child in &self.roots {
-            if self.node(child).key_eq(id, tag) {
-                self.roots_last_child = Some(child);
-                return child;
-            }
-        }
-
-        let child = self.alloc_node(id, tag);
-        self.roots.push(child);
-        self.roots_last_child = Some(child);
-        child
-    }
-
-    /// Look up or allocate a child node under `parent` for the given key.
-    #[inline]
-    fn find_or_create_child(
-        &mut self,
-        parent: NodeId,
-        id: &'static SpanId,
-        tag: Option<Tag>,
-    ) -> NodeId {
-        if let Some(last) = self.node(parent).last_child {
-            if self.node(last).key_eq(id, tag) {
-                return last;
-            }
-        }
-
-        let children: &[NodeId] = &self.node(parent).children;
-        for &child in children {
-            if self.node(child).key_eq(id, tag) {
-                self.node_mut(parent).last_child = Some(child);
-                return child;
-            }
-        }
-
-        let child = self.alloc_node(id, tag);
-        let p = self.node_mut(parent);
-        p.children.push(child);
-        p.last_child = Some(child);
-        child
-    }
-
-    /// The node id of the currently active (innermost) span, if any.
-    #[inline(always)]
-    fn current_parent(&self) -> Option<NodeId> {
-        self.stack.last().map(|f| f.node)
-    }
-
-    /// Resolve (find-or-create) the node for a span, either as a root or
-    /// as a child of the current parent.
-    #[inline(always)]
-    fn resolve_node(&mut self, id: &'static SpanId, tag: Option<Tag>) -> NodeId {
-        match self.current_parent() {
-            None => self.find_or_create_root(id, tag),
-            Some(parent) => self.find_or_create_child(parent, id, tag),
-        }
-    }
-
-    /// Convert the arena into a tree of [`ProfileStats`], consuming nodes in place.
-    fn materialize_node(nodes: &mut Vec<Option<Node>>, node_id: NodeId) -> ProfileStats {
-        let node = nodes[node_id as usize]
-            .take()
-            .expect("node already materialized or missing");
-
-        let mut children = Vec::with_capacity(node.children.len());
-        for &child_id in &node.children {
-            children.push(Self::materialize_node(nodes, child_id));
-        }
-
-        ProfileStats {
-            id: node.id,
-            tag: node.tag,
-            wall_time_ns: node.wall_time_ns,
-            cpu_time_ns: node.cpu_time_ns,
-            children,
-            entered_count: node.entered_count,
-            sampled_count: node.sampled_count,
-            records: node.records,
-            counters: node.counters,
-        }
-    }
-
-    /// Drain the arena into a `Vec<ProfileStats>` tree and reset state.
-    fn take_results_and_reset(&mut self) -> Vec<ProfileStats> {
-        debug_assert!(
-            self.stack.is_empty(),
-            "take_results called while spans are still active"
-        );
-
-        let nodes = std::mem::take(&mut self.nodes);
-        let roots = std::mem::take(&mut self.roots);
-
-        let mut nodes_opt: Vec<Option<Node>> = nodes.into_iter().map(Some).collect();
-
-        let mut out = Vec::with_capacity(roots.len());
-        for root in roots {
-            out.push(Self::materialize_node(&mut nodes_opt, root));
-        }
-
-        self.stack.clear();
-        self.roots_last_child = None;
-
-        out
-    }
-
-    /// Discard all accumulated nodes and reset the arena.
-    fn clear(&mut self) {
-        self.stack.clear();
-        self.nodes.clear();
-        self.roots.clear();
-        self.roots_last_child = None;
-    }
-}
-
-thread_local! {
-    /// Per-thread profiler state (arena + stack).  Accessed via `RefCell`
-    /// so that `begin_span` / `end_span` can borrow mutably.
-    static STATE: RefCell<ThreadState> = RefCell::new(ThreadState::new());
-}
-
-thread_local! {
-    /// Suppression nesting depth.  Kept separate from [`STATE`] so that
-    /// `is_suppressed()` can be checked without borrowing the `RefCell`.
-    static SUPPRESS_DEPTH: Cell<u32> = Cell::new(0);
-}
-
 /// A static, callsite-unique identifier for a profiling span.
 ///
-/// A `SpanId` is typically created once per callsite (via a `OnceLock` inside
-/// the [`span!`] macro or [the `#[profile]` attribute](profile)) and then
-/// reused on every subsequent invocation.
+/// A `SpanId` is typically created once per callsite (via a `OnceLock` inside the [`span!`] macro
+/// or [the `#[profile]` attribute](profile)) and then reused on every subsequent invocation.
 ///
-/// Two `SpanId`s are considered equal when all four fields match.  As an
-/// optimization, pointer equality is tried first — this is correct because
-/// callsite-generated `SpanId`s use `&'static str` literals that are
-/// guaranteed pointer-unique per callsite.
+/// Two `SpanId`s are considered equal when all four fields match.  As an optimization, pointer
+/// equality is tried first — this is correct because callsite-generated `SpanId`s use `&'static
+/// str` literals that are guaranteed pointer-unique per callsite.
 #[derive(Debug, Copy, Clone, Eq, Hash)]
 pub struct SpanId {
     /// Human-readable span name (e.g., `"execute_tx"`).
@@ -520,9 +184,8 @@ impl SpanId {
 
 /// Collected metrics for one node in the profiling tree.
 ///
-/// Each node aggregates timing from every sampled entry of the same
-/// `(SpanId, Tag)` pair under the same parent path.  The tree mirrors
-/// the dynamic call structure observed at runtime.
+/// Each node aggregates timing from every sampled entry of the same `(SpanId, Tag)` pair under the
+/// same parent path.  The tree mirrors the dynamic call structure observed at runtime.
 #[derive(Debug, Clone)]
 pub struct ProfileStats {
     /// The callsite identity.
@@ -576,9 +239,8 @@ impl ProfileStats {
         self.entered_count
     }
 
-    /// Estimated time the thread was **not** running on a CPU core
-    /// (wall time minus CPU time).  See [`platform`](crate::platform)
-    /// module docs for per-platform resolution caveats.
+    /// Estimated time the thread was **not** running on a CPU core (wall time minus CPU time).  See
+    /// [`platform`](crate::platform) module docs for per-platform resolution caveats.
     pub fn wait_time(&self) -> Duration {
         Duration::from_nanos(self.wall_time_ns.saturating_sub(self.cpu_time_ns))
     }
@@ -623,17 +285,17 @@ impl ProfileStats {
 
 /// Static entry-point for all profiler operations.
 ///
-/// `Profiler` is a zero-sized struct with only associated functions.
-/// Most users should prefer the [`span!`], [`measure!`], and
-/// [`#[profile]`](profile) macros, which handle `SpanId` caching and
+/// `Profiler` is a zero-sized struct with only associated functions. Most users should prefer the
+/// [`span!`], [`measure!`], and [`#[profile]`](profile) macros, which handle `SpanId` caching and
 /// guard lifetime automatically.
 pub struct Profiler;
 
 impl Profiler {
     /// Create a new [`SpanId`] anchored at the caller's source location.
     ///
-    /// Typically called once per callsite inside a `OnceLock`; the macros
-    /// handle this automatically.
+    /// Typically called once per callsite inside a `OnceLock`; the macros handle this
+    /// automatically.
+    #[doc(hidden)]
     #[inline(always)]
     #[track_caller]
     pub fn new_span_id(name: &'static str) -> SpanId {
@@ -641,8 +303,9 @@ impl Profiler {
         SpanId::new_from_loc(name, loc)
     }
 
-    /// Begin a **timed** span.  Wall and CPU clocks are read on entry;
-    /// elapsed time is accumulated when the returned guard is dropped.
+    /// Begin a **timed** span.  Wall and CPU clocks are read on entry; elapsed time is accumulated
+    /// when the returned guard is dropped.
+    #[doc(hidden)]
     #[inline(always)]
     pub fn begin_span(id: &'static SpanId, tag: Option<Tag>) -> ProfileGuard {
         let start_wall = Instant::now();
@@ -665,8 +328,9 @@ impl Profiler {
         }
     }
 
-    /// Begin a **count-only** span — preserves hierarchy and increments
-    /// `entered_count`, but does **not** read clocks.
+    /// Begin a **count-only** span — preserves hierarchy and increments `entered_count`, but does
+    /// **not** read clocks.
+    #[doc(hidden)]
     #[inline(always)]
     pub fn begin_span_count_only(id: &'static SpanId, tag: Option<Tag>) -> ProfileGuard {
         STATE.with(|cell| {
@@ -683,9 +347,9 @@ impl Profiler {
         }
     }
 
-    /// Enter a **suppression** region.  While suppressed, nested
-    /// `span!`/`measure!` calls return `None` (no-op), preventing
-    /// children from attaching to the wrong parent.
+    /// Enter a **suppression** region.  While suppressed, nested `span!`/`measure!` calls return
+    /// `None` (no-op), preventing children from attaching to the wrong parent.
+    #[doc(hidden)]
     #[inline(always)]
     pub fn begin_suppression() -> ProfileGuard {
         SUPPRESS_DEPTH.with(|d| d.set(d.get().wrapping_add(1)));
@@ -746,8 +410,8 @@ impl Profiler {
         RECORD_ENABLED.store(true, Ordering::Relaxed);
     }
 
-    /// Disable record/counter attachment process-wide.  Spans and timing
-    /// are unaffected — only [`record!`] and [`counter_add!`] become no-ops.
+    /// Disable record/counter attachment process-wide.  Spans and timing are unaffected — only
+    /// [`record!`] and [`counter_add!`] become no-ops.
     #[inline(always)]
     pub fn disable_record() {
         RECORD_ENABLED.store(false, Ordering::Relaxed);
@@ -759,15 +423,11 @@ impl Profiler {
         RECORD_ENABLED.load(Ordering::Relaxed)
     }
 
-    /// Attach a key/value [`Record`] to the innermost active span on this
-    /// thread.  No-op if recording is disabled, suppressed, or no span
-    /// is active.
+    /// Attach a key/value [`Record`] to the innermost active span on this thread.  No-op if
+    /// recording is disabled, suppressed, or no span is active.
     #[inline]
     pub fn record(key: &'static str, value: RecordValue) {
-        if !RECORD_ENABLED.load(Ordering::Relaxed) {
-            return;
-        }
-        if Self::is_suppressed() {
+        if !Self::is_record_enabled() || Self::is_suppressed() {
             return;
         }
 
@@ -788,14 +448,11 @@ impl Profiler {
         });
     }
 
-    /// Add `delta` to the named [`Counter`] on the innermost active span.
-    /// Counters with the same key are summed (saturating).
+    /// Add `delta` to the named [`Counter`] on the innermost active span. Counters with the same
+    /// key are summed (saturating).
     #[inline]
     pub fn counter_add(key: &'static str, delta: u64) {
-        if !RECORD_ENABLED.load(Ordering::Relaxed) {
-            return;
-        }
-        if Self::is_suppressed() {
+        if !Self::is_record_enabled() || Self::is_suppressed() {
             return;
         }
 
@@ -819,9 +476,8 @@ impl Profiler {
         });
     }
 
-    /// Drain the calling thread's profile tree and return it as a
-    /// `Vec<ProfileStats>` (one entry per root span).  The thread-local
-    /// state is reset afterward.
+    /// Drain the calling thread's profile tree and return it as a `Vec<ProfileStats>` (one entry
+    /// per root span).  The thread-local state is reset afterward.
     ///
     /// # Panics (debug)
     ///
@@ -831,9 +487,8 @@ impl Profiler {
         STATE.with(|cell| cell.borrow_mut().take_results_and_reset())
     }
 
-    /// Discard all accumulated data on the calling thread without
-    /// returning it.  Suppression depth is **not** affected (it is
-    /// scoped by guards).
+    /// Discard all accumulated data on the calling thread without returning it.  Suppression depth
+    /// is **not** affected (it is scoped by guards).
     #[inline]
     pub fn clear() {
         STATE.with(|cell| cell.borrow_mut().clear())
@@ -841,8 +496,7 @@ impl Profiler {
     }
 }
 
-/// Discriminates the two kinds of RAII guard so that `Drop` calls the
-/// correct cleanup path.
+/// Discriminates the two kinds of RAII guard so that `Drop` calls the correct cleanup path.
 enum GuardKind {
     /// Timed or count-only — calls `end_span()` on drop.
     Span,
@@ -852,9 +506,8 @@ enum GuardKind {
 
 /// RAII guard that ends a span (or suppression region) when dropped.
 ///
-/// Created by [`Profiler::begin_span`], [`Profiler::begin_span_count_only`],
-/// or [`Profiler::begin_suppression`] (and transitively by the [`span!`] and
-/// [`measure!`] macros).
+/// Created by [`Profiler::begin_span`], [`Profiler::begin_span_count_only`], or
+/// [`Profiler::begin_suppression`] (and transitively by the [`span!`] and [`measure!`] macros).
 pub struct ProfileGuard {
     kind: GuardKind,
 }

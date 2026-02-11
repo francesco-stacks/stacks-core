@@ -1,10 +1,25 @@
+// Copyright (C) 2026 Stacks Open Internet Foundation
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 /// Execute a block of code inside a profiling span.
 ///
-/// This is the most convenient way to profile a scope because it guarantees the span
-/// is ended even if the block returns early or panics (the guard is dropped).
+/// This is the most convenient way to profile a scope because it guarantees the span is ended even
+/// if the block returns early or panics (the guard is dropped).
 ///
-/// `measure!` is implemented in terms of [`span!`](crate::span), and uses the same
-/// sampling and tagging options.
+/// `measure!` is implemented in terms of [`span!`](crate::span), and uses the same sampling and
+/// tagging options.
 ///
 /// ## When to use
 /// - You want to profile a lexical scope (a block).
@@ -15,31 +30,31 @@
 /// directly.
 ///
 /// ## Sampling
-/// The `rate: N` forms record timing for approximately **1 out of every N executions**
-/// at the callsite. Lower `N` means more overhead and better fidelity.
+/// The `rate: N` forms record timing for approximately **1 out of every N executions** at the
+/// callsite. Lower `N` means more overhead and better fidelity.
 ///
-/// By default, if a span is **not sampled**, `span!` returns `None` (no guard is created),
-/// which is the cheapest path.
+/// By default, if a span is **not sampled**, `span!` returns `None` (no guard is created), which is
+/// the cheapest path.
 ///
 /// ## Suppression vs count-only (for unsampled calls)
 /// Two optional modes affect what happens on the **unsampled** path:
 ///
-/// - `suppress`: unsampled parent spans enter *hierarchical suppression*.
-///   While suppressed, nested `span!`/`measure!` calls become no-ops so that children
-///   do **not** incorrectly attach to the nearest sampled ancestor. This prevents tree
-///   distortion but drops nested detail under unsampled parents.
+/// - `suppress`: unsampled parent spans enter *hierarchical suppression*. While suppressed, nested
+///   `span!`/`measure!` calls become no-ops so that children do **not** incorrectly attach to the
+///   nearest sampled ancestor. This prevents tree distortion but drops nested detail under
+///   unsampled parents.
 ///
-/// - `count_only`: unsampled parent spans still push a lightweight frame to preserve
-///   hierarchy and increment counts, but do **not** read clocks. This keeps children
-///   correctly parented and yields accurate per-context call counts, at higher overhead
-///   than `suppress` / returning `None`.
+/// - `count_only`: unsampled parent spans still push a lightweight frame to preserve hierarchy and
+///   increment counts, but do **not** read clocks. This keeps children correctly parented and
+///   yields accurate per-context call counts, at higher overhead than `suppress` / returning
+///   `None`.
 ///
 /// ## Tagging
-/// Many forms accept a `$tag` which is converted into [`Tag`](crate::Tag). Tags are used
-/// to distinguish otherwise identical spans (for example, different transaction indices).
+/// Many forms accept a `$tag` which is converted into [`Tag`](crate::Tag). Tags are used to
+/// distinguish otherwise identical spans (for example, different transaction indices).
 ///
-/// Be careful with very high-cardinality tags (e.g. unique IDs) at hot callsites:
-/// this can create many distinct nodes in the profile tree.
+/// Be careful with very high-cardinality tags (e.g. unique IDs) at hot callsites: this can create
+/// many distinct nodes in the profile tree.
 ///
 /// ## Examples
 ///
@@ -98,9 +113,8 @@
 ///
 /// ## Notes
 /// - All macros are thread-local: each thread records its own tree.
-/// - `count_only` affects how you should interpret `count`:
-///   `count` becomes "number of calls" (sampled + unsampled),
-///   while timing fields are accumulated only for sampled calls.
+/// - `count_only` affects how you should interpret `count`: `count` becomes "number of calls"
+///   (sampled + unsampled), while timing fields are accumulated only for sampled calls.
 #[macro_export]
 macro_rules! measure {
     // Name, Tag, Rate, count_only, Block
@@ -308,7 +322,7 @@ macro_rules! span {
             static __PROFILER_SAMPLE_COUNTER: std::sync::atomic::AtomicUsize =
                 std::sync::atomic::AtomicUsize::new(0);
 
-            // IMPORTANT: hoist id + tag so both branches share the same OnceLock/static.
+            // Hoist id + tag so both branches share the same OnceLock/static.
             let __id = $crate::span!(@get_id $name);
             let __tag: $crate::Tag = ::core::convert::Into::into($tag);
 
@@ -328,7 +342,7 @@ macro_rules! span {
             static __PROFILER_SAMPLE_COUNTER: std::sync::atomic::AtomicUsize =
                 std::sync::atomic::AtomicUsize::new(0);
 
-            // IMPORTANT: hoist id so both branches share the same OnceLock/static.
+            // Hoist id so both branches share the same OnceLock/static.
             let __id = $crate::span!(@get_id $name);
 
             if $crate::span!(@should_sample __PROFILER_SAMPLE_COUNTER, $rate) {
@@ -433,8 +447,8 @@ macro_rules! span {
 
 /// Conditionally create a profiling span guard based on a predicate.
 ///
-/// This macro returns `None` when the predicate is false and otherwise forwards
-/// its arguments to [`span!`](crate::span).
+/// This macro returns `None` when the predicate is false and otherwise forwards its arguments to
+/// [`span!`](crate::span).
 #[macro_export]
 macro_rules! span_if {
     ($pred:expr, $($rest:tt)+) => {{
@@ -448,8 +462,8 @@ macro_rules! span_if {
 
 /// Attach a key/value record to the current span (if any).
 ///
-/// Records are stored per-occurrence (not aggregated). The value is converted
-/// via `Into<RecordValue>`, which accepts `&'static str`, `u64`, `i64`, and `bool`.
+/// Records are stored per-occurrence (not aggregated). The value is converted via
+/// `Into<RecordValue>`, which accepts `&'static str`, `u64`, `i64`, and `bool`.
 ///
 /// ## Examples
 ///
@@ -470,8 +484,8 @@ macro_rules! record {
 
 /// Attach a key/value record to the current span (if any), when a predicate is true.
 ///
-/// Equivalent to `if pred { record!(key, val) }`, but reads more naturally at callsites
-/// that are gated on a runtime flag.
+/// Equivalent to `if pred { record!(key, val) }`, but reads more naturally at callsites that are
+/// gated on a runtime flag.
 ///
 /// ## Examples
 ///
@@ -494,8 +508,8 @@ macro_rules! record_if {
 
 /// Increment a named counter on the current span (aggregated by key).
 ///
-/// If a counter with this key already exists on the span, `delta` is added
-/// to it (saturating). Otherwise a new counter is created with the given value.
+/// If a counter with this key already exists on the span, `delta` is added to it (saturating).
+/// Otherwise a new counter is created with the given value.
 ///
 /// ## Examples
 ///
@@ -518,8 +532,8 @@ macro_rules! counter_add {
 
 /// Increment a named counter on the current span (aggregated by key), when a predicate is true.
 ///
-/// Equivalent to `if pred { counter_add!(key, delta) }`, but reads more naturally
-/// at callsites gated on a runtime flag.
+/// Equivalent to `if pred { counter_add!(key, delta) }`, but reads more naturally at callsites
+/// gated on a runtime flag.
 ///
 /// ## Examples
 ///

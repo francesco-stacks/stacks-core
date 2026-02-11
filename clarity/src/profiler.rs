@@ -1,5 +1,4 @@
-// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
-// Copyright (C) 2020 Stacks Open Internet Foundation
+// Copyright (C) 2026 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -16,23 +15,20 @@
 
 //! Runtime profiler configuration for Clarity instrumentation.
 //!
-//! This module is feature-gated behind `profiler` and provides low-overhead
-//! toggles for profiler capture modes.
+//! This module is feature-gated behind `profiler` and provides low-overhead toggles for profiler
+//! capture modes.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bitflags that control profiler capture behavior.
 pub mod flags {
-    /// Capture per-call execution costs (counters in `runtime_cost`).
+    /// Capture per-call execution costs (counters and cost-function records in `runtime_cost`).
     pub const CAPTURE_COSTS: u64 = 1 << 0;
-    /// Attach cost function identifiers as span tags.
-    pub const CAPTURE_COST_FN: u64 = 1 << 1;
-    /// Attach contract-call function identifiers as span tags.
-    pub const CAPTURE_CONTRACT_CALL_IDENT: u64 = 1 << 2;
+    /// Attach entity names/identifiers to spans via [`record_name!`] and as tags.
+    pub const CAPTURE_NAMES: u64 = 1 << 1;
 }
 
-const DEFAULT_FLAGS: u64 =
-    flags::CAPTURE_COSTS | flags::CAPTURE_COST_FN | flags::CAPTURE_CONTRACT_CALL_IDENT;
+const DEFAULT_FLAGS: u64 = flags::CAPTURE_COSTS | flags::CAPTURE_NAMES;
 
 static PROFILER_FLAGS: AtomicU64 = AtomicU64::new(DEFAULT_FLAGS);
 
@@ -60,32 +56,27 @@ pub fn is_enabled(flags: u64) -> bool {
     (PROFILER_FLAGS.load(Ordering::Relaxed) & flags) == flags
 }
 
-/// Returns true if any given flags are enabled.
+/// Returns `true` when Clarity profiling spans should be emitted.
+///
+/// Checks the profiler's record-enabled toggle and suppression state.  This is the base gate for
+/// all Clarity-specific instrumentation; individual dimensions are further gated by their own
+/// flags (e.g. [`CAPTURE_COSTS`](flags::CAPTURE_COSTS), [`CAPTURE_NAMES`](flags::CAPTURE_NAMES)).
+#[cfg(feature = "profiler")]
 #[inline(always)]
-pub fn is_any_enabled(flags: u64) -> bool {
-    (PROFILER_FLAGS.load(Ordering::Relaxed) & flags) != 0
-}
-
-#[inline(always)]
-pub fn capture_costs() -> bool {
-    is_enabled(flags::CAPTURE_COSTS)
-}
-
-#[inline(always)]
-pub fn capture_contract_call_ident() -> bool {
-    is_enabled(flags::CAPTURE_CONTRACT_CALL_IDENT)
+pub fn should_profile() -> bool {
+    stacks_profiler::Profiler::is_record_enabled() && !stacks_profiler::Profiler::is_suppressed()
 }
 
 /// Begin a profiler span for a Clarity built-in function.
 ///
-/// Caches [`stacks_profiler::SpanId`] instances per `clarity_name` in a thread-local
-/// to avoid repeated allocation (the standard `span!` macro uses a per-callsite
-/// `OnceLock`, but here we dispatch ~80 different Clarity functions from one callsite).
+/// Caches [`stacks_profiler::SpanId`] instances per `clarity_name` in a thread-local to avoid
+/// repeated allocation (the standard `span!` macro uses a per-callsite `OnceLock`, but here we
+/// dispatch ~80 different Clarity functions from one callsite).
 ///
-/// Returns `Some(ProfileGuard)` when profiling is active, `None` otherwise.
-/// The span's `name` is set to `clarity_name` (the Clarity-facing name such as `"+"`
-/// or `"tuple"`) and its optional `tag` to `rust_name` (the backing Rust function
-/// name such as `"native_add"` or `"special_tuple"`).
+/// Returns `Some(ProfileGuard)` when profiling is active, `None` otherwise. The span's `name` is
+/// set to `clarity_name` (the Clarity-facing name such as `"+"` or `"tuple"`) and its optional
+/// `tag` to `rust_name` (the backing Rust function name such as `"native_add"` or
+/// `"special_tuple"`).
 #[cfg(feature = "profiler")]
 #[track_caller]
 pub fn begin_builtin_span(
@@ -94,17 +85,14 @@ pub fn begin_builtin_span(
 ) -> Option<stacks_profiler::ProfileGuard> {
     use std::cell::RefCell;
 
-    if !capture_costs()
-        || !stacks_profiler::Profiler::is_record_enabled()
-        || stacks_profiler::Profiler::is_suppressed()
-    {
+    if !should_profile() {
         return None;
     }
 
     let caller = std::panic::Location::caller();
 
-    // Thread-local cache: maps clarity_name pointer to &'static SpanId.
-    // At most ~80 entries (one per Clarity built-in); linear scan is fast.
+    // Thread-local cache: maps clarity_name pointer to &'static SpanId. Bounded to the number of
+    // clarity built-ins; linear scan is fast.
     thread_local! {
         static CACHE: RefCell<Vec<(*const u8, &'static stacks_profiler::SpanId)>> =
             const { RefCell::new(Vec::new()) };
@@ -112,8 +100,8 @@ pub fn begin_builtin_span(
 
     let span_id = CACHE.with(|cache| {
         let mut vec = cache.borrow_mut();
-        // Pointer equality is sound because clarity_name always originates
-        // from the same &'static str returned by NativeFunctions::get_name_str().
+        // Pointer equality is sound because clarity_name always originates from the same &'static
+        // str returned by NativeFunctions::get_name_str().
         let ptr = clarity_name.as_ptr();
         for &(cached_ptr, id) in vec.iter() {
             if cached_ptr == ptr {
@@ -137,15 +125,16 @@ pub fn begin_builtin_span(
 
 /// Begin a profiler span for a user-defined Clarity function.
 ///
-/// Unlike `begin_builtin_span`, user function names are dynamic (coming from
-/// contracts). We cache SpanId per unique function name string, bounded by the
-/// number of unique user functions called during profiling.
+/// Unlike `begin_builtin_span`, user function names are dynamic (coming from contracts). We cache
+/// SpanId per unique function name string, bounded by the number of unique user functions called
+/// during profiling.
 ///
-/// The span name is the Clarity function name (e.g. `"transfer-tokens"`),
-/// and the tag is the fully-qualified identifier (e.g.
+/// The span name is the Clarity function name (e.g. `"transfer-tokens"`), and the tag is the
+/// fully-qualified identifier (e.g.
 /// `"ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VG:my-contract:transfer-tokens"`).
-/// The `define_type` (`"private"`, `"public"`, or `"read-only"`) is recorded as
-/// context so the UI can visually distinguish them.
+///
+/// The `define_type` (`"private"`, `"public"`, or `"read-only"`) is recorded as context so the UI
+/// can visually distinguish them.
 #[cfg(feature = "profiler")]
 #[track_caller]
 pub fn begin_user_fn_span(
@@ -156,17 +145,14 @@ pub fn begin_user_fn_span(
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    if !capture_costs()
-        || !stacks_profiler::Profiler::is_record_enabled()
-        || stacks_profiler::Profiler::is_suppressed()
-    {
+    if !should_profile() {
         return None;
     }
 
     let caller = std::panic::Location::caller();
 
-    // Thread-local cache: maps function name to &'static SpanId.
-    // Bounded by the number of unique user-defined functions seen on this thread.
+    // Thread-local cache: maps function name to &'static SpanId. Bounded by the number of unique
+    // user-defined functions seen on this thread.
     thread_local! {
         static CACHE: RefCell<HashMap<String, &'static stacks_profiler::SpanId>> =
             RefCell::new(HashMap::new());
@@ -218,10 +204,9 @@ pub fn begin_user_fn_span(
 
 /// Begin a profiler span for contract function execution.
 ///
-/// Emits `execute-contract` with the target `contract.function` as tag.
-/// Used by both transaction entry points and `contract-call?` cross-contract
-/// calls.  Uses a static [`OnceLock`]-backed [`SpanId`](stacks_profiler::SpanId)
-/// since the span name is fixed.
+/// Emits `execute-contract` with the target `contract.function` as tag.  Used by both transaction
+/// entry points and `contract-call?` cross-contract calls.  Uses a static [`OnceLock`]-backed
+/// [`SpanId`](stacks_profiler::SpanId) since the span name is fixed.
 #[cfg(feature = "profiler")]
 #[track_caller]
 pub fn begin_contract_call_span(
@@ -230,10 +215,7 @@ pub fn begin_contract_call_span(
 ) -> Option<stacks_profiler::ProfileGuard> {
     use std::sync::OnceLock;
 
-    if !capture_costs()
-        || !stacks_profiler::Profiler::is_record_enabled()
-        || stacks_profiler::Profiler::is_suppressed()
-    {
+    if !should_profile() {
         return None;
     }
 
@@ -247,15 +229,8 @@ pub fn begin_contract_call_span(
         line: caller.line(),
     });
 
-    let tag = if capture_contract_call_ident() {
-        Some(stacks_profiler::Tag::from(format!(
-            "{}.{}",
-            contract_identifier, tx_name
-        )))
-    } else {
-        None
-    };
-    Some(stacks_profiler::Profiler::begin_span(span_id, tag))
+    let tag = stacks_profiler::Tag::from(format!("{}.{}", contract_identifier, tx_name));
+    Some(stacks_profiler::Profiler::begin_span(span_id, Some(tag)))
 }
 
 /// No-op when the `profiler` feature is not enabled.
@@ -270,10 +245,8 @@ pub fn begin_contract_call_span(
 
 /// Begin a profiler span for a function-as-transaction execution.
 ///
-/// Emits `begin-read-only-tx` or `begin-public-tx` depending on
-/// whether the function is read-only.  The function identifier is attached as
-/// tag when [`CAPTURE_CONTRACT_CALL_IDENT`](flags::CAPTURE_CONTRACT_CALL_IDENT)
-/// is enabled.
+/// Emits `begin-read-only-tx` or `begin-public-tx` depending on whether the function is read-only.
+/// The function identifier is always attached as tag.
 #[cfg(feature = "profiler")]
 #[track_caller]
 pub fn begin_exec_tx_span(
@@ -282,10 +255,7 @@ pub fn begin_exec_tx_span(
 ) -> Option<stacks_profiler::ProfileGuard> {
     use std::sync::OnceLock;
 
-    if !capture_costs()
-        || !stacks_profiler::Profiler::is_record_enabled()
-        || stacks_profiler::Profiler::is_suppressed()
-    {
+    if !should_profile() {
         return None;
     }
 
@@ -310,12 +280,8 @@ pub fn begin_exec_tx_span(
         })
     };
 
-    let tag = if capture_contract_call_ident() {
-        Some(stacks_profiler::Tag::from(fn_identifier.to_string()))
-    } else {
-        None
-    };
-    Some(stacks_profiler::Profiler::begin_span(span_id, tag))
+    let tag = stacks_profiler::Tag::from(fn_identifier.to_string());
+    Some(stacks_profiler::Profiler::begin_span(span_id, Some(tag)))
 }
 
 /// No-op when the `profiler` feature is not enabled.
@@ -330,14 +296,14 @@ pub fn begin_exec_tx_span(
 
 /// Create a profiler span when cost capturing is enabled.
 ///
-/// Use as: `let _span = crate::profiler::profile!("name")` or
-/// `let _span = crate::profiler::profile!("name", tag_value)`.
+/// Use as: `let _span = crate::profiler::profile!("name")` or `let _span =
+/// crate::profiler::profile!("name", tag_value)`.
 #[macro_export]
 macro_rules! profile {
     ($name:expr) => {{
         #[cfg(feature = "profiler")]
         {
-            if $crate::profiler::capture_costs() && stacks_profiler::Profiler::is_record_enabled() {
+            if $crate::profiler::should_profile() {
                 Some(stacks_profiler::span!($name))
             } else {
                 None
@@ -351,11 +317,8 @@ macro_rules! profile {
     ($name:expr, $tag:expr) => {{
         #[cfg(feature = "profiler")]
         {
-            if $crate::profiler::capture_costs() && stacks_profiler::Profiler::is_record_enabled() {
-                if $crate::profiler::is_any_enabled(
-                    $crate::profiler::flags::CAPTURE_COST_FN
-                        | $crate::profiler::flags::CAPTURE_CONTRACT_CALL_IDENT,
-                ) {
+            if $crate::profiler::should_profile() {
+                if $crate::profiler::is_enabled($crate::profiler::flags::CAPTURE_NAMES) {
                     let __tag = $tag.to_string();
                     Some(stacks_profiler::span!($name, __tag))
                 } else {
@@ -372,20 +335,17 @@ macro_rules! profile {
     }};
 }
 
-/// Record the active Clarity function name when cost capturing is enabled.
+/// Record the name of the entity being operated on by the current span.
 ///
-/// Use as: `crate::profiler::record_name!(name)` where `name` is a Clarity identifier.
+/// Use as: `crate::profiler::record_name!(name)` where `name` is any Clarity identifier
+/// (function name, variable name, map name, token name, etc.).
 #[macro_export]
 macro_rules! record_name {
     ($name:expr) => {{
         #[cfg(feature = "profiler")]
         {
-            if $crate::profiler::capture_costs()
-                && stacks_profiler::Profiler::is_record_enabled()
-                && $crate::profiler::is_any_enabled(
-                    $crate::profiler::flags::CAPTURE_COST_FN
-                        | $crate::profiler::flags::CAPTURE_CONTRACT_CALL_IDENT,
-                )
+            if $crate::profiler::should_profile()
+                && $crate::profiler::is_enabled($crate::profiler::flags::CAPTURE_NAMES)
             {
                 stacks_profiler::record!("NAME", $name.to_string());
             }
@@ -401,3 +361,37 @@ macro_rules! record_name {
 pub use crate::profile;
 #[doc(hidden)]
 pub use crate::record_name;
+
+/// Record cost counters and (optionally) cost-function identity for the current span.
+///
+/// Called from [`CostTracker::compute_cost`](crate::vm::costs::CostTracker::compute_cost) after
+/// a successful cost evaluation.  Gated by [`CAPTURE_COSTS`](flags::CAPTURE_COSTS); cost-function
+/// name records are further gated by [`CAPTURE_NAMES`](flags::CAPTURE_NAMES).
+#[cfg(feature = "profiler")]
+pub fn capture_costs(
+    cost: &crate::vm::costs::ExecutionCost,
+    cost_function: &crate::vm::costs::cost_functions::ClarityCostFunction,
+    input: &[u64],
+) {
+    if !should_profile() || !is_enabled(flags::CAPTURE_COSTS) || cost.is_zero() {
+        return;
+    }
+
+    let cost_fn_input = *input.first().unwrap_or(&0_u64);
+
+    // Cost-function identity (gated by CAPTURE_NAMES).
+    if is_enabled(flags::CAPTURE_NAMES) {
+        let cost_fn_name = cost_function.get_name();
+        let cost_fn_str = format!("{cost_fn_name}({cost_fn_input})");
+        stacks_profiler::record!("clarity:costs:fn_input", cost_fn_str);
+        stacks_profiler::record!("clarity:costs:fn", cost_fn_name);
+    }
+
+    // Cost counters.
+    stacks_profiler::counter_add!("CIN", cost_fn_input);
+    stacks_profiler::counter_add!("CR", cost.runtime);
+    stacks_profiler::counter_add!("CRC", cost.read_count);
+    stacks_profiler::counter_add!("CRL", cost.read_length);
+    stacks_profiler::counter_add!("CWC", cost.write_count);
+    stacks_profiler::counter_add!("CWL", cost.write_length);
+}

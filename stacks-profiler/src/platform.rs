@@ -1,12 +1,25 @@
+// Copyright (C) 2026 Stacks Open Internet Foundation
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 //! Platform-specific per-thread CPU time.
 //!
-//! Each platform module implements [`ThreadCpuTimer`] on a zero-sized struct,
-//! and a single `cfg`-gated `use` selects the active implementation.  The
-//! public [`thread_cpu_nanos`] free function delegates to whichever platform
-//! was selected at compile time.
+//! Each platform module implements [`ThreadCpuTimer`] on a zero-sized struct, and a single
+//! `cfg`-gated `use` selects the active implementation.  The public [`thread_cpu_nanos`] free
+//! function delegates to whichever platform was selected at compile time.
 //!
-//! Returns the cumulative CPU time (user + kernel) consumed by the calling
-//! thread, in nanoseconds.
+//! Returns the cumulative CPU time (user + kernel) consumed by the calling thread, in nanoseconds.
 //!
 //! | Platform | Source | Typical resolution |
 //! |----------|--------|--------------------|
@@ -17,30 +30,28 @@
 //!
 //! # Windows caveats
 //!
-//! `GetThreadTimes` reports CPU time in `FILETIME` units (100 ns intervals),
-//! but the underlying counter only advances once per system clock interrupt,
-//! which defaults to ~15.625 ms (64 Hz). This means:
+//! `GetThreadTimes` reports CPU time in `FILETIME` units (100 ns intervals), but the underlying
+//! counter only advances once per system clock interrupt, which defaults to ~15.625 ms (64 Hz).
+//! This means:
 //!
 //! - Individual short spans may report **0 ns** of CPU time.
 //! - Aggregated totals across many calls converge to accurate values.
 //! - Wall-time minus CPU-time ("wait time") is unreliable for sub-16 ms spans.
 //!
-//! The alternative `QueryThreadCycleTime` offers cycle-level precision but
-//! returns CPU cycles rather than wall-clock nanoseconds; converting back
-//! requires knowledge of the effective clock frequency, which varies under
-//! dynamic frequency scaling. `GetThreadTimes` was chosen for its direct
-//! time-unit semantics and simplicity.
+//! The alternative `QueryThreadCycleTime` offers cycle-level precision but returns CPU cycles
+//! rather than wall-clock nanoseconds; converting back requires knowledge of the effective clock
+//! frequency, which varies under dynamic frequency scaling. `GetThreadTimes` was chosen for its
+//! direct time-unit semantics and simplicity.
 
 // ── trait ────────────────────────────────────────────────────────────────────
 
 /// Contract that every platform backend must satisfy.
 ///
-/// Implementations live on zero-sized structs so the compiler can
-/// monomorphise and inline the call — no vtable overhead.
+/// Implementations live on zero-sized structs so the compiler can monomorphise and inline the call
+/// — no vtable overhead.
 trait ThreadCpuTimer {
-    /// Cumulative CPU time (user + kernel) of the calling thread, in
-    /// nanoseconds.  Must be monotonically non-decreasing within a
-    /// thread.
+    /// Cumulative CPU time (user + kernel) of the calling thread, in nanoseconds.  Must be
+    /// monotonically non-decreasing within a thread.
     fn thread_cpu_nanos() -> u64;
 }
 
@@ -49,8 +60,7 @@ trait ThreadCpuTimer {
 #[cfg(target_os = "macos")]
 mod darwin {
     unsafe extern "C" {
-        // In libSystem on macOS:
-        // uint64_t clock_gettime_nsec_np(clockid_t clk_id);
+        /// In libSystem on macOS: `uint64_t clock_gettime_nsec_np(clockid_t clk_id);`
         pub(super) fn clock_gettime_nsec_np(clk_id: libc::clockid_t) -> u64;
     }
 
@@ -64,8 +74,8 @@ mod darwin {
         }
     }
 
-    /// Sanity-check that both available macOS methods of reading the
-    /// thread CPU timer yield consistent results.
+    /// Sanity-check that both available macOS methods of reading the thread CPU timer yield
+    /// consistent results.
     #[test]
     fn timer_equivalence_smoke() {
         fn via_timespec() -> u64 {
@@ -125,8 +135,8 @@ mod linux {
 
 #[cfg(target_os = "windows")]
 mod windows {
-    /// Win32 FILETIME — two 32-bit parts forming a 64-bit count of
-    /// 100-nanosecond intervals since 1601-01-01 UTC.
+    /// Win32 FILETIME — two 32-bit parts forming a 64-bit count of 100-nanosecond intervals since
+    /// 1601-01-01 UTC.
     #[repr(C)]
     struct FILETIME {
         low: u32,
@@ -147,6 +157,7 @@ mod windows {
         fn GetCurrentThread() -> *mut core::ffi::c_void;
 
         /// Retrieves timing information for the specified thread.
+        ///
         /// <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadtimes>
         fn GetThreadTimes(
             hThread: *mut core::ffi::c_void,
@@ -171,8 +182,8 @@ mod windows {
 
                 let handle = GetCurrentThread();
                 if GetThreadTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0 {
-                    // kernel + user = total CPU time.
-                    // FILETIME units are 100 ns intervals; multiply by 100 for nanos.
+                    // kernel + user = total CPU time. FILETIME units are 100 ns intervals; multiply
+                    // by 100 for nanos.
                     (kernel.as_100ns() + user.as_100ns()) * 100
                 } else {
                     0
@@ -208,9 +219,8 @@ use unsupported::Timer as PlatformTimer;
 #[cfg(target_os = "windows")]
 use windows::Timer as PlatformTimer;
 
-/// Returns the cumulative CPU time (user + kernel) of the calling thread
-/// in nanoseconds.  See [module-level docs](self) for per-platform
-/// resolution and caveats.
+/// Returns the cumulative CPU time (user + kernel) of the calling thread in nanoseconds. See
+/// [module-level docs](self) for per-platform resolution and caveats.
 #[inline(always)]
 pub fn thread_cpu_nanos() -> u64 {
     PlatformTimer::thread_cpu_nanos()

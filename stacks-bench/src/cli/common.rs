@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use stacks_bench::context::{BenchEnv, BenchEnvOpts};
 use stacks_bench::db::DbOpenForRead;
 use stacks_bench::db::app::AppDb;
+use stacks_bench::db::app::models::BenchmarkRun;
 use stacks_bench::db::node::ChainStateDb;
 use stacks_bench::db::node::sortition::SortitionDb;
 use stacks_bench::indexer::ChainIndexPlan;
@@ -113,6 +114,32 @@ impl UpperHex for TxIdArg {
         }
         Ok(())
     }
+}
+
+/// Format a benchmark run for display in interactive select / multiselect lists.
+///
+/// Returns something like: `✔ my-run  —  2026-02-11 14:30:00`
+pub fn format_run_label(run: &BenchmarkRun) -> String {
+    let status = if run.end_time.is_some() {
+        console::style("✔").green().to_string()
+    } else {
+        console::style("…").yellow().to_string()
+    };
+    let name = run.run_name.as_deref().unwrap_or("(unnamed)");
+    format!(
+        "{status} {name}  —  {}",
+        run.start_time.format("%Y-%m-%d %H:%M:%S"),
+    )
+}
+
+/// Format a run's name as a bold parenthetical suffix for log messages.
+///
+/// Returns `" (name)"` (with bold styling) when a name exists, or `""` otherwise.
+pub fn format_run_name_suffix(run: &BenchmarkRun) -> String {
+    run.run_name
+        .as_deref()
+        .map(|n| format!(" ({})", console::style(n).bold()))
+        .unwrap_or_default()
 }
 
 // Helper to get the current git commit hash
