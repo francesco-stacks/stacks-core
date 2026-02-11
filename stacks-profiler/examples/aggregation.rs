@@ -1,4 +1,4 @@
-//! **aggregation** – Loop aggregation, call-site identity, and sampling.
+//! **aggregation** – Loop aggregation and sampling.
 //!
 //! Run with:
 //! ```sh
@@ -8,8 +8,6 @@
 //! This example covers:
 //! - **Loop aggregation**: repeated spans at the same call site are merged
 //!   into a single node with an accurate `count`.
-//! - **Call-site identity**: two textually identical `span!("Sub Task")` calls
-//!   at *different* source locations produce *separate* tree nodes.
 //! - **`rate: N`**: sample ~1 in N invocations (cheap fast-path for hot loops).
 //! - **`count_only`**: unsampled calls still maintain parent context & count.
 //! - **`suppress`**: unsampled calls suppress the entire subtree.
@@ -18,7 +16,7 @@ use stacks_profiler::Profiler;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// A tiny unit of work called from two different source locations.
+/// A tiny unit of work — called multiple times but always from the same `span!` callsite.
 fn sub_task() {
     let _span = stacks_profiler::span!("Sub Task");
     let mut _x = 0u64;
@@ -30,21 +28,21 @@ fn sub_task() {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
-    // ── Part 1: Basic aggregation & call-site identity ───────────────────
+    // ── Part 1: Basic loop aggregation ────────────────────────────────────
     //
     // "Iteration" is called 100 times at a single call site → 1 node, count=100.
-    // "Sub Task" is called from two *different* lines inside the loop, so each
-    // call site gets its own node despite sharing the same span name.
+    // "Sub Task" has its span! inside the function body (one callsite), so both
+    // the unconditional and conditional calls aggregate into a single node.
     {
         let _root = stacks_profiler::span!("Loop (always recorded)");
 
         for i in 0..100 {
             let _iter = stacks_profiler::span!("Iteration");
 
-            sub_task(); // call-site A
+            sub_task(); // same span! callsite → aggregated into one node
 
             if i % 10 == 0 {
-                sub_task(); // call-site B (different line → separate node)
+                sub_task(); // same span! callsite → same aggregated node
             }
         }
     }

@@ -18,7 +18,7 @@
 //! This module defines the data-carrying types that appear in profile results:
 //! [`RecordValue`], [`Record`], [`Counter`], and [`Tag`].
 
-/// A dynamically-typed value that can be attached to a span via [`record!`].
+/// A dynamically-typed value that can be attached to a span via [`record!`](crate::record).
 #[derive(Debug, Clone)]
 pub enum RecordValue {
     U64(u64),
@@ -75,7 +75,8 @@ impl std::fmt::Display for RecordValue {
     }
 }
 
-/// A key/value record attached to a span via [`record!`] or [`Profiler::record`].
+/// A key/value record attached to a span via [`record!`](crate::record) or
+/// [`Profiler::record`](crate::Profiler::record).
 ///
 /// Records are per-occurrence: each call appends a new entry (they are not aggregated).  Use
 /// [`Counter`] for additive metrics.
@@ -85,7 +86,8 @@ pub struct Record {
     pub value: RecordValue,
 }
 
-/// An aggregated counter attached to a span via [`counter_add!`] or [`Profiler::counter_add`].
+/// An aggregated counter attached to a span via [`counter_add!`](crate::counter_add) or
+/// [`Profiler::counter_add`](crate::Profiler::counter_add).
 ///
 /// Counters with the same key on the same node are summed (saturating).
 #[derive(Debug, Clone)]
@@ -94,8 +96,8 @@ pub struct Counter {
     pub value: u64,
 }
 
-/// A lightweight, `Copy` discriminator for spans that share the same [`SpanId`] but represent
-/// distinct logical instances (e.g., different transaction indices within a block).
+/// A lightweight, `Copy` discriminator for spans that share the same [`SpanId`](crate::SpanId) but
+/// represent distinct logical instances (e.g., different transaction indices within a block).
 ///
 /// Spans with the same `SpanId` but different tags are stored as separate nodes in the profile
 /// tree.  Avoid very-high-cardinality tags at hot callsites, as each distinct `(SpanId, Tag)` pair
@@ -154,5 +156,16 @@ impl From<String> for Tag {
     #[inline(always)]
     fn from(v: String) -> Self {
         Tag::Str(crate::intern_tag_str(v))
+    }
+}
+
+impl std::fmt::Display for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Tag::U64(v) => write!(f, "{v}"),
+            Tag::I64(v) => write!(f, "{v}"),
+            Tag::Usize(v) => write!(f, "{v}"),
+            Tag::Str(v) => write!(f, "{v}"),
+        }
     }
 }

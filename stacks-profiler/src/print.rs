@@ -40,17 +40,6 @@ impl Style {
     const WHITE: &str = "\x1b[37m";
 }
 
-impl std::fmt::Display for Tag {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Tag::U64(v) => write!(f, "{}", v),
-            Tag::I64(v) => write!(f, "{}", v),
-            Tag::Usize(v) => write!(f, "{}", v),
-            Tag::Str(v) => write!(f, "{}", v),
-        }
-    }
-}
-
 /// Context passed to the formatter for the current node being visited.
 pub struct NodeContext<'a> {
     pub stats: &'a ProfileStats,

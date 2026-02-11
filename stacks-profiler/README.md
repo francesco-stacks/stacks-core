@@ -25,7 +25,7 @@ contention) is vital.
 
 ### Instrumentation Macros
 
-#### `#[profile]` / `#[profile(name = "...")]`
+#### `#[profile]` / `#[profile(name = "...", sample_rate = N, unsampled = "...")]`
 
 Attribute macro for profiling an entire function. Use when every call to the
 function should be timed. The span name defaults to the function name.
@@ -39,6 +39,29 @@ fn setup() { /* ... */ }
 #[profile(name = "Teardown Phase")] // span name: "Teardown Phase"
 fn teardown() { /* ... */ }
 ```
+
+Supports sampling via `sample_rate` and control over unsampled calls via
+`unsampled` (same semantics as `rate:` / `suppress` / `count_only` on `span!`):
+
+```rust
+use stacks_profiler::profile;
+
+// Time ~1% of calls; unsampled calls are no-ops (default):
+#[profile(sample_rate = 100)]
+fn hot_path() { /* ... */ }
+
+// Unsampled calls suppress nested spans (prevents tree distortion):
+#[profile(sample_rate = 100, unsampled = "suppress")]
+fn request_handler() { /* ... */ }
+
+// Unsampled calls preserve hierarchy and increment counts without timing:
+#[profile(sample_rate = 100, unsampled = "count_only")]
+fn execute_tx() { /* ... */ }
+```
+
+**Tip:** Power-of-two rates (e.g., 2, 4, 8, 16, 32, 64, 128) use a bitmask
+instead of modulo on the hot path, so prefer them when the exact ratio doesn't
+matter.
 
 #### `span!(name, [tag], [rate: N], [suppress | count_only])`
 

@@ -130,10 +130,10 @@ impl ThreadState {
     /// Look up or allocate a root-level node for the given `(SpanId, Tag)`.
     #[inline]
     pub fn find_or_create_root(&mut self, id: &'static SpanId, tag: Option<Tag>) -> NodeId {
-        if let Some(last) = self.roots_last_child {
-            if self.node(last).key_eq(id, tag) {
-                return last;
-            }
+        if let Some(last) = self.roots_last_child
+            && self.node(last).key_eq(id, tag)
+        {
+            return last;
         }
 
         for &child in &self.roots {
@@ -157,10 +157,10 @@ impl ThreadState {
         id: &'static SpanId,
         tag: Option<Tag>,
     ) -> NodeId {
-        if let Some(last) = self.node(parent).last_child {
-            if self.node(last).key_eq(id, tag) {
-                return last;
-            }
+        if let Some(last) = self.node(parent).last_child
+            && self.node(last).key_eq(id, tag)
+        {
+            return last;
         }
 
         let children: &[NodeId] = &self.node(parent).children;

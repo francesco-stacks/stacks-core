@@ -19,30 +19,26 @@
 //!
 //! ## Key concepts
 //!
-//! - **Span** — a named region of execution.  Spans form a tree: each span is
-//!   either a root or a child of the span that was active when it was entered.
-//! - **[`SpanId`]** — a static, callsite-unique identifier (name + source
-//!   location).
-//! - **[`Tag`]** — an optional value that further distinguishes spans with the
-//!   same `SpanId` (e.g., a transaction index).
-//! - **[`ProfileGuard`]** — an RAII guard returned by [`Profiler::begin_span`].
-//!   Dropping the guard ends the span and records elapsed wall and CPU time.
-//! - **[`ProfileStats`]** — the collected metrics tree, retrieved via
-//!   [`Profiler::take_results`].
+//! - **Span** — a named region of execution.  Spans form a tree: each span is either a root or a
+//!   child of the span that was active when it was entered.
+//! - **[`SpanId`]** — a static, callsite-unique identifier (name + source location).
+//! - **[`Tag`]** — an optional value that further distinguishes spans with the same `SpanId` (e.g.,
+//!   a transaction index).
+//! - **[`ProfileGuard`]** — an RAII guard returned by [`Profiler::begin_span`]. Dropping the guard
+//!   ends the span and records elapsed wall and CPU time.
+//! - **[`ProfileStats`]** — the collected metrics tree, retrieved via [`Profiler::take_results`].
 //!
 //! ## Threading model
 //!
-//! All state is **thread-local**: each thread maintains its own independent
-//! span stack and node arena.  There is no cross-thread synchronisation on the
-//! hot path.  The only process-global state is [`Profiler::enable_record`] /
-//! [`Profiler::disable_record`], which is an `AtomicBool` kill-switch for
-//! record/counter attachment.
+//! All state is **thread-local**: each thread maintains its own independent span stack and node
+//! arena.  There is no cross-thread synchronisation on the hot path.  The only process-global state
+//! is [`Profiler::enable_record`] / [`Profiler::disable_record`], which is an [`AtomicBool`]
+//! kill-switch for record/counter attachment.
 //!
 //! ## Typical usage
 //!
-//! Most code should instrument using the [`span!`], [`measure!`], or
-//! [`#[profile]`](profile) macros rather than calling [`Profiler`] methods
-//! directly.
+//! Most code should instrument using the [`span!`](span), [`measure!`](measure), or
+//! [`#[profile]`](profile) macros rather than calling [`Profiler`] methods directly.
 //!
 //! ```rust
 //! use stacks_profiler::{measure, Profiler};
@@ -58,6 +54,7 @@
 //! ```
 
 use std::cell::{Cell, RefCell};
+use std::marker::PhantomData;
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -89,9 +86,9 @@ thread_local! {
 }
 
 thread_local! {
-    /// Suppression nesting depth.  Kept separate from [`STATE`] so that `is_suppressed()` can be
-    /// checked without borrowing the `RefCell`.
-    static SUPPRESS_DEPTH: Cell<u32> = Cell::new(0);
+    /// Suppression nesting depth.  Kept separate from [`STATE`] so that
+    /// [`Profiler::is_suppressed()`] can be checked without borrowing the [`RefCell`].
+    static SUPPRESS_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 thread_local! {
@@ -122,13 +119,15 @@ fn intern_tag_str(s: String) -> &'static str {
 
 /// A static, callsite-unique identifier for a profiling span.
 ///
-/// A `SpanId` is typically created once per callsite (via a `OnceLock` inside the [`span!`] macro
-/// or [the `#[profile]` attribute](profile)) and then reused on every subsequent invocation.
+/// A `SpanId` is typically created once per callsite (via a [`OnceLock`](std::sync::OnceLock)
+/// inside the [`span!`](span) macro or the [`#[profile]`](profile) attribute) and
+/// then reused on every subsequent invocation.
 ///
 /// Two `SpanId`s are considered equal when all four fields match.  As an optimization, pointer
 /// equality is tried first — this is correct because callsite-generated `SpanId`s use `&'static
 /// str` literals that are guaranteed pointer-unique per callsite.
 #[derive(Debug, Copy, Clone, Eq, Hash)]
+#[allow(clippy::derived_hash_with_manual_eq)] // Manual PartialEq is semantically equivalent
 pub struct SpanId {
     /// Human-readable span name (e.g., `"execute_tx"`).
     pub name: &'static str,
@@ -200,11 +199,11 @@ pub struct ProfileStats {
     pub children: Vec<ProfileStats>,
     /// Total number of times this span was entered (sampled **and** count-only).
     pub entered_count: usize,
-    /// Number of entries that were fully timed (a subset of `entered_count`).
+    /// Number of entries that were fully timed (a subset of [`Self::entered_count`]).
     pub sampled_count: usize,
-    /// Per-occurrence key/value records (see [`record!`]).
+    /// Per-occurrence key/value records (see [`record!`](record)).
     pub records: Vec<Record>,
-    /// Aggregated counters (see [`counter_add!`]).
+    /// Aggregated counters (see [`counter_add!`](counter_add)).
     pub counters: Vec<Counter>,
 }
 
@@ -240,7 +239,7 @@ impl ProfileStats {
     }
 
     /// Estimated time the thread was **not** running on a CPU core (wall time minus CPU time).  See
-    /// [`platform`](crate::platform) module docs for per-platform resolution caveats.
+    /// [`platform`] module docs for per-platform resolution caveats.
     pub fn wait_time(&self) -> Duration {
         Duration::from_nanos(self.wall_time_ns.saturating_sub(self.cpu_time_ns))
     }
@@ -286,15 +285,15 @@ impl ProfileStats {
 /// Static entry-point for all profiler operations.
 ///
 /// `Profiler` is a zero-sized struct with only associated functions. Most users should prefer the
-/// [`span!`], [`measure!`], and [`#[profile]`](profile) macros, which handle `SpanId` caching and
-/// guard lifetime automatically.
+/// [`span!`](span), [`measure!`](measure), and [`#[profile]`](profile) macros, which handle
+/// `SpanId` caching and guard lifetime automatically.
 pub struct Profiler;
 
 impl Profiler {
     /// Create a new [`SpanId`] anchored at the caller's source location.
     ///
-    /// Typically called once per callsite inside a `OnceLock`; the macros handle this
-    /// automatically.
+    /// Typically called once per callsite inside a [`OnceLock`](std::sync::OnceLock); the macros
+    /// handle this automatically.
     #[doc(hidden)]
     #[inline(always)]
     #[track_caller]
@@ -325,11 +324,12 @@ impl Profiler {
 
         ProfileGuard {
             kind: GuardKind::Span,
+            _not_send: PhantomData,
         }
     }
 
-    /// Begin a **count-only** span — preserves hierarchy and increments `entered_count`, but does
-    /// **not** read clocks.
+    /// Begin a **count-only** span — preserves hierarchy and increments [`Node::entered_count`],
+    /// but does **not** read clocks.
     #[doc(hidden)]
     #[inline(always)]
     pub fn begin_span_count_only(id: &'static SpanId, tag: Option<Tag>) -> ProfileGuard {
@@ -344,17 +344,20 @@ impl Profiler {
 
         ProfileGuard {
             kind: GuardKind::Span,
+            _not_send: PhantomData,
         }
     }
 
-    /// Enter a **suppression** region.  While suppressed, nested `span!`/`measure!` calls return
-    /// `None` (no-op), preventing children from attaching to the wrong parent.
+    /// Enter a **suppression** region.  While suppressed, nested
+    /// [`span!`](span)/[`measure!`](measure) calls return [`None`] (no-op), preventing children
+    /// from attaching to the wrong parent.
     #[doc(hidden)]
     #[inline(always)]
     pub fn begin_suppression() -> ProfileGuard {
         SUPPRESS_DEPTH.with(|d| d.set(d.get().wrapping_add(1)));
         ProfileGuard {
             kind: GuardKind::Suppression,
+            _not_send: PhantomData,
         }
     }
 
@@ -411,7 +414,7 @@ impl Profiler {
     }
 
     /// Disable record/counter attachment process-wide.  Spans and timing are unaffected — only
-    /// [`record!`] and [`counter_add!`] become no-ops.
+    /// [`record!`](record) and [`counter_add!`](counter_add) become no-ops.
     #[inline(always)]
     pub fn disable_record() {
         RECORD_ENABLED.store(false, Ordering::Relaxed);
@@ -476,8 +479,8 @@ impl Profiler {
         });
     }
 
-    /// Drain the calling thread's profile tree and return it as a `Vec<ProfileStats>` (one entry
-    /// per root span).  The thread-local state is reset afterward.
+    /// Drain the calling thread's profile tree and return it as a [`Vec<ProfileStats>`] (one entry
+    /// per root span). The thread-local state is reset afterward.
     ///
     /// # Panics (debug)
     ///
@@ -487,29 +490,48 @@ impl Profiler {
         STATE.with(|cell| cell.borrow_mut().take_results_and_reset())
     }
 
-    /// Discard all accumulated data on the calling thread without returning it.  Suppression depth
+    /// Discard all accumulated data on the calling thread without returning it. Suppression depth
     /// is **not** affected (it is scoped by guards).
     #[inline]
     pub fn clear() {
         STATE.with(|cell| cell.borrow_mut().clear())
-        // NOTE: do not touch SUPPRESS_DEPTH here; suppression is scoped by guards.
     }
 }
 
-/// Discriminates the two kinds of RAII guard so that `Drop` calls the correct cleanup path.
+/// Discriminates the two kinds of RAII guard so that [`Drop`] calls the correct cleanup path.
 enum GuardKind {
-    /// Timed or count-only — calls `end_span()` on drop.
+    /// Timed or count-only — calls [`Profiler::end_span()`] on drop.
     Span,
-    /// Suppression region — calls `end_suppression()` on drop.
+    /// Suppression region — calls [`Profiler::end_suppression()`] on drop.
     Suppression,
 }
 
 /// RAII guard that ends a span (or suppression region) when dropped.
 ///
 /// Created by [`Profiler::begin_span`], [`Profiler::begin_span_count_only`], or
-/// [`Profiler::begin_suppression`] (and transitively by the [`span!`] and [`measure!`] macros).
+/// [`Profiler::begin_suppression`] (and transitively by the [`span!`](span) and
+/// [`measure!`](measure) macros).
+///
+/// # Thread safety
+///
+/// `ProfileGuard` is intentionally `!Send` and `!Sync` because its [`Drop`] impl operates on
+/// thread-local state. Sending a guard to another thread and dropping it there would corrupt that
+/// thread's profiler state. The `PhantomData<*const ()>` field enforces this at compile time: raw
+/// pointers are `!Send + !Sync`, and [`PhantomData`] propagates those bounds to the containing
+/// struct.
+///
+/// ```compile_fail,E0277
+/// fn assert_send<T: Send>() {}
+/// assert_send::<stacks_profiler::ProfileGuard>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<stacks_profiler::ProfileGuard>();
+/// ```
 pub struct ProfileGuard {
     kind: GuardKind,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl Drop for ProfileGuard {

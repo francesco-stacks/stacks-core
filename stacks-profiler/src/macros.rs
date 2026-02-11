@@ -463,7 +463,7 @@ macro_rules! span_if {
 /// Attach a key/value record to the current span (if any).
 ///
 /// Records are stored per-occurrence (not aggregated). The value is converted via
-/// `Into<RecordValue>`, which accepts `&'static str`, `u64`, `i64`, and `bool`.
+/// `Into<RecordValue>`, which accepts `&str`, `String`, `u64`, `i64`, and `&[u8]`.
 ///
 /// ## Examples
 ///

@@ -11,7 +11,7 @@ fn make_unique_tag(i: u64) -> String {
 #[inline]
 fn clear_every(counter: &mut u64, n: u64) {
     *counter += 1;
-    if *counter % n == 0 {
+    if counter.is_multiple_of(n) {
         Profiler::clear();
     }
 }

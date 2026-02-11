@@ -73,6 +73,7 @@ where
 fn build_context_extraction() -> TokenStream2 {
     quote! {
         let type_name = std::any::type_name::<__StacksProfilerScope>();
+        // Strip the "::__StacksProfilerScope" suffix (23 chars) to get the enclosing path.
         let full_path = &type_name[..type_name.len() - 23];
 
         let (mut context, auto_name) = match full_path.rfind("::") {
@@ -198,7 +199,7 @@ fn build_guard_creation(sample_rate: Option<usize>, mode: UnsampledBehavior) -> 
 
 /// Instruments a function by automatically creating a `stacks_profiler` span for its body.
 ///
-/// This is the attribute-macro equivalent of placing a [`stacks_profiler::span!`] guard at the
+/// This is the attribute-macro equivalent of placing a `stacks_profiler::span!` guard at the
 /// top of a function and letting it drop on return (or panic).
 ///
 /// The span name defaults to the function name and is scoped with a derived "context"
@@ -293,6 +294,7 @@ pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
 
     let input_fn = parse_macro_input!(input as ItemFn);
 
+    let attrs = &input_fn.attrs;
     let vis = &input_fn.vis;
     let sig = &input_fn.sig;
     let block = &input_fn.block;
@@ -301,6 +303,7 @@ pub fn profile(args: TokenStream, input: TokenStream) -> TokenStream {
     let guard_creation = build_guard_creation(args.sample_rate, args.unsampled);
 
     let output = quote! {
+        #(#attrs)*
         #vis #sig {
             let __profiler_span_id = #setup_block;
             #guard_creation
