@@ -74,6 +74,15 @@ fn build_clarity_marf(
             .insert_metadata(&contract_id, "source", "contract source code v0")
             .unwrap();
 
+        // Insert metadata with keys that contain "::" (similar to
+        // `vm-metadata::N::VAR` keys produced by ClarityDB::make_metadata_key).
+        store
+            .insert_metadata(&contract_id, "vm-metadata::9", "meta_value_9")
+            .unwrap();
+        store
+            .insert_metadata(&contract_id, "vm-metadata::10::sub", "meta_value_10_sub")
+            .unwrap();
+
         store.commit_to_processed_block(&blocks[0]).unwrap();
     }
 
@@ -394,4 +403,56 @@ fn test_validate_clarity_side_tables_detects_mismatch() {
             || validation.missing_required_metadata_rows > 0,
         "expected validation to detect mismatch between trie and data_table"
     );
+}
+
+#[test]
+fn test_copy_clarity_side_tables_with_double_colon_metadata_keys() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    // build_clarity_marf now inserts metadata keys with "::" in them
+    // (e.g. "vm-metadata::9", "vm-metadata::10::sub").
+    let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
+    assert!(!blocks.is_empty());
+
+    let squashed_db = squash_clarity_marf(&src_dir, &dir.path().join("squashed"), 3);
+
+    // Validate side tables - this would previously fail with a
+    // CorruptionError("Failed to parse contract identifier ...").
+    let validation = validate_clarity_side_tables(
+        clarity_marf_db_path(&src_dir).to_str().unwrap(),
+        squashed_db.to_str().unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        validation.data_table_rows_match,
+        "missing required data_table keys"
+    );
+    assert!(
+        validation.metadata_table_rows_match,
+        "missing required metadata rows"
+    );
+    assert_eq!(validation.sample_contracts_missing_in_trie, 0);
+    assert_eq!(validation.sample_contracts_missing_in_data_table, 0);
+    assert_eq!(validation.missing_required_data_table_keys, 0);
+    assert_eq!(validation.missing_required_metadata_rows, 0);
+
+    // Also verify the metadata with "::" keys is readable.
+    let squashed_dir = dir.path().join("squashed");
+    let mut kv = MarfedKV::open(squashed_dir.to_str().unwrap(), Some(&blocks[3]), None).unwrap();
+    {
+        let mut store = kv.begin_read_only(Some(&blocks[3]));
+        let contract_id =
+            clarity::vm::types::QualifiedContractIdentifier::local("test-contract").unwrap();
+
+        let md = store.get_metadata(&contract_id, "vm-metadata::9").unwrap();
+        assert!(md.is_some(), "vm-metadata::9 should be present");
+        assert_eq!(md.unwrap(), "meta_value_9");
+
+        let md2 = store
+            .get_metadata(&contract_id, "vm-metadata::10::sub")
+            .unwrap();
+        assert!(md2.is_some(), "vm-metadata::10::sub should be present");
+        assert_eq!(md2.unwrap(), "meta_value_10_sub");
+    }
 }
