@@ -1377,7 +1377,7 @@ pub fn copy_clarity_side_tables(
             for row in rows {
                 if let Ok(key) = row {
                     if let Some(rest) = key.strip_prefix("clr-meta::") {
-                        if let Some((contract_id, _meta_key)) = rest.rsplit_once("::") {
+                        if let Some((contract_id, _meta_key)) = rest.split_once("::") {
                             contract_ids.insert(contract_id.to_string());
                         }
                     }
@@ -1429,7 +1429,7 @@ pub fn copy_clarity_side_tables(
             for row in rows {
                 let (key, blockhash, value) = row.map_err(Error::SQLError)?;
                 if let Some(rest) = key.strip_prefix("clr-meta::") {
-                    if let Some((contract_id, _meta_key)) = rest.rsplit_once("::") {
+                    if let Some((contract_id, _meta_key)) = rest.split_once("::") {
                         if !required_contract_ids.contains(contract_id) {
                             continue;
                         }
@@ -1543,7 +1543,7 @@ pub fn validate_clarity_side_tables(
             }
             if let Ok(key) = row {
                 if let Some(rest) = key.strip_prefix("clr-meta::") {
-                    if let Some((contract_id, _meta_key)) = rest.rsplit_once("::") {
+                    if let Some((contract_id, _meta_key)) = rest.split_once("::") {
                         contract_ids.insert(contract_id.to_string());
                     }
                 }
@@ -1656,7 +1656,7 @@ pub fn validate_clarity_side_tables(
         for row in rows {
             let (key, blockhash, value) = row.map_err(Error::SQLError)?;
             if let Some(rest) = key.strip_prefix("clr-meta::") {
-                if let Some((contract_id, _meta_key)) = rest.rsplit_once("::") {
+                if let Some((contract_id, _meta_key)) = rest.split_once("::") {
                     if !required_contract_ids.contains(contract_id) {
                         continue;
                     }
