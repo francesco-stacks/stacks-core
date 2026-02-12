@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD060 -->
 # `stacks-bench`: Stacks-Core Benchmarking Tool
 
 ## Hardware Disk Qualification Test
@@ -87,7 +88,7 @@ docker exec stacks-bench-postgres \
 First, connect to the database:
 
 ```bash
-psql -h localhost -p 5432 -U USERNAME -d PASSWORD
+psql -h localhost -p 5432 -U metabase -d metabase
 ```
 
 Create a metabase user and database to use as a restore target:

@@ -157,18 +157,18 @@ impl<P: BlockHeaderProvider, C: ChainCache> BackwardsBlockStream<P, C> {
             .cache
             .find_closest_ancestor(anchor_tip, target_height)
             .await
+            && cached_h < curr_h
+            && cached_h >= target_height
         {
-            if cached_h < curr_h && cached_h >= target_height {
-                println!("  [Cache Hit] Jumping from height {curr_h} to {cached_h} ({cached_id})");
-                self.current_id = cached_id;
-                // Fetch header for new location
-                header = self
-                    .provider
-                    .get_header(&self.current_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("Missing header for {}", self.current_id))?;
-                curr_h = header.height;
-            }
+            println!("  [Cache Hit] Jumping from height {curr_h} to {cached_h} ({cached_id})");
+            self.current_id = cached_id;
+            // Fetch header for new location
+            header = self
+                .provider
+                .get_header(&self.current_id)
+                .await?
+                .ok_or_else(|| anyhow!("Missing header for {}", self.current_id))?;
+            curr_h = header.height;
         }
 
         // 3. Walk back
@@ -213,6 +213,6 @@ impl<P: BlockHeaderProvider, C: ChainCache> BackwardsBlockStream<P, C> {
     }
 
     fn should_cache_block(height: u64) -> bool {
-        height % 1_000 == 0
+        height.is_multiple_of(1_000)
     }
 }

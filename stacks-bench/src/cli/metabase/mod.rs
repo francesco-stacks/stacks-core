@@ -69,7 +69,7 @@ impl MetabaseArgs {
         }
 
         // Setup and run Metabase container
-        run_metabase_container(&app_data, self.port, self.image_tag.clone()).await
+        run_metabase_container(app_data, self.port, self.image_tag.clone()).await
     }
 }
 
@@ -221,10 +221,10 @@ async fn run_metabase_container(app_data: &AppDataDir, port: u16, image_tag: Str
                 );
             }
 
-            if let Some(health) = state.health {
-                if health.status == Some(bollard::models::HealthStatusEnum::HEALTHY) {
-                    break;
-                }
+            if let Some(health) = state.health
+                && health.status == Some(bollard::models::HealthStatusEnum::HEALTHY)
+            {
+                break;
             }
         }
 

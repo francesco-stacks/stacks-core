@@ -50,7 +50,7 @@ impl<Mode> SortitionDb<Mode> {
         epochs
             .load::<models::Epoch>(&mut self.handle.get_conn().await?)
             .await
-            .context(format!("Failed to load epochs from sortition db"))
+            .context("Failed to load epochs from sortition db")
     }
 
     pub async fn get_canonical_stacks_tip(&mut self) -> Result<(StacksBlockId, u64)> {
@@ -127,13 +127,13 @@ impl<Mode> SortitionDb<Mode> {
         } else {
             // Pre-Nakamoto Behavior:
             // The Stacks tip is stored directly on the snapshot row.
-            return Ok((
+            Ok((
                 StacksBlockId::new(
                     &ConsensusHash::from_hex(&tip_snapshot.canonical_stacks_tip_consensus_hash)?,
                     &BlockHeaderHash::from_hex(&tip_snapshot.canonical_stacks_tip_hash)?,
                 ),
                 tip_snapshot.canonical_stacks_tip_height as u64,
-            ));
+            ))
         }
     }
 }

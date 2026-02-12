@@ -214,8 +214,7 @@ impl ListArgs {
             .map(|r| r.run_name.as_deref().unwrap_or("—").len())
             .max()
             .unwrap_or(4)
-            .max(4)
-            .min(40);
+            .clamp(4, 40);
 
         // Header — pad plain strings first, then apply styles so ANSI escapes
         // don't throw off column alignment.

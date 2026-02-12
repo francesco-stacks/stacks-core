@@ -82,7 +82,7 @@ impl TryInto<crate::StacksBlockHeader> for BlockHeader {
             hash: BlockHeaderHash::from_hex(&self.block_hash)?,
             parent_id: StacksBlockId::from_hex(&self.parent_block_id)?,
             height: self.block_height.try_into()?,
-            burn_block_hash: BurnchainHeaderHash::from_hex(&self.burn_header_hash)?.into(),
+            burn_block_hash: BurnchainHeaderHash::from_hex(&self.burn_header_hash)?,
             burn_block_height: self.burn_header_height.try_into()?,
         })
     }

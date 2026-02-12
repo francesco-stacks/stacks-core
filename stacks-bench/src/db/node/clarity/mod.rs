@@ -50,6 +50,7 @@ impl ClarityDb<ReadWrite> {
             .await
             .context("Failed to perform WAL checkpoint")?;
 
+        #[allow(clippy::get_first)]
         if let Some(res) = results.get(0) {
             // Print status regardless of busy state to debug
             eprintln!(

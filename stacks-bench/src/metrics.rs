@@ -52,10 +52,10 @@ impl CostModel {
         }
 
         // 1. Try Linear Regression (requires N >= 3 for stability after warmup)
-        if data.len() >= 3 {
-            if let Some(model) = Self::compute_regression(data) {
-                return model;
-            }
+        if data.len() >= 3
+            && let Some(model) = Self::compute_regression(data)
+        {
+            return model;
         }
 
         // 2. Fallback: Min-Anchor Strategy

@@ -26,6 +26,10 @@ pub enum ReplayMode {
     Ephemeral,
     /// Execute via replay_nakamoto_by_segments() using build_segments_filtered()
     SegmentedFiltered(crate::filter::TxFilter),
+    /// Single-tx mode: segments are built using build_segments_for_txid(),
+    /// which produces prefix (unmeasured) + target (measured) only — no
+    /// suffix transactions after the target are executed.
+    SingleTx(crate::filter::TxFilter),
 }
 
 impl std::fmt::Display for ReplayMode {
@@ -35,6 +39,7 @@ impl std::fmt::Display for ReplayMode {
             ReplayMode::Follower => write!(f, "Follower"),
             ReplayMode::Ephemeral => write!(f, "Ephemeral"),
             ReplayMode::SegmentedFiltered(_) => write!(f, "SegmentedFiltered"),
+            ReplayMode::SingleTx(_) => write!(f, "SingleTx"),
         }
     }
 }
@@ -59,18 +64,6 @@ struct TxSegment {
     /// Whether to sample per-tx metrics and include in totals
     sampled: bool,
 }
-
-// fn is_full_replay_segments(
-//     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
-//     segments: &[TxSegment],
-// ) -> bool {
-//     if segments.len() != 1 {
-//         return false;
-//     }
-//     let seg = &segments[0];
-
-//     seg.record && seg.range.start == 0 && seg.range.end == block.txs.len()
-// }
 
 fn build_segments_full(
     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
@@ -124,6 +117,44 @@ fn build_segments_filtered(
         });
     }
 
+    out
+}
+
+/// Build segments for single-tx replay mode: prefix (unmeasured) + target
+/// (measured). Unlike `build_segments_filtered()`, no suffix transactions
+/// after the target are executed since they are irrelevant to the measurement.
+fn build_segments_for_txid(
+    block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
+    filter: &crate::filter::TxFilter,
+) -> Vec<TxSegment> {
+    let n = block.txs.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    // Find the first matching transaction
+    let match_idx = block.txs.iter().position(|tx| filter.matches(tx));
+    let Some(idx) = match_idx else {
+        return vec![];
+    };
+
+    let mut out = Vec::new();
+
+    // Prefix: unmeasured transactions before the target
+    if idx > 0 {
+        out.push(TxSegment {
+            range: 0..idx,
+            sampled: false,
+        });
+    }
+
+    // Target: the single measured transaction
+    out.push(TxSegment {
+        range: idx..(idx + 1),
+        sampled: true,
+    });
+
+    // No suffix — we don't execute transactions after the target
     out
 }
 
@@ -199,7 +230,7 @@ where
                 }
 
                 ReplayMode::SegmentedFiltered(filter) => {
-                    let segments = build_segments_filtered(&naka_block, &filter);
+                    let segments = build_segments_filtered(&naka_block, filter);
 
                     // No recorded segments => no metrics.
                     if segments.is_empty() || segments.iter().all(|s| !s.sampled) {
@@ -209,6 +240,29 @@ where
                     // IMPORTANT:
                     // Do NOT wrap this in stacks_profiler::measure! because replay_nakamoto_by_segments
                     // uses Profiler::clear() / take_results() per recorded segment.
+                    let seg_metrics = replay_nakamoto_by_segments(
+                        chainstate,
+                        burnchain,
+                        &naka_block,
+                        &segments,
+                        repetition,
+                        on_segment,
+                    )?;
+
+                    if seg_metrics.is_empty() {
+                        None
+                    } else {
+                        Some(seg_metrics)
+                    }
+                }
+
+                ReplayMode::SingleTx(filter) => {
+                    let segments = build_segments_for_txid(&naka_block, filter);
+
+                    if segments.is_empty() || segments.iter().all(|s| !s.sampled) {
+                        return Ok(None);
+                    }
+
                     let seg_metrics = replay_nakamoto_by_segments(
                         chainstate,
                         burnchain,
@@ -397,10 +451,8 @@ where
             }
 
             out.push(m);
-        } else {
-            if let Some(cb) = on_segment.as_deref_mut() {
-                cb(&info, None)?;
-            }
+        } else if let Some(cb) = on_segment.as_deref_mut() {
+            cb(&info, None)?;
         }
     }
 
@@ -427,8 +479,25 @@ fn execute_segment(
     segment_coinbase_tx: Option<&blockstack_lib::chainstate::stacks::StacksTransaction>,
     segment_cause: MinerTenureInfoCause,
     setup_start: Option<Instant>,
-    #[allow(unused_variables)] repetition: u32,
+    repetition: u32,
 ) -> Result<SegmentExecResult> {
+    // Vary the timestamp per repetition so each synthetic block gets a
+    // unique block hash.  This prevents MARF key / header-table collisions
+    // when replaying the same block multiple times from the same parent.
+    // The timestamp offset does NOT affect transaction execution — the
+    // Clarity VM reads block-height/burn-height from the parent state, not
+    // the current block's timestamp.
+    let synth_timestamp = block
+        .header
+        .timestamp
+        .checked_add(repetition as u64)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "timestamp overflow: base {} + repetition {repetition} exceeds u64::MAX",
+                block.header.timestamp
+            )
+        })?;
+
     let mut builder = NakamotoBlockBuilder::new(
         cur_parent_info,
         &block.header.consensus_hash,
@@ -438,7 +507,7 @@ fn execute_segment(
         block.header.pox_treatment.len(),
         None,
         None,
-        Some(block.header.timestamp),
+        Some(synth_timestamp),
         DEFAULT_MAX_TENURE_BYTES,
     )?;
 

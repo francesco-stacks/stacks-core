@@ -122,7 +122,6 @@ impl StacksBlockRef {
                     .get_stacks_block_height(&consensus_hash, &header_hash)
                     .with_context(|| format!("lookup height for {block_id}"))?
                     .ok_or_else(|| anyhow!("missing height for {block_id}"))
-                    .map(|h| h)
             }
         }
     }

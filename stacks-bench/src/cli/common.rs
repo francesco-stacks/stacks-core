@@ -42,7 +42,7 @@ macro_rules! fmt_failure {
     ($($arg:tt)*) => {{
         format!(
             "{} {}",
-            ::console::style($crate::cli::common::FAILURE_ICON).green(),
+            ::console::style($crate::cli::common::FAILURE_ICON).red(),
             format_args!($($arg)*)
         )
     }};
@@ -116,6 +116,12 @@ impl UpperHex for TxIdArg {
     }
 }
 
+impl TxIdArg {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// Format a benchmark run for display in interactive select / multiselect lists.
 ///
 /// Returns something like: `✔ my-run  —  2026-02-11 14:30:00`
@@ -183,10 +189,16 @@ pub fn create_shadow_dir<P: AsRef<Path>>(
     Ok(shadow_dir)
 }
 
-pub async fn setup_bench_env_and_plan<'a, A: IndexerArgs, P: AsRef<Path> + 'a>(
+/// Initializes a [`BenchEnv`] from a working directory with network, chain_id,
+/// and epoch resolution. Returns the env and the resolved anchor tip.
+///
+/// When `tip_override` is `Some`, the tip is resolved from the override;
+/// otherwise the canonical node tip is used.
+pub async fn setup_bench_env<P: AsRef<Path>>(
     working_dir: P,
-    args: &'_ A,
-) -> Result<(BenchEnv, ChainIndexPlan)> {
+    network_override: Option<Network>,
+    tip_override: Option<&StacksBlockRef>,
+) -> Result<(BenchEnv, stacks_bench::blocks::BlockRef)> {
     let chainstate_path = ChainStateDir::from_node_root(&working_dir);
     let burnchain_path = BurnChainDir::from_node_root(&working_dir);
 
@@ -195,7 +207,7 @@ pub async fn setup_bench_env_and_plan<'a, A: IndexerArgs, P: AsRef<Path> + 'a>(
         let chainstate_db = ChainStateDb::open_for_read(chainstate_path.index_db_path()).await?;
         let db_config = chainstate_db.read_db_config().await?;
 
-        let network = if let Some(n) = args.network() {
+        let network = if let Some(n) = network_override {
             db_config.assert_matches_network(n)?;
             n
         } else if db_config.is_mainnet() {
@@ -217,19 +229,16 @@ pub async fn setup_bench_env_and_plan<'a, A: IndexerArgs, P: AsRef<Path> + 'a>(
             .collect::<Result<Vec<_>>>()?
     };
 
-    let context_opts = BenchEnvOpts::new(network, chain_id, epochs)?
-        .with_start_block(args.start_at().cloned())
-        .with_end_block(args.end_at().cloned())
-        .with_block_count(args.block_count())
-        .with_tip(args.tip().cloned());
+    let context_opts =
+        BenchEnvOpts::new(network, chain_id, epochs)?.with_tip(tip_override.cloned());
 
     let (env, node_tip) = BenchEnv::initialize(working_dir, context_opts).await?;
 
     let chainstate_db = ChainStateDb::open_for_read(chainstate_path.index_db_path()).await?;
 
-    // Anchor tip: best-practice for “no pre-walk” is to require an explicit tip *id*
+    // Anchor tip: best-practice for "no pre-walk" is to require an explicit tip *id*
     // if the user overrides it. (Tip-by-height would require a chain-walk to get the id.)
-    let anchor_tip = match args.tip() {
+    let anchor_tip = match tip_override {
         None => node_tip,
         Some(StacksBlockRef::Id(id)) => {
             let tip_height =
@@ -246,6 +255,18 @@ pub async fn setup_bench_env_and_plan<'a, A: IndexerArgs, P: AsRef<Path> + 'a>(
             );
         }
     };
+
+    Ok((env, anchor_tip))
+}
+
+pub async fn setup_bench_env_and_plan<'a, A: IndexerArgs, P: AsRef<Path> + 'a>(
+    working_dir: P,
+    args: &'_ A,
+) -> Result<(BenchEnv, ChainIndexPlan)> {
+    let (env, anchor_tip) = setup_bench_env(&working_dir, args.network(), args.tip()).await?;
+
+    let chainstate_path = ChainStateDir::from_node_root(&working_dir);
+    let chainstate_db = ChainStateDb::open_for_read(chainstate_path.index_db_path()).await?;
 
     // start_height
     let start_height = match args.start_at() {

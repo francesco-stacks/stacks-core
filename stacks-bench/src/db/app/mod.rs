@@ -474,6 +474,87 @@ impl AppDb {
             .context("Failed to list benchmark runs")
     }
 
+    /// Gets a chainstate by ID, returning `None` if it doesn't exist.
+    pub async fn get_chainstate(&self, chainstate_id: i32) -> Result<Option<Chainstate>> {
+        chainstate::table
+            .find(chainstate_id)
+            .first::<Chainstate>(&mut self.get_conn().await?)
+            .await
+            .optional()
+            .context("Failed to look up chainstate")
+    }
+
+    /// Lists all chainstates ordered by ID.
+    pub async fn list_chainstates(&self) -> Result<Vec<Chainstate>> {
+        chainstate::table
+            .order(chainstate::id.asc())
+            .load::<Chainstate>(&mut self.get_conn().await?)
+            .await
+            .context("Failed to list chainstates")
+    }
+
+    /// Gets the network name for a network ID.
+    pub async fn get_network_name(&self, network_id: i32) -> Result<String> {
+        network::table
+            .select(network::name)
+            .find(network_id)
+            .first::<String>(&mut self.get_conn().await?)
+            .await
+            .context("Failed to get network name")
+    }
+
+    /// Counts benchmark runs associated with a given chainstate.
+    pub async fn count_benchmark_runs_for_chainstate(&self, chainstate_id: i32) -> Result<i64> {
+        benchmark_run::table
+            .filter(benchmark_run::chainstate_id.eq(chainstate_id))
+            .count()
+            .get_result::<i64>(&mut self.get_conn().await?)
+            .await
+            .context("Failed to count benchmark runs for chainstate")
+    }
+
+    /// Deletes a chainstate and all associated data (benchmark runs, epochs).
+    ///
+    /// Benchmark runs are deleted first (via [`delete_benchmark_run`]) since the
+    /// `benchmark_run.chainstate_id` FK does not cascade. Epochs are deleted
+    /// explicitly for the same reason.
+    pub async fn delete_chainstate(&mut self, chainstate_id: i32) -> Result<()> {
+        // First delete all associated benchmark runs
+        let run_ids: Vec<i32> = benchmark_run::table
+            .select(benchmark_run::id)
+            .filter(benchmark_run::chainstate_id.eq(chainstate_id))
+            .load::<i32>(&mut self.get_conn().await?)
+            .await
+            .context("Failed to list benchmark runs for chainstate")?;
+
+        for run_id in run_ids {
+            self.delete_benchmark_run(run_id).await?;
+        }
+
+        // Delete epochs and the chainstate row itself
+        self.get_conn()
+            .await?
+            .transaction::<_, anyhow::Error, _>(|conn| {
+                Box::pin(async move {
+                    diesel::delete(epoch::table.filter(epoch::chainstate_id.eq(chainstate_id)))
+                        .execute(conn)
+                        .await?;
+
+                    let deleted = diesel::delete(chainstate::table.find(chainstate_id))
+                        .execute(conn)
+                        .await?;
+
+                    if deleted == 0 {
+                        return Err(anyhow!("Chainstate {} not found", chainstate_id));
+                    }
+
+                    Ok(())
+                })
+            })
+            .await
+            .context("Failed to delete chainstate")
+    }
+
     /// Deletes a benchmark run and all of its dependent data.
     ///
     /// Tables with `ON DELETE CASCADE` (block_processing_baseline, profiler_record,
@@ -1290,25 +1371,25 @@ impl ProfilerInsertContext<'_> {
 
             let mut result = InsertNodeResult::default();
 
-            if node.name() == "Transaction" {
-                if let Some(tag) = node.tag() {
-                    let idx = match tag {
-                        stacks_profiler::Tag::Usize(v) => Some(*v),
-                        stacks_profiler::Tag::U64(v) => usize::try_from(*v).ok(),
-                        stacks_profiler::Tag::I64(v) => usize::try_from(*v).ok(), // negative => None
-                        stacks_profiler::Tag::Str(_) => None,
-                    };
+            if node.name() == "Transaction"
+                && let Some(tag) = node.tag()
+            {
+                let idx = match tag {
+                    stacks_profiler::Tag::Usize(v) => Some(*v),
+                    stacks_profiler::Tag::U64(v) => usize::try_from(*v).ok(),
+                    stacks_profiler::Tag::I64(v) => usize::try_from(*v).ok(), // negative => None
+                    stacks_profiler::Tag::Str(_) => None,
+                };
 
-                    if let Some(i) = idx {
-                        stacks_tx_id = self.tx_pks.get(i).and_then(|x| *x);
-                    }
+                if let Some(i) = idx {
+                    stacks_tx_id = self.tx_pks.get(i).and_then(|x| *x);
                 }
             }
 
             let loc_id = AppDb::resolve_profiler_location(
                 conn,
                 self.loc_cache.clone(),
-                &node.source_file(),
+                node.source_file(),
                 node.source_line() as i32,
             )
             .await?;
@@ -1317,13 +1398,13 @@ impl ProfilerInsertContext<'_> {
                 conn,
                 self.span_cache.clone(),
                 node.context(),
-                &node.name(),
+                node.name(),
             )
             .await?;
 
             let tag_id: Option<i32> = match node.tag() {
                 Some(stacks_profiler::Tag::Str(s)) => {
-                    Some(AppDb::resolve_profiler_tag(conn, self.tag_cache.clone(), *s).await?)
+                    Some(AppDb::resolve_profiler_tag(conn, self.tag_cache.clone(), s).await?)
                 }
                 _ => None, // numeric tags used for tx routing only
             };

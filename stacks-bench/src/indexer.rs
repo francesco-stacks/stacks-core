@@ -316,7 +316,7 @@ impl<'a> ChainstateIndexer<'a> {
         );
 
         let writer_task = Self::run_writer(
-            &mut self.app_db,
+            self.app_db,
             tx_receiver,
             &anchor_tip,
             start_height, // NEW
