@@ -782,14 +782,11 @@ impl Trie {
         // Using that value would produce the wrong number of ancestors.
         // Instead, look up the actual height from the SQL side-table that
         // was populated during squashing.
-        let cur_block_height = if let Some(h) = storage
-            .squash_info()
-            .and_then(|_| {
-                trie_sql::read_squash_block_height(storage.sqlite_conn(), &cur_block_header)
-                    .ok()
-                    .flatten()
-            })
-        {
+        let cur_block_height = if let Some(h) = storage.squash_info().and_then(|_| {
+            trie_sql::read_squash_block_height(storage.sqlite_conn(), &cur_block_header)
+                .ok()
+                .flatten()
+        }) {
             h
         } else {
             MARF::get_block_height_miner_tip(storage, &cur_block_header, &cur_block_header)

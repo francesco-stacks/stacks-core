@@ -13,7 +13,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
@@ -21,9 +20,6 @@ use tempfile::tempdir;
 
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashStats, MARF, OWN_BLOCK_HEIGHT_KEY,
-};
-use crate::chainstate::stacks::index::node::{
-    clear_backptr, is_backptr, TrieNodeID, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{
