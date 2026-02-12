@@ -858,11 +858,13 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                         trace!("Squash shunt must have exactly one hash (the archival trie hash)");
                         return None;
                     }
+                    let archival_trie_hash = hashes
+                        .first()
+                        .expect("Squash shunt must have exactly one hash (the archival trie hash)");
                     trace!(
-                        "Squash shunt proof head: using archival trie hash {:?}",
-                        &hashes[0]
+                        "Squash shunt proof head: using archival trie hash {archival_trie_hash:?}",
                     );
-                    return Some(hashes[0]);
+                    return Some(*archival_trie_hash);
                 }
 
                 if *idx != 0 {
@@ -921,11 +923,13 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                             trace!("Squash shunt in tail must have exactly one hash");
                             return None;
                         }
-                        trace!(
-                            "Squash shunt in tail: using archival trie hash {:?}",
-                            &hashes[0]
+                        let archival_trie_hash = hashes.first().expect(
+                            "Squash shunt must have exactly one hash (the archival trie hash)",
                         );
-                        hashes[0]
+                        trace!(
+                            "Squash shunt in tail: using archival trie hash {archival_trie_hash:?}",
+                        );
+                        *archival_trie_hash
                     } else if *idx == 0 {
                         trace!("Invalid shunt proof tail: idx == 0");
                         return None;
