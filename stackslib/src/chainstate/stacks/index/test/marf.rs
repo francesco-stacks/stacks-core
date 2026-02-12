@@ -37,7 +37,7 @@ use crate::chainstate::stacks::index::storage::{
 use crate::chainstate::stacks::index::test::{
     make_node4_path, make_node_path, merkle_test_marf, merkle_test_marf_key_value,
 };
-use crate::chainstate::stacks::index::{trie_sql, ClarityMarfTrieId, Error, MARFValue, TrieLeaf};
+use crate::chainstate::stacks::index::{ClarityMarfTrieId, Error, MARFValue, TrieLeaf};
 
 #[test]
 fn marf_insert_different_leaf_same_block_100() {

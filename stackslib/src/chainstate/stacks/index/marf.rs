@@ -749,16 +749,19 @@ impl<T: MarfTrieId> MARF<T> {
     /// MARF, keeping root hashes identical.
     fn node_copy_update_ptrs(ptrs: &mut [TriePtr], child_block_id: u32, is_squashed: bool) {
         for pointer in ptrs.iter_mut() {
-            // if the node is empty, do nothing, if it's a back pointer,
             if pointer.id() == TrieNodeID::Empty as u8 || is_backptr(pointer.id()) {
+                // Empty slot or already a back-pointer: leave as-is.
                 continue;
             } else {
                 if is_squashed && pointer.back_block != 0 {
-                    // Preserve the annotated original block ID from the
-                    // squash blob.  The hash computation will use the
-                    // StacksBlockId that this local block_id maps to,
-                    // which is the same as in the archival MARF.
+                    // Squash-annotated child: the `back_block` already
+                    // records the squashed-DB local block-id of the
+                    // original historical block. Preserve it so that
+                    // `inner_write_children_hashes` uses the correct
+                    // `StacksBlockId` (matching the archival MARF).
                 } else {
+                    // Normal inline child (or non-squashed MARF): point
+                    // the back-pointer at the parent block.
                     pointer.back_block = child_block_id;
                 }
                 pointer.id = set_backptr(pointer.id());

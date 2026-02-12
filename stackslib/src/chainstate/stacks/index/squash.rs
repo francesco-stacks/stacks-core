@@ -300,12 +300,16 @@ impl<T: MarfTrieId> MARF<T> {
             let mut stmt = conn.prepare(
                 "INSERT OR REPLACE INTO marf_squash_root_hashes (height, root_hash) VALUES (?1, ?2)",
             )?;
-            for (h, _, rh) in &block_info {
+            let mut stmt_bh = conn.prepare(
+                "INSERT OR REPLACE INTO marf_squash_block_heights (block_hash, height) VALUES (?1, ?2)",
+            )?;
+            for (h, bh, rh) in &block_info {
                 stmt.execute(params![*h as i64, rh.as_bytes().to_vec()])?;
+                stmt_bh.execute(params![bh.to_string(), *h as i64])?;
             }
         }
         info!(
-            "Squash step 6 (SQL metadata): {} root hashes in {:?}",
+            "Squash step 6 (SQL metadata): {} root hashes + block heights in {:?}",
             block_info.len(),
             start_sql_meta.elapsed()
         );

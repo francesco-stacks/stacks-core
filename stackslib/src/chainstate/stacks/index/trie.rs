@@ -250,6 +250,29 @@ impl Trie {
         Ok(trie_hashes)
     }
 
+    /// Like `get_children_hashes` but ignores squash-blob `back_block`
+    /// annotations, always using the stored node hash for inline children.
+    ///
+    /// This produces hashes consistent with how the proof verifier walks
+    /// a squash blob (where annotated children are inline, not backptrs).
+    pub fn get_children_hashes_raw<T: MarfTrieId>(
+        storage: &mut TrieStorageConnection<T>,
+        node: &TrieNodeType,
+    ) -> Result<Vec<TrieHash>, Error> {
+        let mut buffer = Vec::with_capacity(node.ptrs().len() * TRIEHASH_ENCODED_SIZE);
+        storage.write_children_hashes_raw(node, &mut buffer)?;
+        assert_eq!(buffer.len() % TRIEHASH_ENCODED_SIZE, 0);
+
+        let trie_hashes: Vec<_> = buffer
+            .chunks_exact(TRIEHASH_ENCODED_SIZE)
+            .map(|x| {
+                TrieHash::from_bytes(x).expect("Failed to re-encode TrieHash from byte buffer")
+            })
+            .collect();
+
+        Ok(trie_hashes)
+    }
+
     /// Given an existing leaf, replace it with the new leaf.
     /// c must point to the node to replace.
     fn replace_leaf<T: MarfTrieId>(
@@ -753,7 +776,22 @@ impl Trie {
         // here is where some mind-bending things begin to happen.
         //   we want to find the block at a given _height_. but how to do so?
         //   use the data stored already in the MARF.
-        let cur_block_height =
+        //
+        // In a squashed MARF, all blocks at heights 0..=H share a single
+        // blob whose OWN_BLOCK_HEIGHT_KEY value is H (the squash height).
+        // Using that value would produce the wrong number of ancestors.
+        // Instead, look up the actual height from the SQL side-table that
+        // was populated during squashing.
+        let cur_block_height = if let Some(h) = storage
+            .squash_info()
+            .and_then(|_| {
+                trie_sql::read_squash_block_height(storage.sqlite_conn(), &cur_block_header)
+                    .ok()
+                    .flatten()
+            })
+        {
+            h
+        } else {
             MARF::get_block_height_miner_tip(storage, &cur_block_header, &cur_block_header)
                 .map_err(|e| match e {
                     Error::NotFoundError => Error::CorruptionError(format!(
@@ -767,7 +805,8 @@ impl Trie {
                         "Could not obtain block height for block {}: got None",
                         &cur_block_header
                     ))
-                })?;
+                })?
+        };
 
         let mut log_depth = 0;
         while log_depth < 32 && (1u32 << log_depth) <= cur_block_height {

@@ -275,16 +275,28 @@ impl TriePtr {
     }
 
     /// The parts of a child pointer that are relevant for consensus are only its ID, path
-    /// character, and referred-to block hash.  The software doesn't care about the details of how/where
-    /// nodes are stored.
+    /// character, and referred-to block hash.
+    ///
+    /// In a squashed MARF blob, children that were originally back-pointers
+    /// have their backptr flag cleared but carry a non-zero `back_block`
+    /// annotation. For consensus-byte purposes we must treat them
+    /// identically to real back-pointers: emit the backptr-flagged ID and
+    /// the resolved block hash so that the resulting node hash matches the
+    /// archival MARF.
     pub fn write_consensus_bytes<W: Write, M: BlockMap>(
         &self,
         block_map: &mut M,
         w: &mut W,
     ) -> Result<(), Error> {
-        w.write_all(&[self.id(), self.chr()])?;
-
-        if is_backptr(self.id()) {
+        if is_backptr(self.id()) || self.back_block != 0 {
+            // Real back-pointer or squash-annotated child - use the
+            // backptr-flagged id and the resolved block hash.
+            let consensus_id = if is_backptr(self.id()) {
+                self.id()
+            } else {
+                set_backptr(self.id())
+            };
+            w.write_all(&[consensus_id, self.chr()])?;
             w.write_all(
                 block_map
                     .get_block_hash_caching(self.back_block())
@@ -292,6 +304,7 @@ impl TriePtr {
                     .as_bytes(),
             )?;
         } else {
+            w.write_all(&[self.id(), self.chr()])?;
             w.write_all(&[0; BLOCK_HEADER_HASH_ENCODED_SIZE])?;
         }
         Ok(())

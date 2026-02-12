@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS marf_squash_root_hashes (
     height INTEGER PRIMARY KEY,
     root_hash BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS marf_squash_block_heights (
+    block_hash TEXT PRIMARY KEY,
+    height INTEGER NOT NULL
+);
 ";
 
 pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
@@ -190,6 +194,42 @@ pub fn read_squash_root_hash(conn: &Connection, height: u32) -> Result<Option<Tr
         }
         None => Ok(None),
     }
+}
+
+/// Read the stored height for a block hash from the squash block-heights table.
+/// Returns `None` if the block hash is not present (archival MARF or block
+/// outside the squashed range).
+pub fn read_squash_block_height<T: MarfTrieId>(
+    conn: &Connection,
+    block_hash: &T,
+) -> Result<Option<u32>, Error> {
+    let result: Option<i64> = conn
+        .query_row(
+            "SELECT height FROM marf_squash_block_heights WHERE block_hash = ?1",
+            params![&block_hash.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    Ok(result.map(|h| h as u32))
+}
+
+/// Read the block hash for a given height from the squash block-heights table.
+/// This is the reverse lookup: height → block_hash.
+/// Returns `None` if the height is not in the squashed range.
+pub fn read_squash_block_height_reverse<T: MarfTrieId>(
+    conn: &Connection,
+    height: u32,
+) -> Result<Option<T>, Error> {
+    let result: Option<T> = conn
+        .query_row(
+            "SELECT block_hash FROM marf_squash_block_heights WHERE height = ?1",
+            params![height as i64],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    Ok(result)
 }
 
 /// Insert a placeholder `marf_data` entry for a historical block in a squashed MARF.

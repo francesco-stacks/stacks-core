@@ -2209,10 +2209,46 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         Ok(ret)
     }
 
-    /// Generate a mapping between Trie root hashes and the blocks that contain them
+    /// Generate a mapping between Trie root hashes and the blocks that contain them.
+    ///
+    /// For squashed MARFs, blocks within the squashed range (0..=H) share a
+    /// single blob whose stored trie hash was computed at height H. The
+    /// standard blob-scanning approach would produce collisions (all blocks
+    /// get the same trie hash). Instead, for each squashed block at height
+    /// K we re-derive the trie hash by combining the squash blob's content
+    /// hash with the archival ancestor hashes at height K from the SQL
+    /// metadata. This mirrors what the proof verifier computes when it
+    /// processes a segment proof inside the squash blob and the subsequent
+    /// initial shunt.
     #[cfg(test)]
     pub fn read_root_to_block_table(&mut self) -> Result<HashMap<TrieHash, T>, Error> {
         let mut ret = self.inner_read_persisted_root_to_blocks()?;
+
+        // Override entries for blocks in the squashed range.
+        // All blocks at heights 0..=H share a single squash blob, so
+        // `inner_read_persisted_root_to_blocks` maps them all to the same
+        // trie hash. Replace those entries with the per-height archival
+        // trie hashes stored during squashing. These are the hashes that
+        // the proof verifier expects (the squash shunt at idx = -1 injects
+        // the archival trie hash directly).
+        if let Some(info) = self.data.squash_info.clone() {
+            for h in 0..=info.height {
+                let bh: T = match trie_sql::read_squash_block_height_reverse(self.sqlite_conn(), h)
+                {
+                    Ok(Some(bh)) => bh,
+                    _ => continue,
+                };
+
+                let archival_trie_hash =
+                    match trie_sql::read_squash_root_hash(self.sqlite_conn(), h) {
+                        Ok(Some(h)) => h,
+                        _ => continue,
+                    };
+
+                ret.insert(archival_trie_hash, bh);
+            }
+        }
+
         let uncommitted_writes = match self.data.uncommitted_writes.take() {
             Some((bhh, trie_ram)) => {
                 let ptr = TriePtr::new(set_backptr(TrieNodeID::Node256 as u8), 0, 0);
@@ -2570,20 +2606,38 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
 
                 bench.write_children_hashes_empty_finish(start_time);
             } else if !is_backptr(ptr.id()) {
-                // hash is in the same block as this node
-                let start_time = bench.write_children_hashes_same_block_start();
+                if ptr.back_block != 0 {
+                    // This child is physically inline in a squashed blob but
+                    // was originally a back-pointer. The `back_block` field
+                    // carries the squashed-DB local block-id of the original
+                    // block. To keep the hash computation identical to the
+                    // archival MARF (which used the ancestor block hash for
+                    // back-pointer children), we use the block hash here.
+                    let start_time = bench.write_children_hashes_ancestor_block_start();
 
-                let mut buf = Vec::with_capacity(TRIEHASH_ENCODED_SIZE);
-                hash_reader.read_node_hash_bytes(ptr, &mut buf)?;
-                trace!(
-                    "inner_write_children_hashes for node {:?}: {:?} same block {}",
-                    &node,
-                    &ptr,
-                    &to_hex(&buf)
-                );
-                w.write_all(&buf[..])?;
+                    let block_hash = map.get_block_hash_caching(ptr.back_block())?;
+                    trace!(
+                        "inner_write_children_hashes for node {node:?}: {ptr:?} squash-annotated back block {block_hash:?}"
+                    );
+                    w.write_all(block_hash.as_bytes())?;
 
-                bench.write_children_hashes_same_block_finish(start_time);
+                    bench.write_children_hashes_ancestor_block_finish(start_time);
+                } else {
+                    // hash is in the same block as this node
+                    let start_time = bench.write_children_hashes_same_block_start();
+
+                    let mut buf = Vec::with_capacity(TRIEHASH_ENCODED_SIZE);
+                    hash_reader.read_node_hash_bytes(ptr, &mut buf)?;
+                    trace!(
+                        "inner_write_children_hashes for node {:?}: {:?} same block {}",
+                        &node,
+                        &ptr,
+                        &to_hex(&buf)
+                    );
+                    w.write_all(&buf[..])?;
+
+                    bench.write_children_hashes_same_block_finish(start_time);
+                }
             } else {
                 // hash is in a different block altogether, so we just use the ancestor block hash.  The
                 // ptr.ptr() value points to the actual node in the ancestor block.
@@ -2604,6 +2658,61 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         trace!("inner_write_children_hashes end for node {:?}:", &node);
 
         Ok(())
+    }
+
+    /// Like `inner_write_children_hashes` but ignores squash-blob
+    /// `back_block` annotations: every non-backptr, non-empty child is
+    /// hashed using the stored node hash, regardless of `back_block`.
+    ///
+    /// This matches how the proof verifier reconstructs hashes when
+    /// walking inside a squash blob (where all children are inline).
+    fn inner_write_children_hashes_raw<W: Write, H: NodeHashReader>(
+        hash_reader: &mut H,
+        node: &TrieNodeType,
+        w: &mut W,
+    ) -> Result<(), Error> {
+        for ptr in node.ptrs().iter() {
+            if ptr.id() == TrieNodeID::Empty as u8 {
+                w.write_all(TrieHash::from_data(&[]).as_bytes())?;
+            } else if !is_backptr(ptr.id()) {
+                // Ignore back_block annotations - always read stored hash.
+                let mut buf = Vec::with_capacity(TRIEHASH_ENCODED_SIZE);
+                hash_reader.read_node_hash_bytes(ptr, &mut buf)?;
+                w.write_all(&buf[..])?;
+            } else {
+                // True backpointer - should not exist inside a squash blob,
+                // but handle gracefully by writing an empty hash.
+                w.write_all(TrieHash::from_data(&[]).as_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compute children hashes for a node inside a squash blob, ignoring
+    /// `back_block` annotations. This gives the "raw" hash that the
+    /// proof verifier computes when walking the blob's actual structure.
+    pub fn write_children_hashes_raw<W: Write>(
+        &mut self,
+        node: &TrieNodeType,
+        w: &mut W,
+    ) -> Result<(), Error> {
+        if let Some(blobs) = self.blobs.as_mut() {
+            let block_id = self.data.cur_block_id.ok_or_else(|| {
+                error!("Failed to get cur block as hash reader (raw)");
+                Error::NotFoundError
+            })?;
+            let mut cursor = TrieFileNodeHashReader::new(&self.db, blobs, block_id);
+            TrieStorageConnection::<T>::inner_write_children_hashes_raw(&mut cursor, node, w)
+        } else {
+            let mut cursor = TrieSqlCursor {
+                db: &self.db,
+                block_id: self.data.cur_block_id.ok_or_else(|| {
+                    error!("Failed to get cur block as hash reader (raw)");
+                    Error::NotFoundError
+                })?,
+            };
+            TrieStorageConnection::<T>::inner_write_children_hashes_raw(&mut cursor, node, w)
+        }
     }
 
     /// read a persisted node's hash
