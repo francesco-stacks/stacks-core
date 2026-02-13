@@ -762,6 +762,54 @@ impl AppDb {
         (s_block, b_block, parent_hash_opt).try_into()
     }
 
+    /// Attempts to resolve the block containing `tx_hash` from previously indexed benchmark data
+    /// for the given chain tip.
+    ///
+    /// This is a best-effort fast-path used to avoid a full chain walk when the transaction was
+    /// already seen in runs for the same chainstate tip.
+    pub async fn find_block_for_tx_hash_on_chain_tip(
+        &self,
+        tx_hash: &[u8],
+        chain_tip: &StacksBlockId,
+    ) -> Result<Option<StacksBlockHeader>> {
+        #[derive(Debug, QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = Binary)]
+            index_hash: Vec<u8>,
+        }
+
+        let query = r#"
+            SELECT sb.index_hash
+            FROM stacks_tx st
+            JOIN stacks_block sb ON sb.id = st.stacks_block_id
+            JOIN synthetic_block syn ON syn.stacks_block_id = sb.id
+            JOIN stacks_block_stats sbs ON sbs.synthetic_block_id = syn.id
+            JOIN benchmark_run br ON br.id = sbs.benchmark_run_id
+            JOIN chainstate cs ON cs.id = br.chainstate_id
+            WHERE st.tx_hash = ?1
+              AND cs.tip_index_hash = ?2
+            ORDER BY br.start_time DESC
+            LIMIT 1
+        "#;
+
+        let row = sql_query(query)
+            .bind::<Binary, _>(tx_hash)
+            .bind::<Binary, _>(chain_tip.as_bytes())
+            .get_result::<Row>(&mut self.get_conn().await?)
+            .await
+            .optional()
+            .context("Failed to query tx fast-path block lookup")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let block_id = StacksBlockId::from_vec(&row.index_hash)
+            .ok_or_else(|| anyhow!("Invalid stacks_block.index_hash in fast-path lookup"))?;
+
+        self.get_block(&block_id).await.map(Some)
+    }
+
     async fn get_or_create_synth_block_id(
         conn: &mut AsyncSqliteConnection,
         index_hash: &[u8],

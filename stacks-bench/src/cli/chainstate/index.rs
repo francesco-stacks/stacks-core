@@ -4,8 +4,11 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use stacks_bench::indexer::ChainstateIndexer;
 use stacks_bench::{Network, StacksBlockRef};
+use tokio::sync::mpsc;
 
-use crate::cli::common::{CliContext, IndexerArgs, setup_bench_env_and_plan};
+use crate::cli::common::{
+    CliContext, IndexerArgs, run_indexer_progress_ui, setup_bench_env_and_plan,
+};
 
 #[derive(clap::Args, Debug, Serialize, Deserialize)]
 pub struct IndexArgs {
@@ -64,17 +67,27 @@ impl IndexArgs {
 
         let (env, plan) = setup_bench_env_and_plan(&self.source_dir, self).await?;
 
-        let mut indexer = ChainstateIndexer::new(&mut app_db, &env);
-        let (resolved, _block_ids) = indexer
-            .index_chainstate_range(env.network, env.chain_id, &env.epochs, plan)
-            .await?;
+        let tip_height = plan.anchor_tip.height;
+        let start_height = plan.start_height;
+        let end_height = plan.end_height;
 
-        println!(
-            "Indexing complete: start={} end={}",
-            resolved.start, resolved.end
-        );
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut indexer = ChainstateIndexer::new(&mut app_db, &env).with_events(event_tx);
 
-        drop(env);
+        let ui_fut = run_indexer_progress_ui(event_rx, start_height, end_height, tip_height);
+        let index_fut =
+            indexer.index_chainstate_range(env.network, env.chain_id, &env.epochs, plan);
+
+        let ((resolved, _block_ids), _) = tokio::try_join!(index_fut, ui_fut)?;
+
+        cliclack::note(
+            "Indexing Complete",
+            format!(
+                "Start: {} (height {})\n\
+                 End:   {} (height {})",
+                resolved.start.id, resolved.start.height, resolved.end.id, resolved.end.height,
+            ),
+        )?;
 
         Ok(())
     }

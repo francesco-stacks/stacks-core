@@ -226,6 +226,19 @@ pub struct TransactionMetrics {
     pub profiler_roots: Vec<ProfileStats>,
 }
 
+/// Read-only snapshot of accumulated benchmark metrics.
+pub struct MetricsSummary {
+    pub count: u64,
+    pub txs: u64,
+    pub duration: Duration,
+    pub setup: Duration,
+    pub exec: Duration,
+    pub commit: Duration,
+    pub runtime: u64,
+    pub write_len: u64,
+    pub read_len: u64,
+}
+
 #[derive(Default)]
 pub struct MetricsAccumulator {
     count: u64,
@@ -258,39 +271,17 @@ impl MetricsAccumulator {
         }
     }
 
-    pub fn print_summary(&self) {
-        if self.count == 0 {
-            return;
+    pub fn summary(&self) -> MetricsSummary {
+        MetricsSummary {
+            count: self.count,
+            txs: self.txs,
+            duration: self.duration,
+            setup: self.setup,
+            exec: self.exec,
+            commit: self.commit,
+            runtime: self.runtime,
+            write_len: self.write_len,
+            read_len: self.read_len,
         }
-
-        println!("\n========================================");
-        println!("           BENCHMARK SUMMARY            ");
-        println!("========================================");
-        println!("Total Blocks:       {}", self.count);
-        println!("Total Transactions: {}", self.txs);
-        println!("Total Duration:     {:.2?}", self.duration);
-        println!("  - Setup:          {:.2?}", self.setup);
-        println!("  - Execution:      {:.2?}", self.exec);
-        println!("  - Commit:         {:.2?}", self.commit);
-        println!("Total Clarity Runtime:  {}", self.runtime);
-        println!("Total Write Length:     {} bytes", self.write_len);
-        println!("Total Read Length:      {} bytes", self.read_len);
-
-        let avg_duration = self.duration / self.count as u32;
-        let avg_setup = self.setup / self.count as u32;
-        let avg_exec = self.exec / self.count as u32;
-        let avg_commit = self.commit / self.count as u32;
-        let avg_txs = self.txs as f64 / self.count as f64;
-
-        println!("\nAverages per Block:");
-        println!("  Duration:         {:.2?}", avg_duration);
-        println!("  Setup:            {:.2?}", avg_setup);
-        println!("  Execution:        {:.2?}", avg_exec);
-        println!("  Commit:           {:.2?}", avg_commit);
-        println!("  Transactions:     {:.1}", avg_txs);
-        println!("  Clarity Runtime:  {}", self.runtime / self.count);
-        println!("  Write Length:     {} bytes", self.write_len / self.count);
-        println!("  Read Length:      {} bytes", self.read_len / self.count);
-        println!("========================================\n");
     }
 }

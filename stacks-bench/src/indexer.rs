@@ -7,7 +7,6 @@ use blockstack_lib::chainstate::stacks::StacksTransaction;
 use futures::StreamExt;
 use stacks_common::types::chainstate::StacksBlockId;
 use tokio::sync::mpsc;
-use tokio::task;
 
 use crate::blocks::{BlockRef, ChainCache as _};
 use crate::context::BenchEnv;
@@ -26,13 +25,48 @@ pub struct ResolvedRange {
     pub end: BlockRef,
 }
 
+/// Discrete events emitted by the indexer for UI rendering.
+///
+/// The `Finished` variant is a terminal event: the UI must exit upon receiving it.
+/// If the indexer errors before sending `Finished`, the channel closes (sender dropped)
+/// and the UI should handle `None` from `recv()` gracefully.
+#[derive(Debug)]
+pub enum IndexerEvent {
+    /// The requested range is already fully indexed; no pipeline needed.
+    AlreadyCached,
+    /// The AppDb index is incomplete; pipeline will run.
+    IndexIncomplete { found: usize, expected: usize },
+    /// Pipeline started — includes shared metrics handle for polling and
+    /// a walk-progress tracker (current height during the pre-range chain walk).
+    PipelineStarted {
+        metrics: Arc<IndexerMetrics>,
+        walk_progress: Arc<AtomicU64>,
+    },
+    /// A merge operation has started (incremental or final).
+    MergeStarted,
+    /// An incremental merge completed.
+    MergeComplete { duration: Duration },
+    /// The final merge completed.
+    FinalMergeComplete { duration: Duration },
+    /// Checkpoint started (after pipeline).
+    CheckpointStarted,
+    /// Checkpoint finished.
+    CheckpointComplete,
+    /// Vacuum started.
+    VacuumStarted,
+    /// Vacuum finished.
+    VacuumComplete,
+    /// Indexing is complete (terminal event). UI must exit on receiving this.
+    Finished,
+}
+
 #[derive(Debug, Default)]
-struct IndexerMetrics {
-    loaded_blocks: AtomicUsize,
-    loaded_txs: AtomicUsize,
-    last_loaded_height: AtomicU64,
-    flushed_blocks: AtomicUsize,
-    flushed_txs: AtomicUsize,
+pub struct IndexerMetrics {
+    pub loaded_blocks: AtomicUsize,
+    pub loaded_txs: AtomicUsize,
+    pub last_loaded_height: AtomicU64,
+    pub flushed_blocks: AtomicUsize,
+    pub flushed_txs: AtomicUsize,
 }
 
 impl IndexerMetrics {
@@ -55,6 +89,7 @@ pub struct ChainstateIndexer<'a> {
     batch_size: usize,
     merge_threshold: usize,
     channel_buffer_size: usize,
+    event_tx: Option<mpsc::UnboundedSender<IndexerEvent>>,
 }
 
 impl<'a> ChainstateIndexer<'a> {
@@ -69,11 +104,23 @@ impl<'a> ChainstateIndexer<'a> {
             batch_size: Self::DEFAULT_BATCH_SIZE,
             merge_threshold: Self::DEFAULT_MERGE_THRESHOLD,
             channel_buffer_size: Self::DEFAULT_CHANNEL_BUFFER_SIZE,
+            event_tx: None,
         }
+    }
+
+    pub fn with_events(mut self, tx: mpsc::UnboundedSender<IndexerEvent>) -> Self {
+        self.event_tx = Some(tx);
+        self
     }
 
     pub fn set_batch_size(&mut self, batch_size: usize) {
         self.batch_size = batch_size;
+    }
+
+    fn send_event(&self, event: IndexerEvent) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event);
+        }
     }
 
     async fn try_get_cached_id_at_height(
@@ -127,6 +174,7 @@ impl<'a> ChainstateIndexer<'a> {
             anchor_tip.id.clone(),
             start_height,
             end_height,
+            None,
         );
 
         while let Some(hdr) = stream.next().await {
@@ -170,11 +218,6 @@ impl<'a> ChainstateIndexer<'a> {
         } else {
             plan.start_height
         };
-
-        println!(
-            "Targeting block range: {} to {} (Anchor tip: {})",
-            plan.start_height, plan.end_height, plan.anchor_tip
-        );
 
         let (_chainstate_model, _) = self
             .app_db
@@ -241,6 +284,8 @@ impl<'a> ChainstateIndexer<'a> {
                     )
                     .await?;
 
+                self.send_event(IndexerEvent::AlreadyCached);
+                self.send_event(IndexerEvent::Finished);
                 return Ok((resolved, ids));
             }
 
@@ -263,23 +308,28 @@ impl<'a> ChainstateIndexer<'a> {
                 ids.remove(0);
             }
 
+            self.send_event(IndexerEvent::AlreadyCached);
+            self.send_event(IndexerEvent::Finished);
             return Ok((resolved, ids));
         }
 
-        println!(
-            "App DB tx index incomplete (found {}, expected {expected_indexed_count}). Indexing from Node DB...",
-            indexed_ids.len(),
-        );
+        self.send_event(IndexerEvent::IndexIncomplete {
+            found: indexed_ids.len(),
+            expected: expected_indexed_count,
+        });
 
         // Slow path: run the real pipeline (single canonical walk + tx loading)
         let resolved = self
             .run_indexing_pipeline(plan.anchor_tip.clone(), index_start_height, plan.end_height)
             .await?;
 
-        println!("Checkpointing database...");
+        self.send_event(IndexerEvent::CheckpointStarted);
         self.app_db.checkpoint(CheckpointMode::Truncate).await?;
-        println!("Vacuuming database...");
+        self.send_event(IndexerEvent::CheckpointComplete);
+
+        self.send_event(IndexerEvent::VacuumStarted);
         self.app_db.vacuum().await?;
+        self.send_event(IndexerEvent::VacuumComplete);
 
         let mut ids = self
             .app_db
@@ -290,6 +340,7 @@ impl<'a> ChainstateIndexer<'a> {
             ids.remove(0);
         }
 
+        self.send_event(IndexerEvent::Finished);
         Ok((resolved, ids))
     }
 
@@ -304,6 +355,12 @@ impl<'a> ChainstateIndexer<'a> {
             mpsc::channel::<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>(100);
 
         let metrics = Arc::new(IndexerMetrics::default());
+        let walk_progress = Arc::new(AtomicU64::new(0));
+
+        self.send_event(IndexerEvent::PipelineStarted {
+            metrics: metrics.clone(),
+            walk_progress: walk_progress.clone(),
+        });
 
         let loader_task = Self::run_loader(
             self.env,
@@ -313,26 +370,27 @@ impl<'a> ChainstateIndexer<'a> {
             self.channel_buffer_size,
             tx_sender,
             metrics.clone(),
+            walk_progress,
         );
 
         let writer_task = Self::run_writer(
             self.app_db,
             tx_receiver,
             &anchor_tip,
-            start_height, // NEW
-            end_height,   // NEW
+            start_height,
+            end_height,
             self.batch_size,
             self.merge_threshold,
             metrics.clone(),
+            self.event_tx.clone(),
         );
 
-        let reporter_handle = task::spawn(run_reporter(metrics.clone(), start_height, end_height));
         let (resolved, _) = tokio::try_join!(loader_task, writer_task)?;
-        reporter_handle.abort();
 
         Ok(resolved)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_loader(
         env: &BenchEnv,
         anchor_tip: BlockRef,
@@ -341,9 +399,8 @@ impl<'a> ChainstateIndexer<'a> {
         channel_buffer_size: usize,
         tx_sender: mpsc::Sender<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>,
         metrics: Arc<IndexerMetrics>,
+        walk_progress: Arc<AtomicU64>,
     ) -> Result<ResolvedRange> {
-        println!("  Indexing loader started");
-
         let blocks_dir = env.chainstate_dir.blocks_dir();
         let nakamoto_db = env.open_nakamoto_db_for_read().await?;
         let min_naka_height = nakamoto_db
@@ -412,6 +469,7 @@ impl<'a> ChainstateIndexer<'a> {
             anchor_tip.id.clone(),
             start_height,
             end_height,
+            Some(walk_progress),
         );
 
         while let Some(block_res) = stream.next().await {
@@ -458,17 +516,24 @@ impl<'a> ChainstateIndexer<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_writer(
         app_db: &mut AppDb,
         mut tx_receiver: mpsc::Receiver<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>,
         anchor_tip: &BlockRef,
-        start_height: u64, // NEW
-        end_height: u64,   // NEW
+        start_height: u64,
+        end_height: u64,
         batch_size: usize,
         merge_threshold: usize,
         metrics: Arc<IndexerMetrics>,
+        event_tx: Option<mpsc::UnboundedSender<IndexerEvent>>,
     ) -> Result<()> {
-        println!("  Indexing writer started with a batch size of {batch_size}");
+        let send_event = |event: IndexerEvent| {
+            if let Some(tx) = &event_tx {
+                let _ = tx.send(event);
+            }
+        };
+
         app_db
             .set_synchronization_mode(SynchronizationMode::Off)
             .await?;
@@ -538,16 +603,13 @@ impl<'a> ChainstateIndexer<'a> {
                 metrics.record_flush(block_count, tx_count);
 
                 if txs_since_last_merge >= merge_threshold {
-                    println!(
-                        "  Merge threshold reached ({txs_since_last_merge} txs). Merging staging data..."
-                    );
+                    send_event(IndexerEvent::MergeStarted);
                     let start = Instant::now();
                     app_db.merge_staging().await?;
                     app_db.checkpoint(CheckpointMode::Passive).await?;
-                    println!(
-                        "  Incremental merge & checkpoint complete in {:.2?}",
-                        start.elapsed()
-                    );
+                    send_event(IndexerEvent::MergeComplete {
+                        duration: start.elapsed(),
+                    });
 
                     txs_since_last_merge = 0;
                     blocks_since_last_merge = 0;
@@ -571,14 +633,13 @@ impl<'a> ChainstateIndexer<'a> {
         }
 
         if blocks_since_last_merge > 0 {
-            println!("  Performing final staging data merge...");
+            send_event(IndexerEvent::MergeStarted);
             let start = Instant::now();
             app_db.merge_staging().await?;
             app_db.checkpoint(CheckpointMode::Truncate).await?;
-            println!(
-                "  Final merge & checkpoint complete in {:.2?}",
-                start.elapsed()
-            );
+            send_event(IndexerEvent::FinalMergeComplete {
+                duration: start.elapsed(),
+            });
         }
 
         app_db
@@ -588,86 +649,6 @@ impl<'a> ChainstateIndexer<'a> {
             .set_foreign_key_enforcement(ForeignKeyMode::Enforced)
             .await?;
 
-        println!("Indexing writer finished");
         Ok(())
     }
-}
-
-async fn run_reporter(
-    metrics: Arc<IndexerMetrics>,
-    start_height: u64,
-    end_height: u64,
-) -> Result<()> {
-    let total_blocks = (end_height.saturating_sub(start_height) + 1) as usize;
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
-
-    let mut last_flushed_blocks = 0;
-    let mut last_loaded_blocks = 0;
-    let mut last_loaded_txs = 0;
-    let mut last_flushed_txs = 0;
-    let mut last_time = Instant::now();
-
-    loop {
-        interval.tick().await;
-        let now = Instant::now();
-        let elapsed = now.duration_since(last_time).as_secs_f64();
-
-        let current_loaded_blocks = metrics.loaded_blocks.load(Ordering::Relaxed);
-        let current_flushed_blocks = metrics.flushed_blocks.load(Ordering::Relaxed);
-        let current_loaded_txs = metrics.loaded_txs.load(Ordering::Relaxed);
-        let current_flushed_txs = metrics.flushed_txs.load(Ordering::Relaxed);
-        let current_height = metrics.last_loaded_height.load(Ordering::Relaxed);
-
-        let delta_loaded_blocks = current_loaded_blocks.saturating_sub(last_loaded_blocks);
-        let delta_flushed_blocks = current_flushed_blocks.saturating_sub(last_flushed_blocks);
-        let delta_loaded_txs = current_loaded_txs.saturating_sub(last_loaded_txs);
-        let delta_flushed_txs = current_flushed_txs.saturating_sub(last_flushed_txs);
-
-        let rate_loaded_blocks = if elapsed > 0.0 {
-            delta_loaded_blocks as f64 / elapsed
-        } else {
-            0.0
-        };
-
-        let rate_flushed_blocks = if elapsed > 0.0 {
-            delta_flushed_blocks as f64 / elapsed
-        } else {
-            0.0
-        };
-
-        let rate_loaded_txs = if elapsed > 0.0 {
-            delta_loaded_txs as f64 / elapsed
-        } else {
-            0.0
-        };
-
-        let rate_flushed_txs = if elapsed > 0.0 {
-            delta_flushed_txs as f64 / elapsed
-        } else {
-            0.0
-        };
-
-        let progress = if total_blocks > 0 {
-            (current_flushed_blocks as f64 / total_blocks as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        println!(
-            "  Status: {progress:>5.1}% | Height: {current_height:<7} | \
-            Blocks: +{delta_loaded_blocks:<4} ({rate_loaded_blocks:>5.1}/s) -> +{delta_flushed_blocks:<4} ({rate_flushed_blocks:>5.1}/s) | \
-            Txs: +{delta_loaded_txs:<5} ({rate_loaded_txs:>6.1}/s) -> +{delta_flushed_txs:<5} ({rate_flushed_txs:>6.1}/s)"
-        );
-
-        last_loaded_blocks = current_loaded_blocks;
-        last_flushed_blocks = current_flushed_blocks;
-        last_loaded_txs = current_loaded_txs;
-        last_flushed_txs = current_flushed_txs;
-        last_time = now;
-
-        if current_flushed_blocks >= total_blocks {
-            break;
-        }
-    }
-    Ok(())
 }

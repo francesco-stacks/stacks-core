@@ -55,7 +55,13 @@ impl Cli {
         let app_data = AppDataDir::resolve_from_opt(self.app_data_dir.as_ref())?;
 
         let app_db_path = app_data.app_db_path();
-        let app_db = AppDb::open(&app_db_path).await?;
+        let app_db = AppDb::open(&app_db_path).await.inspect_err(|e| {
+            let msg = format!(
+                "Failed to open app database at {}: {e}",
+                app_db_path.display()
+            );
+            cliclack::log::error(msg).ok();
+        })?;
 
         let ctx = CliContext::new(app_data, app_db);
 

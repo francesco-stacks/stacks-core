@@ -160,7 +160,6 @@ impl<P: BlockHeaderProvider, C: ChainCache> BackwardsBlockStream<P, C> {
             && cached_h < curr_h
             && cached_h >= target_height
         {
-            println!("  [Cache Hit] Jumping from height {curr_h} to {cached_h} ({cached_id})");
             self.current_id = cached_id;
             // Fetch header for new location
             header = self
@@ -184,7 +183,6 @@ impl<P: BlockHeaderProvider, C: ChainCache> BackwardsBlockStream<P, C> {
                     .cache
                     .cache_ancestor(anchor_tip, next_h, &self.current_id)
                     .await;
-                eprint!(".");
             }
 
             // Fetch next header
@@ -196,8 +194,6 @@ impl<P: BlockHeaderProvider, C: ChainCache> BackwardsBlockStream<P, C> {
 
             curr_h = header.height;
         }
-
-        println!(); // Newline after dots
 
         // Cache final result
         let _ = self
@@ -214,5 +210,129 @@ impl<P: BlockHeaderProvider, C: ChainCache> BackwardsBlockStream<P, C> {
 
     fn should_cache_block(height: u64) -> bool {
         height.is_multiple_of(1_000)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use futures::StreamExt;
+    use stacks_common::types::chainstate::StacksBlockId;
+
+    use super::*;
+
+    /// In-memory mock that holds a chain of headers linked by parent_id.
+    struct MockHeaderProvider {
+        headers: HashMap<StacksBlockId, StacksBlockHeader>,
+    }
+
+    impl BlockHeaderProvider for &MockHeaderProvider {
+        async fn get_header(&self, id: &StacksBlockId) -> Result<Option<StacksBlockHeader>> {
+            Ok(self.headers.get(id).cloned())
+        }
+    }
+
+    fn make_block_id(height: u64) -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&height.to_be_bytes());
+        StacksBlockId(bytes)
+    }
+
+    /// Build a synthetic chain of headers: genesis(0) ← 1 ← 2 ← ... ← tip_height.
+    fn build_mock_chain(tip_height: u64) -> (MockHeaderProvider, StacksBlockId) {
+        use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash};
+
+        let mut headers = HashMap::new();
+
+        for h in 0..=tip_height {
+            let id = make_block_id(h);
+            let parent_id = if h > 0 {
+                make_block_id(h - 1)
+            } else {
+                StacksBlockId([0xff; 32]) // genesis parent
+            };
+            headers.insert(
+                id.clone(),
+                StacksBlockHeader {
+                    id,
+                    hash: BlockHeaderHash([0u8; 32]),
+                    parent_id,
+                    height: h,
+                    burn_block_height: 0,
+                    burn_block_hash: BurnchainHeaderHash([0u8; 32]),
+                },
+            );
+        }
+
+        let tip_id = make_block_id(tip_height);
+        (MockHeaderProvider { headers }, tip_id)
+    }
+
+    /// Test that the walk_progress tracker is updated during the pre-range
+    /// portion of the chain walk (heights above end_height).
+    ///
+    /// This replicates the exact unfold pattern from
+    /// `ChainStateDb::canonical_block_stream_from_tip`.
+    #[tokio::test]
+    async fn walk_progress_tracker_updates() {
+        let tip_height = 100u64;
+        let end_height = 50u64;
+        let start_height = 40u64;
+
+        let (provider, tip_id) = build_mock_chain(tip_height);
+        let walk_progress = Arc::new(AtomicU64::new(0));
+
+        // Replicate the exact stream construction from canonical_block_stream_from_tip
+        let stream = BackwardsBlockStream::new(&provider, tip_id);
+        let wp = Some(walk_progress.clone());
+
+        let mut stream = Box::pin(futures::stream::unfold(stream, move |mut bs| {
+            let walk_progress = wp.clone();
+            async move {
+                loop {
+                    match bs.next_block().await {
+                        Ok(Some(header)) => {
+                            if header.height < start_height {
+                                return None;
+                            }
+                            if header.height <= end_height {
+                                return Some((Ok(header), bs));
+                            }
+                            // above end_height: keep walking, update tracker
+                            if let Some(ref tracker) = walk_progress {
+                                tracker.store(header.height, Ordering::Relaxed);
+                            }
+                        }
+                        Ok(None) => return Some((Err(anyhow!("Missing header")), bs)),
+                        Err(e) => return Some((Err(e), bs)),
+                    }
+                }
+            }
+        }));
+
+        // Consume the stream and collect yielded headers
+        let mut yielded_heights = Vec::new();
+        while let Some(result) = stream.next().await {
+            let header = result.expect("stream should not error");
+            yielded_heights.push(header.height);
+        }
+
+        // (a) Walk tracker should have been updated with heights above end_height
+        let final_walk_height = walk_progress.load(Ordering::Relaxed);
+        // The last pre-range height walked is end_height + 1 = 51
+        assert_eq!(final_walk_height, end_height + 1);
+
+        // (b) Stream should yield exactly the 11 in-range headers (50 down to 40)
+        assert_eq!(yielded_heights.len(), 11);
+        assert_eq!(*yielded_heights.first().unwrap(), end_height);
+        assert_eq!(*yielded_heights.last().unwrap(), start_height);
+
+        // Verify descending order
+        for i in 1..yielded_heights.len() {
+            assert_eq!(yielded_heights[i], yielded_heights[i - 1] - 1);
+        }
     }
 }

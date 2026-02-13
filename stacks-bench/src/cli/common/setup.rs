@@ -1,154 +1,17 @@
-use std::fmt::{LowerHex, UpperHex};
 use std::path::Path;
-use std::str::FromStr;
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow};
 use stacks_bench::context::{BenchEnv, BenchEnvOpts};
 use stacks_bench::db::DbOpenForRead;
-use stacks_bench::db::app::AppDb;
-use stacks_bench::db::app::models::BenchmarkRun;
 use stacks_bench::db::node::ChainStateDb;
 use stacks_bench::db::node::sortition::SortitionDb;
 use stacks_bench::indexer::ChainIndexPlan;
-use stacks_bench::paths::{AppDataDir, BurnChainDir, ChainStateDir};
+use stacks_bench::paths::{BurnChainDir, ChainStateDir};
 use stacks_bench::shadow::{ShadowDir, ShadowDirBuilder};
 use stacks_bench::{Network, StacksBlockRef, StacksEpoch};
 
-pub struct CliContext {
-    /// The path to the application database (SQLite). If not specified, the database
-    /// will be created in the same directory as the `stacks-bench` binary.
-    app_data_dir: AppDataDir,
-    /// The application database.
-    app_db: AppDb,
-}
+use super::args::IndexerArgs;
 
-pub const SUCCESS_ICON: &str = "✔";
-#[allow(unused)]
-pub const FAILURE_ICON: &str = "✘";
-
-macro_rules! fmt_success {
-    ($($arg:tt)*) => {{
-        format!(
-            "{} {}",
-            ::console::style($crate::cli::common::SUCCESS_ICON).green(),
-            format_args!($($arg)*)
-        )
-    }};
-}
-
-#[allow(unused)]
-macro_rules! fmt_failure {
-    ($($arg:tt)*) => {{
-        format!(
-            "{} {}",
-            ::console::style($crate::cli::common::FAILURE_ICON).red(),
-            format_args!($($arg)*)
-        )
-    }};
-}
-
-impl CliContext {
-    pub fn new(app_data_dir: AppDataDir, app_db: AppDb) -> Self {
-        Self {
-            app_data_dir,
-            app_db,
-        }
-    }
-
-    pub fn app_data_dir(&self) -> &AppDataDir {
-        &self.app_data_dir
-    }
-
-    pub fn app_db(&self) -> AppDb {
-        self.app_db.clone()
-    }
-}
-
-pub trait IndexerArgs {
-    fn start_at(&self) -> Option<&StacksBlockRef>;
-    fn end_at(&self) -> Option<&StacksBlockRef>;
-    fn block_count(&self) -> Option<u32>;
-    fn tip(&self) -> Option<&StacksBlockRef>;
-    fn network(&self) -> Option<Network>;
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TxIdArg([u8; 32]);
-
-impl FromStr for TxIdArg {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = hex::decode(s).with_context(|| format!("invalid hex in txid '{s}'"))?;
-        if bytes.len() != 32 {
-            bail!(
-                "invalid txid length: expected 32 bytes, got {} bytes",
-                bytes.len()
-            );
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(TxIdArg(arr))
-    }
-}
-
-impl std::fmt::Display for TxIdArg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
-    }
-}
-
-impl LowerHex for TxIdArg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{:02x}", byte)?;
-        }
-        Ok(())
-    }
-}
-
-impl UpperHex for TxIdArg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{:02X}", byte)?;
-        }
-        Ok(())
-    }
-}
-
-impl TxIdArg {
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-/// Format a benchmark run for display in interactive select / multiselect lists.
-///
-/// Returns something like: `✔ my-run  —  2026-02-11 14:30:00`
-pub fn format_run_label(run: &BenchmarkRun) -> String {
-    let status = if run.end_time.is_some() {
-        console::style("✔").green().to_string()
-    } else {
-        console::style("…").yellow().to_string()
-    };
-    let name = run.run_name.as_deref().unwrap_or("(unnamed)");
-    format!(
-        "{status} {name}  —  {}",
-        run.start_time.format("%Y-%m-%d %H:%M:%S"),
-    )
-}
-
-/// Format a run's name as a bold parenthetical suffix for log messages.
-///
-/// Returns `" (name)"` (with bold styling) when a name exists, or `""` otherwise.
-pub fn format_run_name_suffix(run: &BenchmarkRun) -> String {
-    run.run_name
-        .as_deref()
-        .map(|n| format!(" ({})", console::style(n).bold()))
-        .unwrap_or_default()
-}
-
-// Helper to get the current git commit hash
 pub fn get_git_hash() -> Option<Vec<u8>> {
     std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])

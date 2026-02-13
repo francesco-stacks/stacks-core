@@ -1,6 +1,8 @@
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use clarity::types::chainstate::StacksBlockId;
@@ -104,30 +106,38 @@ impl<Mode: Send + Sync + 'static> ChainStateDb<Mode> {
     /// Stream canonical headers by walking parent links from `tip_id`,
     /// yielding headers whose height is in [start_height, end_height] (descending).
     ///
-    /// Note: this still performs per-header lookups (via `get_header()`), but it avoids
-    /// the extra pre-walk done by BenchContext::initialize().
+    /// When `walk_progress` is provided, the tracker is updated with the current
+    /// height as the stream walks backwards through blocks above `end_height`.
+    /// This allows callers to monitor progress during the pre-range walk phase.
     pub fn canonical_block_stream_from_tip(
         &self,
         tip_id: StacksBlockId,
         start_height: u64,
         end_height: u64,
+        walk_progress: Option<Arc<AtomicU64>>,
     ) -> impl Stream<Item = Result<StacksBlockHeader>> {
         let stream = BackwardsBlockStream::new(self, tip_id);
 
-        Box::pin(futures::stream::unfold(stream, move |mut bs| async move {
-            loop {
-                match bs.next_block().await {
-                    Ok(Some(header)) => {
-                        if header.height < start_height {
-                            return None;
+        Box::pin(futures::stream::unfold(stream, move |mut bs| {
+            let walk_progress = walk_progress.clone();
+            async move {
+                loop {
+                    match bs.next_block().await {
+                        Ok(Some(header)) => {
+                            if header.height < start_height {
+                                return None;
+                            }
+                            if header.height <= end_height {
+                                return Some((Ok(header), bs));
+                            }
+                            // above end_height: keep walking, update tracker
+                            if let Some(ref tracker) = walk_progress {
+                                tracker.store(header.height, Ordering::Relaxed);
+                            }
                         }
-                        if header.height <= end_height {
-                            return Some((Ok(header), bs));
-                        }
-                        // above end_height: keep walking
+                        Ok(None) => return Some((Err(anyhow!("Missing header")), bs)),
+                        Err(e) => return Some((Err(e), bs)),
                     }
-                    Ok(None) => return Some((Err(anyhow!("Missing header")), bs)),
-                    Err(e) => return Some((Err(e), bs)),
                 }
             }
         }))

@@ -109,6 +109,8 @@ impl DbOpen<ReadWrite> for SqliteDbHandle<ReadWrite> {
 }
 
 async fn build_pool<U: Into<String>>(url: U, size: u32) -> Result<Pool<AsyncSqliteConnection>> {
+    let url = url.into();
+
     let mut manager_config = diesel_async::pooled_connection::ManagerConfig::default();
     manager_config.custom_setup = Box::new(|url| {
         Box::pin(async move {
@@ -129,7 +131,7 @@ async fn build_pool<U: Into<String>>(url: U, size: u32) -> Result<Pool<AsyncSqli
     });
 
     let manager = AsyncDieselConnectionManager::<AsyncSqliteConnection>::new_with_config(
-        url.into(),
+        url.clone(),
         manager_config,
     );
 
@@ -139,5 +141,5 @@ async fn build_pool<U: Into<String>>(url: U, size: u32) -> Result<Pool<AsyncSqli
         .connection_timeout(Duration::from_secs(1))
         .build(manager)
         .await
-        .context("Failed to build SQLite pool (ReadWrite)")
+        .with_context(|| format!("Failed to build SQLite pool (ReadWrite) for URL/path: {url}"))
 }

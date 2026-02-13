@@ -1,8 +1,7 @@
 use anyhow::{Result, bail};
 use console::style;
-use stacks_bench::db::app::CheckpointMode;
 
-use crate::cli::common::CliContext;
+use crate::cli::common::{CliContext, run_db_cleanup};
 
 #[derive(clap::Args, Debug)]
 pub struct RemoveArgs {
@@ -117,25 +116,12 @@ impl RemoveArgs {
             let spinner = multi.add(cliclack::spinner());
             spinner.start(format!("Deleting chainstate {}…", cs.id));
             app_db.delete_chainstate(cs.id).await?;
-            spinner.stop(format!(
-                "{} Chainstate {} deleted",
-                style("✔").green(),
-                cs.id,
-            ));
+            spinner.stop(fmt_success!("Chainstate {} deleted", cs.id));
         }
 
         multi.stop();
 
-        // Checkpoint + vacuum to reclaim space
-        let maint_spinner = cliclack::spinner();
-        maint_spinner.start("Checkpointing database…");
-        app_db.checkpoint(CheckpointMode::Truncate).await?;
-        maint_spinner.stop(format!("{} Checkpoint complete", style("✔").green()));
-
-        let vacuum_spinner = cliclack::spinner();
-        vacuum_spinner.start("Vacuuming database…");
-        app_db.vacuum().await?;
-        vacuum_spinner.stop(format!("{} Vacuum complete", style("✔").green()));
+        run_db_cleanup(app_db).await?;
 
         Ok(())
     }

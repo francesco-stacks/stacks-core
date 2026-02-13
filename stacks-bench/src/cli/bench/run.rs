@@ -8,19 +8,21 @@ use serde::{Deserialize, Serialize};
 use stacks_bench::blocks::{BackwardsBlockStream, BlockRef};
 use stacks_bench::context::BenchContext;
 use stacks_bench::db::DbOpenForRead;
-use stacks_bench::db::app::CheckpointMode;
+use stacks_bench::db::app::{AppDb, CheckpointMode};
 use stacks_bench::db::node::{ChainStateDb, NakamotoDb};
 use stacks_bench::filter::TxFilter;
 use stacks_bench::indexer::{ChainIndexPlan, ChainstateIndexer};
 use stacks_bench::metrics::{BlockMetrics, CostModel, MetricsAccumulator, ModelSource};
 use stacks_bench::paths::ChainStateDir;
 use stacks_bench::replay::{ReplayMode, SegmentReplayInfo};
+use stacks_bench::shadow::{ShadowDir, ShadowDirDeltaReport};
 use stacks_bench::{Network, StacksBlockHeader, StacksBlockLoader, StacksBlockRef};
 use stacks_profiler::Profiler;
+use tokio::sync::mpsc;
 
 use crate::cli::common::{
-    CliContext, IndexerArgs, TxIdArg, create_shadow_dir, get_git_hash, setup_bench_env,
-    setup_bench_env_and_plan,
+    Align, CliContext, IndexerArgs, Table, TxIdArg, create_shadow_dir, fmt_u64_thousands,
+    get_git_hash, run_indexer_progress_ui, setup_bench_env, setup_bench_env_and_plan,
 };
 
 const BASELINE_MEASURED_BLOCKS: u32 = 1000;
@@ -33,28 +35,27 @@ pub struct RunArgs {
     #[arg(long = "source", short = 's')]
     source_dir: PathBuf,
 
-    /// The Stacks block (height or hex block id) to start at, inclusive. Cannot
-    /// be used with the `txid` flag.
+    /// The Stacks block (height or hex block id) to start at, inclusive. Cannot be used with the
+    /// `txid` flag.
     #[arg(long, conflicts_with = "txid", default_value = "1")]
     #[serde(skip_serializing_if = "Option::is_none")]
     start_at: Option<StacksBlockRef>,
 
-    /// The Stacks block (height or hex block id) to end at, inclusive. Cannot
-    /// be used with the `txid` or `count` flags.
+    /// The Stacks block (height or hex block id) to end at, inclusive. Cannot be used with the
+    /// `txid` or `count` flags.
     #[arg(long, conflicts_with_all = ["txid", "block_count"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     end_at: Option<StacksBlockRef>,
 
-    /// The tip block (height or hex block id) to use as the anchor for
-    /// resolving canonical history. Defaults to the node's current canonical
-    /// tip. Useful for benchmarking in forks: provide the fork's tip hash here.
+    /// The tip block (height or hex block id) to use as the anchor for resolving canonical history.
+    /// Defaults to the node's current canonical tip. Useful for benchmarking in forks: provide the
+    /// fork's tip hash here.
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     tip: Option<StacksBlockRef>,
 
-    /// The network to use (`mainnet`, `testnet`, `regtest`). If not specified,
-    /// the network is inferred from the chainstate database.
-    #[arg(long, short = 'n')]
+    /// The network to use. If not specified, the network is inferred from the chainstate database.
+    #[arg(long, short = 'n', value_enum)]
     #[serde(skip_serializing_if = "Option::is_none")]
     network: Option<Network>,
 
@@ -63,26 +64,37 @@ pub struct RunArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     block_count: Option<u32>,
 
-    /// A specific transaction id (hex) to benchmark. May not be used with
-    /// `start-at`, `end-at`, or `count`.
+    /// A specific transaction id (hex) to benchmark. May not be used with `start-at`, `end-at`, or
+    /// `count`.
     #[arg(long, conflicts_with_all = ["start_at", "end_at", "block_count", "filter"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     txid: Option<TxIdArg>,
 
-    /// Number of times to replay the target transaction's block when using
-    /// `--txid`. Each repetition forks from the same parent block, producing
-    /// an independent measurement. Defaults to 10.
+    /// Number of measured times to replay the target transaction's block in `--txid` mode.
+    ///
+    /// Warmup runs (from `--warmup`) are additional and executed before these measured
+    /// repetitions. Each replay forks from the same parent block, producing an independent
+    /// measurement.
     #[arg(long, default_value_t = 10, requires = "txid")]
     repetitions: u32,
 
-    /// Number of blocks to use for calibration of the commit cost model.
-    #[arg(long, value_name = "CALIBRATION_BLOCKS", default_value_t = 20)]
+    /// Number of measured blocks to collect before fitting the commit cost
+    /// model in block-range mode.
+    #[arg(
+        long,
+        value_name = "CALIBRATION_BLOCKS",
+        default_value_t = 20,
+        conflicts_with = "txid"
+    )]
     calibration: usize,
 
     /// Number of blocks to process as warmup before starting measurements.
-    /// In block-range mode, this is the number of warmup blocks.
-    /// In `--txid` mode, this is the number of warmup repetitions
-    /// (discarded before measurement begins).
+    ///
+    /// In block-range mode, this is the number of warmup blocks (the earliest
+    /// selected blocks).
+    ///
+    /// In `--txid` mode, this is the number of warmup repetitions (discarded
+    /// before measurement begins). These runs are additive to `--repetitions`.
     #[arg(long, default_value_t = 0)]
     warmup: usize,
 
@@ -91,15 +103,16 @@ pub struct RunArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     filter: Option<FilterArg>,
 
-    /// Disable capturing of profiler key-value records generated via `record!()`. This can
-    /// provide a slight performance benefit and reduce storage if you do not need them.
+    /// Disable capturing of profiler key-value records generated via `record!` and `counter!`
+    /// macros. This can provide a slight performance benefit and reduce storage if you do not need
+    /// them.
     #[arg(long, default_value_t = false)]
     no_profiler_kv: bool,
 
     /// Whether or not to include pre-Nakamoto blocks in the reflink copy of the source node data
     /// directory, which is necessary if benchmarking from blocks prior to the chainstate's Nakamoto
     /// start height + 1. Enabling this can add significant time when creating the reflink copy
-    /// for large chainstates. Defaults to false/disabled.
+    /// for large chainstates. [default: false]
     #[arg(long = "with-pre-naka", default_value_t = false)]
     include_pre_nakamoto_blocks: bool,
 }
@@ -142,9 +155,11 @@ struct TxidScanResult {
 /// This operates on the **source** node directory (read-only) and does not
 /// require a shadow copy or prior indexing.
 async fn scan_for_txid(
+    app_db: &mut AppDb,
     source_dir: &Path,
     tip: &BlockRef,
     target_txid: &Txid,
+    mut on_progress: impl FnMut(u64, u64),
 ) -> Result<TxidScanResult> {
     let chainstate_dir = ChainStateDir::from_node_root(source_dir);
     let chainstate_db = ChainStateDb::open_for_read(chainstate_dir.index_db_path()).await?;
@@ -152,7 +167,8 @@ async fn scan_for_txid(
     let min_naka_height = naka_db.get_min_block_height().await?.unwrap_or(u64::MAX);
     let blocks_dir = chainstate_dir.blocks_dir();
 
-    let mut stream = BackwardsBlockStream::new(&chainstate_db, tip.id.clone());
+    let mut stream = BackwardsBlockStream::new(&chainstate_db, tip.id.clone()).with_cache(app_db);
+
     let mut scanned: u64 = 0;
 
     loop {
@@ -176,9 +192,7 @@ async fn scan_for_txid(
         }
 
         scanned += 1;
-        if scanned.is_multiple_of(1000) {
-            eprint!(".");
-        }
+        on_progress(scanned, header.height);
     }
 }
 
@@ -199,13 +213,11 @@ impl RunArgs {
         let mut app_db = ctx.app_db();
 
         let shadow_dir_spinner = cliclack::spinner();
-        shadow_dir_spinner.start(
-            "Creating reflink copy of source node data directory (this may take some time)...",
-        );
+        shadow_dir_spinner.start("Coping source node data directory (this may take some time)...");
         let shadow_dir_timer = Instant::now();
         let shadow_dir = create_shadow_dir(&self.source_dir, self.include_pre_nakamoto_blocks)?;
         shadow_dir_spinner.stop(format!(
-            "Chainstate working directory reflink-copied in {:.2}s",
+            "Chainstate copied in {:.2}s [reflink/CoW]",
             shadow_dir_timer.elapsed().as_secs_f32()
         ));
 
@@ -233,11 +245,18 @@ impl RunArgs {
         )?;
 
         // Setup indexer and index chainstate range
-        cliclack::log::step("Indexing node chainstate...")?;
-        let mut indexer = ChainstateIndexer::new(&mut app_db, &env);
-        let (resolved, block_ids) = indexer
-            .index_chainstate_range(env.network, env.chain_id, &env.epochs, plan)
-            .await?;
+        let tip_height = plan.anchor_tip.height;
+        let idx_start = plan.start_height;
+        let idx_end = plan.end_height;
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut indexer = ChainstateIndexer::new(&mut app_db, &env).with_events(event_tx);
+
+        let ui_fut = run_indexer_progress_ui(event_rx, idx_start, idx_end, tip_height);
+        let index_fut =
+            indexer.index_chainstate_range(env.network, env.chain_id, &env.epochs, plan);
+
+        let ((resolved, block_ids), _) = tokio::try_join!(index_fut, ui_fut)?;
 
         // Ensure chainstate row exists
         let (chainstate_model, _) = app_db
@@ -253,6 +272,13 @@ impl RunArgs {
         );
 
         let selected_block_count = block_ids.len();
+        if self.warmup > selected_block_count {
+            bail!(
+                "--warmup ({}) cannot exceed selected block count ({})",
+                self.warmup,
+                selected_block_count
+            );
+        }
         let actual_block_count = selected_block_count - self.warmup;
 
         let run_name = format!("{}", Utc::now().format("%Y%m%d-%H%M%S"));
@@ -293,10 +319,10 @@ impl RunArgs {
 
         shadow_dir.calculate_storage_delta()?; // Reset storage delta baseline
 
-        println!(
-            "Re-executing {selected_block_count} selected blocks ({} block warmup)...",
+        cliclack::log::step(format!(
+            "Re-executing {selected_block_count} selected blocks ({} block warmup)",
             self.warmup
-        );
+        ))?;
 
         const METRICS_FLUSH_THRESHOLD: usize = 250;
         let mut metrics_buffer = Vec::new();
@@ -471,10 +497,10 @@ impl RunArgs {
 
         // Flush any remaining metrics in the calibration buffer
         if !metrics_buffer.is_empty() {
-            println!(
-                "\nFlushing remaining {} block metrics from buffer...",
+            cliclack::log::step(format!(
+                "Flushing remaining {} block metrics from buffer",
                 metrics_buffer.len()
-            );
+            ))?;
 
             for m in metrics_buffer.iter_mut() {
                 if !calibrated {
@@ -487,7 +513,7 @@ impl RunArgs {
                 .save_block_metrics(run_model.id, metrics_buffer.drain(..))
                 .await?;
         } else if is_warmup {
-            println!("\nNo blocks executed for benchmarking (all warmup).");
+            cliclack::log::info("No blocks executed for benchmarking (all warmup).")?;
         }
 
         let duration = start.elapsed();
@@ -496,71 +522,32 @@ impl RunArgs {
             .finish_benchmark_run(run_model.id, Utc::now().naive_utc())
             .await?;
 
-        println!("Re-executed {selected_block_count} blocks in {duration:.2?}");
-        println!("  - Clarity DB Checkpointing: {total_clarity_db_checkpoint_duration:.2?}");
-        println!(
-            "  - Benchmarking Overhead: {:.2?}",
-            duration - total_clarity_db_checkpoint_duration
-        );
+        {
+            let mut table = Table::new()
+                .col("Metric", Align::Left)
+                .col("Value", Align::Right);
+            table.row(vec!["Blocks".into(), selected_block_count.to_string()]);
+            table.row(vec!["Total Duration".into(), format!("{duration:.2?}")]);
+            table.row(vec![
+                "Clarity DB Checkpointing".into(),
+                format!("{total_clarity_db_checkpoint_duration:.2?}"),
+            ]);
+            table.row(vec![
+                "Benchmarking Overhead".into(),
+                format!("{:.2?}", duration - total_clarity_db_checkpoint_duration),
+            ]);
+            cliclack::note("Replay Summary", table.to_string())?;
+        }
 
-        accumulator.print_summary(); // Print summary
+        print_benchmark_summary(&accumulator)?;
 
         // Give the OS a moment to sync metadata
         std::thread::sleep(Duration::from_millis(100));
 
         let storage_delta_report = shadow_dir.calculate_storage_delta()?;
-        let growth = storage_delta_report.net_growth_bytes;
-        let written = storage_delta_report.estimated_bytes_written;
+        print_storage_delta_report(&storage_delta_report)?;
 
-        println!("\n========================================");
-        println!("          STORAGE DELTA REPORT          ");
-        println!("========================================");
-        for file_report in &storage_delta_report.file_reports {
-            let status = if !file_report.was_modified {
-                "CREATED "
-            } else {
-                "MODIFIED"
-            };
-
-            let sign = if file_report.size_delta_bytes > 0 {
-                "+"
-            } else {
-                ""
-            };
-
-            println!(
-                "  {status}: {:<60} | Delta: {sign}{:.4} MB",
-                file_report.path.display(),
-                file_report.size_delta_bytes as f64 / 1_024.0 / 1_024.0
-            );
-        }
-        println!();
-        println!(
-            "  Net Change:        {:.4} MB ({growth} bytes)",
-            growth as f64 / 1_024.0 / 1_024.0
-        );
-        println!(
-            "  Est. Data Written: {:.4} MB ({written} bytes)",
-            written as f64 / 1_024.0 / 1_024.0
-        );
-        println!("========================================");
-
-        println!();
-        println!("Checkpointing database...");
-        app_db.checkpoint(CheckpointMode::Truncate).await?;
-        println!("Vacuuming database...");
-        app_db.vacuum().await?;
-
-        let cleanup_spinner = cliclack::spinner();
-        let cleanup_start = Instant::now();
-        cleanup_spinner.start("Cleaning up (this may take a few moments for large chainstates)...");
-        // Moving the context into a local binding ensures the shadow dir is
-        // cleaned up (its Drop runs here).
-        let _cleanup = bench_context;
-        cleanup_spinner.stop(fmt_success!(
-            "Finished cleanup in {:.2}s",
-            cleanup_start.elapsed().as_secs_f32()
-        ));
+        run_cleanup(app_db, shadow_dir).await?;
 
         Ok(())
     }
@@ -576,7 +563,7 @@ impl RunArgs {
         stacks_profiler::Profiler::disable_record();
 
         let txid_arg = self.txid.as_ref().expect("--txid required for exec_txid");
-        let target_txid = Txid::from_bytes_be(txid_arg.as_bytes())
+        let target_txid = Txid::from_bytes(txid_arg.as_bytes())
             .ok_or_else(|| anyhow::anyhow!("Failed to convert txid bytes to Txid"))?;
 
         let mut app_db = ctx.app_db();
@@ -633,7 +620,39 @@ impl RunArgs {
         scan_spinner.start(format!("Scanning canonical chain for txid {}…", txid_arg));
         let scan_start = Instant::now();
 
-        let scan_result = scan_for_txid(&self.source_dir, &scan_tip, &target_txid).await?;
+        let scan_result = if let Some(block_header) = app_db
+            .find_block_for_tx_hash_on_chain_tip(txid_arg.as_bytes(), &scan_tip.id)
+            .await?
+        {
+            scan_spinner.set_message(format!(
+                "Fast-path hit: found txid {} in App DB for chain tip {}",
+                txid_arg, scan_tip.id
+            ));
+            TxidScanResult {
+                block_header,
+                tx_index: 0,
+            }
+        } else {
+            let mut last_progress_update = Instant::now();
+            scan_for_txid(
+                &mut app_db,
+                &self.source_dir,
+                &scan_tip,
+                &target_txid,
+                |scanned, height| {
+                    if last_progress_update.elapsed() >= Duration::from_secs(1) {
+                        scan_spinner.set_message(format!(
+                            "Scanning canonical chain for txid {}… checked {} blocks (current height {})",
+                            txid_arg,
+                            fmt_u64_thousands(scanned),
+                            height
+                        ));
+                        last_progress_update = Instant::now();
+                    }
+                },
+            )
+            .await?
+        };
 
         scan_spinner.stop(fmt_success!(
             "Found txid {} in block {} (height {}) — scanned in {:.2}s",
@@ -700,11 +719,19 @@ impl RunArgs {
             end_height: target_height,
         };
 
-        cliclack::log::step("Indexing target block range...")?;
-        let mut indexer = ChainstateIndexer::new(&mut app_db, &env);
-        let (resolved, _block_ids) = indexer
-            .index_chainstate_range(env.network, env.chain_id, &env.epochs, plan)
-            .await?;
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut indexer = ChainstateIndexer::new(&mut app_db, &env).with_events(event_tx);
+
+        let ui_fut = run_indexer_progress_ui(
+            event_rx,
+            plan.start_height,
+            plan.end_height,
+            plan.anchor_tip.height,
+        );
+        let index_fut =
+            indexer.index_chainstate_range(env.network, env.chain_id, &env.epochs, plan);
+
+        let ((resolved, _block_ids), _) = tokio::try_join!(index_fut, ui_fut)?;
 
         // Ensure chainstate row exists
         let (chainstate_model, _) = app_db
@@ -741,9 +768,9 @@ impl RunArgs {
 
         shadow_dir.calculate_storage_delta()?; // Reset storage delta baseline
 
-        let total_reps = self.repetitions as usize;
-        let warmup_reps = self.warmup.min(total_reps);
-        let measured_reps = total_reps - warmup_reps;
+        let warmup_reps = self.warmup;
+        let measured_reps = self.repetitions as usize;
+        let total_reps = warmup_reps + measured_reps;
 
         let replay_multi_pb = cliclack::multi_progress(format!(
             "Replaying txid {} — {} repetitions ({} warmup)",
@@ -857,67 +884,31 @@ impl RunArgs {
             .finish_benchmark_run(run_model.id, Utc::now().naive_utc())
             .await?;
 
-        println!(
-            "\nReplayed txid {} × {measured_reps} measured reps in {duration:.2?}",
-            txid_arg
-        );
-        println!("  - Clarity DB Checkpointing: {total_clarity_db_checkpoint_duration:.2?}");
+        {
+            let mut table = Table::new()
+                .col("Metric", Align::Left)
+                .col("Value", Align::Right);
+            table.row(vec!["Transaction".into(), txid_arg.to_string()]);
+            table.row(vec![
+                "Measured Repetitions".into(),
+                measured_reps.to_string(),
+            ]);
+            table.row(vec!["Total Duration".into(), format!("{duration:.2?}")]);
+            table.row(vec![
+                "Clarity DB Checkpointing".into(),
+                format!("{total_clarity_db_checkpoint_duration:.2?}"),
+            ]);
+            cliclack::note("Replay Summary", table.to_string())?;
+        }
 
-        accumulator.print_summary();
+        print_benchmark_summary(&accumulator)?;
 
         // Storage delta report
         std::thread::sleep(Duration::from_millis(100));
         let storage_delta_report = shadow_dir.calculate_storage_delta()?;
-        let growth = storage_delta_report.net_growth_bytes;
-        let written = storage_delta_report.estimated_bytes_written;
+        print_storage_delta_report(&storage_delta_report)?;
 
-        println!("\n========================================");
-        println!("          STORAGE DELTA REPORT          ");
-        println!("========================================");
-        for file_report in &storage_delta_report.file_reports {
-            let status = if !file_report.was_modified {
-                "CREATED "
-            } else {
-                "MODIFIED"
-            };
-            let sign = if file_report.size_delta_bytes > 0 {
-                "+"
-            } else {
-                ""
-            };
-            println!(
-                "  {status}: {:<60} | Delta: {sign}{:.4} MB",
-                file_report.path.display(),
-                file_report.size_delta_bytes as f64 / 1_024.0 / 1_024.0
-            );
-        }
-        println!();
-        println!(
-            "  Net Change:        {:.4} MB ({growth} bytes)",
-            growth as f64 / 1_024.0 / 1_024.0
-        );
-        println!(
-            "  Est. Data Written: {:.4} MB ({written} bytes)",
-            written as f64 / 1_024.0 / 1_024.0
-        );
-        println!("========================================");
-
-        println!();
-        println!("Checkpointing database...");
-        app_db.checkpoint(CheckpointMode::Truncate).await?;
-        println!("Vacuuming database...");
-        app_db.vacuum().await?;
-
-        let cleanup_spinner = cliclack::spinner();
-        let cleanup_start = Instant::now();
-        cleanup_spinner.start("Cleaning up (this may take a few moments for large chainstates)...");
-        let _cleanup = bench_context;
-        cleanup_spinner.stop(fmt_success!(
-            "Finished cleanup in {:.2}s",
-            cleanup_start.elapsed().as_secs_f32()
-        ));
-
-        Ok(())
+        run_cleanup(app_db, shadow_dir).await
     }
 
     fn run_overhead_baselines(
@@ -929,6 +920,7 @@ impl RunArgs {
         stacks_bench::metrics::BlockProcessingBaseline,
         stacks_bench::metrics::BlockProcessingBaseline,
     )> {
+        let mut timer;
         let baseline_multipb =
             cliclack::multi_progress("Calculating block processing overhead baseline");
 
@@ -954,7 +946,7 @@ impl RunArgs {
 
         if let Some(warmup_pb) = maybe_warmup_pb {
             warmup_pb.start("Warming up");
-            let warmup_timer = Instant::now();
+            timer = Instant::now();
             stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
                 chainstate,
                 burnchain,
@@ -965,12 +957,12 @@ impl RunArgs {
             warmup_pb.stop(fmt_success!(
                 "Warmed up for {} blocks ({:.2}s)",
                 self.warmup,
-                warmup_timer.elapsed().as_secs_f32()
+                timer.elapsed().as_secs_f32()
             ));
         }
 
         baseline_pb1.start("Measuring baseline (round 1)...".to_string());
-        let t1 = Instant::now();
+        timer = Instant::now();
         let round1 = stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
             chainstate,
             burnchain,
@@ -980,11 +972,11 @@ impl RunArgs {
         )?;
         baseline_pb1.stop(fmt_success!(
             "Baseline round 1 finished ({:.2}s)",
-            t1.elapsed().as_secs_f32()
+            timer.elapsed().as_secs_f32()
         ));
 
         baseline_pb2.start("Measuring baseline (round 2)...".to_string());
-        let t2 = Instant::now();
+        timer = Instant::now();
         let round2 = stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
             chainstate,
             burnchain,
@@ -994,14 +986,21 @@ impl RunArgs {
         )?;
         baseline_pb2.stop(fmt_success!(
             "Baseline round 2 finished ({:.2}s)",
-            t2.elapsed().as_secs_f32()
+            timer.elapsed().as_secs_f32()
+        ));
+
+        // Checkpoint the chainstate/clarity dbs so we don't incur the cost of overhead calculations
+        // during replay checkpointing.
+        timer = Instant::now();
+        let checkpoint_pb = baseline_multipb.add(cliclack::spinner());
+        checkpoint_pb.start("Checkpointing chainstate and Clarity DBs...");
+        chainstate.checkpoint_sqlite_dbs()?;
+        checkpoint_pb.stop(fmt_success!(
+            "Checkpointing complete ({:.2}s)",
+            timer.elapsed().as_secs_f32()
         ));
 
         baseline_multipb.stop();
-
-        // Checkpoint the chainstate/clarity dbs so we don't incur the cost of overhead calculations
-        // during replay
-        chainstate.checkpoint_sqlite_dbs()?;
 
         Ok((round1, round2))
     }
@@ -1026,45 +1025,255 @@ fn format_baseline_note(
     round1: &stacks_bench::metrics::BlockProcessingBaseline,
     round2: &stacks_bench::metrics::BlockProcessingBaseline,
 ) -> String {
-    let fmt_duration = |d: Duration| format!("{d:.2?}");
+    let mut table = Table::new()
+        .col("Phase", Align::Left)
+        .col("Round 1", Align::Right)
+        .col("Round 2", Align::Right)
+        .col("Average", Align::Right);
 
-    let line = |label: &str, r1: Duration, r2: Duration| {
-        let avg = (r1 + r2) / 2;
-        format!(
-            "{label:<26} {r1s:>12} / {r2s:>12}  avg {avgs:>12}",
-            label = label,
-            r1s = fmt_duration(r1),
-            r2s = fmt_duration(r2),
-            avgs = fmt_duration(avg),
-        )
+    let row = |label: &str, r1: Duration, r2: Duration| {
+        vec![
+            label.into(),
+            format!("{r1:.2?}"),
+            format!("{r2:.2?}"),
+            format!("{:.2?}", (r1 + r2) / 2),
+        ]
     };
 
-    [
-        line(
-            "Setup:",
-            round1.avg_setup_duration,
-            round2.avg_setup_duration,
-        ),
-        line(
-            "Finalize:",
-            round1.avg_finalize_duration,
-            round2.avg_finalize_duration,
-        ),
-        line(
-            "Clarity commit:",
-            round1.avg_clarity_state_commit_duration,
-            round2.avg_clarity_state_commit_duration,
-        ),
-        line(
-            "Advance tip:",
-            round1.avg_advance_tip_duration,
-            round2.avg_advance_tip_duration,
-        ),
-        line(
-            "Index commit:",
-            round1.avg_index_commit_duration,
-            round2.avg_index_commit_duration,
-        ),
-    ]
-    .join("\n")
+    table.row(row(
+        "Setup",
+        round1.avg_setup_duration,
+        round2.avg_setup_duration,
+    ));
+    table.row(row(
+        "Finalize",
+        round1.avg_finalize_duration,
+        round2.avg_finalize_duration,
+    ));
+    table.row(row(
+        "Clarity commit",
+        round1.avg_clarity_state_commit_duration,
+        round2.avg_clarity_state_commit_duration,
+    ));
+    table.row(row(
+        "Advance tip",
+        round1.avg_advance_tip_duration,
+        round2.avg_advance_tip_duration,
+    ));
+    table.row(row(
+        "Index commit",
+        round1.avg_index_commit_duration,
+        round2.avg_index_commit_duration,
+    ));
+
+    table.to_string()
+}
+
+fn print_benchmark_summary(acc: &MetricsAccumulator) -> Result<()> {
+    let s = acc.summary();
+    if s.count == 0 {
+        return Ok(());
+    }
+
+    let count = s.count as u32;
+    let avg_txs = s.txs as f64 / s.count as f64;
+
+    let mut table = Table::new()
+        .col("Metric", Align::Left)
+        .col("Total", Align::Right)
+        .col("Per Block", Align::Right);
+
+    table.row(vec![
+        "Blocks".into(),
+        fmt_u64_thousands(s.count),
+        "\u{2014}".into(),
+    ]);
+    table.row(vec![
+        "Transactions".into(),
+        fmt_u64_thousands(s.txs),
+        format!("{avg_txs:.1}"),
+    ]);
+    table.row(vec![
+        "Duration".into(),
+        format!("{:.2?}", s.duration),
+        format!("{:.2?}", s.duration / count),
+    ]);
+    table.row(vec![
+        "  Setup".into(),
+        format!("{:.2?}", s.setup),
+        format!("{:.2?}", s.setup / count),
+    ]);
+    table.row(vec![
+        "  Execution".into(),
+        format!("{:.2?}", s.exec),
+        format!("{:.2?}", s.exec / count),
+    ]);
+    table.row(vec![
+        "  Commit".into(),
+        format!("{:.2?}", s.commit),
+        format!("{:.2?}", s.commit / count),
+    ]);
+    table.row(vec![
+        "Clarity Runtime".into(),
+        fmt_u64_thousands(s.runtime),
+        fmt_u64_thousands(s.runtime / s.count),
+    ]);
+    table.row(vec![
+        "Write Length".into(),
+        fmt_u64_thousands(s.write_len),
+        fmt_u64_thousands(s.write_len / s.count),
+    ]);
+    table.row(vec![
+        "Read Length".into(),
+        fmt_u64_thousands(s.read_len),
+        fmt_u64_thousands(s.read_len / s.count),
+    ]);
+
+    cliclack::note("Benchmark Summary", table)?;
+    Ok(())
+}
+
+fn print_storage_delta_report(report: &ShadowDirDeltaReport) -> Result<()> {
+    let growth = report.net_growth_bytes;
+    let written = report.estimated_bytes_written;
+
+    let build_summary_table = |min_width: usize| {
+        let metric_col_w = "Est. Data Written".len();
+        // Ensure the Value column is wide enough to fill remaining space.
+        let value_min = min_width.saturating_sub(metric_col_w + 2); // 2 = gap
+        let mut t = Table::new().col("Metric", Align::Left).col_with(
+            "Value",
+            Align::Right,
+            value_min,
+            None,
+        );
+        t.row(vec![
+            "Net Change".into(),
+            format!("{:.3} MB", growth as f64 / 1_024.0 / 1_024.0),
+        ]);
+        t.row(vec![
+            "Est. Data Written".into(),
+            format!("{:.3} MB", written as f64 / 1_024.0 / 1_024.0),
+        ]);
+        t
+    };
+
+    if report.file_reports.is_empty() {
+        cliclack::note("Storage Summary", build_summary_table(0).to_string())?;
+        return Ok(());
+    }
+
+    let mut table = Table::new()
+        .col("Status", Align::Left)
+        .col_with("Path", Align::Left, 20, Some(60))
+        .col("Delta (MB)", Align::Right);
+
+    for file_report in &report.file_reports {
+        let status = if file_report.was_modified {
+            "MODIFIED"
+        } else {
+            "CREATED"
+        };
+        let sign = if file_report.size_delta_bytes > 0 {
+            "+"
+        } else {
+            ""
+        };
+        let delta_mb = file_report.size_delta_bytes as f64 / 1_024.0 / 1_024.0;
+
+        table.row(vec![
+            status.into(),
+            file_report.path.display().to_string(),
+            format!("{sign}{delta_mb:.3}"),
+        ]);
+    }
+
+    let summary_table = build_summary_table(table.display_width());
+
+    cliclack::note("Storage Summary", format!("{table}\n\n{summary_table}"))?;
+    Ok(())
+}
+
+async fn run_cleanup(mut app_db: AppDb, shadow_dir: ShadowDir) -> Result<()> {
+    let cleanup = cliclack::multi_progress("Cleaning up");
+
+    // Shadow dir removal and the checkpoint→vacuum chain run concurrently — they touch completely
+    // separate files.
+    let shadow_spinner = cleanup.add(cliclack::spinner());
+    shadow_spinner.start("Removing shadow directory...");
+    let shadow_start = Instant::now();
+    let shadow_handle = tokio::task::spawn_blocking(move || drop(shadow_dir));
+
+    // Checkpoint + vacuum the App DB to clear out the WAL and clean up allocated pages allocated
+    // by the bulk staging imports.
+    let db_spinner = cleanup.add(cliclack::spinner());
+    db_spinner.start("Checkpointing database...");
+    let db_start = Instant::now();
+    let db_handle = tokio::spawn(async move {
+        app_db.checkpoint(CheckpointMode::Truncate).await?;
+        app_db.vacuum().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    match db_handle.await {
+        Ok(Ok(())) => db_spinner.stop(fmt_success!(
+            "Checkpoint + vacuum complete ({:.2}s)",
+            db_start.elapsed().as_secs_f32()
+        )),
+        Ok(Err(e)) => db_spinner.stop(fmt_failure!(
+            "Checkpoint/vacuum failed: {e} ({:.2}s)",
+            db_start.elapsed().as_secs_f32()
+        )),
+        Err(e) => db_spinner.stop(fmt_failure!(
+            "Checkpoint/vacuum task panicked: {e} ({:.2}s)",
+            db_start.elapsed().as_secs_f32()
+        )),
+    }
+
+    match shadow_handle.await {
+        Ok(()) => shadow_spinner.stop(fmt_success!(
+            "Shadow directory removed ({:.2}s)",
+            shadow_start.elapsed().as_secs_f32()
+        )),
+        Err(e) => shadow_spinner.stop(fmt_failure!(
+            "Shadow directory removal failed: {e} ({:.2}s)",
+            shadow_start.elapsed().as_secs_f32()
+        )),
+    }
+
+    cleanup.stop();
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use stacks_bench::metrics::{BlockMetrics, MetricsAccumulator};
+    use stacks_common::types::chainstate::StacksBlockId;
+
+    use super::print_benchmark_summary;
+
+    #[test]
+    fn benchmark_summary_zero_count_is_noop() {
+        let acc = MetricsAccumulator::default();
+        let result = print_benchmark_summary(&acc);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn benchmark_summary_with_data() {
+        let mut acc = MetricsAccumulator::default();
+        let mut m = BlockMetrics::new_default(StacksBlockId([0; 32]), StacksBlockId([1; 32]));
+        m.total_duration = Duration::from_millis(100);
+        m.setup_duration = Duration::from_millis(10);
+        m.execution_duration = Duration::from_millis(60);
+        m.commit_duration = Duration::from_millis(30);
+        acc.add(&m);
+        acc.add(&m);
+
+        let result = print_benchmark_summary(&acc);
+        assert!(result.is_ok());
+    }
 }

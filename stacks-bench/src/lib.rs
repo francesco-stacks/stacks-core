@@ -128,7 +128,7 @@ impl StacksBlockRef {
 }
 
 /// The Stacks network from which the node data is sourced.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Network {
     Mainnet,
     Testnet,

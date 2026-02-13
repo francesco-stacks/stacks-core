@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use console::style;
 
 use super::run::RunArgs;
-use crate::cli::common::{CliContext, format_run_label, format_run_name_suffix};
+use crate::cli::common::{CliContext, fmt_run_label, fmt_run_name_suffix};
 
 #[derive(clap::Args, Debug)]
 pub struct RerunArgs {
@@ -32,7 +32,7 @@ impl RerunArgs {
                 runs.len()
             ));
             for run in &runs {
-                select = select.item(run.id, format!("Run {}", run.id), format_run_label(run));
+                select = select.item(run.id, format!("Run {}", run.id), fmt_run_label(run));
             }
             select.filter_mode().interact()?
         };
@@ -46,7 +46,7 @@ impl RerunArgs {
         cliclack::log::step(format!(
             "Re-running benchmark run {}{} started at {}",
             style(run.id).bold(),
-            format_run_name_suffix(&run),
+            fmt_run_name_suffix(&run),
             run.start_time.format("%Y-%m-%d %H:%M:%S"),
         ))?;
 

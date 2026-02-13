@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
@@ -123,12 +123,19 @@ async fn start_explorer(ctx: &CliContext, args: &ExplorerStartArgs) -> Result<()
     fs::write(&pid_path, pid.to_string())
         .with_context(|| format!("Failed to write pid file at {pid_path:?}"))?;
 
-    println!(
-        "Profiler explorer started on http://{}:{} (pid {})",
-        args.host, args.port, pid
-    );
-    println!("  - App DB: {:?}", db_path);
-    println!("  - Log:    {:?}", log_path);
+    cliclack::note(
+        "Explorer started",
+        format!(
+            "URL:    http://{}:{}\n\
+             PID:    {pid}\n\
+             App DB: {}\n\
+             Log:    {}",
+            args.host,
+            args.port,
+            db_path.display(),
+            log_path.display(),
+        ),
+    )?;
     Ok(())
 }
 
@@ -145,7 +152,7 @@ async fn stop_explorer(ctx: &CliContext) -> Result<()> {
     }
 
     let _ = fs::remove_file(&pid_path);
-    println!("Profiler explorer stopped (pid {}).", pid);
+    cliclack::log::info(format!("Explorer stopped (pid {pid})"))?;
     Ok(())
 }
 
@@ -154,13 +161,13 @@ async fn status_explorer(ctx: &CliContext) -> Result<()> {
     let pid_path = app_data.path().join(PID_FILE_NAME);
     if let Some(pid) = read_pid(&pid_path)? {
         if pid_is_running(pid) {
-            println!("Profiler explorer is running (pid {}).", pid);
+            cliclack::log::info(format!("Explorer is running (pid {pid})"))?;
             return Ok(());
         }
-        println!("Profiler explorer is not running (stale pid {}).", pid);
+        cliclack::log::warning(format!("Explorer is not running (stale pid {pid})"))?;
         return Ok(());
     }
-    println!("Profiler explorer is not running.");
+    cliclack::log::info("Explorer is not running")?;
     Ok(())
 }
 
@@ -177,7 +184,24 @@ fn ensure_node_deps(explorer_root: &Path) -> Result<()> {
     let package_json = explorer_root.join("package.json");
     let sentinel = explorer_root.join(SENTINEL_FILE_NAME);
 
-    let should_install = match (package_json.metadata(), sentinel.metadata()) {
+    // Detect the current Node major version so we can rebuild native
+    // modules when Node is upgraded.
+    let node_major = Command::new("node")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|v| {
+            // v24.1.0 → "24"
+            v.trim()
+                .strip_prefix('v')?
+                .split('.')
+                .next()
+                .map(String::from)
+        })
+        .unwrap_or_default();
+
+    let package_json_changed = match (package_json.metadata(), sentinel.metadata()) {
         (Ok(pkg_meta), Ok(sent_meta)) => {
             let pkg_time = pkg_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let sent_time = sent_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -187,19 +211,33 @@ fn ensure_node_deps(explorer_root: &Path) -> Result<()> {
         (Err(_), _) => false,
     };
 
-    if should_install || !node_modules_dir.exists() {
+    // The sentinel stores the Node major version from the last install.
+    // If it differs, native modules need to be rebuilt.
+    let node_version_changed = fs::read_to_string(&sentinel)
+        .map(|s| s.trim() != node_major)
+        .unwrap_or(false);
+
+    if package_json_changed || node_version_changed || !node_modules_dir.exists() {
+        let spinner = cliclack::spinner();
+        spinner.start("Installing Node dependencies...");
+
         let status = Command::new("npm")
             .arg("install")
             .current_dir(explorer_root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .context("Failed to install profiler explorer Node dependencies")?;
 
         if !status.success() {
+            spinner.error("npm install failed");
             bail!("npm install failed with status {:?}", status.code());
         }
 
-        File::create(&sentinel)
+        fs::write(&sentinel, &node_major)
             .with_context(|| format!("Failed to write sentinel file at {sentinel:?}"))?;
+
+        spinner.stop(fmt_success!("Node dependencies installed"));
     }
 
     Ok(())
@@ -225,17 +263,24 @@ fn build_ui(explorer_root: &Path) -> Result<()> {
         bail!("Explorer web directory not found at {:?}", web_dir);
     }
 
+    let spinner = cliclack::spinner();
+    spinner.start("Building explorer UI...");
+
     let status = Command::new("npm")
         .arg("run")
         .arg("build")
         .current_dir(&web_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .context("Failed to run npm build for profiler explorer")?;
 
     if !status.success() {
+        spinner.error("UI build failed");
         bail!("npm run build failed with status {:?}", status.code());
     }
 
+    spinner.stop(fmt_success!("Explorer UI built"));
     Ok(())
 }
 
