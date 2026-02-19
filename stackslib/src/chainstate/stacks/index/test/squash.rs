@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
@@ -22,7 +23,9 @@ use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashStats, MARF, OWN_BLOCK_HEIGHT_KEY,
 };
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
-use crate::chainstate::stacks::index::{trie_sql, ClarityMarfTrieId, Error, MARFValue};
+use crate::chainstate::stacks::index::{
+    trie_sql, ClarityMarfTrieId, Error, MARFValue, TrieMerkleProof,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -148,7 +151,7 @@ fn test_squash_info_detected_on_open() {
                 let info = conn.squash_info().expect("missing squash info");
                 Ok((
                     conn.is_squashed(),
-                    info.root,
+                    info.archival_marf_root_hash,
                     info.height,
                     info.block_hash.clone(),
                 ))
@@ -157,9 +160,10 @@ fn test_squash_info_detected_on_open() {
         .unwrap();
 
     // Cross-check with the SQL table directly.
-    let (sql_root, sql_height) = trie_sql::read_squash_info(squashed.sqlite_conn())
-        .unwrap()
-        .expect("SQL squash info missing");
+    let (sql_root, _sql_squash_root, sql_height) =
+        trie_sql::read_squash_info(squashed.sqlite_conn())
+            .unwrap()
+            .expect("SQL squash info missing");
 
     assert!(is_squashed);
     assert_eq!(info_root, sql_root);
@@ -240,8 +244,8 @@ fn test_validate_squashed_correct_fast() {
     )
     .unwrap();
 
-    assert!(stats.squash_root_present, "squash root present");
-    assert!(stats.squash_root_matches, "squash root matches");
+    assert!(stats.archival_root_present, "squash root present");
+    assert!(stats.archival_root_matches, "squash root matches");
     assert_eq!(stats.root_hash_missing, 0);
     assert_eq!(stats.root_hash_mismatches, 0);
     assert_eq!(stats.blob_offset_mismatches, 0);
@@ -273,8 +277,8 @@ fn test_validate_squashed_correct_full() {
     )
     .unwrap();
 
-    assert!(stats.squash_root_present, "squash root present");
-    assert!(stats.squash_root_matches, "squash root matches");
+    assert!(stats.archival_root_present, "squash root present");
+    assert!(stats.archival_root_matches, "squash root matches");
     assert_eq!(stats.root_hash_missing, 0);
     assert_eq!(stats.root_hash_mismatches, 0);
     assert_eq!(stats.blob_offset_mismatches, 0);
@@ -313,7 +317,7 @@ fn test_validate_detects_wrong_height() {
 
     // Source at height 0 has a different root hash than squashed (at height 1).
     assert!(
-        !stats.squash_root_matches,
+        !stats.archival_root_matches,
         "Expected squash root mismatch when validating at wrong height: {stats:?}"
     );
 }
@@ -469,7 +473,7 @@ fn test_multi_height_extension_hash_equality() {
 }
 
 /// Verify that all historical marf_data entries share the same
-/// external_offset (i.e. point to the single shared blob).
+/// external_offset (i.e. point to the single shared trie storage).
 #[test]
 fn test_marf_data_entries_share_blob_offset() {
     let dir = tempdir().unwrap();
@@ -550,4 +554,362 @@ fn test_walk_cow_preserves_backpointer_identity() {
     let arch_root = archival.get_root_hash_at(&b_new).unwrap();
     let sq_root = squashed.get_root_hash_at(&b_new).unwrap();
     assert_eq!(arch_root, sq_root, "Root hash mismatch after walk_cow");
+}
+
+/// Generate and verify Merkle proofs from a squashed MARF at an
+/// extended height.  The keys proved were last modified at heights < H
+/// (the squash height), so the proof path traverses from the extended
+/// block into the squashed blob via back-pointers with annotated
+/// `back_block` values.
+///
+/// The proof must verify against the archival root hash and root-to-block
+/// mapping, demonstrating full hash-compatibility with the archival MARF.
+#[test]
+fn test_squashed_marf_proof_at_extended_height() {
+    let dir = tempdir().unwrap();
+    let archival_path = dir.path().join("archival.sqlite");
+    let (mut archival, blocks) = setup_large_marf(archival_path.to_str().unwrap());
+
+    let (squashed_path, _) = squash_helper(
+        archival_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        8,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut squashed =
+        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    // Extend both MARFs to height 9.
+    let b_new = StacksBlockId::from_bytes(&[101u8; 32]).unwrap();
+
+    archival.begin(&blocks[8], &b_new).unwrap();
+    archival
+        .insert("k_ext", MARFValue::from_value("ext_val"))
+        .unwrap();
+    archival.commit().unwrap();
+
+    squashed.begin(&blocks[8], &b_new).unwrap();
+    squashed
+        .insert("k_ext", MARFValue::from_value("ext_val"))
+        .unwrap();
+    squashed.commit().unwrap();
+
+    // Sanity: root hashes at the extended height must match.
+    let archival_root = archival.get_root_hash_at(&b_new).unwrap();
+    let squashed_root = squashed.get_root_hash_at(&b_new).unwrap();
+    assert_eq!(
+        archival_root, squashed_root,
+        "Root hash mismatch at height 9"
+    );
+
+    // Build the root-to-block mapping from both MARFs.
+    // Archival proofs verify against the archival map.
+    // Squashed proofs verify against the squashed map (which computes
+    // per-height trie hashes using the squash trie's content hash +
+    // archival ancestor hashes).
+    let archival_root_to_block = archival
+        .borrow_storage_backend()
+        .read_root_to_block_table()
+        .unwrap();
+    let squashed_root_to_block = squashed
+        .borrow_storage_backend()
+        .read_root_to_block_table()
+        .unwrap();
+
+    // --- Prove keys that live deep in the squashed blob ---
+    // k2 was inserted at height 1, k5 at height 4, k9 at height 8.
+    // All are accessed via annotated back-pointer chains.
+    let test_cases: Vec<(&str, &str)> = vec![
+        ("k2", "v2_at_1"),
+        ("k5", "v5_at_4"),
+        ("k9", "v9_at_8"),
+        ("k1", "v1_at_8"),    // overwritten at every height through 8
+        ("k_ext", "ext_val"), // newly inserted at height 9
+    ];
+
+    for (key, value) in &test_cases {
+        // Generate proof from the squashed MARF.
+        let squashed_proof = {
+            let mut s = squashed.borrow_storage_backend();
+            TrieMerkleProof::<StacksBlockId>::from_entry(&mut s, key, value, &b_new)
+                .unwrap_or_else(|e| panic!("Proof generation failed for key {key}: {e:?}"))
+        };
+
+        // Generate proof from the archival MARF for comparison.
+        let archival_proof = {
+            let mut s = archival.borrow_storage_backend();
+            TrieMerkleProof::<StacksBlockId>::from_entry(&mut s, key, value, &b_new)
+                .unwrap_or_else(|e| panic!("Archival proof generation failed for key {key}: {e:?}"))
+        };
+
+        // Verify archival proof (sanity).
+        let path = TrieHash::from_key(key);
+        let marf_value = MARFValue::from_value(value);
+        let archival_ok = archival_proof.verify(
+            &path,
+            &marf_value,
+            &archival_root,
+            &archival_root_to_block,
+            &HashSet::new(),
+        );
+        assert!(
+            archival_ok,
+            "Archival proof verification failed for key {key}"
+        );
+
+        // Verify squashed proof against the squashed MARF's root hash
+        // and root-to-block mapping.  The root hash at H+1 matches
+        // archival, but intermediate trie hashes for blocks within the
+        // squashed range differ (the squash trie has a different internal
+        // structure).  The squashed root-to-block map accounts for this
+        // by computing per-height trie hashes from the squash trie root node hash.
+        let trusted = squashed.trusted_squash_node_hashes();
+        let squashed_ok = squashed_proof.verify(
+            &path,
+            &marf_value,
+            &squashed_root,
+            &squashed_root_to_block,
+            &trusted,
+        );
+        assert!(
+            squashed_ok,
+            "Squashed proof verification failed for key {key} (value {value})"
+        );
+    }
+}
+
+/// Generate and verify Merkle proofs from a squashed MARF across many
+/// extended heights.  This exercises the skip-list at varying depths
+/// and confirms that shunt proofs are correctly constructed even when
+/// intermediate ancestor heights fall within the squashed range.
+#[test]
+fn test_squashed_marf_proof_across_many_extended_heights() {
+    let dir = tempdir().unwrap();
+    let archival_path = dir.path().join("archival.sqlite");
+    let (mut archival, blocks) = setup_large_marf(archival_path.to_str().unwrap());
+
+    let (squashed_path, _) = squash_helper(
+        archival_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        5,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut squashed =
+        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    // Extend both MARFs through 10 additional heights (6-15).
+    let mut prev_block = blocks[5].clone();
+    let mut new_blocks: Vec<StacksBlockId> = Vec::new();
+    for i in 0..10u8 {
+        let new_bh = StacksBlockId::from_bytes(&[200 + i; 32]).unwrap();
+        let key = format!("ext_k{i}");
+        let val = format!("ext_v{i}");
+
+        archival.begin(&prev_block, &new_bh).unwrap();
+        archival.insert(&key, MARFValue::from_value(&val)).unwrap();
+        archival.commit().unwrap();
+
+        squashed.begin(&prev_block, &new_bh).unwrap();
+        squashed.insert(&key, MARFValue::from_value(&val)).unwrap();
+        squashed.commit().unwrap();
+
+        new_blocks.push(new_bh.clone());
+        prev_block = new_bh;
+    }
+
+    // Build root-to-block from the squashed MARF (handles per-height
+    // trie hashes correctly for the squashed range).
+    let squashed_root_to_block = squashed
+        .borrow_storage_backend()
+        .read_root_to_block_table()
+        .unwrap();
+
+    let trusted = squashed.trusted_squash_node_hashes();
+
+    // At each extended height, prove a key from the squashed range (k2,
+    // inserted at height 1) and a key from the extended range.
+    for (i, bh) in new_blocks.iter().enumerate() {
+        let archival_root = archival.get_root_hash_at(bh).unwrap();
+        let squashed_root = squashed.get_root_hash_at(bh).unwrap();
+        assert_eq!(
+            archival_root,
+            squashed_root,
+            "Root hash mismatch at extended height {}",
+            i + 6
+        );
+
+        // Prove k2 (from squashed range, height 1).
+        {
+            let mut s = squashed.borrow_storage_backend();
+            let proof = TrieMerkleProof::<StacksBlockId>::from_entry(&mut s, "k2", "v2_at_1", bh)
+                .unwrap_or_else(|e| panic!("Proof gen failed for k2 at height {}: {e:?}", i + 6));
+            let path = TrieHash::from_key("k2");
+            let marf_value = MARFValue::from_value("v2_at_1");
+            assert!(
+                proof.verify(
+                    &path,
+                    &marf_value,
+                    &squashed_root,
+                    &squashed_root_to_block,
+                    &trusted,
+                ),
+                "Proof verification failed for k2 at height {}",
+                i + 6
+            );
+        }
+
+        // Prove the most recently inserted key at this height.
+        let ext_key = format!("ext_k{i}");
+        let ext_val = format!("ext_v{i}");
+        {
+            let mut s = squashed.borrow_storage_backend();
+            let proof =
+                TrieMerkleProof::<StacksBlockId>::from_entry(&mut s, &ext_key, &ext_val, bh)
+                    .unwrap_or_else(|e| {
+                        panic!("Proof gen failed for {ext_key} at height {}: {e:?}", i + 6)
+                    });
+            let path = TrieHash::from_key(&ext_key);
+            let marf_value = MARFValue::from_value(&ext_val);
+            assert!(
+                proof.verify(
+                    &path,
+                    &marf_value,
+                    &squashed_root,
+                    &squashed_root_to_block,
+                    &trusted,
+                ),
+                "Proof verification failed for {ext_key} at height {}",
+                i + 6
+            );
+        }
+    }
+}
+
+/// Verify that a squashed proof is rejected when no trusted squash root
+/// hashes are provided.
+#[test]
+fn test_squashed_proof_rejected_without_trusted_hash() {
+    let dir = tempdir().unwrap();
+    let archival_path = dir.path().join("archival.sqlite");
+    let (_archival, blocks) = setup_large_marf(archival_path.to_str().unwrap());
+
+    let (squashed_path, _) = squash_helper(
+        archival_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        8,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut squashed =
+        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    // Extend the squashed MARF to height 9.
+    let b_new = StacksBlockId::from_bytes(&[101u8; 32]).unwrap();
+    squashed.begin(&blocks[8], &b_new).unwrap();
+    squashed
+        .insert("k_ext", MARFValue::from_value("ext_val"))
+        .unwrap();
+    squashed.commit().unwrap();
+
+    let squashed_root = squashed.get_root_hash_at(&b_new).unwrap();
+    let squashed_root_to_block = squashed
+        .borrow_storage_backend()
+        .read_root_to_block_table()
+        .unwrap();
+
+    // Generate a proof for a key in the squashed range.
+    let proof = {
+        let mut s = squashed.borrow_storage_backend();
+        TrieMerkleProof::<StacksBlockId>::from_entry(&mut s, "k2", "v2_at_1", &b_new).unwrap()
+    };
+
+    let path = TrieHash::from_key("k2");
+    let marf_value = MARFValue::from_value("v2_at_1");
+
+    // With an empty trusted set, the squash shunt should be rejected.
+    assert!(
+        !proof.verify(
+            &path,
+            &marf_value,
+            &squashed_root,
+            &squashed_root_to_block,
+            &HashSet::new(),
+        ),
+        "Proof should have been rejected with no trusted squash hashes"
+    );
+
+    // With the correct trusted set, it should pass.
+    let trusted = squashed.trusted_squash_node_hashes();
+    assert!(
+        !trusted.is_empty(),
+        "Squashed MARF should have a trusted hash"
+    );
+    assert!(
+        proof.verify(
+            &path,
+            &marf_value,
+            &squashed_root,
+            &squashed_root_to_block,
+            &trusted,
+        ),
+        "Proof should pass with the correct trusted hash"
+    );
+}
+
+/// Verify that a squashed proof is rejected when the trusted hash set
+/// contains a wrong hash.
+#[test]
+fn test_squashed_proof_rejected_with_wrong_trusted_hash() {
+    let dir = tempdir().unwrap();
+    let archival_path = dir.path().join("archival.sqlite");
+    let (_archival, blocks) = setup_large_marf(archival_path.to_str().unwrap());
+
+    let (squashed_path, _) = squash_helper(
+        archival_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        8,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut squashed =
+        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    // Extend the squashed MARF to height 9.
+    let b_new = StacksBlockId::from_bytes(&[101u8; 32]).unwrap();
+    squashed.begin(&blocks[8], &b_new).unwrap();
+    squashed
+        .insert("k_ext", MARFValue::from_value("ext_val"))
+        .unwrap();
+    squashed.commit().unwrap();
+
+    let squashed_root = squashed.get_root_hash_at(&b_new).unwrap();
+    let squashed_root_to_block = squashed
+        .borrow_storage_backend()
+        .read_root_to_block_table()
+        .unwrap();
+
+    // Generate a proof for a key in the squashed range.
+    let proof = {
+        let mut s = squashed.borrow_storage_backend();
+        TrieMerkleProof::<StacksBlockId>::from_entry(&mut s, "k2", "v2_at_1", &b_new).unwrap()
+    };
+
+    let path = TrieHash::from_key("k2");
+    let marf_value = MARFValue::from_value("v2_at_1");
+
+    // A wrong trusted hash should cause rejection.
+    let mut wrong_trusted = HashSet::new();
+    wrong_trusted.insert(TrieHash::from_data(b"totally_wrong_hash"));
+    assert!(
+        !proof.verify(
+            &path,
+            &marf_value,
+            &squashed_root,
+            &squashed_root_to_block,
+            &wrong_trusted,
+        ),
+        "Proof should have been rejected with a wrong trusted hash"
+    );
 }

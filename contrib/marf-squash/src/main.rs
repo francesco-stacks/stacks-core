@@ -496,8 +496,8 @@ fn validate_or_exit(
 
 fn print_validation(stats: &SquashValidationStats) {
     println!("Validation:");
-    println!("Squash root present: {}", stats.squash_root_present);
-    println!("Squash root matches: {}", stats.squash_root_matches);
+    println!("Archival root present: {}", stats.archival_root_present);
+    println!("Archival root matches: {}", stats.archival_root_matches);
     println!(
         "Per-height root hashes missing: {}",
         stats.root_hash_missing

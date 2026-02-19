@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
 use std::ops::Deref;
@@ -34,8 +34,8 @@ use crate::chainstate::stacks::index::node::{
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
-    BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, ProofTrieNode, ProofTriePtr,
-    TrieMerkleProof, TrieMerkleProofType,
+    trie_sql, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, ProofTrieNode,
+    ProofTriePtr, TrieMerkleProof, TrieMerkleProofType,
 };
 
 impl<T: MarfTrieId> ConsensusSerializable<()> for ProofTrieNode<T> {
@@ -482,6 +482,39 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     fn make_initial_shunt_proof(
         storage: &mut TrieStorageConnection<T>,
     ) -> Result<Vec<TrieMerkleProofType<T>>, Error> {
+        // In a squash trie, the segment proof walks the trie's actual inline
+        // structure, producing a content hash that differs from the archival
+        // block's content hash. If we compute the trie hash from that
+        // content hash, it won't match the archival trie hash that was used
+        // when committing blocks above the squash height.
+        //
+        // To bridge this gap, we use a "squash shunt" (idx = -1) that
+        // carries the archival trie hash directly. The verifier uses this
+        // hash instead of computing it from the content hash + ancestors.
+        let cur_block = storage.get_cur_block();
+        if let Some(block_height) = storage.squash_info().and_then(|_| {
+            trie_sql::read_squash_block_height(storage.sqlite_conn(), &cur_block)
+                .ok()
+                .flatten()
+        }) {
+            // Inside the squash trie: produce a squash shunt with the
+            // archival trie hash for this height.
+            let archival_trie_hash =
+                trie_sql::read_squash_archival_marf_root_hash(storage.sqlite_conn(), block_height)?
+                    .ok_or_else(|| {
+                        Error::CorruptionError(format!(
+                            "Missing archival root hash at height {block_height} for squash shunt"
+                        ))
+                    })?;
+
+            trace!(
+                "Squash shunt proof: height={block_height}, archival_trie_hash={archival_trie_hash:?}"
+            );
+
+            let backptr_proof = TrieMerkleProofType::Shunt((-1, vec![archival_trie_hash]));
+            return Ok(vec![backptr_proof]);
+        }
+
         let backptr_ancestor_hashes = Trie::get_trie_ancestor_hashes_bytes(storage)?;
 
         trace!(
@@ -523,21 +556,34 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         let ancestor_block_hash = storage
             .get_block_from_local_id(backptr.back_block())?
             .clone();
-        storage.open_block(&ancestor_block_hash)?;
 
-        let ancestor_root_hash = read_root_hash(storage)?;
-
-        let mut found_backptr = false;
-
-        let ancestor_height =
+        // Compute heights first - we need the ancestor height to decide how
+        // to read the root hash (from the blob vs. from the SQL table).
+        //
+        // In a squashed MARF, all blocks at heights 0..=H share a single
+        // blob whose OWN_BLOCK_HEIGHT_KEY is H. Use the SQL side-table
+        // to get the correct per-block height when the block falls within
+        // the squashed range.
+        let ancestor_height = if let Some(h) = storage.squash_info().and_then(|_| {
+            trie_sql::read_squash_block_height(storage.sqlite_conn(), &ancestor_block_hash)
+                .ok()
+                .flatten()
+        }) {
+            h
+        } else {
             MARF::get_block_height_miner_tip(storage, &ancestor_block_hash, &block_header)?
                 .ok_or_else(|| {
                     Error::CorruptionError(format!(
-                        "Could not find block height of ancestor block {} from {}",
-                        &ancestor_block_hash, &block_header
-                    ))
-                })?;
-        let mut current_height =
+                        "Could not find block height of ancestor block {ancestor_block_hash} from {block_header}"                    ))
+                })?
+        };
+        let mut current_height = if let Some(h) = storage.squash_info().and_then(|_| {
+            trie_sql::read_squash_block_height(storage.sqlite_conn(), &block_header)
+                .ok()
+                .flatten()
+        }) {
+            h
+        } else {
             MARF::get_block_height_miner_tip(storage, &block_header, &block_header)?.ok_or_else(
                 || {
                     Error::CorruptionError(format!(
@@ -545,7 +591,29 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                         &block_header, &block_header
                     ))
                 },
-            )?;
+            )?
+        };
+
+        // In a squashed MARF, all blocks at heights <= squash_height share a
+        // single shared trie storage whose root-hash position holds the squash-height root
+        // hash - not the root hash for the specific block we opened. Read the
+        // correct per-height root hash from the SQL table instead.
+        let ancestor_root_hash = if storage
+            .squash_info()
+            .is_some_and(|info| ancestor_height <= info.height)
+        {
+            trie_sql::read_squash_archival_marf_root_hash(storage.sqlite_conn(), ancestor_height)?
+                .ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "Could not obtain squashed root hash at height {ancestor_height}"
+                ))
+            })?
+        } else {
+            storage.open_block(&ancestor_block_hash)?;
+            read_root_hash(storage)?
+        };
+
+        let mut found_backptr = false;
 
         if current_height == ancestor_height {
             debug!(
@@ -621,6 +689,45 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             // need the target node's root trie ptr, unless this is the first proof (in which case
             // it's a junction proof)
             if !proof.is_empty() {
+                // For intermediate blocks in the squashed range, the squash
+                // squash trie root node hash differs from the archival. Emit a
+                // squash shunt (idx = -1) with the archival trie hash so
+                // the verifier uses it directly, bypassing the incorrect
+                // content hash computation.
+                let prev_height = current_height + (1u32 << (idx - 1));
+                if storage
+                    .squash_info()
+                    .is_some_and(|info| prev_height <= info.height)
+                {
+                    let archival_trie =
+                        trie_sql::read_squash_archival_marf_root_hash(storage.sqlite_conn(), prev_height)?
+                            .ok_or_else(|| {
+                                Error::CorruptionError(format!(
+                                    "Missing archival root hash at height {prev_height} for intermediate squash shunt"
+                                ))
+                            })?;
+
+                    trace!(
+                        "Intermediate squash shunt: height={prev_height}, archival_trie_hash={archival_trie:?}"
+                    );
+
+                    let squash_shunt = TrieMerkleProofType::Shunt((-1, vec![archival_trie]));
+                    proof.push(squash_shunt);
+
+                    if !found_backptr {
+                        trace!(
+                            "Backptr not found yet. Squash shunt to {block_header:?}; shunt to {current_height} and walk to {ancestor_height}"
+
+                        );
+                    } else {
+                        trace!(
+                            "Backptr found (ancestor_height = {ancestor_height}). Squash shunt at height {prev_height}"
+
+                        );
+                    }
+                    continue;
+                }
+
                 let root_ptr = storage.root_trieptr();
                 let (root_node, _) = storage.read_nodetype(&root_ptr)?;
 
@@ -702,16 +809,48 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         Some(next_hash)
     }
 
-    /// Verify the head of a shunt proof
+    /// Verify the head of a shunt proof.
+    ///
+    /// `trusted_squash_node_hashes` contains the set of squash trie root-node
+    /// hashes that the verifier trusts. When a squash shunt (idx=-1) is
+    /// encountered, the `node_root_hash` (computed from the segment proof)
+    /// must be in this set for the proof to be accepted.
     fn verify_shunt_proof_head(
         node_root_hash: &TrieHash,
         shunt_proof_head: &TrieMerkleProofType<T>,
+        trusted_squash_node_hashes: &HashSet<TrieHash>,
     ) -> Option<TrieHash> {
         // ancestor hashes are always the first item
         let hash = match shunt_proof_head {
             TrieMerkleProofType::Shunt((ref idx, ref hashes)) => {
+                if *idx == -1 {
+                    // Squash shunt: the segment proof verified the
+                    // key/value inside the squash trie. Check the squash trie's
+                    // content hash against the trusted set before
+                    // accepting.
+                    if hashes.len() != 1 {
+                        trace!("Squash shunt must have exactly one hash (the archival trie hash)");
+                        return None;
+                    }
+                    if !trusted_squash_node_hashes.contains(node_root_hash) {
+                        eprintln!(
+                            "DEBUG Squash shunt rejected: node_root_hash {node_root_hash:?} not in trusted set {trusted_squash_node_hashes:?}"                        );
+                        trace!(
+                            "Squash shunt rejected: node_root_hash {node_root_hash:?} not in trusted set"
+                        );
+                        return None;
+                    }
+                    let archival_trie_hash = hashes
+                        .first()
+                        .expect("Squash shunt must have exactly one hash (the archival trie hash)");
+                    trace!(
+                        "Squash shunt proof head: using archival trie hash {archival_trie_hash:?}",
+                    );
+                    return Some(*archival_trie_hash);
+                }
+
                 if *idx != 0 {
-                    trace!("First shunt proof entry must have idx == 0");
+                    trace!("First shunt proof entry must have idx == 0 or -1");
                     return None;
                 }
 
@@ -760,15 +899,28 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         for proof_node in shunt_proof.iter() {
             hash = match proof_node {
                 TrieMerkleProofType::Shunt((ref idx, ref hashes)) => {
-                    if *idx == 0 {
+                    if *idx == -1 {
+                        // Squash shunt: use the archival trie hash directly.
+                        if hashes.len() != 1 {
+                            trace!("Squash shunt in tail must have exactly one hash");
+                            return None;
+                        }
+                        let archival_trie_hash = hashes.first().expect(
+                            "Squash shunt must have exactly one hash (the archival trie hash)",
+                        );
+                        trace!(
+                            "Squash shunt in tail: using archival trie hash {archival_trie_hash:?}",
+                        );
+                        *archival_trie_hash
+                    } else if *idx == 0 {
                         trace!("Invalid shunt proof tail: idx == 0");
                         return None;
-                    }
-
-                    match TrieMerkleProof::<T>::next_shunt_hash(&hash, *idx, hashes) {
-                        Some(h) => h,
-                        None => {
-                            return None;
+                    } else {
+                        match TrieMerkleProof::<T>::next_shunt_hash(&hash, *idx, hashes) {
+                            Some(h) => h,
+                            None => {
+                                return None;
+                            }
                         }
                     }
                 }
@@ -1099,6 +1251,11 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     /// For the proof validation to work, the verifier needs to know which Trie roots correspond to
     /// which block headers.  This can be calculated and verified independently from the blockchain
     /// headers.
+    ///
+    /// `trusted_squash_node_hashes` contains squash trie root-node hashes for any
+    /// trusted squashed snapshots.  Pass an empty set when no squashed
+    /// snapshots are trusted -- squash shunts (idx=-1) will be rejected.
+    ///
     /// NOTE: Trie root hashes are globally unique by design, even if they represent the same contents, so the root_to_block map is bijective with high probability.
     pub fn verify_proof(
         proof: &[TrieMerkleProofType<T>],
@@ -1106,6 +1263,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         value: &MARFValue,
         root_hash: &TrieHash,
         root_to_block: &HashMap<TrieHash, T>,
+        trusted_squash_node_hashes: &HashSet<TrieHash>,
     ) -> bool {
         if !TrieMerkleProof::is_proof_well_formed(proof, path) {
             test_debug!("Invalid proof -- proof is not well-formed");
@@ -1159,9 +1317,11 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
 
         // verify the very first shunt proof head.
         trace!("verify shunt proof head at {i}: {shunt_proof_head:?}");
-        let Some(mut trie_hash) =
-            TrieMerkleProof::verify_shunt_proof_head(&node_root_hash, shunt_proof_head)
-        else {
+        let Some(mut trie_hash) = TrieMerkleProof::verify_shunt_proof_head(
+            &node_root_hash,
+            shunt_proof_head,
+            trusted_squash_node_hashes,
+        ) else {
             test_debug!("Unable to verify shunt proof head at {i}: {shunt_proof_head:?}",);
             return false;
         };
@@ -1307,15 +1467,27 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         *root_hash == trie_hash
     }
 
-    /// Verify this proof
+    /// Verify this proof.
+    ///
+    /// `trusted_squash_node_hashes` contains squash trie root-node hashes for any
+    /// trusted squashed snapshots. Pass an empty set when no squashed
+    /// snapshots are trusted.
     pub fn verify(
         &self,
         path: &TrieHash,
         marf_value: &MARFValue,
         root_hash: &TrieHash,
         root_to_block: &HashMap<TrieHash, T>,
+        trusted_squash_node_hashes: &HashSet<TrieHash>,
     ) -> bool {
-        TrieMerkleProof::<T>::verify_proof(&self.0, path, marf_value, root_hash, root_to_block)
+        TrieMerkleProof::<T>::verify_proof(
+            &self.0,
+            path,
+            marf_value,
+            root_hash,
+            root_to_block,
+            trusted_squash_node_hashes,
+        )
     }
 
     /// Walk down the trie pointed to by s until we reach a backptr or a leaf

@@ -1255,13 +1255,17 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
 
 /// Snapshot metadata cached at open time for squashed MARFs.
 ///
-/// Contains the root hash, height, and block hash at which the MARF was
-/// squashed.  This is populated once when the MARF is opened and used by
-/// the ancestor-hash computation to avoid opening pruned historical blocks.
+/// Contains the archival root hash, squash root node hash, height, and
+/// block hash at which the MARF was squashed.  This is populated once
+/// when the MARF is opened and used by the ancestor-hash computation to
+/// avoid opening pruned historical blocks.
 #[derive(Clone, Debug)]
 pub struct SquashInfo<T: MarfTrieId> {
-    /// Root hash recorded in the squashed snapshot.
-    pub root: TrieHash,
+    /// Archival MARF root hash committed to the chain at the squash height.
+    pub archival_marf_root_hash: TrieHash,
+    /// Root node hash of the squash trie. i.e. `hash(consensus_bytes(root) || children_content_hashes)`
+    /// `TrieHash::from_data(&[])` if not yet computed.
+    pub squash_root_node_hash: TrieHash,
     /// Height at which the MARF was squashed.
     pub height: u32,
     /// Block hash at the snapshot height.
@@ -1375,10 +1379,12 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         // Gracefully handle databases that don't have the squash tables
         // (e.g. in-memory test databases created via `new_memory()`).
         let squash_info = match trie_sql::read_squash_info(&self.db) {
-            Ok(Some((root, height))) => {
+            Ok(Some((archival_marf_root_hash, squash_root_node_hash_opt, height))) => {
                 let tip = trie_sql::get_latest_confirmed_block_hash::<T>(&self.db)?;
                 Some(SquashInfo {
-                    root,
+                    archival_marf_root_hash,
+                    squash_root_node_hash: squash_root_node_hash_opt
+                        .unwrap_or_else(|| TrieHash::from_data(&[])),
                     height,
                     block_hash: tip,
                 })
@@ -1389,6 +1395,11 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 
         self.data.set_squash_info(squash_info);
         Ok(())
+    }
+
+    /// Returns cached squashing metadata, if present.
+    pub fn squash_info(&self) -> Option<&SquashInfo<T>> {
+        self.data.squash_info.as_ref()
     }
 
     pub fn connection(&mut self) -> TrieStorageConnection<'_, T> {
@@ -2109,7 +2120,7 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     /// Returns a reference to the underlying SQLite connection.
     ///
     /// Used by squashing code to read/write out-of-trie metadata
-    /// (e.g. root hashes stored in the SQL `marf_squash_root_hashes` table)
+    /// (e.g. root hashes stored in the SQL `marf_squash_archival_marf_roots` table)
     /// without polluting the trie content.
     pub(crate) fn sqlite_conn(&self) -> &Connection {
         &self.db
@@ -2209,10 +2220,46 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         Ok(ret)
     }
 
-    /// Generate a mapping between Trie root hashes and the blocks that contain them
+    /// Generate a mapping between Trie root hashes and the blocks that contain them.
+    ///
+    /// For squashed MARFs, blocks within the squashed range (0..=H) share a
+    /// single shared trie storage whose stored trie hash was computed at height H. The
+    /// standard blob-scanning approach would produce collisions (all blocks
+    /// get the same trie hash). Instead, for each squashed block at height
+    /// K we re-derive the trie hash by combining the squash trie's content
+    /// hash with the archival ancestor hashes at height K from the SQL
+    /// metadata. This mirrors what the proof verifier computes when it
+    /// processes a segment proof inside the squash trie and the subsequent
+    /// initial shunt.
     #[cfg(test)]
     pub fn read_root_to_block_table(&mut self) -> Result<HashMap<TrieHash, T>, Error> {
         let mut ret = self.inner_read_persisted_root_to_blocks()?;
+
+        // Override entries for blocks in the squashed range.
+        // All blocks at heights 0..=H share a single squash trie, so
+        // `inner_read_persisted_root_to_blocks` maps them all to the same
+        // trie hash. Replace those entries with the per-height archival
+        // trie hashes stored during squashing. These are the hashes that
+        // the proof verifier expects (the squash shunt at idx = -1 injects
+        // the archival trie hash directly).
+        if let Some(info) = self.data.squash_info.clone() {
+            for h in 0..=info.height {
+                let bh: T = match trie_sql::read_squash_block_height_reverse(self.sqlite_conn(), h)
+                {
+                    Ok(Some(bh)) => bh,
+                    _ => continue,
+                };
+
+                let archival_trie_hash =
+                    match trie_sql::read_squash_archival_marf_root_hash(self.sqlite_conn(), h) {
+                        Ok(Some(h)) => h,
+                        _ => continue,
+                    };
+
+                ret.insert(archival_trie_hash, bh);
+            }
+        }
+
         let uncommitted_writes = match self.data.uncommitted_writes.take() {
             Some((bhh, trie_ram)) => {
                 let ptr = TriePtr::new(set_backptr(TrieNodeID::Node256 as u8), 0, 0);

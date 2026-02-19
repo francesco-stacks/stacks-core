@@ -275,8 +275,7 @@ impl TriePtr {
     }
 
     /// The parts of a child pointer that are relevant for consensus are only its ID, path
-    /// character, and referred-to block hash.  The software doesn't care about the details of how/where
-    /// nodes are stored.
+    /// character, and referred-to block hash.
     pub fn write_consensus_bytes<W: Write, M: BlockMap>(
         &self,
         block_map: &mut M,

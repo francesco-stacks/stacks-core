@@ -753,7 +753,19 @@ impl Trie {
         // here is where some mind-bending things begin to happen.
         //   we want to find the block at a given _height_. but how to do so?
         //   use the data stored already in the MARF.
-        let cur_block_height =
+        //
+        // In a squashed MARF, all blocks at heights 0..=H share a single
+        // blob whose OWN_BLOCK_HEIGHT_KEY value is H (the squash height).
+        // Using that value would produce the wrong number of ancestors.
+        // Instead, look up the actual height from the SQL side-table that
+        // was populated during squashing.
+        let cur_block_height = if let Some(h) = storage.squash_info().and_then(|_| {
+            trie_sql::read_squash_block_height(storage.sqlite_conn(), &cur_block_header)
+                .ok()
+                .flatten()
+        }) {
+            h
+        } else {
             MARF::get_block_height_miner_tip(storage, &cur_block_header, &cur_block_header)
                 .map_err(|e| match e {
                     Error::NotFoundError => Error::CorruptionError(format!(
@@ -767,7 +779,8 @@ impl Trie {
                         "Could not obtain block height for block {}: got None",
                         &cur_block_header
                     ))
-                })?;
+                })?
+        };
 
         let mut log_depth = 0;
         while log_depth < 32 && (1u32 << log_depth) <= cur_block_height {
@@ -790,12 +803,15 @@ impl Trie {
                 .is_some_and(|info| ancestor_height <= info.height);
 
             let ancestor_hash = if use_stored_root {
-                trie_sql::read_squash_root_hash(storage.sqlite_conn(), ancestor_height)?
-                    .ok_or_else(|| {
-                        Error::CorruptionError(format!(
-                            "Could not obtain squashed root hash at height {ancestor_height}"
-                        ))
-                    })?
+                trie_sql::read_squash_archival_marf_root_hash(
+                    storage.sqlite_conn(),
+                    ancestor_height,
+                )?
+                .ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "Could not obtain squashed root hash at height {ancestor_height}"
+                    ))
+                })?
             } else {
                 storage.open_block(&prev_block_header)?;
                 let root_ptr = storage.root_trieptr();
