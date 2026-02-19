@@ -1670,6 +1670,21 @@ impl<T: MarfTrieId> MARF<T> {
         self.storage.connection()
     }
 
+    /// Build the set of trusted squash trie root-node hashes from this
+    /// MARF's squash metadata.  Returns an empty set for archival
+    /// (non-squashed) MARFs.
+    #[cfg(test)]
+    pub fn trusted_squash_node_hashes(&self) -> std::collections::HashSet<TrieHash> {
+        let mut set = std::collections::HashSet::new();
+        if let Some(info) = self.storage.squash_info() {
+            let h = info.squash_root_node_hash;
+            if h != TrieHash::from_data(&[]) {
+                set.insert(h);
+            }
+        }
+        set
+    }
+
     #[cfg(test)]
     pub fn borrow_storage_transaction(&mut self) -> TrieStorageTransaction<'_, T> {
         self.storage.transaction().unwrap()

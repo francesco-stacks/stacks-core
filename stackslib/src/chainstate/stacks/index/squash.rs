@@ -27,10 +27,12 @@ use std::io::{BufReader, Read as _, Seek, SeekFrom};
 use std::time::Instant;
 
 use rusqlite::params;
+use sha2::Digest;
 use stacks_common::types::chainstate::{
-    TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE,
+    StacksBlockId, TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE,
 };
 
+use crate::chainstate::stacks::index::bits::get_leaf_hash;
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, MARF,
 };
@@ -39,7 +41,33 @@ use crate::chainstate::stacks::index::storage::{
     SquashInfo, TrieFileStorage, TrieStorageConnection,
 };
 use crate::chainstate::stacks::index::trie::Trie;
-use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
+use crate::chainstate::stacks::index::{trie_sql, BlockMap, Error, MarfTrieId, TrieHasher};
+
+/// A dummy `BlockMap` used only for serializing consensus bytes of nodes
+/// that have no backpointer children (all pointers in the squash trie are
+/// inline). Since `write_consensus_bytes` writes zero bytes for non-backptr
+/// children, none of the `BlockMap` methods are called.
+struct SquashBlockMap;
+
+impl BlockMap for SquashBlockMap {
+    type TrieId = StacksBlockId;
+
+    fn get_block_hash(&self, _id: u32) -> Result<Self::TrieId, Error> {
+        unreachable!("SquashBlockMap: no backpointers in squash trie")
+    }
+    fn get_block_hash_caching(&mut self, _id: u32) -> Result<&Self::TrieId, Error> {
+        unreachable!("SquashBlockMap: no backpointers in squash trie")
+    }
+    fn is_block_hash_cached(&self, _id: u32) -> bool {
+        false
+    }
+    fn get_block_id(&self, _bhh: &Self::TrieId) -> Result<u32, Error> {
+        unreachable!("SquashBlockMap: no backpointers in squash trie")
+    }
+    fn get_block_id_caching(&mut self, _bhh: &Self::TrieId) -> Result<u32, Error> {
+        unreachable!("SquashBlockMap: no backpointers in squash trie")
+    }
+}
 
 /// Key that stores the squashed root hash at the snapshot tip.
 pub const MARF_SQUASH_ROOT_KEY: &str = "__MARF_SQUASH_ROOT";
@@ -59,7 +87,7 @@ pub struct SquashStats {
 /// Summary statistics from a validation run.
 ///
 /// The default validation checks:
-/// - Per-height root hashes stored in `marf_squash_root_hashes` match the
+/// - Per-height root hashes stored in `marf_squash_archival_marf_roots` match the
 ///   archival source (guarantees correct ancestor hash computation for the
 ///   skip-list at blocks > H).
 /// - Squash metadata (`marf_squash_info`) is present and correct.
@@ -72,10 +100,10 @@ pub struct SquashStats {
 pub struct SquashValidationStats {
     // --- Fast-path (always populated) ---
     /// Whether the squashed root key was found in the SQL metadata.
-    pub squash_root_present: bool,
+    pub archival_root_present: bool,
     /// Whether the stored archival root hash at the squash height
     /// matches the source MARF's root hash at that height.
-    pub squash_root_matches: bool,
+    pub archival_root_matches: bool,
     /// Per-height root hashes missing from the SQL table.
     pub root_hash_missing: u64,
     /// Per-height root hashes with mismatched values.
@@ -101,8 +129,8 @@ impl<T: MarfTrieId> MARF<T> {
     /// Squash the MARF at `height` into a new database at `dst_path`.
     ///
     /// Produces a hash-preserving squash: the squashed MARF contains a single
-    /// shared blob with all trie nodes reachable at `height`.  Each historical
-    /// block (0..=height) has a `marf_data` row pointing at this shared blob so
+    /// shared trie storage with all trie nodes reachable at `height`. Each historical
+    /// block (0..=height) has a `marf_data` row pointing at this shared trie storage so
     /// that `get_block_hash_caching(local_id)` returns the correct original
     /// `StacksBlockId`.
     ///
@@ -281,7 +309,66 @@ impl<T: MarfTrieId> MARF<T> {
             start_remap.elapsed()
         );
 
-        // Write collected nodes into the destination TrieRAM.
+        // Step 5: Recompute all node hashes.
+        //
+        // The BFS collected hashes from the original archival blocks.
+        // After squashing, all nodes are inline children, so the new
+        // node hash may be different and needs to be recomputed.
+        //
+        // Process in reverse BFS order so children
+        // are computed before their parents.
+        {
+            let empty_hash = TrieHash::from_data(&[]);
+            for (node, hash, _) in nodes.iter_mut() {
+                if let TrieNodeType::Leaf(ref leaf) = node {
+                    *hash = get_leaf_hash(leaf);
+                }
+            }
+            for idx in (0..nodes.len()).rev() {
+                let (left, right) = nodes.split_at_mut(idx);
+                let Some((curr, right_rest)) = right.split_first_mut() else {
+                    return Err(Error::CorruptionError(
+                        "Failed to access current node during squash hashing".to_string(),
+                    ));
+                };
+                let (curr_node, curr_hash, _) = curr;
+                if curr_node.is_leaf() {
+                    continue;
+                }
+                let mut children_content_hashes = Vec::with_capacity(curr_node.ptrs().len());
+                for child_ptr in curr_node.ptrs().iter() {
+                    if child_ptr.id() == TrieNodeID::Empty as u8 || is_backptr(child_ptr.id()) {
+                        children_content_hashes.push(empty_hash);
+                    } else {
+                        let child_idx = child_ptr.ptr() as usize;
+                        let child_hash = if child_idx < idx {
+                            left.get(child_idx).map(|(_, h, _)| *h)
+                        } else if child_idx == idx {
+                            Some(*curr_hash)
+                        } else {
+                            right_rest.get(child_idx - idx - 1).map(|(_, h, _)| *h)
+                        }
+                        .ok_or_else(|| {
+                            Error::CorruptionError(format!(
+                                "Invalid child index {child_idx} while recomputing squash hashes"
+                            ))
+                        })?;
+                        children_content_hashes.push(child_hash);
+                    }
+                }
+                // Same as get_node_hash(): H(consensus_bytes || children_hashes).
+                let mut hasher = TrieHasher::new();
+                curr_node
+                    .write_consensus_bytes(&mut SquashBlockMap, &mut hasher)
+                    .expect("IO Failure pushing to hasher.");
+                for h in &children_content_hashes {
+                    hasher.update(h.as_ref());
+                }
+                *curr_hash = TrieHash(hasher.finalize().into());
+            }
+        }
+
+        // Write collected nodes (with node hashes) into the destination TrieRAM.
         for (idx, (node, hash, _)) in nodes.iter().enumerate() {
             tx.write_node_direct(idx as u32, node, *hash)?;
         }
@@ -298,7 +385,7 @@ impl<T: MarfTrieId> MARF<T> {
         {
             let conn = tx.sqlite_tx();
             let mut stmt = conn.prepare(
-                "INSERT OR REPLACE INTO marf_squash_root_hashes (height, root_hash) VALUES (?1, ?2)",
+                "INSERT OR REPLACE INTO marf_squash_archival_marf_roots (height, marf_root_hash) VALUES (?1, ?2)",
             )?;
             let mut stmt_bh = conn.prepare(
                 "INSERT OR REPLACE INTO marf_squash_block_heights (block_hash, height) VALUES (?1, ?2)",
@@ -314,8 +401,15 @@ impl<T: MarfTrieId> MARF<T> {
             start_sql_meta.elapsed()
         );
 
+        let squash_root_node_hash = nodes
+            .first()
+            .map(|(_, hash, _)| *hash)
+            .ok_or_else(|| Error::CorruptionError("No nodes in squash trie".to_string()))?;
+        info!("Squash blob content root hash: {squash_root_node_hash}");
+
         tx.set_squash_info(Some(SquashInfo {
-            root: source_root_hash,
+            archival_marf_root_hash: source_root_hash,
+            squash_root_node_hash,
             height,
             block_hash: block_at_height.clone(),
         }));
@@ -325,6 +419,17 @@ impl<T: MarfTrieId> MARF<T> {
         info!("Squash commit: starting commit");
         tx.commit()?;
         info!("Squash commit: finished in {:?}", start_commit.elapsed());
+
+        // Persist squash_root_node_hash to SQL.
+        {
+            let conn = dst.sqlite_conn();
+            conn.execute_batch("BEGIN IMMEDIATE")
+                .map_err(|e| Error::CorruptionError(format!("BEGIN squash_root_node_hash: {e}")))?;
+            trie_sql::update_squash_root_node_hash(conn, &squash_root_node_hash)?;
+            conn.execute_batch("COMMIT").map_err(|e| {
+                Error::CorruptionError(format!("COMMIT squash_root_node_hash: {e}"))
+            })?;
+        }
 
         // Step 8: bulk-update placeholders to share the blob
         let start_blob_update = Instant::now();
@@ -460,7 +565,7 @@ impl<T: MarfTrieId> MARF<T> {
     /// - Children that were backpointers to an ancestor block have
     ///   `back_block = squashed_local_id` (looked up via `block_id_map`).
     /// - All children have the backptr flag cleared (they are physically
-    ///   present in the single shared blob).
+    ///   present in the single shared trie storage).
     fn deep_copy_remap(
         nodes: &mut Vec<(TrieNodeType, TrieHash, u32)>,
         source_to_idx: &HashMap<(u32, u32), usize>,
@@ -605,8 +710,8 @@ impl<T: MarfTrieId> MARF<T> {
             .unwrap_or_else(|| squashed_block_at_height.clone());
 
         let mut stats = SquashValidationStats {
-            squash_root_present: false,
-            squash_root_matches: false,
+            archival_root_present: false,
+            archival_root_matches: false,
             root_hash_missing: 0,
             root_hash_mismatches: 0,
             blob_offset_mismatches: 0,
@@ -620,7 +725,7 @@ impl<T: MarfTrieId> MARF<T> {
         // Check 1: Per-height root hashes
         //
         // Compare archival root hashes from the source blobs against the
-        // squashed MARF's `marf_squash_root_hashes` SQL table. These
+        // squashed MARF's `marf_squash_archival_marf_roots` SQL table. These
         // values are used by the skip-list for blocks > H.
         //
         // Note: we do NOT compare the trie root hashes of block H between
@@ -675,7 +780,7 @@ impl<T: MarfTrieId> MARF<T> {
 
         // (c) Squashed side: single SQL query for all stored root hashes.
         let squashed_root_hashes: HashMap<u32, TrieHash> =
-            trie_sql::bulk_read_squash_root_hashes(squashed.sqlite_conn())?
+            trie_sql::bulk_read_squash_archival_marf_root_hashes(squashed.sqlite_conn())?
                 .into_iter()
                 .collect();
 
@@ -707,13 +812,13 @@ impl<T: MarfTrieId> MARF<T> {
         // Check 2: Squash metadata in SQL (O(1))
         let sql_squash_info = trie_sql::read_squash_info(squashed.sqlite_conn())?;
         match sql_squash_info {
-            Some((root, _height)) => {
-                stats.squash_root_present = true;
-                stats.squash_root_matches = root == expected_squash_root;
+            Some((archival_marf_root_hash, _squash_root_node_hash, _height)) => {
+                stats.archival_root_present = true;
+                stats.archival_root_matches = archival_marf_root_hash == expected_squash_root;
             }
             None => {
-                stats.squash_root_present = false;
-                stats.squash_root_matches = false;
+                stats.archival_root_present = false;
+                stats.archival_root_matches = false;
             }
         }
 

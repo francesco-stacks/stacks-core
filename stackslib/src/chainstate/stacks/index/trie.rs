@@ -250,29 +250,6 @@ impl Trie {
         Ok(trie_hashes)
     }
 
-    /// Like `get_children_hashes` but ignores squash-blob `back_block`
-    /// annotations, always using the stored node hash for inline children.
-    ///
-    /// This produces hashes consistent with how the proof verifier walks
-    /// a squash blob (where annotated children are inline, not backptrs).
-    pub fn get_children_hashes_raw<T: MarfTrieId>(
-        storage: &mut TrieStorageConnection<T>,
-        node: &TrieNodeType,
-    ) -> Result<Vec<TrieHash>, Error> {
-        let mut buffer = Vec::with_capacity(node.ptrs().len() * TRIEHASH_ENCODED_SIZE);
-        storage.write_children_hashes_raw(node, &mut buffer)?;
-        assert_eq!(buffer.len() % TRIEHASH_ENCODED_SIZE, 0);
-
-        let trie_hashes: Vec<_> = buffer
-            .chunks_exact(TRIEHASH_ENCODED_SIZE)
-            .map(|x| {
-                TrieHash::from_bytes(x).expect("Failed to re-encode TrieHash from byte buffer")
-            })
-            .collect();
-
-        Ok(trie_hashes)
-    }
-
     /// Given an existing leaf, replace it with the new leaf.
     /// c must point to the node to replace.
     fn replace_leaf<T: MarfTrieId>(
@@ -826,12 +803,15 @@ impl Trie {
                 .is_some_and(|info| ancestor_height <= info.height);
 
             let ancestor_hash = if use_stored_root {
-                trie_sql::read_squash_root_hash(storage.sqlite_conn(), ancestor_height)?
-                    .ok_or_else(|| {
-                        Error::CorruptionError(format!(
-                            "Could not obtain squashed root hash at height {ancestor_height}"
-                        ))
-                    })?
+                trie_sql::read_squash_archival_marf_root_hash(
+                    storage.sqlite_conn(),
+                    ancestor_height,
+                )?
+                .ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "Could not obtain squashed root hash at height {ancestor_height}"
+                    ))
+                })?
             } else {
                 storage.open_block(&prev_block_header)?;
                 let root_ptr = storage.root_trieptr();

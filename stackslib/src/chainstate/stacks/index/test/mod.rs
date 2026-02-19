@@ -17,7 +17,7 @@
 #![allow(unused_variables)]
 #![allow(unused_assignments)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::util::hash::to_hex;
@@ -115,7 +115,8 @@ pub fn merkle_test(s: &mut TrieStorageConnection<BlockHeaderHash>, path: &[u8], 
         &triepath,
         &MARFValue(marf_value),
         &root_hash,
-        &empty_root_to_block
+        &empty_root_to_block,
+        &HashSet::new(),
     ));
 }
 
@@ -156,7 +157,8 @@ pub fn merkle_test_marf(
         &triepath,
         &MARFValue(marf_value),
         &root_hash,
-        &root_to_block
+        &root_to_block,
+        &HashSet::new(),
     ));
 
     root_to_block
@@ -192,7 +194,13 @@ pub fn merkle_test_marf_key_value(
     let triepath = TrieHash::from_key(key);
     let marf_value = MARFValue::from_value(value);
 
-    assert!(proof.verify(&triepath, &marf_value, &root_hash, &root_to_block));
+    assert!(proof.verify(
+        &triepath,
+        &marf_value,
+        &root_hash,
+        &root_to_block,
+        &HashSet::new(),
+    ));
 
     root_to_block
 }
