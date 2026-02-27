@@ -272,6 +272,17 @@ impl<T: MarfTrieId> UncommittedState<T> {
         }
     }
 
+    /// Replace the in-memory trie payload in one move.
+    /// Panics if the UncommittedState is sealed already.
+    pub fn replace_nodetypes(&mut self, data: Vec<(TrieNodeType, TrieHash)>) -> Result<(), Error> {
+        match self {
+            UncommittedState::RW(ref mut trie_ram) => trie_ram.replace_nodetypes(data),
+            UncommittedState::Sealed(..) => {
+                panic!("FATAL: tried to write to a sealed TrieRAM");
+            }
+        }
+    }
+
     /// Write a node hash to a particular slot in the TrieRAM.
     /// Panics of the UncommittedState is sealed already.
     pub fn write_node_hash(&mut self, node_array_ptr: u32, hash: TrieHash) -> Result<(), Error> {
@@ -827,6 +838,12 @@ impl<T: MarfTrieId> TrieRAM<T> {
             }
 
             node_data.push(pointer);
+            if ptr > u32::MAX as u64 {
+                return Err(Error::CorruptionError(format!(
+                    "Trie dump offset overflow: computed offset {ptr} exceeds u32::MAX ({})",
+                    u32::MAX
+                )));
+            }
             offsets.push(ptr as u32);
         }
 
@@ -1058,6 +1075,34 @@ impl<T: MarfTrieId> TrieRAM<T> {
             error!("Failed to write node bytes: off the end of the buffer");
             Err(Error::NotFoundError)
         }
+    }
+
+    /// Replace all trie nodes in the uncommitted state in one move.
+    pub fn replace_nodetypes(&mut self, data: Vec<(TrieNodeType, TrieHash)>) -> Result<(), Error> {
+        if self.readonly {
+            trace!("Read-only!");
+            return Err(Error::ReadOnlyError);
+        }
+
+        let mut total_bytes = 0usize;
+        let mut write_leaf_count = 0u64;
+        let mut write_node_count = 0u64;
+
+        for (node, _) in data.iter() {
+            total_bytes += get_node_byte_len(node);
+            if matches!(node, TrieNodeType::Leaf(_)) {
+                write_leaf_count += 1;
+            } else {
+                write_node_count += 1;
+            }
+        }
+
+        self.write_count = data.len() as u64;
+        self.write_node_count = write_node_count;
+        self.write_leaf_count = write_leaf_count;
+        self.total_bytes = total_bytes;
+        self.data = data;
+        Ok(())
     }
 
     /// Store a node hash into the TrieRAM at a given node slot.
@@ -2863,6 +2908,25 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         {
             if &self.data.cur_block == uncommitted_bhh {
                 return uncommitted_trie.write_nodetype(disk_ptr, node, hash);
+            }
+        }
+
+        panic!("Tried to write to another Trie besides the currently-buffered one.  This should never happen -- only flush() can write to disk!");
+    }
+
+    /// Replace all nodes in the currently-buffered trie in one move.
+    pub fn replace_nodetypes_bulk(
+        &mut self,
+        data: Vec<(TrieNodeType, TrieHash)>,
+    ) -> Result<(), Error> {
+        if self.data.readonly {
+            return Err(Error::ReadOnlyError);
+        }
+
+        if let Some((ref uncommitted_bhh, ref mut uncommitted_trie)) = self.data.uncommitted_writes
+        {
+            if &self.data.cur_block == uncommitted_bhh {
+                return uncommitted_trie.replace_nodetypes(data);
             }
         }
 

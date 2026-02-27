@@ -159,6 +159,29 @@ fn collect_child_hashes(
     Ok(out)
 }
 
+fn read_proc_status_kib(field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with(field))?;
+    let mut parts = line.split_whitespace();
+    let _ = parts.next()?;
+    parts.next()?.parse::<u64>().ok()
+}
+
+fn log_memory_snapshot(stage: &str) {
+    let rss_kib = read_proc_status_kib("VmRSS:");
+    let hwm_kib = read_proc_status_kib("VmHWM:");
+
+    match (rss_kib, hwm_kib) {
+        (Some(rss), Some(hwm)) => info!(
+            "Squash memory ({stage}): VmRSS={} MiB, VmHWM={} MiB",
+            rss / 1024,
+            hwm / 1024
+        ),
+        (Some(rss), None) => info!("Squash memory ({stage}): VmRSS={} MiB", rss / 1024),
+        _ => info!("Squash memory ({stage}): unavailable"),
+    }
+}
+
 /// Key that stores the squashed root hash at the snapshot tip.
 pub const MARF_SQUASH_ROOT_KEY: &str = "__MARF_SQUASH_ROOT";
 /// Key that stores the snapshot height for a squashed MARF.
@@ -225,21 +248,19 @@ fn collect_block_map<T: MarfTrieId>(src: &MARF<T>) -> Result<HashMap<T, (u32, u6
 }
 
 /// Step 2: For each height 0..=H, resolve (block_hash, root_hash) via trie
-/// walk + direct blob seek.  Returns the per-height info plus the archival
-/// block_id mapping needed for placeholder insertion.
+/// walk + direct blob seek.
 fn collect_per_height_metadata<T: MarfTrieId>(
     src: &mut MARF<T>,
     source_tip: &T,
     block_map: &HashMap<T, (u32, u64)>,
     blobs_path: &str,
     height: u32,
-) -> Result<(Vec<BlockInfo<T>>, HashMap<T, u32>), Error> {
+) -> Result<Vec<BlockInfo<T>>, Error> {
     let root_ptr_offset = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
     let blobs_file = File::open(blobs_path).map_err(Error::IOError)?;
     let mut blobs_reader = BufReader::with_capacity(64 * 1024, blobs_file);
 
     let mut block_info: Vec<BlockInfo<T>> = Vec::with_capacity((height + 1) as usize);
-    let mut archival_ids: HashMap<T, u32> = HashMap::with_capacity((height + 1) as usize);
     let mut last_log = Instant::now();
     let start = Instant::now();
 
@@ -252,7 +273,7 @@ fn collect_per_height_metadata<T: MarfTrieId>(
             })?;
         let bh = T::from(val);
 
-        let &(block_id, blob_offset) = block_map.get(&bh).ok_or_else(|| {
+        let &(_block_id, blob_offset) = block_map.get(&bh).ok_or_else(|| {
             Error::CorruptionError(format!(
                 "Missing block map entry for block hash at height {h}"
             ))
@@ -263,7 +284,6 @@ fn collect_per_height_metadata<T: MarfTrieId>(
         blobs_reader.read_exact(&mut hash_bytes)?;
         let rh = TrieHash(hash_bytes);
 
-        archival_ids.insert(bh.clone(), block_id);
         block_info.push((h, bh, rh));
 
         if last_log.elapsed().as_secs() >= 30 || (h > 0 && h % 100_000 == 0) {
@@ -282,7 +302,7 @@ fn collect_per_height_metadata<T: MarfTrieId>(
         start.elapsed()
     );
 
-    Ok((block_info, archival_ids))
+    Ok(block_info)
 }
 
 /// Step 4: Bulk-insert `marf_data` placeholder rows for blocks 0..H-1.
@@ -292,7 +312,7 @@ fn insert_placeholder_blocks<T: MarfTrieId>(
     conn: &rusqlite::Connection,
     block_info: &[BlockInfo<T>],
     block_at_height: &T,
-    archival_ids: &HashMap<T, u32>,
+    block_map: &HashMap<T, (u32, u64)>,
 ) -> Result<HashMap<u32, u32>, Error> {
     let start = Instant::now();
     let mut archival_to_squashed: HashMap<u32, u32> = HashMap::new();
@@ -305,12 +325,12 @@ fn insert_placeholder_blocks<T: MarfTrieId>(
         if bh == block_at_height {
             continue;
         }
-        let archival_id = *archival_ids.get(bh).ok_or(Error::NotFoundError)?;
+        let (archival_id, _) = block_map.get(bh).ok_or(Error::NotFoundError)?;
         let squashed_id: u32 = stmt
             .insert(params![bh.to_string(), empty_blob, 0i64, 0i64])?
             .try_into()
             .expect("block_id overflow");
-        archival_to_squashed.insert(archival_id, squashed_id);
+        archival_to_squashed.insert(*archival_id, squashed_id);
         if *h % 100_000 == 0 && *h > 0 {
             info!(
                 "Squash placeholders: inserted {h} entries in {:?}",
@@ -430,10 +450,11 @@ impl<T: MarfTrieId> MARF<T> {
 
         // Step 2: per-height metadata
         let blobs_path = format!("{src_path}.blobs");
-        let (block_info, archival_ids) =
+        let block_info =
             collect_per_height_metadata(&mut src, &tip, &block_map, &blobs_path, height)?;
 
         // Step 3: BFS deep copy
+        log_memory_snapshot("before step 3 BFS");
         let start = Instant::now();
         let (mut nodes, source_to_idx) =
             src.with_conn(|conn| MARF::<T>::collect_all_nodes(conn, &block_at_height))?;
@@ -442,6 +463,7 @@ impl<T: MarfTrieId> MARF<T> {
             "Squash step 3 (BFS): {node_count} nodes in {:?}",
             start.elapsed()
         );
+        log_memory_snapshot("after step 3 BFS");
 
         // Open destination MARF and begin transaction
         let mut dst = MARF::from_path(dst_path, open_opts)?;
@@ -449,33 +471,46 @@ impl<T: MarfTrieId> MARF<T> {
         tx.begin(&T::sentinel(), &block_at_height)?;
 
         // Step 4: placeholder marf_data rows
-        let archival_to_squashed = insert_placeholder_blocks(
-            tx.sqlite_tx(),
-            &block_info,
-            &block_at_height,
-            &archival_ids,
-        )?;
+        let archival_to_squashed =
+            insert_placeholder_blocks(tx.sqlite_tx(), &block_info, &block_at_height, &block_map)?;
+        drop(block_map);
 
         // Step 5a: remap pointers (in-memory)
+        log_memory_snapshot("before step 5a remap");
         let start = Instant::now();
         Self::deep_copy_remap(&mut nodes, &source_to_idx, &archival_to_squashed)?;
         info!(
             "Squash step 5a (remap): {node_count} nodes in {:?}",
             start.elapsed()
         );
+        drop(source_to_idx);
+        drop(archival_to_squashed);
+        log_memory_snapshot("after step 5a remap");
 
         // Step 5b: recompute content hashes
+        log_memory_snapshot("before step 5b content hashes");
         let start = Instant::now();
         recompute_content_hashes(&mut nodes)?;
         info!(
             "Squash step 5b (content hashes): {node_count} nodes in {:?}",
             start.elapsed()
         );
+        log_memory_snapshot("after step 5b content hashes");
+
+        let squash_root_node_hash = nodes
+            .first()
+            .map(|(_, hash, _)| *hash)
+            .ok_or_else(|| Error::CorruptionError("No nodes in squash trie".to_string()))?;
+
+        let nodes = nodes
+            .into_iter()
+            .map(|(node, hash, _)| (node, hash))
+            .collect();
 
         // Write nodes to TrieRAM
-        for (idx, (node, hash, _)) in nodes.iter().enumerate() {
-            tx.write_node_direct(idx as u32, node, *hash)?;
-        }
+        log_memory_snapshot("before TrieRAM write");
+        tx.write_nodes_direct_bulk(nodes)?;
+        log_memory_snapshot("after TrieRAM write");
 
         // Step 6: SQL metadata
         let source_root_hash = block_info
@@ -484,11 +519,6 @@ impl<T: MarfTrieId> MARF<T> {
             .map(|(_, _, rh)| *rh)
             .ok_or(Error::NotFoundError)?;
         persist_squash_metadata(tx.sqlite_tx(), &block_info, &source_root_hash, height)?;
-
-        let squash_root_node_hash = nodes
-            .first()
-            .map(|(_, hash, _)| *hash)
-            .ok_or_else(|| Error::CorruptionError("No nodes in squash trie".to_string()))?;
         info!("Squash blob content root hash: {squash_root_node_hash}");
 
         tx.set_squash_info(Some(SquashInfo {

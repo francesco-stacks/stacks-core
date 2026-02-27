@@ -135,9 +135,13 @@ pub fn ptrs_from_bytes<R: Read>(
         .ok_or_else(|| Error::CorruptionError("Failed to read 1 byte from bytes array".into()))?;
     if clear_backptr(*nid) != clear_backptr(node_id) {
         trace!("Bad idbuf: {:x} != {:x}", nid, node_id);
-        return Err(Error::CorruptionError(
-            "Failed to read expected node ID".to_string(),
-        ));
+        return Err(Error::CorruptionError(format!(
+            "Failed to read expected node ID (expected={:#04x}, actual={:#04x}, expected_cleared={:#04x}, actual_cleared={:#04x})",
+            node_id,
+            *nid,
+            clear_backptr(node_id),
+            clear_backptr(*nid)
+        )));
     }
 
     let ptr_bytes = bytes
@@ -280,7 +284,15 @@ pub fn read_nodetype<F: Read + Seek>(
     f.seek(SeekFrom::Start(ptr.ptr() as u64))
         .map_err(Error::IOError)?;
     trace!("read_nodetype at {:?}", ptr);
-    read_nodetype_at_head(f, ptr.id())
+    read_nodetype_at_head(f, ptr.id()).map_err(|e| {
+        Error::CorruptionError(format!(
+            "read_nodetype failed at ptr(off={}, id={:#04x}, chr={:#04x}, back_block={}): {e}",
+            ptr.ptr(),
+            ptr.id(),
+            ptr.chr(),
+            ptr.back_block()
+        ))
+    })
 }
 
 /// Read a node
@@ -291,7 +303,15 @@ pub fn read_nodetype_nohash<F: Read + Seek>(
     f.seek(SeekFrom::Start(ptr.ptr() as u64))
         .map_err(Error::IOError)?;
     trace!("read_nodetype_nohash at {:?}", ptr);
-    read_nodetype_at_head_nohash(f, ptr.id())
+    read_nodetype_at_head_nohash(f, ptr.id()).map_err(|e| {
+        Error::CorruptionError(format!(
+            "read_nodetype_nohash failed at ptr(off={}, id={:#04x}, chr={:#04x}, back_block={}): {e}",
+            ptr.ptr(),
+            ptr.id(),
+            ptr.chr(),
+            ptr.back_block()
+        ))
+    })
 }
 
 /// Read a node and hash at the stream's current position

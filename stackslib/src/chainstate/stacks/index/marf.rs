@@ -384,6 +384,17 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         self.storage.write_nodetype(slot, node, hash)
     }
 
+    /// Replace all trie nodes in the current uncommitted TrieRAM.
+    ///
+    /// Used by `squash_to_path` to move a precomputed deep-copy into
+    /// TrieRAM without cloning each node individually.
+    pub(crate) fn write_nodes_direct_bulk(
+        &mut self,
+        nodes: Vec<(TrieNodeType, TrieHash)>,
+    ) -> Result<(), Error> {
+        self.storage.replace_nodetypes_bulk(nodes)
+    }
+
     /// Reopen this MARF transaction with readonly storage.
     ///   NOTE: any pending operations in the SQLite transaction _will not_
     ///         have materialized in the reopened view.
