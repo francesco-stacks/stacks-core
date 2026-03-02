@@ -23,7 +23,7 @@ use stacks_common::util::hash::to_hex;
 
 use crate::chainstate::stacks::index::node::{
     clear_backptr, ConsensusSerializable, TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48,
-    TrieNodeID, TrieNodeType, TriePtr, TRIEPTR_SIZE,
+    TrieNodeID, TrieNodeType, TriePtr, TriePtrFormat,
 };
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::{BlockMap, Error, MarfTrieId, TrieLeaf};
@@ -95,9 +95,9 @@ pub fn node_id_to_ptr_count(node_id: u8) -> usize {
 }
 
 /// Helper to determine how many bytes a Trie node's child pointers will take to encode.
-pub fn get_ptrs_byte_len(ptrs: &[TriePtr]) -> usize {
+pub const fn get_ptrs_byte_len(ptrs: &[TriePtr], format: TriePtrFormat) -> usize {
     let node_id_len = 1;
-    node_id_len + TRIEPTR_SIZE * ptrs.len()
+    node_id_len + format.encoded_size() * ptrs.len()
 }
 
 /// Read a Trie node's children from a Readable object, and write them to the given ptrs_buf slice.
@@ -106,6 +106,7 @@ pub fn ptrs_from_bytes<R: Read>(
     node_id: u8,
     r: &mut R,
     ptrs_buf: &mut [TriePtr],
+    format: TriePtrFormat,
 ) -> Result<u8, Error> {
     if !check_node_id(node_id) {
         trace!("Bad node ID {:x}", node_id);
@@ -116,12 +117,13 @@ pub fn ptrs_from_bytes<R: Read>(
     }
 
     let num_ptrs = node_id_to_ptr_count(node_id);
-    let mut bytes = vec![0u8; 1 + num_ptrs * TRIEPTR_SIZE];
+    let ptr_size = format.encoded_size();
+    let mut bytes = vec![0u8; 1 + num_ptrs * ptr_size];
     r.read_exact(&mut bytes).map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
             Error::CorruptionError(format!(
                 "Failed to read 1 + {} bytes of ptrs",
-                num_ptrs * TRIEPTR_SIZE
+                num_ptrs * ptr_size
             ))
         } else {
             eprintln!("failed: {:?}", &e);
@@ -149,11 +151,9 @@ pub fn ptrs_from_bytes<R: Read>(
         .ok_or_else(|| Error::CorruptionError("Failed to read >1 bytes from bytes array".into()))?;
     // iterate over the read-in bytes in chunks of TRIEPTR_SIZE and store them
     //   to `ptrs_buf`
-    let reading_ptrs = ptr_bytes
-        .chunks_exact(TRIEPTR_SIZE)
-        .zip(ptrs_buf.iter_mut());
+    let reading_ptrs = ptr_bytes.chunks_exact(ptr_size).zip(ptrs_buf.iter_mut());
     for (next_ptr_bytes, ptr_slot) in reading_ptrs {
-        *ptr_slot = TriePtr::from_bytes(next_ptr_bytes);
+        *ptr_slot = TriePtr::from_bytes(next_ptr_bytes, format);
     }
     Ok(*nid)
 }
@@ -188,7 +188,7 @@ pub fn get_node_hash<M, T: ConsensusSerializable<M> + std::fmt::Debug>(
 /// Calculate the hash of a TrieLeaf
 pub fn get_leaf_hash(node: &TrieLeaf) -> TrieHash {
     let mut hasher = TrieHasher::new();
-    node.write_bytes(&mut hasher)
+    node.write_bytes(&mut hasher, TriePtrFormat::V1U32) // format is ignored for leaves
         .expect("IO Failure pushing to hasher.");
 
     let res = hasher.finalize().into();
@@ -280,11 +280,12 @@ pub fn count_children(children: &[TriePtr]) -> usize {
 pub fn read_nodetype<F: Read + Seek>(
     f: &mut F,
     ptr: &TriePtr,
+    format: TriePtrFormat,
 ) -> Result<(TrieNodeType, TrieHash), Error> {
     f.seek(SeekFrom::Start(ptr.ptr() as u64))
         .map_err(Error::IOError)?;
     trace!("read_nodetype at {:?}", ptr);
-    read_nodetype_at_head(f, ptr.id()).map_err(|e| {
+    read_nodetype_at_head(f, ptr.id(), format).map_err(|e| {
         Error::CorruptionError(format!(
             "read_nodetype failed at ptr(off={}, id={:#04x}, chr={:#04x}, back_block={}): {e}",
             ptr.ptr(),
@@ -299,11 +300,12 @@ pub fn read_nodetype<F: Read + Seek>(
 pub fn read_nodetype_nohash<F: Read + Seek>(
     f: &mut F,
     ptr: &TriePtr,
+    format: TriePtrFormat,
 ) -> Result<TrieNodeType, Error> {
     f.seek(SeekFrom::Start(ptr.ptr() as u64))
         .map_err(Error::IOError)?;
     trace!("read_nodetype_nohash at {:?}", ptr);
-    read_nodetype_at_head_nohash(f, ptr.id()).map_err(|e| {
+    read_nodetype_at_head_nohash(f, ptr.id(), format).map_err(|e| {
         Error::CorruptionError(format!(
             "read_nodetype_nohash failed at ptr(off={}, id={:#04x}, chr={:#04x}, back_block={}): {e}",
             ptr.ptr(),
@@ -318,8 +320,9 @@ pub fn read_nodetype_nohash<F: Read + Seek>(
 pub fn read_nodetype_at_head<F: Read + Seek>(
     f: &mut F,
     ptr_id: u8,
+    format: TriePtrFormat,
 ) -> Result<(TrieNodeType, TrieHash), Error> {
-    inner_read_nodetype_at_head(f, ptr_id, true).map(|(node, hash_opt)| {
+    inner_read_nodetype_at_head(f, ptr_id, true, format).map(|(node, hash_opt)| {
         (
             node,
             hash_opt.expect("FATAL: queried hash but received None"),
@@ -331,8 +334,9 @@ pub fn read_nodetype_at_head<F: Read + Seek>(
 pub fn read_nodetype_at_head_nohash<F: Read + Seek>(
     f: &mut F,
     ptr_id: u8,
+    format: TriePtrFormat,
 ) -> Result<TrieNodeType, Error> {
-    inner_read_nodetype_at_head(f, ptr_id, false).map(|(node, _)| node)
+    inner_read_nodetype_at_head(f, ptr_id, false, format).map(|(node, _)| node)
 }
 
 /// Deserialize a node.
@@ -349,6 +353,7 @@ fn inner_read_nodetype_at_head<F: Read + Seek>(
     f: &mut F,
     ptr_id: u8,
     read_hash: bool,
+    format: TriePtrFormat,
 ) -> Result<(TrieNodeType, Option<TrieHash>), Error> {
     let h = if read_hash {
         let h = read_hash_bytes(f)?;
@@ -362,23 +367,23 @@ fn inner_read_nodetype_at_head<F: Read + Seek>(
         Error::CorruptionError(format!("read_node_type: Unknown trie node type {}", ptr_id))
     })? {
         TrieNodeID::Node4 => {
-            let node = TrieNode4::from_bytes(f)?;
+            let node = TrieNode4::from_bytes(f, format)?;
             TrieNodeType::Node4(node)
         }
         TrieNodeID::Node16 => {
-            let node = TrieNode16::from_bytes(f)?;
+            let node = TrieNode16::from_bytes(f, format)?;
             TrieNodeType::Node16(node)
         }
         TrieNodeID::Node48 => {
-            let node = TrieNode48::from_bytes(f)?;
+            let node = TrieNode48::from_bytes(f, format)?;
             TrieNodeType::Node48(Box::new(node))
         }
         TrieNodeID::Node256 => {
-            let node = TrieNode256::from_bytes(f)?;
+            let node = TrieNode256::from_bytes(f, format)?;
             TrieNodeType::Node256(Box::new(node))
         }
         TrieNodeID::Leaf => {
-            let node = TrieLeaf::from_bytes(f)?;
+            let node = TrieLeaf::from_bytes(f, format)?;
             TrieNodeType::Leaf(node)
         }
         TrieNodeID::Empty => {
@@ -392,9 +397,9 @@ fn inner_read_nodetype_at_head<F: Read + Seek>(
 }
 
 /// calculate how many bytes a node will be when serialized, including its hash.
-pub fn get_node_byte_len(node: &TrieNodeType) -> usize {
+pub fn get_node_byte_len(node: &TrieNodeType, format: TriePtrFormat) -> usize {
     let hash_len = TRIEHASH_ENCODED_SIZE;
-    let node_byte_len = node.byte_len();
+    let node_byte_len = node.byte_len(format);
     hash_len + node_byte_len
 }
 
@@ -404,10 +409,11 @@ pub fn write_nodetype_bytes<F: Write + Seek>(
     f: &mut F,
     node: &TrieNodeType,
     hash: TrieHash,
+    format: TriePtrFormat,
 ) -> Result<u64, Error> {
     let start = f.stream_position().map_err(Error::IOError)?;
     f.write_all(hash.as_bytes())?;
-    node.write_bytes(f)?;
+    node.write_bytes(f, format)?;
     let end = f.stream_position().map_err(Error::IOError)?;
     trace!(
         "write_nodetype: {:?} {:?} at {}-{}",

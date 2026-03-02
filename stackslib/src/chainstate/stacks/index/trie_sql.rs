@@ -29,7 +29,7 @@ use crate::chainstate::stacks::index::bits::read_hash_bytes;
 use crate::chainstate::stacks::index::bits::{
     read_node_hash_bytes as bits_read_node_hash_bytes, read_nodetype, read_nodetype_nohash,
 };
-use crate::chainstate::stacks::index::node::{TrieNodeType, TriePtr};
+use crate::chainstate::stacks::index::node::{TrieNodeType, TriePtr, TriePtrFormat};
 #[cfg(test)]
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
@@ -111,7 +111,7 @@ pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
     tx.commit().map_err(|e| e.into())
 }
 
-/// Write squash metadata (archival root hash and height) to the out-of-trie SQL table.
+/// Write squash metadata to the out-of-trie SQL table.
 pub fn write_squash_info(
     conn: &Connection,
     archival_marf_root_hash: &TrieHash,
@@ -413,8 +413,23 @@ fn get_migrated_version(conn: &Connection) -> u64 {
 
 /// Migrate the MARF database to the currently-supported schema.
 /// Returns the version of the DB prior to the migration.
-pub fn migrate_tables_if_needed<T: MarfTrieId>(conn: &mut Connection) -> Result<u64, Error> {
+///
+/// If `readonly` is `true`, this performs compatibility checks only and
+/// returns an error if migration would be required.
+pub fn migrate_tables_if_needed<T: MarfTrieId>(
+    conn: &mut Connection,
+    readonly: bool,
+) -> Result<u64, Error> {
     let first_version = get_schema_version(conn);
+    if readonly {
+        if first_version != SQL_MARF_SCHEMA_VERSION {
+            return Err(Error::CorruptionError(format!(
+                "MARF schema version {first_version} is not compatible with read-only open (expected {SQL_MARF_SCHEMA_VERSION})"
+            )));
+        }
+        return Ok(first_version);
+    }
+
     loop {
         let version = get_schema_version(conn);
         match version {
@@ -768,6 +783,7 @@ pub fn read_node_type(
     conn: &Connection,
     block_id: u32,
     ptr: &TriePtr,
+    ptr_format: TriePtrFormat,
 ) -> Result<(TrieNodeType, TrieHash), Error> {
     let mut blob = conn.blob_open(
         DatabaseName::Main,
@@ -776,7 +792,7 @@ pub fn read_node_type(
         block_id.into(),
         true,
     )?;
-    read_nodetype(&mut blob, ptr)
+    read_nodetype(&mut blob, ptr, ptr_format)
 }
 
 /// Read a node from a sqlite-stored trie blob, excluding its hash.
@@ -784,6 +800,7 @@ pub fn read_node_type_nohash(
     conn: &Connection,
     block_id: u32,
     ptr: &TriePtr,
+    ptr_format: TriePtrFormat,
 ) -> Result<TrieNodeType, Error> {
     let mut blob = conn.blob_open(
         DatabaseName::Main,
@@ -792,7 +809,7 @@ pub fn read_node_type_nohash(
         block_id.into(),
         true,
     )?;
-    read_nodetype_nohash(&mut blob, ptr)
+    read_nodetype_nohash(&mut blob, ptr, ptr_format)
 }
 
 /// Get the offset and length of a trie blob in the trie blobs file.

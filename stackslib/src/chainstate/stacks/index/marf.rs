@@ -377,7 +377,7 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
     /// normal walk-cow insertion path.
     pub(crate) fn write_node_direct(
         &mut self,
-        slot: u32,
+        slot: u64,
         node: &TrieNodeType,
         hash: TrieHash,
     ) -> Result<(), Error> {

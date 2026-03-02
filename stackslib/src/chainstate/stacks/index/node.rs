@@ -80,9 +80,13 @@ pub fn clear_backptr(id: u8) -> u8 {
 
 // Byte writing operations for pointer lists, paths.
 
-fn write_ptrs_to_bytes<W: Write>(ptrs: &[TriePtr], w: &mut W) -> Result<(), Error> {
+fn write_ptrs_to_bytes<W: Write>(
+    ptrs: &[TriePtr],
+    w: &mut W,
+    format: TriePtrFormat,
+) -> Result<(), Error> {
     for ptr in ptrs.iter() {
-        ptr.write_bytes(w)?;
+        ptr.write_bytes(w, format)?;
     }
     Ok(())
 }
@@ -118,7 +122,7 @@ pub trait TrieNode {
     fn replace(&mut self, ptr: &TriePtr) -> bool;
 
     /// Read an encoded instance of this node from a byte stream and instantiate it.
-    fn from_bytes<R: Read>(r: &mut R) -> Result<Self, Error>
+    fn from_bytes<R: Read>(r: &mut R, format: TriePtrFormat) -> Result<Self, Error>
     where
         Self: std::marker::Sized;
 
@@ -132,23 +136,23 @@ pub trait TrieNode {
     fn as_trie_node_type(&self) -> TrieNodeType;
 
     /// Encode this node instance into a byte stream and write it to w.
-    fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
+    fn write_bytes<W: Write>(&self, w: &mut W, format: TriePtrFormat) -> Result<(), Error> {
         w.write_all(&[self.id()])?;
-        write_ptrs_to_bytes(self.ptrs(), w)?;
+        write_ptrs_to_bytes(self.ptrs(), w, format)?;
         write_path_to_bytes(self.path().as_slice(), w)
     }
 
     #[cfg(test)]
-    fn to_bytes(&self) -> Vec<u8> {
+    fn to_bytes(&self, format: TriePtrFormat) -> Vec<u8> {
         let mut r = Vec::new();
-        self.write_bytes(&mut r)
+        self.write_bytes(&mut r, format)
             .expect("Failed to write to byte buffer");
         r
     }
 
     /// Calculate how many bytes this node will take to encode.
-    fn byte_len(&self) -> usize {
-        get_ptrs_byte_len(self.ptrs()) + get_path_byte_len(self.path())
+    fn byte_len(&self, format: TriePtrFormat) -> usize {
+        get_ptrs_byte_len(self.ptrs(), format) + get_path_byte_len(self.path())
     }
 }
 
@@ -188,11 +192,29 @@ impl<T: TrieNode, M: BlockMap> ConsensusSerializable<M> for T {
 pub struct TriePtr {
     pub id: u8, // ID of the child.  Will have bit 0x80 set if the child is a back-pointer (in which case, back_block will be nonzero)
     pub chr: u8, // Path character at which this child resides
-    pub ptr: u32, // Storage-specific pointer to where the child's encoded bytes can be found
+    pub ptr: u64, // Storage-specific pointer to where the child's encoded bytes can be found
     pub back_block: u32, // Pointer back to the block that contains the child, if it's not in this trie
 }
 
-pub const TRIEPTR_SIZE: usize = 10; // full size of a TriePtr
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// On-disk encoding versions for `TriePtr`.
+///
+/// `V1U32` matches the legacy archival encoding (`ptr` is 4 bytes),
+/// and `V2U64` is the squashed encoding (`ptr` is 8 bytes).
+pub enum TriePtrFormat {
+    V1U32,
+    V2U64,
+}
+
+impl TriePtrFormat {
+    /// Get the encoded `TriePtr` size for this format.
+    pub const fn encoded_size(self) -> usize {
+        match self {
+            TriePtrFormat::V1U32 => 10, // id (1) + chr (1) + ptr (4) + back_block (4)
+            TriePtrFormat::V2U64 => 14, // id (1) + chr (1) + ptr (8) + back_block (4)
+        }
+    }
+}
 
 pub fn ptrs_fmt(ptrs: &[TriePtr]) -> String {
     let mut strs = vec![];
@@ -221,7 +243,7 @@ impl Default for TriePtr {
 
 impl TriePtr {
     #[inline]
-    pub fn new(id: u8, chr: u8, ptr: u32) -> TriePtr {
+    pub fn new(id: u8, chr: u8, ptr: u64) -> TriePtr {
         TriePtr {
             id,
             chr,
@@ -247,7 +269,7 @@ impl TriePtr {
     }
 
     #[inline]
-    pub fn ptr(&self) -> u32 {
+    pub fn ptr(&self) -> u64 {
         self.ptr
     }
 
@@ -267,9 +289,22 @@ impl TriePtr {
     }
 
     #[inline]
-    pub fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
+    pub fn write_bytes<W: Write>(&self, w: &mut W, format: TriePtrFormat) -> Result<(), Error> {
         w.write_all(&[self.id(), self.chr()])?;
-        w.write_all(&self.ptr().to_be_bytes())?;
+        match format {
+            TriePtrFormat::V1U32 => {
+                if self.ptr() > u32::MAX as u64 {
+                    return Err(Error::CorruptionError(format!(
+                        "Cannot encode ptr {} in v1 u32 format",
+                        self.ptr()
+                    )));
+                }
+                w.write_all(&(self.ptr() as u32).to_be_bytes())?;
+            }
+            TriePtrFormat::V2U64 => {
+                w.write_all(&self.ptr().to_be_bytes())?;
+            }
+        }
         w.write_all(&self.back_block().to_be_bytes())?;
         Ok(())
     }
@@ -298,12 +333,26 @@ impl TriePtr {
 
     #[inline]
     #[allow(clippy::indexing_slicing)]
-    pub fn from_bytes(bytes: &[u8]) -> TriePtr {
-        assert!(bytes.len() >= TRIEPTR_SIZE);
+    /// Deserialize a pointer from raw bytes using the requested wire format.
+    pub fn from_bytes(bytes: &[u8], format: TriePtrFormat) -> TriePtr {
+        let min_len = format.encoded_size();
+        assert!(bytes.len() >= min_len);
         let id = bytes[0];
         let chr = bytes[1];
-        let ptr = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-        let back_block = u32::from_be_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+        let (ptr, back_block) = match format {
+            TriePtrFormat::V1U32 => {
+                let ptr = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as u64;
+                let back_block = u32::from_be_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+                (ptr, back_block)
+            }
+            TriePtrFormat::V2U64 => {
+                let ptr = u64::from_be_bytes([
+                    bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
+                ]);
+                let back_block = u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+                (ptr, back_block)
+            }
+        };
 
         TriePtr {
             id,
@@ -823,9 +872,9 @@ impl TrieNode for TrieNode4 {
         None
     }
 
-    fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode4, Error> {
+    fn from_bytes<R: Read>(r: &mut R, format: TriePtrFormat) -> Result<TrieNode4, Error> {
         let mut ptrs_slice = [TriePtr::default(); 4];
-        ptrs_from_bytes(TrieNodeID::Node4 as u8, r, &mut ptrs_slice)?;
+        ptrs_from_bytes(TrieNodeID::Node4 as u8, r, &mut ptrs_slice, format)?;
         let path = path_from_bytes(r)?;
 
         Ok(TrieNode4 {
@@ -892,10 +941,9 @@ impl TrieNode for TrieNode16 {
         None
     }
 
-    fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode16, Error> {
+    fn from_bytes<R: Read>(r: &mut R, format: TriePtrFormat) -> Result<TrieNode16, Error> {
         let mut ptrs_slice = [TriePtr::default(); 16];
-        ptrs_from_bytes(TrieNodeID::Node16 as u8, r, &mut ptrs_slice)?;
-
+        ptrs_from_bytes(TrieNodeID::Node16 as u8, r, &mut ptrs_slice, format)?;
         let path = path_from_bytes(r)?;
 
         Ok(TrieNode16 {
@@ -966,9 +1014,9 @@ impl TrieNode for TrieNode48 {
         Some(*ptr)
     }
 
-    fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
+    fn write_bytes<W: Write>(&self, w: &mut W, format: TriePtrFormat) -> Result<(), Error> {
         w.write_all(&[self.id()])?;
-        write_ptrs_to_bytes(self.ptrs(), w)?;
+        write_ptrs_to_bytes(self.ptrs(), w, format)?;
 
         for i in self.indexes.iter() {
             w.write_all(&[*i as u8])?;
@@ -977,14 +1025,14 @@ impl TrieNode for TrieNode48 {
         write_path_to_bytes(self.path().as_slice(), w)
     }
 
-    fn byte_len(&self) -> usize {
-        get_ptrs_byte_len(&self.ptrs) + 256 + get_path_byte_len(&self.path)
+    fn byte_len(&self, format: TriePtrFormat) -> usize {
+        get_ptrs_byte_len(&self.ptrs, format) + 256 + get_path_byte_len(&self.path)
     }
 
     #[allow(clippy::indexing_slicing)]
-    fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode48, Error> {
+    fn from_bytes<R: Read>(r: &mut R, format: TriePtrFormat) -> Result<TrieNode48, Error> {
         let mut ptrs_slice = [TriePtr::default(); 48];
-        ptrs_from_bytes(TrieNodeID::Node48 as u8, r, &mut ptrs_slice)?;
+        ptrs_from_bytes(TrieNodeID::Node48 as u8, r, &mut ptrs_slice, format)?;
 
         let mut indexes = [0u8; 256];
         let l_indexes = r.read(&mut indexes).map_err(Error::IOError)?;
@@ -1098,9 +1146,9 @@ impl TrieNode for TrieNode256 {
         Some(*ptr)
     }
 
-    fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode256, Error> {
+    fn from_bytes<R: Read>(r: &mut R, format: TriePtrFormat) -> Result<TrieNode256, Error> {
         let mut ptrs_slice = [TriePtr::default(); 256];
-        ptrs_from_bytes(TrieNodeID::Node256 as u8, r, &mut ptrs_slice)?;
+        ptrs_from_bytes(TrieNodeID::Node256 as u8, r, &mut ptrs_slice, format)?;
 
         let path = path_from_bytes(r)?;
 
@@ -1157,18 +1205,18 @@ impl TrieNode for TrieLeaf {
         None
     }
 
-    fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
+    fn write_bytes<W: Write>(&self, w: &mut W, _format: TriePtrFormat) -> Result<(), Error> {
         w.write_all(&[self.id()])?;
         write_path_to_bytes(&self.path, w)?;
         w.write_all(&self.data.0[..])?;
         Ok(())
     }
 
-    fn byte_len(&self) -> usize {
+    fn byte_len(&self, _format: TriePtrFormat) -> usize {
         1 + get_path_byte_len(&self.path) + self.data.len()
     }
 
-    fn from_bytes<R: Read>(r: &mut R) -> Result<TrieLeaf, Error> {
+    fn from_bytes<R: Read>(r: &mut R, _format: TriePtrFormat) -> Result<TrieLeaf, Error> {
         let mut idbuf = [0u8; 1];
         let l_idbuf = r.read(&mut idbuf).map_err(Error::IOError)?;
 
@@ -1272,8 +1320,8 @@ impl TrieNodeType {
         with_node!(self, ref data, data.walk(chr))
     }
 
-    pub fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
-        with_node!(self, ref data, data.write_bytes(w))
+    pub fn write_bytes<W: Write>(&self, w: &mut W, format: TriePtrFormat) -> Result<(), Error> {
+        with_node!(self, ref data, data.write_bytes(w, format))
     }
 
     pub fn write_consensus_bytes<W: Write, M: BlockMap>(
@@ -1284,8 +1332,8 @@ impl TrieNodeType {
         with_node!(self, ref data, data.write_consensus_bytes(map, w))
     }
 
-    pub fn byte_len(&self) -> usize {
-        with_node!(self, ref data, data.byte_len())
+    pub fn byte_len(&self, format: TriePtrFormat) -> usize {
+        with_node!(self, ref data, data.byte_len(format))
     }
 
     pub fn insert(&mut self, ptr: &TriePtr) -> bool {

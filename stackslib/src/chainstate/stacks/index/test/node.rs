@@ -30,9 +30,9 @@ fn trieptr_to_bytes() {
     let t_bytes = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa];
 
     let mut buf = Vec::new();
-    t.write_bytes(&mut buf).unwrap();
+    t.write_bytes(&mut buf, TriePtrFormat::V1U32).unwrap();
     assert_eq!(buf, t_bytes);
-    assert_eq!(TriePtr::from_bytes(&t_bytes[..]), t);
+    assert_eq!(TriePtr::from_bytes(&t_bytes[..], TriePtrFormat::V1U32), t);
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn trie_node4_to_bytes() {
         assert!(node4.insert(&TriePtr::new(
             TrieNodeID::Node16 as u8,
             (i + 1) as u8,
-            (i + 2) as u32
+            (i + 2) as u64
         )));
     }
     let node4_bytes = vec![
@@ -116,10 +116,13 @@ fn trie_node4_to_bytes() {
         0x13,
     ];
     let mut node4_stream = Cursor::new(node4_bytes.clone());
-    let buf = node4.to_bytes();
+    let buf = node4.to_bytes(TriePtrFormat::V1U32);
     assert_eq!(buf, node4_bytes);
-    assert_eq!(node4.byte_len(), node4_bytes.len());
-    assert_eq!(TrieNode4::from_bytes(&mut node4_stream).unwrap(), node4);
+    assert_eq!(node4.byte_len(TriePtrFormat::V1U32), node4_bytes.len());
+    assert_eq!(
+        TrieNode4::from_bytes(&mut node4_stream, TriePtrFormat::V1U32).unwrap(),
+        node4
+    );
 }
 
 #[test]
@@ -131,7 +134,7 @@ fn trie_node4_to_consensus_bytes() {
         assert!(node4.insert(&TriePtr::new(
             TrieNodeID::Node16 as u8,
             (i + 1) as u8,
-            (i + 2) as u32
+            (i + 2) as u64
         )));
     }
     let node4_bytes = vec![
@@ -312,7 +315,7 @@ fn trie_node16_to_bytes() {
         assert!(node16.insert(&TriePtr::new(
             TrieNodeID::Node48 as u8,
             (i + 1) as u8,
-            (i + 2) as u32
+            (i + 2) as u64
         )));
     }
     let node16_bytes = vec![
@@ -504,10 +507,13 @@ fn trie_node16_to_bytes() {
         0x13,
     ];
     let mut node16_stream = Cursor::new(node16_bytes.clone());
-    let buf = node16.to_bytes();
+    let buf = node16.to_bytes(TriePtrFormat::V1U32);
     assert_eq!(buf, node16_bytes);
-    assert_eq!(node16.byte_len(), node16_bytes.len());
-    assert_eq!(TrieNode16::from_bytes(&mut node16_stream).unwrap(), node16);
+    assert_eq!(node16.byte_len(TriePtrFormat::V1U32), node16_bytes.len());
+    assert_eq!(
+        TrieNode16::from_bytes(&mut node16_stream, TriePtrFormat::V1U32).unwrap(),
+        node16
+    );
 }
 
 #[test]
@@ -519,7 +525,7 @@ fn trie_node16_to_consensus_bytes() {
         assert!(node16.insert(&TriePtr::new(
             TrieNodeID::Node48 as u8,
             (i + 1) as u8,
-            (i + 2) as u32
+            (i + 2) as u64
         )));
     }
     let node16_bytes = vec![
@@ -1106,7 +1112,7 @@ fn trie_node48_to_bytes() {
         assert!(node48.insert(&TriePtr::new(
             TrieNodeID::Node256 as u8,
             (i + 1) as u8,
-            (i + 2) as u32
+            (i + 2) as u64
         )));
     }
 
@@ -1877,10 +1883,13 @@ fn trie_node48_to_bytes() {
     ];
     let mut node48_stream = Cursor::new(node48_bytes.clone());
 
-    let buf = node48.to_bytes();
+    let buf = node48.to_bytes(TriePtrFormat::V1U32);
     assert_eq!(buf, node48_bytes);
-    assert_eq!(node48.byte_len(), node48_bytes.len());
-    assert_eq!(TrieNode48::from_bytes(&mut node48_stream).unwrap(), node48);
+    assert_eq!(node48.byte_len(TriePtrFormat::V1U32), node48_bytes.len());
+    assert_eq!(
+        TrieNode48::from_bytes(&mut node48_stream, TriePtrFormat::V1U32).unwrap(),
+        node48
+    );
 }
 
 #[test]
@@ -1892,7 +1901,7 @@ fn trie_node48_to_consensus_bytes() {
         assert!(node48.insert(&TriePtr::new(
             TrieNodeID::Node256 as u8,
             (i + 1) as u8,
-            (i + 2) as u32
+            (i + 2) as u64
         )));
     }
     let node48_bytes = vec![
@@ -3614,11 +3623,11 @@ fn trie_node256_to_bytes() {
 
     let mut node256_stream = Cursor::new(node256_bytes.clone());
 
-    let buf = node256.to_bytes();
+    let buf = node256.to_bytes(TriePtrFormat::V1U32);
     assert_eq!(buf, node256_bytes);
-    assert_eq!(node256.byte_len(), node256_bytes.len());
+    assert_eq!(node256.byte_len(TriePtrFormat::V1U32), node256_bytes.len());
     assert_eq!(
-        TrieNode256::from_bytes(&mut node256_stream).unwrap(),
+        TrieNode256::from_bytes(&mut node256_stream, TriePtrFormat::V1U32).unwrap(),
         node256
     );
 }
@@ -3811,10 +3820,10 @@ fn trie_leaf_to_bytes() {
         39,
     ];
 
-    let buf = leaf.to_bytes();
+    let buf = leaf.to_bytes(TriePtrFormat::V1U32);
 
     assert_eq!(buf, leaf_bytes);
-    assert_eq!(leaf.byte_len(), buf.len());
+    assert_eq!(leaf.byte_len(TriePtrFormat::V1U32), buf.len());
 }
 
 #[test]
@@ -3826,7 +3835,7 @@ fn read_write_node4() {
         assert!(node4.insert(&TriePtr::new(
             TrieNodeID::Node16 as u8,
             (i + 1) as u8,
-            (i + 2) as u32
+            (i + 2) as u64
         )));
     }
     let marf_opts = MARFOpenOpts::default();
@@ -3855,7 +3864,7 @@ fn read_write_node16() {
         assert!(node16.insert(&TriePtr::new(
             TrieNodeID::Node48 as u8,
             (i + 1) as u8,
-            (i + 2) as u32
+            (i + 2) as u64
         )));
     }
 
@@ -3885,7 +3894,7 @@ fn read_write_node48() {
         assert!(node48.insert(&TriePtr::new(
             TrieNodeID::Node256 as u8,
             (i + 1) as u8,
-            (i + 2) as u32
+            (i + 2) as u64
         )));
     }
 
@@ -3915,7 +3924,7 @@ fn read_write_node256() {
         assert!(node256.insert(&TriePtr::new(
             TrieNodeID::Node256 as u8,
             (i + 1) as u8,
-            (i + 2) as u32
+            (i + 2) as u64
         )));
     }
 

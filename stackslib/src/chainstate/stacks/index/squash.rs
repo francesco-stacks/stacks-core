@@ -33,7 +33,9 @@ use crate::chainstate::stacks::index::bits::get_leaf_hash;
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, MARF,
 };
-use crate::chainstate::stacks::index::node::{is_backptr, TrieNodeID, TrieNodeType, TriePtr};
+use crate::chainstate::stacks::index::node::{
+    is_backptr, TrieNodeID, TrieNodeType, TriePtr, TriePtrFormat,
+};
 use crate::chainstate::stacks::index::storage::{
     SquashInfo, TrieFileStorage, TrieStorageConnection,
 };
@@ -526,6 +528,7 @@ impl<T: MarfTrieId> MARF<T> {
             squash_root_node_hash,
             height,
             block_hash: block_at_height.clone(),
+            ptr_format: TriePtrFormat::V2U64,
         }));
 
         // Step 7: commit
@@ -556,13 +559,13 @@ impl<T: MarfTrieId> MARF<T> {
     fn collect_all_nodes(
         source: &mut TrieStorageConnection<T>,
         block_hash: &T,
-    ) -> Result<(Vec<CollectedNode>, HashMap<(u32, u32), usize>), Error> {
+    ) -> Result<(Vec<CollectedNode>, HashMap<(u32, u64), usize>), Error> {
         source.open_block(block_hash)?;
         let (root_node, root_hash) = Trie::read_root(source)?;
         let root_block_id = source.get_cur_block_identifier()?;
 
         let mut nodes: Vec<CollectedNode> = Vec::new();
-        let mut source_to_idx: HashMap<(u32, u32), usize> = HashMap::new();
+        let mut source_to_idx: HashMap<(u32, u64), usize> = HashMap::new();
 
         let root_disk_ptr = TrieStorageConnection::<T>::root_ptr_disk();
         source_to_idx.insert((root_block_id, root_disk_ptr), 0);
@@ -648,7 +651,7 @@ impl<T: MarfTrieId> MARF<T> {
     ///   present in the single shared trie storage).
     fn deep_copy_remap(
         nodes: &mut [CollectedNode],
-        source_to_idx: &HashMap<(u32, u32), usize>,
+        source_to_idx: &HashMap<(u32, u64), usize>,
         block_id_map: &HashMap<u32, u32>,
     ) -> Result<(), Error> {
         use crate::chainstate::stacks::index::node::clear_backptr;
@@ -713,7 +716,7 @@ impl<T: MarfTrieId> MARF<T> {
                             "deep_copy remap: slot {slot} out of bounds for node at {idx}"
                         ))
                     })?;
-                p.ptr = child_idx as u32;
+                p.ptr = child_idx as u64;
                 p.id = clear_backptr(p.id);
 
                 if was_backptr {
