@@ -14,9 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#![allow(unused_variables)]
-#![allow(unused_assignments)]
-
 use std::io::Cursor;
 
 use super::*;
@@ -5051,4 +5048,276 @@ fn trie_cursor_walk_32() {
     assert!(c.eonp(&c.node().unwrap()));
 
     dump_trie(&mut trie_io);
+}
+
+#[test]
+fn trie_ptr_compressed_size_for_id() {
+    let normal_node_id = TrieNodeID::Node4 as u8;
+    assert_eq!(
+        TriePtrFormat::V1U32.encoded_size_compressed(),
+        TriePtr::compressed_size_for_id(normal_node_id, TriePtrFormat::V1U32)
+    );
+    assert_eq!(
+        TriePtrFormat::V2U64.encoded_size_compressed(),
+        TriePtr::compressed_size_for_id(normal_node_id, TriePtrFormat::V2U64)
+    );
+
+    let backptr_node_id = set_backptr(normal_node_id);
+    assert_eq!(
+        TriePtrFormat::V1U32.encoded_size(),
+        TriePtr::compressed_size_for_id(backptr_node_id, TriePtrFormat::V1U32)
+    );
+    assert_eq!(
+        TriePtrFormat::V2U64.encoded_size(),
+        TriePtr::compressed_size_for_id(backptr_node_id, TriePtrFormat::V2U64)
+    );
+}
+
+#[test]
+fn trie_ptr_compressed_size() {
+    let normal_node = TriePtr::new(TrieNodeID::Node4 as u8, 0x00, 0);
+    assert_eq!(
+        TriePtrFormat::V1U32.encoded_size_compressed(),
+        normal_node.compressed_size(TriePtrFormat::V1U32)
+    );
+    assert_eq!(10, normal_node.compressed_size(TriePtrFormat::V2U64));
+
+    let backptr_node = TriePtr::new_backptr(TrieNodeID::Node4 as u8, 0x00, 0, 1);
+    assert_eq!(
+        TriePtrFormat::V1U32.encoded_size(),
+        backptr_node.compressed_size(TriePtrFormat::V1U32)
+    );
+    assert_eq!(
+        TriePtrFormat::V2U64.encoded_size(),
+        backptr_node.compressed_size(TriePtrFormat::V2U64)
+    );
+}
+
+#[test]
+fn trieptr_v2_uncompressed_roundtrip_boundaries() {
+    let ptr_values = [
+        0u64,
+        u64::from(u32::MAX),
+        u64::from(u32::MAX) + 1,
+        (1u64 << 40) + 0x1234,
+    ];
+
+    for ptr_value in ptr_values {
+        let ptr = TriePtr::new(TrieNodeID::Node16 as u8, 0x2a, ptr_value);
+        let mut bytes = vec![];
+        ptr.write_bytes(&mut bytes, TriePtrFormat::V2U64).unwrap();
+
+        let mut expected = vec![TrieNodeID::Node16 as u8, 0x2a];
+        expected.extend_from_slice(&ptr_value.to_be_bytes());
+        expected.extend_from_slice(&0u32.to_be_bytes());
+
+        assert_eq!(expected, bytes);
+        assert_eq!(ptr, TriePtr::from_bytes(&bytes, TriePtrFormat::V2U64));
+    }
+}
+
+#[test]
+fn trieptr_v2_compressed_roundtrip_non_backptr() {
+    let ptr_values = [
+        0u64,
+        u64::from(u32::MAX),
+        u64::from(u32::MAX) + 1,
+        (1u64 << 56) - 3,
+    ];
+
+    for ptr_value in ptr_values {
+        let ptr = TriePtr::new(TrieNodeID::Node4 as u8, 0x42, ptr_value);
+        let mut bytes = vec![];
+        ptr.write_bytes_compressed(&mut bytes, TriePtrFormat::V2U64)
+            .unwrap();
+
+        assert_eq!(TriePtrFormat::V2U64.encoded_size_compressed(), bytes.len());
+        assert_eq!(set_compressed(TrieNodeID::Node4 as u8), bytes[0]);
+        assert_eq!(
+            ptr,
+            TriePtr::from_bytes_compressed(&bytes, TriePtrFormat::V2U64)
+        );
+        assert_eq!(
+            ptr,
+            TriePtr::read_bytes_compressed(&mut Cursor::new(&bytes), TriePtrFormat::V2U64).unwrap()
+        );
+    }
+}
+
+#[test]
+fn trieptr_v2_compressed_roundtrip_backptr() {
+    let ptr = TriePtr::new_backptr(
+        TrieNodeID::Node48 as u8,
+        0x7f,
+        u64::from(u32::MAX) + 123,
+        0x01020304,
+    );
+
+    let mut bytes = vec![];
+    ptr.write_bytes_compressed(&mut bytes, TriePtrFormat::V2U64)
+        .unwrap();
+
+    assert_eq!(TriePtrFormat::V2U64.encoded_size(), bytes.len());
+    assert_eq!(
+        ptr,
+        TriePtr::from_bytes_compressed(&bytes, TriePtrFormat::V2U64)
+    );
+    assert_eq!(
+        ptr,
+        TriePtr::read_bytes_compressed(&mut Cursor::new(&bytes), TriePtrFormat::V2U64).unwrap()
+    );
+}
+
+#[test]
+fn trieptr_v1_uncompressed_overflow_rejected() {
+    let ptr = TriePtr::new(TrieNodeID::Node4 as u8, 0x1, u64::from(u32::MAX) + 1);
+    let mut bytes = vec![];
+    let err = ptr
+        .write_bytes(&mut bytes, TriePtrFormat::V1U32)
+        .expect_err("v1 should not encode ptr values > u32::MAX");
+    assert!(
+        matches!(err, Error::CorruptionError(ref msg) if msg.contains("v1 u32 format")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn trieptr_v1_compressed_overflow_rejected() {
+    let ptr = TriePtr::new(TrieNodeID::Node4 as u8, 0x1, u64::from(u32::MAX) + 1);
+    let mut bytes = vec![];
+    let err = ptr
+        .write_bytes_compressed(&mut bytes, TriePtrFormat::V1U32)
+        .expect_err("v1 compressed should not encode ptr values > u32::MAX");
+    assert!(
+        matches!(err, Error::CorruptionError(ref msg) if msg.contains("compressed ptr") && msg.contains("v1 u32 format")),
+        "unexpected error: {err:?}"
+    );
+}
+
+fn decode_node4_ptrs_from_compressed_bytes(
+    format: TriePtrFormat,
+    ptrs: &[TriePtr],
+) -> (Vec<u8>, Vec<TriePtr>, Vec<TriePtr>, u64, u64) {
+    let mut node4 = TrieNode4::new(&[]);
+    for ptr in ptrs.iter() {
+        if ptr.id() != TrieNodeID::Empty as u8 {
+            assert!(node4.insert(ptr));
+        }
+    }
+    let expected_ptrs = node4.ptrs().to_vec();
+
+    let mut encoded = vec![];
+    node4
+        .write_bytes_compressed(&mut encoded, format)
+        .expect("node4 encode");
+
+    let mut decoded_ptrs = vec![TriePtr::default(); 4];
+    let mut cursor = Cursor::new(encoded.clone());
+    let decoded_node_id =
+        ptrs_from_bytes(encoded[0], &mut cursor, &mut decoded_ptrs, format).expect("node4 decode");
+
+    assert_eq!(TrieNodeID::Node4 as u8, decoded_node_id);
+    let expected_consumed = u64::try_from(get_ptrs_byte_len_compressed(
+        TrieNodeID::Node4 as u8,
+        &expected_ptrs,
+        format,
+    ))
+    .expect("infallible");
+    (
+        encoded,
+        expected_ptrs,
+        decoded_ptrs,
+        cursor.position(),
+        expected_consumed,
+    )
+}
+
+#[test]
+fn ptrs_from_bytes_compressed_sparse_matrix_v1_v2() {
+    for format in [TriePtrFormat::V1U32, TriePtrFormat::V2U64] {
+        let sparse_ptrs = [
+            TriePtr::new_backptr(TrieNodeID::Node4 as u8, 0x10, 99, 7),
+            TriePtr::new(TrieNodeID::Empty as u8, 0x00, 0),
+            TriePtr::new(TrieNodeID::Node16 as u8, 0x30, 12345),
+            TriePtr::new(TrieNodeID::Empty as u8, 0x00, 0),
+        ];
+
+        let (encoded, expected, decoded, cursor_pos, expected_consumed) =
+            decode_node4_ptrs_from_compressed_bytes(format, &sparse_ptrs);
+        assert!(is_compressed(encoded[0]));
+        assert_eq!(
+            crate::chainstate::stacks::index::bits::SPARSE_PTR_BITMAP_MARKER,
+            encoded[1]
+        );
+        assert_eq!(expected, decoded);
+        assert_eq!(expected_consumed, cursor_pos);
+    }
+}
+
+#[test]
+fn ptrs_from_bytes_compressed_dense_matrix_v1_v2() {
+    for format in [TriePtrFormat::V1U32, TriePtrFormat::V2U64] {
+        let dense_ptrs = [
+            TriePtr::new(TrieNodeID::Node4 as u8, 0x01, 1),
+            TriePtr::new_backptr(TrieNodeID::Node16 as u8, 0x02, 2, 9),
+            TriePtr::new(TrieNodeID::Node48 as u8, 0x03, 3),
+            TriePtr::new_backptr(TrieNodeID::Node256 as u8, 0x04, 4, 11),
+        ];
+
+        let (encoded, expected, decoded, cursor_pos, expected_consumed) =
+            decode_node4_ptrs_from_compressed_bytes(format, &dense_ptrs);
+        assert!(is_compressed(encoded[0]));
+        assert_ne!(
+            crate::chainstate::stacks::index::bits::SPARSE_PTR_BITMAP_MARKER,
+            encoded[1]
+        );
+        assert_eq!(expected, decoded);
+        assert_eq!(expected_consumed, cursor_pos);
+    }
+}
+
+#[test]
+fn test_node_copy_update_ptrs_preserves_nonzero_back_block() {
+    use crate::chainstate::stacks::index::node::node_copy_update_ptrs;
+
+    // Inline pointer with back_block = 0 (normal archival case) — should be overwritten
+    let mut ptrs = [TriePtr::new(TrieNodeID::Node4 as u8, 0x10, 100)];
+    assert_eq!(ptrs[0].back_block, 0);
+    node_copy_update_ptrs(&mut ptrs, 42);
+    assert!(is_backptr(ptrs[0].id()));
+    assert_eq!(ptrs[0].back_block, 42);
+    assert_eq!(ptrs[0].chr(), 0x10);
+    assert_eq!(ptrs[0].ptr(), 100);
+
+    // Inline pointer with back_block != 0 (squash annotation) — should be preserved
+    let mut ptrs = [TriePtr {
+        id: TrieNodeID::Node4 as u8,
+        chr: 0x20,
+        ptr: 200,
+        back_block: 99,
+    }];
+    node_copy_update_ptrs(&mut ptrs, 42);
+    assert!(is_backptr(ptrs[0].id()));
+    assert_eq!(
+        ptrs[0].back_block, 99,
+        "squash annotation must be preserved"
+    );
+    assert_eq!(ptrs[0].chr(), 0x20);
+    assert_eq!(ptrs[0].ptr(), 200);
+
+    // Empty pointer — should be untouched
+    let mut ptrs = [TriePtr::default()];
+    node_copy_update_ptrs(&mut ptrs, 42);
+    assert_eq!(ptrs[0], TriePtr::default());
+
+    // Already a backptr — should be skipped entirely
+    let orig = TriePtr {
+        id: set_backptr(TrieNodeID::Node16 as u8),
+        chr: 0x30,
+        ptr: 300,
+        back_block: 7,
+    };
+    let mut ptrs = [orig];
+    node_copy_update_ptrs(&mut ptrs, 42);
+    assert_eq!(ptrs[0], orig, "existing backptr must not be touched");
 }

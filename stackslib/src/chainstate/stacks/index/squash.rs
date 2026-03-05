@@ -33,9 +33,7 @@ use crate::chainstate::stacks::index::bits::get_leaf_hash;
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, MARF,
 };
-use crate::chainstate::stacks::index::node::{
-    is_backptr, TrieNodeID, TrieNodeType, TriePtr, TriePtrFormat,
-};
+use crate::chainstate::stacks::index::node::{is_backptr, TrieNodeID, TrieNodeType, TriePtr};
 use crate::chainstate::stacks::index::storage::{
     SquashInfo, TrieFileStorage, TrieStorageConnection,
 };
@@ -421,8 +419,8 @@ impl<T: MarfTrieId> MARF<T> {
     /// Backpointer identity is preserved via `TriePtr.back_block` annotations.
     /// Children that were backpointers in the archival MARF are stored inline in
     /// the blob but with `back_block` set to the squashed DB's local_id for the
-    /// original block.  When the squashed MARF is extended to height H+1, the
-    /// modified `node_copy_update_ptrs` preserves these annotations, ensuring
+    /// original block.  When the squashed MARF is extended to height H+1,
+    /// `node_copy_update_ptrs` preserves these annotations, ensuring
     /// that `inner_write_children_hashes` uses the same `StacksBlockId` values
     /// as the archival MARF.  This guarantees identical per-block root hashes.
     pub fn squash_to_path(
@@ -528,7 +526,6 @@ impl<T: MarfTrieId> MARF<T> {
             squash_root_node_hash,
             height,
             block_hash: block_at_height.clone(),
-            ptr_format: TriePtrFormat::V2U64,
         }));
 
         // Step 7: commit
