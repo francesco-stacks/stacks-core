@@ -18,10 +18,11 @@ use std::ops::DerefMut;
 use std::sync::LazyLock;
 use std::time::Instant;
 
-use clarity::types::chainstate::TRIEHASH_ENCODED_SIZE;
 #[cfg(any(test, feature = "testing"))]
 use clarity::util::tests::TestFlag;
 use rusqlite::{Connection, Transaction};
+use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
+use stacks_common::util::hash::Sha512Trunc256Sum;
 
 pub use super::squash::{
     SquashStats, SquashValidationStats, MARF_SQUASHED_BLOCK_ROOT_HASH_KEY, MARF_SQUASH_HEIGHT_KEY,
@@ -39,8 +40,6 @@ use crate::chainstate::stacks::index::storage::{
 };
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{Error, MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof};
-use crate::types::chainstate::TrieHash;
-use crate::util::hash::Sha512Trunc256Sum;
 use crate::util_lib::db::Error as db_error;
 
 pub const BLOCK_HASH_TO_HEIGHT_MAPPING_KEY: &str = "__MARF_BLOCK_HASH_TO_HEIGHT";
@@ -118,7 +117,7 @@ struct WriteChainTip<T> {
 }
 
 /// Options for opening a MARF
-#[derive(Clone, Debug)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct MARFOpenOpts {
     /// Hash calculation mode for calculating a trie root hash
     pub hash_calculation_mode: TrieHashCalculationMode,
@@ -827,7 +826,7 @@ impl<T: MarfTrieId> MARF<T> {
             TrieNodeType::Leaf(leaf) => get_leaf_hash(leaf),
             _ => {
                 node_copy_update_ptrs(node.ptrs_mut(), child_block_id);
-                TrieHash::from_data(&[])
+                TrieHash::EMPTY
             }
         }
     }
@@ -1830,6 +1829,32 @@ impl<T: MarfTrieId> MARF<T> {
     where
         F: FnMut(TrieHash, MARFValue) -> Result<(), Error>,
     {
+        let (original_block_hash, original_block_id) = storage.get_cur_block_and_id();
+        let result = Self::inner_each_leaf(storage, block_hash, &mut handle_leaf);
+
+        storage
+            .open_block_maybe_id(&original_block_hash, original_block_id)
+            .inspect_err(|e| {
+                warn!("Failed to re-open {original_block_hash} {original_block_id:?}: {e:?}");
+            })?;
+
+        let (restored_block_hash, _) = storage.get_cur_block_and_id();
+        assert_eq!(
+            restored_block_hash, original_block_hash,
+            "for_each_leaf: open block changed after traversal"
+        );
+
+        result
+    }
+
+    fn inner_each_leaf<F>(
+        storage: &mut TrieStorageConnection<T>,
+        block_hash: &T,
+        handle_leaf: &mut F,
+    ) -> Result<u64, Error>
+    where
+        F: FnMut(TrieHash, MARFValue) -> Result<(), Error>,
+    {
         storage.open_block(block_hash)?;
         let (root_node, _root_hash) = Trie::read_root(storage)?;
 
@@ -1872,7 +1897,6 @@ impl<T: MarfTrieId> MARF<T> {
             }
         };
 
-        // Seed with root.
         let (cur_block, cur_id) = storage.get_cur_block_and_id();
         if process_node(root_node, vec![], cur_block, cur_id, &mut stack)? {
             leaf_count += 1;
