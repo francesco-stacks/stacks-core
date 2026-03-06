@@ -246,12 +246,15 @@ fn test_validate_squashed_correct_fast() {
 
     assert!(stats.archival_root_present, "squash root present");
     assert!(stats.archival_root_matches, "squash root matches");
+    assert!(stats.squash_node_hash_present, "squash node hash present");
+    assert!(stats.squash_node_hash_matches, "squash node hash matches");
     assert_eq!(stats.root_hash_missing, 0);
     assert_eq!(stats.root_hash_mismatches, 0);
     assert_eq!(stats.blob_offset_mismatches, 0);
     // Fast path skips leaf scan - these should be 0.
     assert_eq!(stats.source_keys_checked, 0);
     assert_eq!(stats.squashed_keys_checked, 0);
+    assert!(stats.is_valid(), "fast validation should pass");
 }
 
 #[test]
@@ -279,6 +282,8 @@ fn test_validate_squashed_correct_full() {
 
     assert!(stats.archival_root_present, "squash root present");
     assert!(stats.archival_root_matches, "squash root matches");
+    assert!(stats.squash_node_hash_present, "squash node hash present");
+    assert!(stats.squash_node_hash_matches, "squash node hash matches");
     assert_eq!(stats.root_hash_missing, 0);
     assert_eq!(stats.root_hash_mismatches, 0);
     assert_eq!(stats.blob_offset_mismatches, 0);
@@ -288,6 +293,7 @@ fn test_validate_squashed_correct_full() {
     assert_eq!(stats.value_mismatches, 0, "value mismatches");
     assert!(stats.source_keys_checked > 0);
     assert!(stats.squashed_keys_checked > 0);
+    assert!(stats.is_valid(), "full validation should pass");
 }
 
 #[test]
@@ -911,5 +917,155 @@ fn test_squashed_proof_rejected_with_wrong_trusted_hash() {
             &wrong_trusted,
         ),
         "Proof should have been rejected with a wrong trusted hash"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// squash_root_node_hash negative tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_validate_detects_tampered_squash_root_node_hash() {
+    // Squash, then mutate the SQL-stored squash_root_node_hash.
+    // Validation should report squash_node_hash_matches = false.
+    let dir = tempdir().unwrap();
+    let src_db_path = dir.path().join("index.sqlite");
+    let _ = setup_marf(src_db_path.to_str().unwrap());
+
+    let (dst_db_path, _) = squash_helper(
+        src_db_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        1,
+    );
+
+    // Tamper with the stored hash.
+    {
+        let conn = rusqlite::Connection::open(&dst_db_path).unwrap();
+        let fake_hash = vec![0xFFu8; 32];
+        conn.execute(
+            "UPDATE marf_squash_info SET squash_root_node_hash = ?1 WHERE id = 1",
+            rusqlite::params![fake_hash],
+        )
+        .unwrap();
+    }
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let stats = MARF::<StacksBlockId>::validate_squashed_at_height(
+        src_db_path.to_str().unwrap(),
+        dst_db_path.to_str().unwrap(),
+        open_opts,
+        1,
+    )
+    .unwrap();
+
+    assert!(stats.squash_node_hash_present, "hash should be present");
+    assert!(
+        !stats.squash_node_hash_matches,
+        "tampered hash must not match: {stats:?}"
+    );
+    assert!(!stats.is_valid(), "validation must fail with tampered hash");
+}
+
+#[test]
+fn test_validate_detects_cleared_squash_root_node_hash() {
+    // Clear the stored hash to NULL. Validation should report not present.
+    let dir = tempdir().unwrap();
+    let src_db_path = dir.path().join("index.sqlite");
+    let _ = setup_marf(src_db_path.to_str().unwrap());
+
+    let (dst_db_path, _) = squash_helper(
+        src_db_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        1,
+    );
+
+    {
+        let conn = rusqlite::Connection::open(&dst_db_path).unwrap();
+        conn.execute(
+            "UPDATE marf_squash_info SET squash_root_node_hash = NULL WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let stats = MARF::<StacksBlockId>::validate_squashed_at_height(
+        src_db_path.to_str().unwrap(),
+        dst_db_path.to_str().unwrap(),
+        open_opts,
+        1,
+    )
+    .unwrap();
+
+    assert!(
+        !stats.squash_node_hash_present,
+        "hash should not be present"
+    );
+    assert!(!stats.squash_node_hash_matches, "matches must be false");
+    assert!(!stats.is_valid(), "validation must fail with missing hash");
+}
+
+#[test]
+fn test_validate_detects_tampered_blob() {
+    // Squash using the larger MARF (10 blocks) for more trie data, then flip
+    // every byte in the trie region one at a time until we find one that
+    // causes detection (hash mismatch or deserialization error).
+    let dir = tempdir().unwrap();
+    let src_db_path = dir.path().join("index.sqlite");
+    let _ = setup_large_marf(src_db_path.to_str().unwrap());
+
+    let (dst_db_path, _) = squash_helper(
+        src_db_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        8,
+    );
+
+    let blobs_path = format!("{}.blobs", dst_db_path.to_str().unwrap());
+    let original_data = std::fs::read(&blobs_path).unwrap();
+    // Trie data starts after the block header hash (32 bytes) + 4 byte length prefix.
+    let trie_start = 36;
+    assert!(
+        original_data.len() > trie_start + 10,
+        "blob should have trie data (len={})",
+        original_data.len()
+    );
+
+    let mut detected = false;
+    // Try flipping each byte in the trie region until corruption is detected.
+    for offset in trie_start..original_data.len() {
+        let mut tampered = original_data.clone();
+        tampered[offset] ^= 0xFF;
+        std::fs::write(&blobs_path, &tampered).unwrap();
+
+        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+        let result = MARF::<StacksBlockId>::validate_squashed_at_height(
+            src_db_path.to_str().unwrap(),
+            dst_db_path.to_str().unwrap(),
+            open_opts,
+            8,
+        );
+
+        match result {
+            Ok(stats) => {
+                if !stats.squash_node_hash_matches || !stats.is_valid() {
+                    detected = true;
+                    break;
+                }
+            }
+            Err(_) => {
+                // Deserialization error is also detection.
+                detected = true;
+                break;
+            }
+        }
+
+        // Restore original for next iteration.
+        std::fs::write(&blobs_path, &original_data).unwrap();
+    }
+
+    assert!(
+        detected,
+        "flipping at least one trie byte must be detected (blob len={})",
+        original_data.len()
     );
 }

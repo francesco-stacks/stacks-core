@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use blockstack_lib::chainstate::stacks::db::snapshot::{
+    copy_index_side_tables, validate_index_side_tables,
+};
 use blockstack_lib::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashValidationStats, MARF,
 };
@@ -12,6 +15,7 @@ use blockstack_lib::clarity_vm::database::marf::{
     copy_clarity_side_tables, validate_clarity_side_tables,
 };
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use stacks_common::types::chainstate::StacksBlockId;
 
 /// Offline squashing CLI for Index and Clarity MARF snapshots.
@@ -119,6 +123,34 @@ struct ChainstatePaths {
     // burnchain/sortition can be added later.
 }
 
+#[derive(Serialize)]
+struct SquashManifest {
+    snapshot: SnapshotSection,
+    roots: RootsSection,
+    squash_roots: SquashRootsSection,
+}
+
+#[derive(Serialize)]
+struct SnapshotSection {
+    version: u32,
+    height: u32,
+    index_block_hash: String,
+    chain_id: u32,
+    mainnet: bool,
+}
+
+#[derive(Serialize)]
+struct RootsSection {
+    clarity_archival_marf_root_hash: String,
+    index_archival_marf_root_hash: String,
+}
+
+#[derive(Serialize)]
+struct SquashRootsSection {
+    clarity_squash_root_node_hash: Option<String>,
+    index_squash_root_node_hash: Option<String>,
+}
+
 fn chainstate_paths(root: &Path) -> ChainstatePaths {
     let clarity_db = root.join("chainstate/vm/clarity/marf.sqlite");
     let index_db = root.join("chainstate/vm/index.sqlite");
@@ -174,30 +206,52 @@ fn run_squash(args: SquashArgs) {
         std::process::exit(1);
     }
 
+    let mut all_valid = true;
+    let mut clarity_out = None;
+    let mut index_out = None;
+
     if do_clarity {
         let out = target_out_paths(&args.out_dir, &paths.clarity.db);
-        squash_one(
+        if !squash_one(
             "clarity",
             &paths.clarity,
             &out,
             args.height,
             args.skip_validate,
             args.full,
-            true,
-        );
+            SideTableMode::Clarity,
+        ) {
+            all_valid = false;
+        }
+        clarity_out = Some(out);
     }
 
     if do_index {
         let out = target_out_paths(&args.out_dir, &paths.index.db);
-        squash_one(
+        if !squash_one(
             "index",
             &paths.index,
             &out,
             args.height,
             args.skip_validate,
             args.full,
-            false,
-        );
+            SideTableMode::Index(args.height),
+        ) {
+            all_valid = false;
+        }
+        index_out = Some(out);
+    }
+
+    if !all_valid {
+        eprintln!("Validation failed for one or more targets");
+        std::process::exit(1);
+    }
+
+    // Generate squash_manifest.toml when both targets squashed and validated successfully.
+    if !args.skip_validate {
+        if let (Some(ref c_out), Some(ref i_out)) = (&clarity_out, &index_out) {
+            generate_manifest(&args.out_dir, c_out, i_out, args.height);
+        }
     }
 }
 
@@ -208,26 +262,37 @@ fn run_validate(args: ValidateArgs) {
     let squashed_paths = chainstate_paths(&args.squashed_chainstate);
     let (do_clarity, do_index) = selected_targets(args.clarity, args.index, args.all);
 
+    let mut all_valid = true;
+
     if do_clarity {
-        validate_one(
+        if !validate_one(
             "clarity",
             &source_paths.clarity,
             &squashed_paths.clarity,
             args.height,
             args.full,
-            true,
-        );
+            SideTableMode::Clarity,
+        ) {
+            all_valid = false;
+        }
     }
 
     if do_index {
-        validate_one(
+        if !validate_one(
             "index",
             &source_paths.index,
             &squashed_paths.index,
             args.height,
             args.full,
-            false,
-        );
+            SideTableMode::Index(args.height),
+        ) {
+            all_valid = false;
+        }
+    }
+
+    if !all_valid {
+        eprintln!("Validation failed for one or more targets");
+        std::process::exit(1);
     }
 }
 
@@ -280,6 +345,13 @@ fn run_latest_height(args: LatestHeightArgs) {
     println!("{height}");
 }
 
+#[derive(Clone)]
+enum SideTableMode {
+    Clarity,
+    Index(u32),
+}
+
+/// Squash a single MARF target. Returns `true` if validation passed (or was skipped).
 fn squash_one(
     label: &str,
     source: &TargetPaths,
@@ -287,8 +359,8 @@ fn squash_one(
     height: u32,
     skip_validate: bool,
     full: bool,
-    copy_clarity_tables: bool,
-) {
+    side_table_mode: SideTableMode,
+) -> bool {
     ensure_blobs_match(source.db.to_str().unwrap(), source.blobs.to_str().unwrap());
 
     if let Some(parent) = out.db.parent() {
@@ -319,21 +391,45 @@ fn squash_one(
         }
     };
 
-    if copy_clarity_tables {
-        println!("Copying Clarity side tables...");
-        match copy_clarity_side_tables(source.db.to_str().unwrap(), out.db.to_str().unwrap()) {
-            Ok(st) => {
-                println!(
-                    "Side-table copy complete: data_table={} rows, metadata_table={} rows",
-                    st.data_table_rows, st.metadata_table_rows
-                );
+    match &side_table_mode {
+        SideTableMode::Clarity => {
+            println!("Copying Clarity side tables...");
+            match copy_clarity_side_tables(source.db.to_str().unwrap(), out.db.to_str().unwrap()) {
+                Ok(st) => {
+                    println!(
+                        "Side-table copy complete: data_table={} rows, metadata_table={} rows",
+                        st.data_table_rows, st.metadata_table_rows
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Failed to copy Clarity side tables: {e:?}");
+                    eprintln!("Cleaning up output files...");
+                    let _ = fs::remove_file(&out.db);
+                    let _ = fs::remove_file(&out.blobs);
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("Failed to copy Clarity side tables: {e:?}");
-                eprintln!("Cleaning up output files...");
-                let _ = fs::remove_file(&out.db);
-                let _ = fs::remove_file(&out.blobs);
-                std::process::exit(1);
+        }
+        SideTableMode::Index(h) => {
+            println!("Copying index side tables...");
+            match copy_index_side_tables(source.db.to_str().unwrap(), out.db.to_str().unwrap(), *h)
+            {
+                Ok(st) => {
+                    println!(
+                        "Index side-table copy complete: block_headers={}, nakamoto_headers={}, payments={}, transactions={}, tenure_events={}, reward_sets={}, signer_stats={}, matured_rewards={}, burnchain_txids={}, epoch_transitions={}",
+                        st.block_headers_rows, st.nakamoto_block_headers_rows, st.payments_rows,
+                        st.transactions_rows, st.nakamoto_tenure_events_rows,
+                        st.nakamoto_reward_sets_rows, st.signer_stats_rows,
+                        st.matured_rewards_rows, st.burnchain_txids_rows, st.epoch_transitions_rows
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Failed to copy index side tables: {e:?}");
+                    eprintln!("Cleaning up output files...");
+                    let _ = fs::remove_file(&out.db);
+                    let _ = fs::remove_file(&out.blobs);
+                    std::process::exit(1);
+                }
             }
         }
     }
@@ -352,16 +448,41 @@ fn squash_one(
         ))
     };
 
-    let side_table_validation = if !skip_validate && copy_clarity_tables {
+    let (side_table_validation, clarity_side_err) = if !skip_validate
+        && matches!(side_table_mode, SideTableMode::Clarity)
+    {
         match validate_clarity_side_tables(source.db.to_str().unwrap(), out.db.to_str().unwrap()) {
-            Ok(v) => Some(v),
+            Ok(v) => (Some(v), false),
             Err(e) => {
-                eprintln!("Warning: side-table validation failed: {e:?}");
-                None
+                eprintln!("Clarity side-table validation failed: {e:?}");
+                (None, true)
             }
         }
     } else {
-        None
+        (None, false)
+    };
+
+    let index_side_valid = if !skip_validate {
+        if let SideTableMode::Index(h) = &side_table_mode {
+            match validate_index_side_tables(
+                source.db.to_str().unwrap(),
+                out.db.to_str().unwrap(),
+                *h,
+            ) {
+                Ok(v) => {
+                    print_index_side_table_validation(&v);
+                    v.is_valid()
+                }
+                Err(e) => {
+                    eprintln!("Warning: index side-table validation failed: {e:?}");
+                    false
+                }
+            }
+        } else {
+            true
+        }
+    } else {
+        true
     };
 
     let original_db_size = fs::metadata(&source.db).map(|m| m.len()).unwrap_or(0);
@@ -389,19 +510,25 @@ fn squash_one(
     println!("Savings: {savings} bytes ({savings_pct:.2}%)");
     println!("Output db: {}", out.db.display());
     println!("Output blobs: {}", out.blobs.display());
-    match validation {
-        Some(validation) => print_validation(&validation),
-        None => println!("Validation skipped"),
-    }
-    if let Some(ref sv) = side_table_validation {
+    let marf_valid = match validation {
+        Some(ref v) => {
+            print_validation(v);
+            v.is_valid()
+        }
+        None => {
+            println!("Validation skipped");
+            true
+        }
+    };
+    let side_valid = if let Some(ref sv) = side_table_validation {
         println!("Side-table validation:");
         println!(
             "  data_table rows: src={}, dst={}, match={}",
-            sv.src_data_table_rows, sv.dst_data_table_rows, sv.data_table_rows_match
+            sv.src_data_table_rows, sv.dst_data_table_rows, sv.required_data_keys_present
         );
         println!(
             "  metadata_table rows: src={}, dst={}, match={}",
-            sv.src_metadata_table_rows, sv.dst_metadata_table_rows, sv.metadata_table_rows_match
+            sv.src_metadata_table_rows, sv.dst_metadata_table_rows, sv.required_metadata_present
         );
         if sv.sample_contracts_checked > 0 {
             println!(
@@ -411,17 +538,26 @@ fn squash_one(
                 sv.sample_contracts_missing_in_data_table
             );
         }
-    }
+        println!("Side-table valid: {}", sv.is_valid());
+        sv.is_valid()
+    } else if clarity_side_err {
+        false
+    } else {
+        true
+    };
+
+    marf_valid && side_valid && index_side_valid
 }
 
+/// Validate a single MARF target. Returns `true` if all validations passed.
 fn validate_one(
     label: &str,
     source: &TargetPaths,
     squashed: &TargetPaths,
     height: u32,
     full: bool,
-    validate_clarity_tables: bool,
-) {
+    side_table_mode: SideTableMode,
+) -> bool {
     let validation = validate_or_exit(
         source.db.to_str().unwrap(),
         source.blobs.to_str().unwrap(),
@@ -434,22 +570,24 @@ fn validate_one(
     println!("Validation results for {label}:");
     print_validation(&validation);
 
-    if validate_clarity_tables {
+    let marf_valid = validation.is_valid();
+
+    let clarity_side_valid = if matches!(side_table_mode, SideTableMode::Clarity) {
         match validate_clarity_side_tables(
             source.db.to_str().unwrap(),
             squashed.db.to_str().unwrap(),
         ) {
             Ok(sv) => {
-                println!("Side-table validation:");
+                println!("Clarity side-table validation:");
                 println!(
                     "  data_table rows: src={}, dst={}, match={}",
-                    sv.src_data_table_rows, sv.dst_data_table_rows, sv.data_table_rows_match
+                    sv.src_data_table_rows, sv.dst_data_table_rows, sv.required_data_keys_present
                 );
                 println!(
                     "  metadata_table rows: src={}, dst={}, match={}",
                     sv.src_metadata_table_rows,
                     sv.dst_metadata_table_rows,
-                    sv.metadata_table_rows_match
+                    sv.required_metadata_present
                 );
                 if sv.sample_contracts_checked > 0 {
                     println!(
@@ -459,12 +597,38 @@ fn validate_one(
                         sv.sample_contracts_missing_in_data_table
                     );
                 }
+                println!("Clarity side-table valid: {}", sv.is_valid());
+                sv.is_valid()
             }
             Err(e) => {
-                eprintln!("Warning: side-table validation failed: {e:?}");
+                eprintln!("Warning: Clarity side-table validation failed: {e:?}");
+                false
             }
         }
-    }
+    } else {
+        true
+    };
+
+    let index_side_valid = if let SideTableMode::Index(h) = &side_table_mode {
+        match validate_index_side_tables(
+            source.db.to_str().unwrap(),
+            squashed.db.to_str().unwrap(),
+            *h,
+        ) {
+            Ok(v) => {
+                print_index_side_table_validation(&v);
+                v.is_valid()
+            }
+            Err(e) => {
+                eprintln!("Warning: index side-table validation failed: {e:?}");
+                false
+            }
+        }
+    } else {
+        true
+    };
+
+    marf_valid && clarity_side_valid && index_side_valid
 }
 
 fn validate_or_exit(
@@ -499,6 +663,14 @@ fn print_validation(stats: &SquashValidationStats) {
     println!("Archival root present: {}", stats.archival_root_present);
     println!("Archival root matches: {}", stats.archival_root_matches);
     println!(
+        "Squash node hash present: {}",
+        stats.squash_node_hash_present
+    );
+    println!(
+        "Squash node hash matches: {}",
+        stats.squash_node_hash_matches
+    );
+    println!(
         "Per-height root hashes missing: {}",
         stats.root_hash_missing
     );
@@ -515,6 +687,166 @@ fn print_validation(stats: &SquashValidationStats) {
         println!("  Missing in source: {}", stats.missing_in_source);
         println!("  Value mismatches: {}", stats.value_mismatches);
     }
+    println!("Valid: {}", stats.is_valid());
+}
+
+fn print_index_side_table_validation(
+    v: &blockstack_lib::chainstate::stacks::db::snapshot::IndexSideTableValidation,
+) {
+    println!("Index side-table validation:");
+    println!("  tables_present: {}", v.tables_present);
+    println!("  db_config_matches: {}", v.db_config_matches);
+    println!(
+        "  block_headers_count_match: {}",
+        v.block_headers_count_match
+    );
+    println!(
+        "  nakamoto_headers_count_match: {}",
+        v.nakamoto_headers_count_match
+    );
+    println!("  payments_count_match: {}", v.payments_count_match);
+    println!("  transactions_count_match: {}", v.transactions_count_match);
+    println!(
+        "  nakamoto_tenure_events_count_match: {}",
+        v.nakamoto_tenure_events_count_match
+    );
+    println!(
+        "  nakamoto_reward_sets_count_match: {}",
+        v.nakamoto_reward_sets_count_match
+    );
+    println!("  signer_stats_count_match: {}", v.signer_stats_count_match);
+    println!(
+        "  matured_rewards_count_match: {}",
+        v.matured_rewards_count_match
+    );
+    println!(
+        "  burnchain_txids_count_match: {}",
+        v.burnchain_txids_count_match
+    );
+    println!(
+        "  epoch_transitions_count_match: {}",
+        v.epoch_transitions_count_match
+    );
+    println!("  staging_tables_empty: {}", v.staging_tables_empty);
+    println!(
+        "  transactions_no_extra_blocks: {}",
+        v.transactions_no_extra_blocks
+    );
+    println!(
+        "  tenure_events_no_extra_blocks: {}",
+        v.tenure_events_no_extra_blocks
+    );
+    println!("  Index side-table valid: {}", v.is_valid());
+}
+
+/// Read squash metadata from a just-squashed MARF DB.
+/// Must be called immediately after squash+validate, before any extension.
+/// Returns (block_hash, archival_root_hash, squash_root_node_hash, height).
+fn read_squash_metadata(db_path: &str) -> (StacksBlockId, String, Option<String>, u32) {
+    let open_opts = default_open_opts();
+    let marf = MARF::<StacksBlockId>::from_path(db_path, open_opts).unwrap_or_else(|e| {
+        eprintln!("Failed to open squashed MARF for manifest: {e:?}");
+        std::process::exit(1);
+    });
+    let tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read latest block hash: {e:?}");
+            std::process::exit(1);
+        });
+    let squash_info = trie_sql::read_squash_info(marf.sqlite_conn()).unwrap_or_else(|e| {
+        eprintln!("Failed to read squash info: {e:?}");
+        std::process::exit(1);
+    });
+    match squash_info {
+        Some((archival_hash, squash_hash, height)) => (
+            tip,
+            format!("0x{archival_hash}"),
+            squash_hash.map(|h| format!("0x{h}")),
+            height,
+        ),
+        None => {
+            eprintln!("No squash info found in DB");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Generate `squash_manifest.toml` after both MARFs have been squashed.
+fn generate_manifest(
+    out_dir: &Path,
+    clarity_out: &TargetPaths,
+    index_out: &TargetPaths,
+    height: u32,
+) {
+    let (c_tip, c_archival, c_squash, c_height) =
+        read_squash_metadata(clarity_out.db.to_str().unwrap());
+    let (i_tip, i_archival, i_squash, i_height) =
+        read_squash_metadata(index_out.db.to_str().unwrap());
+
+    if c_height != height {
+        eprintln!("Manifest error: Clarity squash height {c_height} != requested {height}");
+        std::process::exit(1);
+    }
+    if i_height != height {
+        eprintln!("Manifest error: Index squash height {i_height} != requested {height}");
+        std::process::exit(1);
+    }
+    if c_tip != i_tip {
+        eprintln!("Manifest error: Clarity tip {c_tip} != Index tip {i_tip}");
+        std::process::exit(1);
+    }
+
+    // Read db_config from the squashed index DB (side tables were copied there).
+    let (chain_id, mainnet) = {
+        let conn = rusqlite::Connection::open(index_out.db.to_str().unwrap()).unwrap_or_else(|e| {
+            eprintln!("Failed to open index DB for db_config: {e}");
+            std::process::exit(1);
+        });
+        let row: (i64, i64) = conn
+            .query_row(
+                "SELECT chain_id, mainnet FROM db_config LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to read db_config: {e}");
+                std::process::exit(1);
+            });
+        (row.0 as u32, row.1 != 0)
+    };
+
+    let manifest = SquashManifest {
+        snapshot: SnapshotSection {
+            version: 1,
+            height,
+            index_block_hash: format!("0x{c_tip}"),
+            chain_id,
+            mainnet,
+        },
+        roots: RootsSection {
+            clarity_archival_marf_root_hash: c_archival,
+            index_archival_marf_root_hash: i_archival,
+        },
+        squash_roots: SquashRootsSection {
+            clarity_squash_root_node_hash: c_squash,
+            index_squash_root_node_hash: i_squash,
+        },
+    };
+
+    let toml_str = toml::to_string(&manifest).unwrap_or_else(|e| {
+        eprintln!("Failed to serialize manifest: {e}");
+        std::process::exit(1);
+    });
+
+    let manifest_path = out_dir.join("squash_manifest.toml");
+    fs::write(&manifest_path, toml_str).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to write manifest to '{}': {e}",
+            manifest_path.display()
+        );
+        std::process::exit(1);
+    });
+    println!("Manifest written to {}", manifest_path.display());
 }
 
 fn ensure_blobs_match(db_path: &str, blobs_path: &str) {

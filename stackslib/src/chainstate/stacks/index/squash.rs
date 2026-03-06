@@ -224,6 +224,12 @@ pub struct SquashValidationStats {
     /// Number of historical `marf_data` entries that do NOT share the
     /// tip block's blob offset (should be 0 for a correct squash).
     pub blob_offset_mismatches: u64,
+    /// Whether the `squash_root_node_hash` was found in SQL metadata
+    /// (a `TrieHash::from_data(&[])` value counts as absent).
+    pub squash_node_hash_present: bool,
+    /// Whether the stored `squash_root_node_hash` matches the value
+    /// recomputed from the committed squash trie blob (BFS walk + bottom-up hash).
+    pub squash_node_hash_matches: bool,
 
     // --- Full leaf scan (only populated when full_leaf_scan = true) ---
     /// Total keys compared from the source MARF (0 when fast-only).
@@ -236,6 +242,29 @@ pub struct SquashValidationStats {
     pub missing_in_source: u64,
     /// Keys present in both but with different values (0 when fast-only).
     pub value_mismatches: u64,
+}
+
+impl SquashValidationStats {
+    /// Returns `true` if all validation checks passed.
+    pub fn is_valid(&self) -> bool {
+        let fast_valid = self.archival_root_present
+            && self.archival_root_matches
+            && self.squash_node_hash_present
+            && self.squash_node_hash_matches
+            && self.root_hash_missing == 0
+            && self.root_hash_mismatches == 0
+            && self.blob_offset_mismatches == 0;
+
+        // If a full leaf scan was performed (either direction checked any keys),
+        // also validate the leaf-level results.
+        let full_scan_performed = self.source_keys_checked > 0 || self.squashed_keys_checked > 0;
+        let leaf_valid = !full_scan_performed
+            || (self.missing_in_squashed == 0
+                && self.missing_in_source == 0
+                && self.value_mismatches == 0);
+
+        fast_valid && leaf_valid
+    }
 }
 
 /// Step 1: Build an in-memory block_map from all `marf_data` entries.
@@ -797,6 +826,8 @@ impl<T: MarfTrieId> MARF<T> {
             root_hash_missing: 0,
             root_hash_mismatches: 0,
             blob_offset_mismatches: 0,
+            squash_node_hash_present: false,
+            squash_node_hash_matches: false,
             source_keys_checked: 0,
             squashed_keys_checked: 0,
             missing_in_squashed: 0,
@@ -878,16 +909,87 @@ impl<T: MarfTrieId> MARF<T> {
             None => src.get_root_hash_at(&source_block_at_height)?,
         };
 
-        // Check 2: Squash metadata in SQL (O(1))
+        // Check 2: Squash metadata in SQL
         let sql_squash_info = trie_sql::read_squash_info(squashed.sqlite_conn())?;
-        match sql_squash_info {
-            Some((archival_marf_root_hash, _squash_root_node_hash, _height)) => {
+        let stored_squash_node_hash = match sql_squash_info {
+            Some((archival_marf_root_hash, squash_root_node_hash, _height)) => {
                 stats.archival_root_present = true;
                 stats.archival_root_matches = archival_marf_root_hash == expected_squash_root;
+                squash_root_node_hash
             }
             None => {
                 stats.archival_root_present = false;
                 stats.archival_root_matches = false;
+                None
+            }
+        };
+
+        // Check 2b: Validate squash_root_node_hash by recomputing from blob
+        let empty_hash = TrieHash::from_data(&[]);
+        match stored_squash_node_hash {
+            Some(stored_hash) if stored_hash != empty_hash => {
+                stats.squash_node_hash_present = true;
+                let start_node_hash = Instant::now();
+                info!("Validate: recomputing squash_root_node_hash from blob (BFS walk)...");
+                let (mut nodes, source_to_idx) = squashed
+                    .with_conn(|conn| Self::collect_all_nodes(conn, &squashed_block_at_height))?;
+                // Remap child pointers from blob offsets to array indices.
+                // collect_all_nodes returns nodes keyed by (block_id, ptr_offset)
+                // but recompute_content_hashes expects ptr fields to be array indices.
+                for idx in 0..nodes.len() {
+                    let node = nodes.get(idx).ok_or_else(|| {
+                        Error::CorruptionError(format!("node index {idx} out of bounds"))
+                    })?;
+                    if node.0.is_leaf() {
+                        continue;
+                    }
+                    let origin_block_id = node.2;
+                    let child_ptrs: Vec<TriePtr> = node.0.ptrs().to_vec();
+                    for (slot, ptr) in child_ptrs.iter().enumerate() {
+                        if ptr.id() == TrieNodeID::Empty as u8 {
+                            continue;
+                        }
+                        let (child_block_id, read_ptr) = if is_backptr(ptr.id()) {
+                            (ptr.back_block(), ptr.from_backptr().ptr())
+                        } else {
+                            (origin_block_id, ptr.ptr())
+                        };
+                        let source_key = (child_block_id, read_ptr);
+                        if let Some(&child_idx) = source_to_idx.get(&source_key) {
+                            let node_mut = nodes.get_mut(idx).ok_or_else(|| {
+                                Error::CorruptionError(format!("node index {idx} out of bounds"))
+                            })?;
+                            let ptrs_mut = node_mut.0.ptrs_mut();
+                            let ptr_entry = ptrs_mut.get_mut(slot).ok_or_else(|| {
+                                Error::CorruptionError(format!(
+                                    "slot {slot} out of bounds at node {idx}"
+                                ))
+                            })?;
+                            ptr_entry.ptr = child_idx as u64;
+                        } else {
+                            return Err(Error::CorruptionError(format!(
+                                "squash_root_node_hash validation: unresolved child pointer \
+                                 (block_id={child_block_id}, offset={read_ptr}) at node {idx} slot {slot}"
+                            )));
+                        }
+                    }
+                }
+                recompute_content_hashes(&mut nodes)?;
+                let recomputed_hash = nodes
+                    .first()
+                    .map(|(_, hash, _)| *hash)
+                    .unwrap_or(empty_hash);
+                stats.squash_node_hash_matches = recomputed_hash == stored_hash;
+                info!(
+                    "Validate squash_root_node_hash: {} nodes, matches={}, {:?}",
+                    nodes.len(),
+                    stats.squash_node_hash_matches,
+                    start_node_hash.elapsed()
+                );
+            }
+            _ => {
+                stats.squash_node_hash_present = false;
+                stats.squash_node_hash_matches = false;
             }
         }
 

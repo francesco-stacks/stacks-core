@@ -1516,10 +1516,9 @@ fn collect_trie_value_hashes_for_block(
 /// Validate that a squashed Clarity MARF's side tables match the source.
 ///
 /// Checks:
-/// - `data_table` row count matches.
-/// - `metadata_table` row count matches.
-/// - A sample of `MARFValue` hashes from squashed trie leaves resolve in the
-///   squashed `data_table`.
+/// - All trie-referenced `data_table` keys are present in the destination.
+/// - All required `metadata_table` rows (exhaustive across all contracts) are present.
+/// - A diagnostic sample of contracts is reported for troubleshooting.
 ///
 /// Returns [`ClaritySideTableValidation`] with detailed results.
 pub fn validate_clarity_side_tables(
@@ -1548,10 +1547,10 @@ pub fn validate_clarity_side_tables(
     let dst_meta_rows: u64 =
         dst_conn.query_row("SELECT COUNT(*) FROM metadata_table", [], |row| row.get(0))?;
 
-    // Sample check: take up to N contract identifiers from metadata_table,
-    // derive their contract-hash keys, then ensure the trie values exist
-    // and their hashed values are present in the destination data_table.
+    // Collect ALL unique contract identifiers from metadata_table in scan order.
+    // We keep both a Vec (for deterministic sample order) and a HashSet (for dedup).
     const SAMPLE_CONTRACT_LIMIT: usize = 20;
+    let mut all_contract_ids_ordered: Vec<String> = Vec::new();
     let mut contract_ids: HashSet<String> = HashSet::new();
     {
         let mut stmt = src_conn
@@ -1561,29 +1560,34 @@ pub fn validate_clarity_side_tables(
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(Error::SQLError)?;
         for row in rows {
-            if contract_ids.len() >= SAMPLE_CONTRACT_LIMIT {
-                break;
-            }
             if let Ok(key) = row {
                 if let Some(rest) = key.strip_prefix("clr-meta::") {
                     if let Some((contract_id, _meta_key)) = rest.split_once("::") {
-                        contract_ids.insert(contract_id.to_string());
+                        if contract_ids.insert(contract_id.to_string()) {
+                            all_contract_ids_ordered.push(contract_id.to_string());
+                        }
                     }
                 }
             }
         }
     }
+    // Diagnostic sample: first N unique contracts in scan order.
+    let sample_contract_ids: Vec<&str> = all_contract_ids_ordered
+        .iter()
+        .take(SAMPLE_CONTRACT_LIMIT)
+        .map(|s| s.as_str())
+        .collect();
 
     let mut sample_contracts_checked: u64 = 0;
     let mut sample_contracts_missing_in_trie: u64 = 0;
     let mut sample_contracts_missing_in_data_table: u64 = 0;
 
-    if !contract_ids.is_empty() {
+    if !sample_contract_ids.is_empty() {
         let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
         let mut marf = MARF::<StacksBlockId>::from_path(dst_db_path, open_opts)?;
         let tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())?;
 
-        for contract_id in contract_ids.iter() {
+        for contract_id in sample_contract_ids.iter() {
             sample_contracts_checked += 1;
             let contract = clarity::vm::types::QualifiedContractIdentifier::parse(contract_id)
                 .map_err(|e| {
@@ -1642,13 +1646,14 @@ pub fn validate_clarity_side_tables(
         .map_err(Error::SQLError)?;
 
     // Required metadata rows: those whose contract commitment exists in the trie.
+    // Uses the FULL set of contract IDs (not the sample) for exhaustive validation.
     let mut required_contract_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     {
         let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
         let mut marf = MARF::<StacksBlockId>::from_path(dst_db_path, open_opts)?;
         let tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())?;
-        for contract_id in contract_ids.iter() {
+        for contract_id in all_contract_ids_ordered.iter() {
             let contract = clarity::vm::types::QualifiedContractIdentifier::parse(contract_id)
                 .map_err(|e| {
                     Error::CorruptionError(format!(
@@ -1697,10 +1702,10 @@ pub fn validate_clarity_side_tables(
     }
 
     Ok(ClaritySideTableValidation {
-        data_table_rows_match: missing_required_data_table_keys == 0,
+        required_data_keys_present: missing_required_data_table_keys == 0,
         src_data_table_rows: src_data_rows,
         dst_data_table_rows: dst_data_rows,
-        metadata_table_rows_match: missing_required_metadata_rows == 0,
+        required_metadata_present: missing_required_metadata_rows == 0,
         src_metadata_table_rows: src_meta_rows,
         dst_metadata_table_rows: dst_meta_rows,
         sample_contracts_checked,
@@ -1714,26 +1719,34 @@ pub fn validate_clarity_side_tables(
 /// Validation results for Clarity side tables.
 #[derive(Debug, Clone)]
 pub struct ClaritySideTableValidation {
-    /// Whether `data_table` row counts match.
-    pub data_table_rows_match: bool,
+    /// All trie-referenced data_table keys are present in the destination.
+    pub required_data_keys_present: bool,
     /// Source `data_table` row count.
     pub src_data_table_rows: u64,
     /// Destination `data_table` row count.
     pub dst_data_table_rows: u64,
-    /// Whether `metadata_table` row counts match.
-    pub metadata_table_rows_match: bool,
+    /// All required metadata rows (for contracts with trie commitments) are
+    /// present in the destination. Checked exhaustively over all contracts.
+    pub required_metadata_present: bool,
     /// Source `metadata_table` row count.
     pub src_metadata_table_rows: u64,
     /// Destination `metadata_table` row count.
     pub dst_metadata_table_rows: u64,
-    /// Number of contract identifiers sampled from metadata_table.
+    /// Number of contract identifiers sampled from metadata_table (diagnostic).
     pub sample_contracts_checked: u64,
-    /// Sampled contracts missing from the trie (should be 0).
+    /// Sampled contracts missing from the trie (diagnostic, should be 0).
     pub sample_contracts_missing_in_trie: u64,
-    /// Sampled contracts whose trie values are missing from data_table (should be 0).
+    /// Sampled contracts whose trie values are missing from data_table (diagnostic, should be 0).
     pub sample_contracts_missing_in_data_table: u64,
     /// Required data_table keys missing from destination (should be 0).
     pub missing_required_data_table_keys: u64,
     /// Required metadata rows missing from destination (should be 0).
     pub missing_required_metadata_rows: u64,
+}
+
+impl ClaritySideTableValidation {
+    /// Returns `true` if all required data and metadata are present.
+    pub fn is_valid(&self) -> bool {
+        self.required_data_keys_present && self.required_metadata_present
+    }
 }

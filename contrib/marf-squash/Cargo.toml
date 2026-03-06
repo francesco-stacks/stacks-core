@@ -7,3 +7,6 @@ edition = "2021"
 stackslib = { path = "../../stackslib" }
 stacks-common = { path = "../../stacks-common" }
 clap = { version = "4.5.44", features = ["derive"] }
+rusqlite = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }

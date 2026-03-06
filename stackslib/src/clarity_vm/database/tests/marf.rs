@@ -127,7 +127,7 @@ fn squash_clarity_marf(
     let src_db = clarity_marf_db_path(src_dir);
     let dst_db = dst_dir.join("marf.sqlite");
 
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
     MARF::<StacksBlockId>::squash_to_path(
         src_db.to_str().unwrap(),
         dst_db.to_str().unwrap(),
@@ -162,7 +162,7 @@ fn test_has_clarity_side_tables_detects_clarity_marf() {
 fn test_has_clarity_side_tables_false_for_index_marf() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("index.sqlite");
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
     let mut marf = MARF::<StacksBlockId>::from_path(db_path.to_str().unwrap(), open_opts).unwrap();
     let b1 = StacksBlockId::from_bytes(&[1u8; 32]).unwrap();
     marf.begin(&StacksBlockId::sentinel(), &b1).unwrap();
@@ -192,11 +192,11 @@ fn test_copy_clarity_side_tables_round_trip() {
     .unwrap();
 
     assert!(
-        validation.data_table_rows_match,
+        validation.required_data_keys_present,
         "missing required data_table keys"
     );
     assert!(
-        validation.metadata_table_rows_match,
+        validation.required_metadata_present,
         "missing required metadata rows"
     );
     assert_eq!(validation.sample_contracts_missing_in_trie, 0);
@@ -284,7 +284,7 @@ fn test_squashed_clarity_marf_extend_hash_equality() {
     let squashed_db = squash_clarity_marf(&src_dir, &dir.path().join("squashed"), 3);
 
     // Open both MARFs at the raw MARF level for hash comparison.
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
     let src_db = clarity_marf_db_path(&src_dir);
     let mut archival =
         MARF::<StacksBlockId>::from_path(src_db.to_str().unwrap(), open_opts.clone()).unwrap();
@@ -334,7 +334,7 @@ fn test_mismatched_clarity_db_causes_data_read_failure() {
     let src_db = clarity_marf_db_path(&src_dir);
     let dst_db = squashed_dir.join("marf.sqlite");
 
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
     MARF::<StacksBlockId>::squash_to_path(
         src_db.to_str().unwrap(),
         dst_db.to_str().unwrap(),
@@ -383,7 +383,7 @@ fn test_validate_clarity_side_tables_detects_mismatch() {
     let src_db = clarity_marf_db_path(&src_dir);
     let dst_db = squashed_dir.join("marf.sqlite");
 
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
     MARF::<StacksBlockId>::squash_to_path(
         src_db.to_str().unwrap(),
         dst_db.to_str().unwrap(),
@@ -425,11 +425,11 @@ fn test_copy_clarity_side_tables_with_double_colon_metadata_keys() {
     .unwrap();
 
     assert!(
-        validation.data_table_rows_match,
+        validation.required_data_keys_present,
         "missing required data_table keys"
     );
     assert!(
-        validation.metadata_table_rows_match,
+        validation.required_metadata_present,
         "missing required metadata rows"
     );
     assert_eq!(validation.sample_contracts_missing_in_trie, 0);
