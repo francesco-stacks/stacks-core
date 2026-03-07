@@ -16,12 +16,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
+use stacks_common::types::chainstate::{SortitionId, StacksBlockId, TrieHash};
 use tempfile::tempdir;
 
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashStats, MARF, OWN_BLOCK_HEIGHT_KEY,
 };
+use crate::chainstate::stacks::index::squash::resolve_stacks_to_burn_height;
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{
     trie_sql, ClarityMarfTrieId, Error, MARFValue, TrieMerkleProof,
@@ -1068,4 +1069,171 @@ fn test_validate_detects_tampered_blob() {
         "flipping at least one trie byte must be detected (blob len={})",
         original_data.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Internal blobs (BlobReader::Internal) tests
+// ---------------------------------------------------------------------------
+
+/// Create a MARF with `external_blobs = false` (sortition-style), squash and validate.
+/// This exercises `BlobReader::Internal` for both squash and validation paths.
+#[test]
+fn test_squash_internal_blobs_roundtrip() {
+    let dir = tempdir().unwrap();
+    let src_db_path = dir.path().join("sort.sqlite");
+
+    // Create MARF with external_blobs = false.
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", false);
+    let mut marf =
+        MARF::<StacksBlockId>::from_path(src_db_path.to_str().unwrap(), open_opts.clone()).unwrap();
+
+    let b1 = StacksBlockId::from_bytes(&[1u8; 32]).unwrap();
+    let b2 = StacksBlockId::from_bytes(&[2u8; 32]).unwrap();
+
+    marf.begin(&StacksBlockId::sentinel(), &b1).unwrap();
+    marf.insert("k1", MARFValue::from_value("v1")).unwrap();
+    marf.commit().unwrap();
+
+    marf.begin(&b1, &b2).unwrap();
+    marf.insert("k1", MARFValue::from_value("v2")).unwrap();
+    marf.insert("k2", MARFValue::from_value("v3")).unwrap();
+    marf.commit().unwrap();
+    drop(marf);
+
+    // No .blobs file should exist.
+    let blobs_path = PathBuf::from(format!("{}.blobs", src_db_path.display()));
+    assert!(
+        !blobs_path.exists(),
+        "external_blobs=false should not create .blobs file"
+    );
+
+    // Squash with external_blobs = false.
+    let dst_dir = dir.path().join("squashed");
+    std::fs::create_dir_all(&dst_dir).unwrap();
+    let dst_db_path = dst_dir.join("sort.sqlite");
+
+    let stats = MARF::<StacksBlockId>::squash_to_path(
+        src_db_path.to_str().unwrap(),
+        dst_db_path.to_str().unwrap(),
+        open_opts.clone(),
+        1,
+    )
+    .unwrap();
+
+    assert!(stats.leaf_count > 0, "squash should copy leaves");
+    assert!(dst_db_path.exists(), "squashed DB should exist");
+
+    // No .blobs file for squashed output either.
+    let dst_blobs = PathBuf::from(format!("{}.blobs", dst_db_path.display()));
+    assert!(
+        !dst_blobs.exists(),
+        "squashed output should not have .blobs file"
+    );
+
+    // Read data back from squashed MARF.
+    let mut dst =
+        MARF::<StacksBlockId>::from_path(dst_db_path.to_str().unwrap(), open_opts.clone()).unwrap();
+    let k1 = dst.get(&b2, "k1").unwrap().unwrap();
+    assert_eq!(k1, MARFValue::from_value("v2"));
+
+    // Validate (exercises BlobReader::Internal for root hash reading).
+    let val = MARF::<StacksBlockId>::validate_squashed_at_height(
+        src_db_path.to_str().unwrap(),
+        dst_db_path.to_str().unwrap(),
+        open_opts,
+        1,
+    )
+    .unwrap();
+
+    assert!(val.archival_root_present, "archival root present");
+    assert!(val.archival_root_matches, "archival root matches");
+    assert_eq!(val.root_hash_mismatches, 0);
+    assert!(val.is_valid(), "internal-blobs validation should pass");
+}
+
+// ---------------------------------------------------------------------------
+// resolve_stacks_to_burn_height tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_resolve_stacks_to_burn_height_basic() {
+    use rusqlite::params;
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("sort_resolve.sqlite");
+
+    // Create a SortitionId-keyed MARF with external_blobs = false.
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", false);
+    let mut marf =
+        MARF::<SortitionId>::from_path(db_path.to_str().unwrap(), open_opts.clone()).unwrap();
+
+    // Build 3 burn blocks (heights 0, 1, 2).
+    let s0 = SortitionId::from_bytes(&[0xA0; 32]).unwrap();
+    let s1 = SortitionId::from_bytes(&[0xA1; 32]).unwrap();
+    let s2 = SortitionId::from_bytes(&[0xA2; 32]).unwrap();
+
+    marf.begin(&SortitionId::sentinel(), &s0).unwrap();
+    marf.insert("k", MARFValue::from_value("v0")).unwrap();
+    marf.commit().unwrap();
+
+    marf.begin(&s0, &s1).unwrap();
+    marf.insert("k", MARFValue::from_value("v1")).unwrap();
+    marf.commit().unwrap();
+
+    marf.begin(&s1, &s2).unwrap();
+    marf.insert("k", MARFValue::from_value("v2")).unwrap();
+    marf.commit().unwrap();
+
+    // Create the snapshots table (resolve reads canonical_stacks_tip_height from it).
+    marf.sqlite_conn()
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS snapshots (
+            sortition_id TEXT PRIMARY KEY,
+            canonical_stacks_tip_height INTEGER NOT NULL
+        )",
+        )
+        .unwrap();
+
+    // Burn 0 → stacks tip 0, burn 1 → stacks tip 5, burn 2 → stacks tip 10.
+    marf.sqlite_conn()
+        .execute("INSERT INTO snapshots VALUES (?1, 0)", params![&s0])
+        .unwrap();
+    marf.sqlite_conn()
+        .execute("INSERT INTO snapshots VALUES (?1, 5)", params![&s1])
+        .unwrap();
+    marf.sqlite_conn()
+        .execute("INSERT INTO snapshots VALUES (?1, 10)", params![&s2])
+        .unwrap();
+
+    let tip = trie_sql::get_latest_confirmed_block_hash::<SortitionId>(marf.sqlite_conn()).unwrap();
+    assert_eq!(tip, s2);
+
+    // Resolve various stacks heights.
+    let result: Result<(), Error> = marf.with_conn(|conn| {
+        // Stacks height 0 → burn block 0 (earliest where stacks_tip >= 0).
+        let bh = resolve_stacks_to_burn_height(conn, &s2, 2, 0).unwrap();
+        assert_eq!(bh, 0, "stacks 0 → burn 0");
+
+        // Stacks height 3 → burn block 1 (stacks_tip=5 >= 3).
+        let bh = resolve_stacks_to_burn_height(conn, &s2, 2, 3).unwrap();
+        assert_eq!(bh, 1, "stacks 3 → burn 1");
+
+        // Stacks height 5 → burn block 1 (stacks_tip=5 >= 5).
+        let bh = resolve_stacks_to_burn_height(conn, &s2, 2, 5).unwrap();
+        assert_eq!(bh, 1, "stacks 5 → burn 1");
+
+        // Stacks height 10 → burn block 2.
+        let bh = resolve_stacks_to_burn_height(conn, &s2, 2, 10).unwrap();
+        assert_eq!(bh, 2, "stacks 10 → burn 2");
+
+        // Stacks height 11 → NotFoundError (no burn block has stacks_tip >= 11).
+        let err = resolve_stacks_to_burn_height(conn, &s2, 2, 11);
+        assert!(
+            matches!(err, Err(Error::NotFoundError)),
+            "stacks 11 should not be found"
+        );
+
+        Ok(())
+    });
+    result.unwrap();
 }

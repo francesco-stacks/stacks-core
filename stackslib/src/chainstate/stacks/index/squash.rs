@@ -24,9 +24,9 @@ use std::fs::File;
 use std::io::{BufReader, Read as _, Seek, SeekFrom};
 use std::time::Instant;
 
-use rusqlite::params;
+use rusqlite::{params, DatabaseName};
 use stacks_common::types::chainstate::{
-    StacksBlockId, TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE,
+    SortitionId, StacksBlockId, TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE,
 };
 
 use crate::chainstate::stacks::index::bits::get_leaf_hash;
@@ -45,6 +45,59 @@ type CollectedNode = (TrieNodeType, TrieHash, u32);
 
 /// Per-height block metadata: `(height, block_hash, root_hash)`.
 type BlockInfo<T> = (u32, T, TrieHash);
+
+/// Reads root hashes from either an external `.blobs` file or from SQLite
+/// internal `marf_data.data` BLOB columns.
+enum BlobReader {
+    External(BufReader<File>),
+    Internal(rusqlite::Connection),
+}
+
+impl BlobReader {
+    fn new(db_path: &str, external_blobs: bool) -> Result<Self, Error> {
+        if external_blobs {
+            let blobs_path = format!("{db_path}.blobs");
+            let file = File::open(&blobs_path).map_err(Error::IOError)?;
+            Ok(BlobReader::External(BufReader::with_capacity(
+                64 * 1024,
+                file,
+            )))
+        } else {
+            let conn = rusqlite::Connection::open_with_flags(
+                db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            Ok(BlobReader::Internal(conn))
+        }
+    }
+
+    /// Read the root hash for a block.
+    ///
+    /// For `External`, seeks to `blob_offset + root_ptr_offset` in the `.blobs` file.
+    /// For `Internal`, opens the SQLite blob for `block_id` and seeks within it.
+    fn read_root_hash(&mut self, block_id: u32, blob_offset: u64) -> Result<TrieHash, Error> {
+        let root_ptr_offset = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
+        let mut hash_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
+        match self {
+            BlobReader::External(reader) => {
+                reader.seek(SeekFrom::Start(blob_offset + root_ptr_offset))?;
+                reader.read_exact(&mut hash_bytes)?;
+            }
+            BlobReader::Internal(conn) => {
+                let mut blob = conn.blob_open(
+                    DatabaseName::Main,
+                    "marf_data",
+                    "data",
+                    block_id.into(),
+                    true, // readonly
+                )?;
+                blob.seek(SeekFrom::Start(root_ptr_offset))?;
+                blob.read_exact(&mut hash_bytes)?;
+            }
+        }
+        Ok(TrieHash(hash_bytes))
+    }
+}
 
 /// A `BlockMap` adapter for trie nodes that have no backpointer children.
 ///
@@ -282,13 +335,9 @@ fn collect_per_height_metadata<T: MarfTrieId>(
     src: &mut MARF<T>,
     source_tip: &T,
     block_map: &HashMap<T, (u32, u64)>,
-    blobs_path: &str,
+    blob_reader: &mut BlobReader,
     height: u32,
 ) -> Result<Vec<BlockInfo<T>>, Error> {
-    let root_ptr_offset = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
-    let blobs_file = File::open(blobs_path).map_err(Error::IOError)?;
-    let mut blobs_reader = BufReader::with_capacity(64 * 1024, blobs_file);
-
     let mut block_info: Vec<BlockInfo<T>> = Vec::with_capacity((height + 1) as usize);
     let mut last_log = Instant::now();
     let start = Instant::now();
@@ -302,16 +351,13 @@ fn collect_per_height_metadata<T: MarfTrieId>(
             })?;
         let bh = T::from(val);
 
-        let &(_block_id, blob_offset) = block_map.get(&bh).ok_or_else(|| {
+        let &(block_id, blob_offset) = block_map.get(&bh).ok_or_else(|| {
             Error::CorruptionError(format!(
                 "Missing block map entry for block hash at height {h}"
             ))
         })?;
 
-        blobs_reader.seek(SeekFrom::Start(blob_offset + root_ptr_offset))?;
-        let mut hash_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
-        blobs_reader.read_exact(&mut hash_bytes)?;
-        let rh = TrieHash(hash_bytes);
+        let rh = blob_reader.read_root_hash(block_id, blob_offset)?;
 
         block_info.push((h, bh, rh));
 
@@ -478,9 +524,9 @@ impl<T: MarfTrieId> MARF<T> {
         );
 
         // Step 2: per-height metadata
-        let blobs_path = format!("{src_path}.blobs");
+        let mut blob_reader = BlobReader::new(src_path, open_opts.external_blobs)?;
         let block_info =
-            collect_per_height_metadata(&mut src, &tip, &block_map, &blobs_path, height)?;
+            collect_per_height_metadata(&mut src, &tip, &block_map, &mut blob_reader, height)?;
 
         // Step 3: BFS deep copy
         log_memory_snapshot("before step 3 BFS");
@@ -804,6 +850,7 @@ impl<T: MarfTrieId> MARF<T> {
         height: u32,
         full_leaf_scan: bool,
     ) -> Result<SquashValidationStats, Error> {
+        let external_blobs = open_opts.external_blobs;
         let src_storage = TrieFileStorage::open_readonly(src_path, open_opts.clone())?;
         let mut src = MARF::from_storage(src_storage);
 
@@ -843,10 +890,7 @@ impl<T: MarfTrieId> MARF<T> {
             .into_iter()
             .map(|(id, bh, offset)| (bh, (id, offset)))
             .collect();
-        let source_blobs_path = format!("{src_path}.blobs");
-        let root_ptr_offset = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
-        let blobs_file = File::open(&source_blobs_path).map_err(Error::IOError)?;
-        let mut blobs_reader = BufReader::with_capacity(64 * 1024, blobs_file);
+        let mut blob_reader = BlobReader::new(src_path, external_blobs)?;
 
         info!("Validate: per-height walks for source root hashes ...");
         let source_tip = trie_sql::get_latest_confirmed_block_hash::<T>(src.sqlite_conn())?;
@@ -857,11 +901,9 @@ impl<T: MarfTrieId> MARF<T> {
             let h_key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{h}");
             if let Some(val) = src.with_conn(|conn| Self::get_by_key(conn, &source_tip, &h_key))? {
                 let bh = T::from(val);
-                if let Some(&(_, blob_offset)) = source_block_map.get(&bh) {
-                    blobs_reader.seek(SeekFrom::Start(blob_offset + root_ptr_offset))?;
-                    let mut hash_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
-                    blobs_reader.read_exact(&mut hash_bytes)?;
-                    source_root_hashes.insert(h, TrieHash(hash_bytes));
+                if let Some(&(block_id, blob_offset)) = source_block_map.get(&bh) {
+                    let rh = blob_reader.read_root_hash(block_id, blob_offset)?;
+                    source_root_hashes.insert(h, rh);
                 }
             }
             if last_log.elapsed().as_secs() >= 30 || (h > 0 && h % 100_000 == 0) {
@@ -1074,4 +1116,32 @@ impl<T: MarfTrieId> MARF<T> {
 
         Ok(stats)
     }
+}
+
+/// Resolve a Stacks block height to the earliest canonical burn block height
+/// where `canonical_stacks_tip_height >= stacks_height`.
+///
+/// This walks the canonical burn chain via MARF pointers, querying the
+/// `snapshots` table at each height. Must live in `stackslib` because it
+/// needs `TrieStorageConnection::sqlite_conn()` which is `pub(crate)`.
+pub fn resolve_stacks_to_burn_height(
+    storage: &mut TrieStorageConnection<SortitionId>,
+    tip: &SortitionId,
+    tip_height: u32,
+    stacks_height: u32,
+) -> Result<u32, Error> {
+    for h in 0..=tip_height {
+        let sort_id = MARF::get_block_at_height(storage, h, tip)?;
+        if let Some(sort_id) = sort_id {
+            let stacks_tip_h: i64 = storage.sqlite_conn().query_row(
+                "SELECT canonical_stacks_tip_height FROM snapshots WHERE sortition_id = ?1",
+                params![&sort_id],
+                |row| row.get(0),
+            )?;
+            if stacks_tip_h >= stacks_height as i64 {
+                return Ok(h);
+            }
+        }
+    }
+    Err(Error::NotFoundError)
 }
