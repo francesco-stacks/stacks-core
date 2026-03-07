@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use blockstack_lib::chainstate::stacks::db::snapshot::{
-    copy_index_side_tables, copy_sortition_side_tables, validate_index_side_tables,
+    copy_confirmed_epoch2_microblocks, copy_epoch2_block_files, copy_index_side_tables,
+    copy_nakamoto_staging_blocks, copy_sortition_side_tables, validate_epoch2_block_files,
+    validate_index_side_tables, validate_microblock_streams, validate_nakamoto_staging_blocks,
     validate_sortition_side_tables,
 };
 use blockstack_lib::chainstate::stacks::index::marf::{
@@ -65,6 +67,10 @@ struct SquashArgs {
     /// Squash all three MARFs (Clarity, Index, Sortition).
     #[arg(long)]
     all: bool,
+    /// Copy canonical block data (epoch 2.x files, confirmed microblocks, nakamoto.sqlite).
+    /// Requires --index (or --all).
+    #[arg(long)]
+    blocks: bool,
     /// Skip validation to speed up size measurements.
     #[arg(long = "skip-validate")]
     skip_validate: bool,
@@ -98,6 +104,9 @@ struct ValidateArgs {
     /// Validate all three MARFs.
     #[arg(long)]
     all: bool,
+    /// Validate block data (epoch 2.x files, confirmed microblocks, nakamoto.sqlite).
+    #[arg(long)]
+    blocks: bool,
     /// Run full leaf-by-leaf comparison (slow, O(leaf_count)).
     /// By default, validation uses the fast hash-based check.
     #[arg(long)]
@@ -139,6 +148,8 @@ struct SquashManifest {
     snapshot: SnapshotSection,
     roots: RootsSection,
     squash_roots: SquashRootsSection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocks: Option<BlocksSection>,
 }
 
 #[derive(Serialize)]
@@ -170,6 +181,16 @@ struct SquashRootsSection {
     sortition_squash_root_node_hash: Option<String>,
 }
 
+#[derive(Serialize)]
+struct BlocksSection {
+    epoch2x_files: u64,
+    epoch2x_bytes: u64,
+    epoch2x_microblock_rows: u64,
+    epoch2x_microblock_bytes: u64,
+    nakamoto_rows: u64,
+    nakamoto_bytes: u64,
+}
+
 fn chainstate_paths(root: &Path) -> ChainstatePaths {
     let clarity_db = root.join("chainstate/vm/clarity/marf.sqlite");
     let index_db = root.join("chainstate/vm/index.sqlite");
@@ -198,10 +219,12 @@ fn selected_targets(clarity: bool, index: bool, sortition: bool, all: bool) -> (
     }
 }
 
-fn ensure_targets_selected(clarity: bool, index: bool, sortition: bool, all: bool) {
+fn ensure_targets_selected(clarity: bool, index: bool, sortition: bool, blocks: bool, all: bool) {
     let (c, i, s) = selected_targets(clarity, index, sortition, all);
-    if !c && !i && !s {
-        eprintln!("Must specify at least one target: --clarity, --index, --sortition, or --all");
+    if !c && !i && !s && !blocks {
+        eprintln!(
+            "Must specify at least one target: --clarity, --index, --sortition, --blocks, or --all"
+        );
         std::process::exit(1);
     }
 }
@@ -216,7 +239,13 @@ fn main() {
 }
 
 fn run_squash(args: SquashArgs) {
-    ensure_targets_selected(args.clarity, args.index, args.sortition, args.all);
+    ensure_targets_selected(
+        args.clarity,
+        args.index,
+        args.sortition,
+        args.blocks,
+        args.all,
+    );
 
     let paths = chainstate_paths(&args.chainstate);
     let (do_clarity, do_index, do_sortition) =
@@ -297,27 +326,208 @@ fn run_squash(args: SquashArgs) {
         sortition_out = Some((out, bh));
     }
 
+    // Block preservation: requires --index.
+    let do_blocks = args.blocks || args.all;
+    if do_blocks && !do_index {
+        eprintln!("--blocks requires --index (or --all)");
+        std::process::exit(1);
+    }
+
+    let mut blocks_stats: Option<BlocksSection> = None;
+
+    if do_blocks {
+        let i_out = index_out
+            .as_ref()
+            .expect("--blocks requires --index; index_out must be set");
+
+        let src_index_path = paths.index.db.to_str().unwrap();
+        let dst_index_path = i_out.db.to_str().unwrap();
+
+        // 1. Copy confirmed epoch-2 microblock streams.
+        println!("Copying confirmed epoch-2 microblock streams...");
+        let mblock_stats = match copy_confirmed_epoch2_microblocks(src_index_path, dst_index_path) {
+            Ok(st) => {
+                println!(
+                    "Microblock copy complete: streams_copied={}, streams_skipped={}, rows={}, bytes={}",
+                    st.streams_copied, st.streams_skipped, st.microblock_rows_copied, st.microblock_bytes_copied
+                );
+                st
+            }
+            Err(e) => {
+                eprintln!("Failed to copy microblock streams: {e:?}");
+                std::process::exit(1);
+            }
+        };
+
+        // 2. Copy epoch 2.x block files.
+        let src_blocks_dir = args.chainstate.join("chainstate/blocks");
+        let dst_blocks_dir = args.out_dir.join("chainstate/blocks");
+        println!("Copying epoch 2.x block files...");
+        let file_stats = match copy_epoch2_block_files(
+            dst_index_path,
+            src_blocks_dir.to_str().unwrap(),
+            dst_blocks_dir.to_str().unwrap(),
+        ) {
+            Ok(st) => {
+                println!(
+                    "Epoch 2.x block files copied: files={}, bytes={}, genesis_skipped={}",
+                    st.files_copied, st.total_bytes, st.genesis_skipped
+                );
+                st
+            }
+            Err(e) => {
+                eprintln!("Failed to copy epoch 2.x block files: {e:?}");
+                std::process::exit(1);
+            }
+        };
+
+        // 3. Copy nakamoto staging blocks.
+        let src_nakamoto = args.chainstate.join("chainstate/blocks/nakamoto.sqlite");
+        let dst_nakamoto = dst_blocks_dir.join("nakamoto.sqlite");
+        if !src_nakamoto.exists() {
+            eprintln!(
+                "Source nakamoto.sqlite not found at {}; required for --blocks",
+                src_nakamoto.display()
+            );
+            std::process::exit(1);
+        }
+        println!("Copying nakamoto staging blocks...");
+        let nak_stats = match copy_nakamoto_staging_blocks(
+            src_nakamoto.to_str().unwrap(),
+            dst_nakamoto.to_str().unwrap(),
+            dst_index_path,
+        ) {
+            Ok(st) => {
+                println!(
+                    "Nakamoto blocks copied: rows={}, blob_bytes={}",
+                    st.rows_copied, st.total_blob_bytes
+                );
+                st
+            }
+            Err(e) => {
+                eprintln!("Failed to copy nakamoto staging blocks: {e:?}");
+                std::process::exit(1);
+            }
+        };
+
+        blocks_stats = Some(BlocksSection {
+            epoch2x_files: file_stats.files_copied,
+            epoch2x_bytes: file_stats.total_bytes,
+            epoch2x_microblock_rows: mblock_stats.microblock_rows_copied,
+            epoch2x_microblock_bytes: mblock_stats.microblock_bytes_copied,
+            nakamoto_rows: nak_stats.rows_copied,
+            nakamoto_bytes: nak_stats.total_blob_bytes,
+        });
+
+        // 4. Validate blocks if validation is enabled.
+        if !args.skip_validate {
+            println!("Validating block data...");
+            let mut blocks_valid = true;
+
+            // Microblock validation.
+            match validate_microblock_streams(src_index_path, dst_index_path) {
+                Ok(v) => {
+                    println!("  microblocks_match: {}", v.staging_microblocks_match);
+                    println!(
+                        "  microblocks_data_match: {}",
+                        v.staging_microblocks_data_match
+                    );
+                    println!(
+                        "  microblocks_no_extra: {}",
+                        v.staging_microblocks_no_extra_rows
+                    );
+                    if !v.is_valid() {
+                        blocks_valid = false;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Microblock validation error: {e:?}");
+                    blocks_valid = false;
+                }
+            }
+
+            // Nakamoto validation - required for --blocks.
+            if !dst_nakamoto.exists() {
+                eprintln!(
+                    "  Destination nakamoto.sqlite missing at {}",
+                    dst_nakamoto.display()
+                );
+                blocks_valid = false;
+            } else {
+                match validate_nakamoto_staging_blocks(
+                    src_nakamoto.to_str().unwrap(),
+                    dst_nakamoto.to_str().unwrap(),
+                    dst_index_path,
+                ) {
+                    Ok(v) => {
+                        println!("  nakamoto_metadata_match: {}", v.metadata_match);
+                        println!("  nakamoto_no_extra_blocks: {}", v.no_extra_blocks);
+                        println!("  nakamoto_blob_bytes_match: {}", v.blob_bytes_match);
+                        println!("  nakamoto_db_version_match: {}", v.db_version_match);
+                        println!("  nakamoto_schema_match: {}", v.schema_match);
+                        if !v.is_valid() {
+                            blocks_valid = false;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  Nakamoto validation error: {e:?}");
+                        blocks_valid = false;
+                    }
+                }
+            }
+
+            // Epoch 2.x file validation.
+            match validate_epoch2_block_files(
+                dst_index_path,
+                src_blocks_dir.to_str().unwrap(),
+                dst_blocks_dir.to_str().unwrap(),
+            ) {
+                Ok(v) => {
+                    println!("  epoch2x_all_files_present: {}", v.all_files_present);
+                    println!("  epoch2x_no_extra_files: {}", v.no_extra_files);
+                    println!("  epoch2x_all_bytes_match: {}", v.all_bytes_match);
+                    if !v.is_valid() {
+                        blocks_valid = false;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Epoch 2.x file validation error: {e:?}");
+                    blocks_valid = false;
+                }
+            }
+
+            if !blocks_valid {
+                all_valid = false;
+            }
+        }
+    }
+
     if !all_valid {
         eprintln!("Validation failed for one or more targets");
         std::process::exit(1);
     }
 
-    // Generate manifest when index is included and validation was not skipped.
-    if !args.skip_validate {
-        if let Some(ref i_out) = index_out {
-            generate_manifest(
-                &args.out_dir,
-                clarity_out.as_ref(),
-                i_out,
-                sortition_out.as_ref().map(|(p, bh)| (p, *bh)),
-                args.height,
-            );
-        }
+    // Generate manifest when index is included.
+    if let Some(ref i_out) = index_out {
+        generate_manifest(
+            &args.out_dir,
+            clarity_out.as_ref(),
+            i_out,
+            sortition_out.as_ref().map(|(p, bh)| (p, *bh)),
+            args.height,
+            blocks_stats,
+        );
     }
 }
 
 fn run_validate(args: ValidateArgs) {
-    ensure_targets_selected(args.clarity, args.index, args.sortition, args.all);
+    ensure_targets_selected(
+        args.clarity,
+        args.index,
+        args.sortition,
+        args.blocks,
+        args.all,
+    );
 
     let source_paths = chainstate_paths(&args.source_chainstate);
     let squashed_paths = chainstate_paths(&args.squashed_chainstate);
@@ -369,6 +579,100 @@ fn run_validate(args: ValidateArgs) {
             sortition_open_opts(),
         ) {
             all_valid = false;
+        }
+    }
+
+    // Block validation.
+    let do_blocks = args.blocks || args.all;
+    if do_blocks && !do_index {
+        eprintln!("--blocks requires --index (or --all)");
+        std::process::exit(1);
+    }
+    if do_blocks {
+        println!("Validating block data...");
+
+        let src_index = source_paths.index.db.to_str().unwrap();
+        let dst_index = squashed_paths.index.db.to_str().unwrap();
+
+        // Microblock validation.
+        match validate_microblock_streams(src_index, dst_index) {
+            Ok(v) => {
+                println!("  microblocks_match: {}", v.staging_microblocks_match);
+                println!(
+                    "  microblocks_data_match: {}",
+                    v.staging_microblocks_data_match
+                );
+                println!(
+                    "  microblocks_no_extra: {}",
+                    v.staging_microblocks_no_extra_rows
+                );
+                if !v.is_valid() {
+                    all_valid = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("  Microblock validation error: {e:?}");
+                all_valid = false;
+            }
+        }
+
+        // Nakamoto validation.
+        let src_nakamoto = args
+            .source_chainstate
+            .join("chainstate/blocks/nakamoto.sqlite");
+        let dst_nakamoto = args
+            .squashed_chainstate
+            .join("chainstate/blocks/nakamoto.sqlite");
+        if !dst_nakamoto.exists() || !src_nakamoto.exists() {
+            eprintln!(
+                "  nakamoto.sqlite missing (src={}, dst={}); required for --blocks validation",
+                src_nakamoto.exists(),
+                dst_nakamoto.exists()
+            );
+            all_valid = false;
+        } else {
+            match validate_nakamoto_staging_blocks(
+                src_nakamoto.to_str().unwrap(),
+                dst_nakamoto.to_str().unwrap(),
+                dst_index,
+            ) {
+                Ok(v) => {
+                    println!("  nakamoto_metadata_match: {}", v.metadata_match);
+                    println!("  nakamoto_no_extra_blocks: {}", v.no_extra_blocks);
+                    println!("  nakamoto_blob_bytes_match: {}", v.blob_bytes_match);
+                    println!("  nakamoto_db_version_match: {}", v.db_version_match);
+                    println!("  nakamoto_schema_match: {}", v.schema_match);
+                    if !v.is_valid() {
+                        all_valid = false;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Nakamoto validation error: {e:?}");
+                    all_valid = false;
+                }
+            }
+        }
+
+        // Epoch 2.x file validation.
+        let src_blocks_dir = args.source_chainstate.join("chainstate/blocks");
+        let dst_blocks_dir = args.squashed_chainstate.join("chainstate/blocks");
+        match validate_epoch2_block_files(
+            dst_index,
+            src_blocks_dir.to_str().unwrap(),
+            dst_blocks_dir.to_str().unwrap(),
+        ) {
+            Ok(v) => {
+                println!("  epoch2x_all_files_present: {}", v.all_files_present);
+                println!("  epoch2x_no_extra_files: {}", v.no_extra_files);
+                println!("  epoch2x_all_bytes_match: {}", v.all_bytes_match);
+                if !v.is_valid() {
+                    all_valid = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("  Epoch 2.x file validation error: {e:?}");
+                all_valid = false;
+            }
         }
     }
 
@@ -550,11 +854,12 @@ fn squash_one(
             {
                 Ok(st) => {
                     println!(
-                        "Index side-table copy complete: block_headers={}, nakamoto_headers={}, payments={}, transactions={}, tenure_events={}, reward_sets={}, signer_stats={}, matured_rewards={}, burnchain_txids={}, epoch_transitions={}",
+                        "Index side-table copy complete: block_headers={}, nakamoto_headers={}, payments={}, transactions={}, tenure_events={}, reward_sets={}, signer_stats={}, matured_rewards={}, burnchain_txids={}, epoch_transitions={}, staging_blocks={}",
                         st.block_headers_rows, st.nakamoto_block_headers_rows, st.payments_rows,
                         st.transactions_rows, st.nakamoto_tenure_events_rows,
                         st.nakamoto_reward_sets_rows, st.signer_stats_rows,
-                        st.matured_rewards_rows, st.burnchain_txids_rows, st.epoch_transitions_rows
+                        st.matured_rewards_rows, st.burnchain_txids_rows, st.epoch_transitions_rows,
+                        st.staging_blocks_rows
                     );
                 }
                 Err(e) => {
@@ -953,7 +1258,11 @@ fn print_index_side_table_validation(
         "  epoch_transitions_count_match: {}",
         v.epoch_transitions_count_match
     );
-    println!("  staging_tables_empty: {}", v.staging_tables_empty);
+    println!("  staging_blocks_match: {}", v.staging_blocks_match);
+    println!(
+        "  invalidated_microblocks_data_empty: {}",
+        v.invalidated_microblocks_data_empty
+    );
     println!(
         "  transactions_no_extra_blocks: {}",
         v.transactions_no_extra_blocks
@@ -1046,6 +1355,7 @@ fn generate_manifest(
     index_out: &TargetPaths,
     sortition_out: Option<(&TargetPaths, u32)>,
     height: u32,
+    blocks_section: Option<BlocksSection>,
 ) {
     let (i_tip, i_archival, i_squash, i_height) =
         read_squash_metadata::<StacksBlockId>(index_out.db.to_str().unwrap(), default_open_opts());
@@ -1101,6 +1411,8 @@ fn generate_manifest(
     // Read timestamp from sortition snapshots if available, else from index headers.
     let timestamp = read_snapshot_timestamp(sortition_out, index_out, height);
 
+    let is_full_gss = clarity_out.is_some() && sortition_out.is_some() && blocks_section.is_some();
+
     let manifest = SquashManifest {
         snapshot: SnapshotSection {
             version: 1,
@@ -1120,6 +1432,7 @@ fn generate_manifest(
             index_squash_root_node_hash: i_squash,
             sortition_squash_root_node_hash: s_squash,
         },
+        blocks: blocks_section,
     };
 
     let toml_str = toml::to_string(&manifest).unwrap_or_else(|e| {
@@ -1127,9 +1440,12 @@ fn generate_manifest(
         std::process::exit(1);
     });
 
-    // Always use squash_manifest.toml. GSS_manifest.toml is reserved for the
-    // complete GSS payload (including preserved block data) which is a separate step.
-    let manifest_path = out_dir.join("squash_manifest.toml");
+    let manifest_name = if is_full_gss {
+        "GSS_manifest.toml"
+    } else {
+        "squash_manifest.toml"
+    };
+    let manifest_path = out_dir.join(manifest_name);
     fs::write(&manifest_path, toml_str).unwrap_or_else(|e| {
         eprintln!(
             "Failed to write manifest to '{}': {e}",

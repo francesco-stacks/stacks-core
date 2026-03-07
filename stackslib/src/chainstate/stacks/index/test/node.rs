@@ -5280,7 +5280,7 @@ fn ptrs_from_bytes_compressed_dense_matrix_v1_v2() {
 fn test_node_copy_update_ptrs_preserves_nonzero_back_block() {
     use crate::chainstate::stacks::index::node::node_copy_update_ptrs;
 
-    // Inline pointer with back_block = 0 (normal archival case) — should be overwritten
+    // Inline pointer with back_block = 0 (normal archival case) - should be overwritten
     let mut ptrs = [TriePtr::new(TrieNodeID::Node4 as u8, 0x10, 100)];
     assert_eq!(ptrs[0].back_block, 0);
     node_copy_update_ptrs(&mut ptrs, 42);
@@ -5289,7 +5289,7 @@ fn test_node_copy_update_ptrs_preserves_nonzero_back_block() {
     assert_eq!(ptrs[0].chr(), 0x10);
     assert_eq!(ptrs[0].ptr(), 100);
 
-    // Inline pointer with back_block != 0 (squash annotation) — should be preserved
+    // Inline pointer with back_block != 0 (squash annotation) - should be preserved
     let mut ptrs = [TriePtr {
         id: TrieNodeID::Node4 as u8,
         chr: 0x20,
@@ -5305,12 +5305,12 @@ fn test_node_copy_update_ptrs_preserves_nonzero_back_block() {
     assert_eq!(ptrs[0].chr(), 0x20);
     assert_eq!(ptrs[0].ptr(), 200);
 
-    // Empty pointer — should be untouched
+    // Empty pointer - should be untouched
     let mut ptrs = [TriePtr::default()];
     node_copy_update_ptrs(&mut ptrs, 42);
     assert_eq!(ptrs[0], TriePtr::default());
 
-    // Already a backptr — should be skipped entirely
+    // Already a backptr - should be skipped entirely
     let orig = TriePtr {
         id: set_backptr(TrieNodeID::Node16 as u8),
         chr: 0x30,

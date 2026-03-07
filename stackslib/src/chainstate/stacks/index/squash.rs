@@ -146,8 +146,8 @@ fn compute_node_hash(node: &TrieNodeType, child_hashes: &[TrieHash]) -> TrieHash
 ///
 /// The BFS collection pass stores archival hashes which may include skip-list
 /// information (for nodes that were trie roots in their original blocks).
-/// For proof consistency the blob must store deterministic content hashes —
-/// `H(consensus_bytes(node) || children_content_hashes)` — matching what the
+/// For proof consistency the blob must store deterministic content hashes -
+/// `H(consensus_bytes(node) || children_content_hashes)` - matching what the
 /// proof verifier computes bottom-up.
 ///
 /// Processes in reverse BFS order (children before parents).
