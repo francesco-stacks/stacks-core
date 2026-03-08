@@ -2,10 +2,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use blockstack_lib::chainstate::stacks::db::snapshot::{
-    copy_confirmed_epoch2_microblocks, copy_epoch2_block_files, copy_index_side_tables,
-    copy_nakamoto_staging_blocks, copy_sortition_side_tables, validate_epoch2_block_files,
+    copy_burnchain_db, copy_confirmed_epoch2_microblocks, copy_epoch2_block_files,
+    copy_index_side_tables, copy_nakamoto_staging_blocks, copy_sortition_side_tables,
+    copy_spv_headers, validate_burnchain_db, validate_epoch2_block_files,
     validate_index_side_tables, validate_microblock_streams, validate_nakamoto_staging_blocks,
-    validate_sortition_side_tables,
+    validate_sortition_side_tables, validate_spv_headers,
 };
 use blockstack_lib::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashValidationStats, MARF,
@@ -157,6 +158,10 @@ struct SnapshotSection {
     version: u32,
     height: u32,
     block_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bitcoin_height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bitcoin_block_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<String>,
     chain_id: u32,
@@ -502,6 +507,120 @@ fn run_squash(args: SquashArgs) {
         }
     }
 
+    // Burnchain auxiliary files: burnchain.sqlite + headers.sqlite.
+    // Only when producing a complete GSS (all three MARFs + blocks).
+    let do_burnchain_aux = do_clarity && do_index && do_sortition && do_blocks;
+    let mut has_burnchain_aux = false;
+
+    if do_burnchain_aux {
+        let bh = burn_height.expect("burn_height resolved when do_sortition=true");
+
+        let src_bc_db = args.chainstate.join("burnchain/burnchain.sqlite");
+        let dst_bc_db = args.out_dir.join("burnchain/burnchain.sqlite");
+        let squashed_sort = args.out_dir.join("burnchain/sortition/marf.sqlite");
+
+        println!("Copying burnchain.sqlite (canonical only)...");
+        match copy_burnchain_db(
+            src_bc_db.to_str().unwrap(),
+            dst_bc_db.to_str().unwrap(),
+            squashed_sort.to_str().unwrap(),
+            bh,
+        ) {
+            Ok(bc_stats) => {
+                println!(
+                    "  block_headers={}, block_ops={}, commit_metadata={}, anchor_blocks={}, overrides={}, affirmation_maps={}",
+                    bc_stats.block_headers_rows, bc_stats.block_ops_rows,
+                    bc_stats.block_commit_metadata_rows, bc_stats.anchor_blocks_rows,
+                    bc_stats.overrides_rows, bc_stats.affirmation_maps_rows
+                );
+
+                let src_hdr = args.chainstate.join("headers.sqlite");
+                let dst_hdr = args.out_dir.join("headers.sqlite");
+
+                println!("Copying headers.sqlite (SPV, up to burn height {bh})...");
+                match copy_spv_headers(src_hdr.to_str().unwrap(), dst_hdr.to_str().unwrap(), bh) {
+                    Ok(Some(spv_stats)) => {
+                        println!(
+                            "  headers={}, chain_work={}",
+                            spv_stats.headers_rows, spv_stats.chain_work_rows
+                        );
+                    }
+                    Ok(None) => {
+                        println!(
+                            "  headers.sqlite not found in source (will be rebuilt on startup)"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to copy headers.sqlite: {e:?}");
+                        std::process::exit(1);
+                    }
+                };
+
+                has_burnchain_aux = true;
+
+                // Validate burnchain aux if validation is enabled.
+                if !args.skip_validate {
+                    println!("Validating burnchain auxiliary files...");
+                    match validate_burnchain_db(
+                        src_bc_db.to_str().unwrap(),
+                        dst_bc_db.to_str().unwrap(),
+                        squashed_sort.to_str().unwrap(),
+                        bh,
+                    ) {
+                        Ok(v) => {
+                            println!("  bc_block_headers_match: {}", v.block_headers_match);
+                            println!("  bc_block_ops_match: {}", v.block_ops_match);
+                            println!(
+                                "  bc_commit_metadata_match: {}",
+                                v.block_commit_metadata_match
+                            );
+                            println!("  bc_anchor_blocks_match: {}", v.anchor_blocks_match);
+                            println!("  bc_overrides_match: {}", v.overrides_match);
+                            println!("  bc_db_config_match: {}", v.db_config_match);
+                            println!("  bc_no_extra_headers: {}", v.no_extra_headers);
+                            println!("  bc_canonical_complete: {}", v.canonical_complete);
+                            println!("  bc_affirmation_maps_match: {}", v.affirmation_maps_match);
+                            if !v.is_valid() {
+                                all_valid = false;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  burnchain.sqlite validation error: {e:?}");
+                            all_valid = false;
+                        }
+                    }
+
+                    match validate_spv_headers(
+                        src_hdr.to_str().unwrap(),
+                        dst_hdr.to_str().unwrap(),
+                        bh,
+                    ) {
+                        Ok(Some(v)) => {
+                            println!("  spv_headers_match: {}", v.headers_match);
+                            println!("  spv_chain_work_match: {}", v.chain_work_match);
+                            println!("  spv_db_config_match: {}", v.db_config_match);
+                            println!("  spv_no_extra_headers: {}", v.no_extra_headers);
+                            if !v.is_valid() {
+                                all_valid = false;
+                            }
+                        }
+                        Ok(None) => {
+                            println!("  headers.sqlite: both absent, skipped");
+                        }
+                        Err(e) => {
+                            eprintln!("  headers.sqlite validation error: {e:?}");
+                            all_valid = false;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to copy burnchain.sqlite: {e:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if !all_valid {
         eprintln!("Validation failed for one or more targets");
         std::process::exit(1);
@@ -516,6 +635,7 @@ fn run_squash(args: SquashArgs) {
             sortition_out.as_ref().map(|(p, bh)| (p, *bh)),
             args.height,
             blocks_stats,
+            has_burnchain_aux,
         );
     }
 }
@@ -671,6 +791,76 @@ fn run_validate(args: ValidateArgs) {
             }
             Err(e) => {
                 eprintln!("  Epoch 2.x file validation error: {e:?}");
+                all_valid = false;
+            }
+        }
+    }
+
+    // Burnchain auxiliary validation.
+    let do_burnchain_aux = do_clarity && do_index && do_sortition && do_blocks;
+    if do_burnchain_aux {
+        let burn_height = resolve_burn_height_for_sortition(
+            source_paths.sortition.db.to_str().unwrap(),
+            args.height,
+        );
+
+        let src_bc_db = args.source_chainstate.join("burnchain/burnchain.sqlite");
+        let dst_bc_db = args.squashed_chainstate.join("burnchain/burnchain.sqlite");
+        let squashed_sort = args
+            .squashed_chainstate
+            .join("burnchain/sortition/marf.sqlite");
+
+        println!("Validating burnchain auxiliary files...");
+        match validate_burnchain_db(
+            src_bc_db.to_str().unwrap(),
+            dst_bc_db.to_str().unwrap(),
+            squashed_sort.to_str().unwrap(),
+            burn_height,
+        ) {
+            Ok(v) => {
+                println!("  bc_block_headers_match: {}", v.block_headers_match);
+                println!("  bc_block_ops_match: {}", v.block_ops_match);
+                println!(
+                    "  bc_commit_metadata_match: {}",
+                    v.block_commit_metadata_match
+                );
+                println!("  bc_anchor_blocks_match: {}", v.anchor_blocks_match);
+                println!("  bc_overrides_match: {}", v.overrides_match);
+                println!("  bc_db_config_match: {}", v.db_config_match);
+                println!("  bc_no_extra_headers: {}", v.no_extra_headers);
+                println!("  bc_canonical_complete: {}", v.canonical_complete);
+                println!("  bc_affirmation_maps_match: {}", v.affirmation_maps_match);
+                if !v.is_valid() {
+                    all_valid = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("  burnchain.sqlite validation error: {e:?}");
+                all_valid = false;
+            }
+        }
+
+        let src_hdr = args.source_chainstate.join("headers.sqlite");
+        let dst_hdr = args.squashed_chainstate.join("headers.sqlite");
+        match validate_spv_headers(
+            src_hdr.to_str().unwrap(),
+            dst_hdr.to_str().unwrap(),
+            burn_height,
+        ) {
+            Ok(Some(v)) => {
+                println!("  spv_headers_match: {}", v.headers_match);
+                println!("  spv_chain_work_match: {}", v.chain_work_match);
+                println!("  spv_db_config_match: {}", v.db_config_match);
+                println!("  spv_no_extra_headers: {}", v.no_extra_headers);
+                if !v.is_valid() {
+                    all_valid = false;
+                }
+            }
+            Ok(None) => {
+                println!("  headers.sqlite: both absent, skipped");
+            }
+            Err(e) => {
+                eprintln!("  headers.sqlite validation error: {e:?}");
                 all_valid = false;
             }
         }
@@ -1356,6 +1546,7 @@ fn generate_manifest(
     sortition_out: Option<(&TargetPaths, u32)>,
     height: u32,
     blocks_section: Option<BlocksSection>,
+    has_burnchain_aux: bool,
 ) {
     let (i_tip, i_archival, i_squash, i_height) =
         read_squash_metadata::<StacksBlockId>(index_out.db.to_str().unwrap(), default_open_opts());
@@ -1411,13 +1602,51 @@ fn generate_manifest(
     // Read timestamp from sortition snapshots if available, else from index headers.
     let timestamp = read_snapshot_timestamp(sortition_out, index_out, height);
 
-    let is_full_gss = clarity_out.is_some() && sortition_out.is_some() && blocks_section.is_some();
+    // Read bitcoin height + block hash from sortition DB if available.
+    let (bitcoin_height, bitcoin_block_hash) = if let Some((s_out, bh)) = &sortition_out {
+        let conn = rusqlite::Connection::open(s_out.db.to_str().unwrap()).unwrap_or_else(|e| {
+            eprintln!("Failed to open squashed sortition DB for bitcoin metadata: {e}");
+            std::process::exit(1);
+        });
+        let sort_id: String = conn
+            .query_row(
+                "SELECT block_hash FROM marf_squash_block_heights WHERE height = ?1",
+                [bh],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "Failed to read sortition ID at burn height {bh} from squashed sortition DB: {e}"
+                );
+                std::process::exit(1);
+            });
+        let btc_hash: String = conn
+            .query_row(
+                "SELECT burn_header_hash FROM snapshots WHERE sortition_id = ?1",
+                [&sort_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to read burn_header_hash for sortition_id {sort_id}: {e}");
+                std::process::exit(1);
+            });
+        (Some(*bh), Some(format!("0x{btc_hash}")))
+    } else {
+        (None, None)
+    };
+
+    let is_full_gss = clarity_out.is_some()
+        && sortition_out.is_some()
+        && blocks_section.is_some()
+        && has_burnchain_aux;
 
     let manifest = SquashManifest {
         snapshot: SnapshotSection {
             version: 1,
             height,
             block_hash: format!("0x{i_tip}"),
+            bitcoin_height,
+            bitcoin_block_hash,
             timestamp,
             chain_id,
             mainnet,

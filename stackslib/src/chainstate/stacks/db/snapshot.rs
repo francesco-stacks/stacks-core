@@ -2029,6 +2029,647 @@ pub fn validate_epoch2_block_files(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Burnchain auxiliary: burnchain.sqlite
+// ---------------------------------------------------------------------------
+
+/// Tables required in all burnchain.sqlite versions (v2 and v3).
+const BURNCHAIN_REQUIRED_TABLES: &[&str] = &[
+    "burnchain_db_block_headers",
+    "burnchain_db_block_ops",
+    "block_commit_metadata",
+    "anchor_blocks",
+    "overrides",
+    "db_config",
+];
+
+/// Tables present only in v2 (dropped by BURNCHAIN_DB_MIGRATION_V2_TO_V3).
+/// Copied if present, skipped if absent.
+const BURNCHAIN_OPTIONAL_TABLES: &[&str] = &[
+    "affirmation_maps", // v2 only; v3 drops it and removes FK from block_commit_metadata
+];
+
+/// Row-count statistics returned by [`copy_burnchain_db`].
+#[derive(Debug, Clone)]
+pub struct BurnchainDbCopyStats {
+    pub block_headers_rows: u64,
+    pub block_ops_rows: u64,
+    pub block_commit_metadata_rows: u64,
+    pub anchor_blocks_rows: u64,
+    pub overrides_rows: u64,
+    pub affirmation_maps_rows: u64, // 0 if v3 (table absent)
+}
+
+/// Validation result for a copied burnchain.sqlite.
+#[derive(Debug, Clone)]
+pub struct BurnchainDbValidation {
+    pub block_headers_match: bool,
+    pub block_ops_match: bool,
+    pub block_commit_metadata_match: bool,
+    pub anchor_blocks_match: bool,
+    pub overrides_match: bool,
+    pub db_config_match: bool,
+    pub no_extra_headers: bool,
+    pub canonical_complete: bool, // all sortition burn hashes present
+    pub affirmation_maps_match: bool, // true if both absent (v3)
+}
+
+impl BurnchainDbValidation {
+    pub fn is_valid(&self) -> bool {
+        self.block_headers_match
+            && self.block_ops_match
+            && self.block_commit_metadata_match
+            && self.anchor_blocks_match
+            && self.overrides_match
+            && self.db_config_match
+            && self.no_extra_headers
+            && self.canonical_complete
+            && self.affirmation_maps_match
+    }
+}
+
+/// Build a temp table of canonical burn header hashes from the squashed
+/// sortition DB (ATTACHed as `sort`). The squashed sortition's `snapshots`
+/// table contains only canonical rows.
+fn populate_canonical_burn_hashes(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE canonical_burn_hashes (burn_header_hash TEXT PRIMARY KEY)",
+    )
+    .map_err(Error::SQLError)?;
+    conn.execute(
+        "INSERT INTO canonical_burn_hashes (burn_header_hash) \
+         SELECT DISTINCT burn_header_hash FROM sort.snapshots",
+        [],
+    )
+    .map_err(Error::SQLError)?;
+    Ok(())
+}
+
+/// Copy canonical rows from source `burnchain.sqlite` into a new destination,
+/// using the squashed sortition DB as the authoritative canonical set.
+///
+/// `expected_burn_height` is an assertion: the maximum `block_height` in the
+/// squashed sortition's `snapshots` table must equal this value. This catches
+/// mismatches between the CLI-resolved burn height and the actual sortition DB.
+pub fn copy_burnchain_db(
+    src_burnchain_db_path: &str,
+    dst_burnchain_db_path: &str,
+    squashed_sortition_path: &str,
+    expected_burn_height: u32,
+) -> Result<BurnchainDbCopyStats, Error> {
+    // Pre-check source and sortition paths exist to avoid ATTACH creating
+    // empty files at read-only source locations.
+    if !Path::new(src_burnchain_db_path).exists() {
+        return Err(Error::NotFoundError);
+    }
+    if !Path::new(squashed_sortition_path).exists() {
+        return Err(Error::NotFoundError);
+    }
+
+    // Ensure parent directory exists.
+    if let Some(parent) = Path::new(dst_burnchain_db_path).parent() {
+        fs::create_dir_all(parent).map_err(Error::IOError)?;
+    }
+
+    // Remove stale destination to ensure a clean copy.
+    let dst = Path::new(dst_burnchain_db_path);
+    if dst.exists() {
+        fs::remove_file(dst).map_err(Error::IOError)?;
+    }
+
+    let conn = Connection::open(dst_burnchain_db_path).map_err(Error::SQLError)?;
+
+    // Disable FK enforcement during bulk copy (tables are filled in an order
+    // that may not satisfy FKs mid-transaction). Must be set outside transaction.
+    conn.execute_batch("PRAGMA foreign_keys = OFF")
+        .map_err(Error::SQLError)?;
+
+    conn.execute("ATTACH DATABASE ?1 AS src", params![src_burnchain_db_path])
+        .map_err(Error::SQLError)?;
+    conn.execute(
+        "ATTACH DATABASE ?1 AS sort",
+        params![squashed_sortition_path],
+    )
+    .map_err(Error::SQLError)?;
+
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(Error::SQLError)?;
+
+    let result = copy_burnchain_db_inner(&conn, expected_burn_height);
+
+    match result {
+        Ok(stats) => {
+            conn.execute_batch("COMMIT").map_err(Error::SQLError)?;
+            conn.execute_batch("DETACH DATABASE sort")
+                .map_err(Error::SQLError)?;
+            conn.execute_batch("DETACH DATABASE src")
+                .map_err(Error::SQLError)?;
+            Ok(stats)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch("DETACH DATABASE sort");
+            let _ = conn.execute_batch("DETACH DATABASE src");
+            Err(e)
+        }
+    }
+}
+
+fn copy_burnchain_db_inner(
+    conn: &Connection,
+    expected_burn_height: u32,
+) -> Result<BurnchainDbCopyStats, Error> {
+    // Clone schemas.
+    clone_schemas_from_source(conn, BURNCHAIN_REQUIRED_TABLES)?;
+    let optional_present = clone_optional_schemas_from_source(conn, BURNCHAIN_OPTIONAL_TABLES)?;
+    let has_affirmation_maps = optional_present.contains(&"affirmation_maps".to_string());
+
+    // Copy db_config verbatim.
+    conn.execute("INSERT INTO db_config SELECT * FROM src.db_config", [])
+        .map_err(Error::SQLError)?;
+
+    // Build canonical burn hash set from squashed sortition DB.
+    populate_canonical_burn_hashes(conn)?;
+
+    // Consistency assertion: sortition tip must match expected burn height.
+    let actual_max_height: u32 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(block_height), 0) FROM sort.snapshots",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    if actual_max_height != expected_burn_height {
+        return Err(Error::NotFoundError);
+    }
+
+    // Completeness assertion: every canonical burn hash from the squashed
+    // sortition DB must exist in the source burnchain.sqlite.
+    let missing_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM canonical_burn_hashes \
+             WHERE burn_header_hash NOT IN \
+                 (SELECT block_hash FROM src.burnchain_db_block_headers)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    if missing_count > 0 {
+        return Err(Error::NotFoundError);
+    }
+
+    // Filter-copy tables.
+    let block_headers_rows = conn
+        .execute(
+            "INSERT INTO burnchain_db_block_headers \
+             SELECT * FROM src.burnchain_db_block_headers \
+             WHERE block_hash IN (SELECT burn_header_hash FROM canonical_burn_hashes)",
+            [],
+        )
+        .map_err(Error::SQLError)? as u64;
+
+    let block_ops_rows = conn
+        .execute(
+            "INSERT INTO burnchain_db_block_ops \
+             SELECT * FROM src.burnchain_db_block_ops \
+             WHERE block_hash IN (SELECT burn_header_hash FROM canonical_burn_hashes)",
+            [],
+        )
+        .map_err(Error::SQLError)? as u64;
+
+    let block_commit_metadata_rows = conn
+        .execute(
+            "INSERT INTO block_commit_metadata \
+             SELECT * FROM src.block_commit_metadata \
+             WHERE burn_block_hash IN (SELECT burn_header_hash FROM canonical_burn_hashes)",
+            [],
+        )
+        .map_err(Error::SQLError)? as u64;
+
+    let anchor_blocks_rows = conn
+        .execute(
+            "INSERT INTO anchor_blocks \
+             SELECT * FROM src.anchor_blocks \
+             WHERE reward_cycle IN ( \
+                 SELECT DISTINCT anchor_block FROM block_commit_metadata \
+                 WHERE anchor_block IS NOT NULL \
+             )",
+            [],
+        )
+        .map_err(Error::SQLError)? as u64;
+
+    let overrides_rows = conn
+        .execute(
+            "INSERT INTO overrides \
+             SELECT * FROM src.overrides \
+             WHERE reward_cycle IN (SELECT reward_cycle FROM anchor_blocks)",
+            [],
+        )
+        .map_err(Error::SQLError)? as u64;
+
+    let affirmation_maps_rows = if has_affirmation_maps {
+        conn.execute(
+            "INSERT INTO affirmation_maps \
+             SELECT * FROM src.affirmation_maps \
+             WHERE affirmation_id IN ( \
+                 SELECT DISTINCT affirmation_id FROM block_commit_metadata \
+             )",
+            [],
+        )
+        .map_err(Error::SQLError)? as u64
+    } else {
+        0
+    };
+
+    Ok(BurnchainDbCopyStats {
+        block_headers_rows,
+        block_ops_rows,
+        block_commit_metadata_rows,
+        anchor_blocks_rows,
+        overrides_rows,
+        affirmation_maps_rows,
+    })
+}
+
+/// Validate a copied burnchain.sqlite against its source, using the squashed
+/// sortition DB to derive the canonical set.
+pub fn validate_burnchain_db(
+    src_burnchain_db_path: &str,
+    dst_burnchain_db_path: &str,
+    squashed_sortition_path: &str,
+    expected_burn_height: u32,
+) -> Result<BurnchainDbValidation, Error> {
+    let conn = Connection::open_with_flags(dst_burnchain_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(Error::SQLError)?;
+
+    conn.execute("ATTACH DATABASE ?1 AS src", params![src_burnchain_db_path])
+        .map_err(Error::SQLError)?;
+    conn.execute(
+        "ATTACH DATABASE ?1 AS sort",
+        params![squashed_sortition_path],
+    )
+    .map_err(Error::SQLError)?;
+
+    // Build canonical burn hash set.
+    populate_canonical_burn_hashes(&conn)?;
+
+    // Consistency assertion.
+    let actual_max_height: u32 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(block_height), 0) FROM sort.snapshots",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    if actual_max_height != expected_burn_height {
+        return Err(Error::NotFoundError);
+    }
+
+    // Completeness: every canonical burn hash must be present in the destination.
+    let missing_in_dst: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM canonical_burn_hashes \
+             WHERE burn_header_hash NOT IN \
+                 (SELECT block_hash FROM burnchain_db_block_headers)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(1);
+    let canonical_complete = missing_in_dst == 0;
+
+    let db_config_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM db_config",
+        "SELECT * FROM src.db_config",
+    );
+
+    let block_headers_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM burnchain_db_block_headers",
+        "SELECT * FROM src.burnchain_db_block_headers \
+         WHERE block_hash IN (SELECT burn_header_hash FROM canonical_burn_hashes)",
+    );
+
+    let block_ops_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM burnchain_db_block_ops",
+        "SELECT * FROM src.burnchain_db_block_ops \
+         WHERE block_hash IN (SELECT burn_header_hash FROM canonical_burn_hashes)",
+    );
+
+    let block_commit_metadata_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM block_commit_metadata",
+        "SELECT * FROM src.block_commit_metadata \
+         WHERE burn_block_hash IN (SELECT burn_header_hash FROM canonical_burn_hashes)",
+    );
+
+    // For anchor_blocks and overrides, derive expected set from the copied
+    // block_commit_metadata (already canonical-only in destination).
+    let anchor_blocks_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM anchor_blocks",
+        "SELECT * FROM src.anchor_blocks \
+         WHERE reward_cycle IN ( \
+             SELECT DISTINCT anchor_block FROM block_commit_metadata \
+             WHERE anchor_block IS NOT NULL \
+         )",
+    );
+
+    let overrides_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM overrides",
+        "SELECT * FROM src.overrides \
+         WHERE reward_cycle IN (SELECT reward_cycle FROM anchor_blocks)",
+    );
+
+    // No non-canonical burn hashes in destination.
+    let extra_non_canonical: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM burnchain_db_block_headers \
+             WHERE block_hash NOT IN (SELECT burn_header_hash FROM canonical_burn_hashes)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(1);
+    let no_extra_headers = extra_non_canonical == 0;
+
+    // affirmation_maps: check if present in both or absent in both.
+    let has_src_affirmation: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM src.sqlite_master \
+             WHERE type='table' AND name='affirmation_maps'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    let has_dst_affirmation: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master \
+             WHERE type='table' AND name='affirmation_maps'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    let affirmation_maps_match = match (has_src_affirmation, has_dst_affirmation) {
+        (false, false) => true, // v3: both absent
+        (true, true) => full_row_except_match(
+            &conn,
+            "SELECT * FROM affirmation_maps",
+            "SELECT * FROM src.affirmation_maps \
+             WHERE affirmation_id IN ( \
+                 SELECT DISTINCT affirmation_id FROM block_commit_metadata \
+             )",
+        ),
+        _ => false, // one has it, the other doesn't
+    };
+
+    conn.execute_batch("DETACH DATABASE sort")
+        .map_err(Error::SQLError)?;
+    conn.execute_batch("DETACH DATABASE src")
+        .map_err(Error::SQLError)?;
+
+    Ok(BurnchainDbValidation {
+        block_headers_match,
+        block_ops_match,
+        block_commit_metadata_match,
+        anchor_blocks_match,
+        overrides_match,
+        db_config_match,
+        no_extra_headers,
+        canonical_complete,
+        affirmation_maps_match,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Burnchain auxiliary: headers.sqlite (SPV)
+// ---------------------------------------------------------------------------
+
+/// Tables required in all headers.sqlite versions.
+const SPV_REQUIRED_TABLES: &[&str] = &["headers", "db_config"];
+
+/// Tables present only in SPV schema v2+ (may be absent in very old DBs).
+const SPV_OPTIONAL_TABLES: &[&str] = &[
+    "chain_work", // Added in SPV_SCHEMA_2
+];
+
+/// Bitcoin difficulty chunk size (2016 blocks per difficulty interval).
+const DIFFICULTY_CHUNK_SIZE: u32 = 2016;
+
+/// Row-count statistics returned by [`copy_spv_headers`].
+#[derive(Debug, Clone)]
+pub struct SpvHeadersCopyStats {
+    pub headers_rows: u64,
+    pub chain_work_rows: u64,
+}
+
+/// Validation result for a copied headers.sqlite.
+#[derive(Debug, Clone)]
+pub struct SpvHeadersValidation {
+    pub headers_match: bool,
+    pub chain_work_match: bool,
+    pub db_config_match: bool,
+    pub no_extra_headers: bool,
+}
+
+impl SpvHeadersValidation {
+    pub fn is_valid(&self) -> bool {
+        self.headers_match && self.chain_work_match && self.db_config_match && self.no_extra_headers
+    }
+}
+
+/// Copy canonical SPV headers up to `burn_height` into a new destination.
+///
+/// Returns `Ok(None)` if the source file does not exist (the SpvClient
+/// auto-creates and re-downloads headers on startup).
+pub fn copy_spv_headers(
+    src_path: &str,
+    dst_path: &str,
+    burn_height: u32,
+) -> Result<Option<SpvHeadersCopyStats>, Error> {
+    if !Path::new(src_path).exists() {
+        // Remove stale destination if it exists (e.g. reused output dir).
+        let dst = Path::new(dst_path);
+        if dst.exists() {
+            fs::remove_file(dst).map_err(Error::IOError)?;
+        }
+        return Ok(None);
+    }
+
+    // Ensure parent directory exists.
+    if let Some(parent) = Path::new(dst_path).parent() {
+        fs::create_dir_all(parent).map_err(Error::IOError)?;
+    }
+
+    // Remove stale destination to ensure a clean copy.
+    let dst = Path::new(dst_path);
+    if dst.exists() {
+        fs::remove_file(dst).map_err(Error::IOError)?;
+    }
+
+    let conn = Connection::open(dst_path).map_err(Error::SQLError)?;
+
+    conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
+        .map_err(Error::SQLError)?;
+
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(Error::SQLError)?;
+
+    let result = copy_spv_headers_inner(&conn, burn_height);
+
+    match result {
+        Ok(stats) => {
+            conn.execute_batch("COMMIT").map_err(Error::SQLError)?;
+            conn.execute_batch("DETACH DATABASE src")
+                .map_err(Error::SQLError)?;
+            Ok(Some(stats))
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch("DETACH DATABASE src");
+            Err(e)
+        }
+    }
+}
+
+fn copy_spv_headers_inner(
+    conn: &Connection,
+    burn_height: u32,
+) -> Result<SpvHeadersCopyStats, Error> {
+    clone_schemas_from_source(conn, SPV_REQUIRED_TABLES)?;
+    let optional_present = clone_optional_schemas_from_source(conn, SPV_OPTIONAL_TABLES)?;
+    let has_chain_work = optional_present.contains(&"chain_work".to_string());
+
+    // Copy db_config verbatim.
+    conn.execute("INSERT INTO db_config SELECT * FROM src.db_config", [])
+        .map_err(Error::SQLError)?;
+
+    // Copy headers up to burn_height.
+    let headers_rows = conn
+        .execute(
+            "INSERT INTO headers SELECT * FROM src.headers WHERE height <= ?1",
+            params![burn_height],
+        )
+        .map_err(Error::SQLError)? as u64;
+
+    // Copy chain_work for complete intervals only.
+    // Interval n covers headers [n*2016, (n+1)*2016 - 1].
+    // Include only if (interval + 1) * 2016 - 1 <= burn_height.
+    let chain_work_rows = if has_chain_work {
+        conn.execute(
+            "INSERT INTO chain_work SELECT * FROM src.chain_work \
+             WHERE (interval + 1) * ?1 - 1 <= ?2",
+            params![DIFFICULTY_CHUNK_SIZE, burn_height],
+        )
+        .map_err(Error::SQLError)? as u64
+    } else {
+        0
+    };
+
+    Ok(SpvHeadersCopyStats {
+        headers_rows,
+        chain_work_rows,
+    })
+}
+
+/// Validate a copied headers.sqlite against its source.
+///
+/// **Missing-file semantics:**
+/// - Source absent + destination absent → `Ok(None)` (both agree it was skipped)
+/// - Source present + destination absent → error
+/// - Source absent + destination present → error
+/// - Both present → full validation
+pub fn validate_spv_headers(
+    src_path: &str,
+    dst_path: &str,
+    burn_height: u32,
+) -> Result<Option<SpvHeadersValidation>, Error> {
+    let src_exists = Path::new(src_path).exists();
+    let dst_exists = Path::new(dst_path).exists();
+
+    match (src_exists, dst_exists) {
+        (false, false) => return Ok(None),
+        (true, false) => {
+            return Err(Error::NotFoundError);
+        }
+        (false, true) => {
+            return Err(Error::ExistsError);
+        }
+        (true, true) => {} // proceed with validation
+    }
+
+    let conn = Connection::open_with_flags(dst_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(Error::SQLError)?;
+
+    conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
+        .map_err(Error::SQLError)?;
+
+    let db_config_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM db_config",
+        "SELECT * FROM src.db_config",
+    );
+
+    let headers_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM headers",
+        &format!("SELECT * FROM src.headers WHERE height <= {burn_height}"),
+    );
+
+    // chain_work: check if present in both.
+    let has_src_cw: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM src.sqlite_master \
+             WHERE type='table' AND name='chain_work'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    let has_dst_cw: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master \
+             WHERE type='table' AND name='chain_work'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    let chain_work_match = match (has_src_cw, has_dst_cw) {
+        (false, false) => true,
+        (true, true) => full_row_except_match(
+            &conn,
+            "SELECT * FROM chain_work",
+            &format!(
+                "SELECT * FROM src.chain_work \
+                 WHERE (interval + 1) * {DIFFICULTY_CHUNK_SIZE} - 1 <= {burn_height}"
+            ),
+        ),
+        _ => false,
+    };
+
+    // No headers above burn_height in destination.
+    let extra_above: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM headers WHERE height > {burn_height}"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(1);
+    let no_extra_headers = extra_above == 0;
+
+    conn.execute_batch("DETACH DATABASE src")
+        .map_err(Error::SQLError)?;
+
+    Ok(Some(SpvHeadersValidation {
+        headers_match,
+        chain_work_match,
+        db_config_match,
+        no_extra_headers,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::{params, Connection};
@@ -2330,183 +2971,53 @@ mod tests {
 
     use super::{copy_sortition_side_tables, validate_sortition_side_tables};
 
-    /// Create a sortition source DB with a minimal schema matching production
-    /// (after all migrations through schema 10). Returns the connection for
-    /// inserting test data.
+    use crate::chainstate::burn::db::sortdb::{
+        SORTITION_DB_INITIAL_SCHEMA, SORTITION_DB_SCHEMA_10, SORTITION_DB_SCHEMA_2,
+        SORTITION_DB_SCHEMA_3, SORTITION_DB_SCHEMA_4, SORTITION_DB_SCHEMA_5,
+        SORTITION_DB_SCHEMA_6, SORTITION_DB_SCHEMA_7, SORTITION_DB_SCHEMA_8,
+        SORTITION_DB_SCHEMA_9,
+    };
+
+    /// Create a sortition source DB with the real schema (all migrations
+    /// through schema 10). Applies only the DDL; epoch data inserts are
+    /// skipped since tests only need the table structure.
     fn create_sortition_source_db(path: &std::path::Path) -> Connection {
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-
-            CREATE TABLE snapshots(
-                block_height INTEGER NOT NULL,
-                burn_header_hash TEXT NOT NULL,
-                sortition_id TEXT UNIQUE NOT NULL,
-                parent_sortition_id TEXT NOT NULL,
-                burn_header_timestamp INT NOT NULL,
-                parent_burn_header_hash TEXT NOT NULL,
-                consensus_hash TEXT UNIQUE NOT NULL,
-                ops_hash TEXT NOT NULL,
-                total_burn TEXT NOT NULL,
-                sortition INTEGER NOT NULL,
-                sortition_hash TEXT NOT NULL,
-                winning_block_txid TEXT NOT NULL,
-                winning_stacks_block_hash TEXT NOT NULL,
-                index_root TEXT UNIQUE NOT NULL,
-                num_sortitions INTEGER NOT NULL,
-                stacks_block_accepted INTEGER NOT NULL,
-                stacks_block_height INTEGER NOT NULL,
-                arrival_index INTEGER NOT NULL,
-                canonical_stacks_tip_height INTEGER NOT NULL,
-                canonical_stacks_tip_hash TEXT NOT NULL,
-                canonical_stacks_tip_consensus_hash TEXT NOT NULL,
-                pox_valid INTEGER NOT NULL,
-                accumulated_coinbase_ustx TEXT NOT NULL,
-                pox_payouts TEXT NOT NULL,
-                miner_pk_hash TEXT DEFAULT NULL,
-                PRIMARY KEY(sortition_id)
-            );
-
-            CREATE TABLE snapshot_transition_ops(
-                sortition_id TEXT PRIMARY KEY,
-                accepted_ops TEXT NOT NULL,
-                consumed_keys TEXT NOT NULL
-            );
-
-            CREATE TABLE leader_keys(
-                txid TEXT NOT NULL,
-                vtxindex INTEGER NOT NULL,
-                block_height INTEGER NOT NULL,
-                burn_header_hash TEXT NOT NULL,
-                sortition_id TEXT NOT NULL,
-                consensus_hash TEXT NOT NULL,
-                public_key TEXT NOT NULL,
-                memo TEXT,
-                PRIMARY KEY(txid,sortition_id),
-                FOREIGN KEY(sortition_id) REFERENCES snapshots(sortition_id)
-            );
-
-            CREATE TABLE block_commits(
-                txid TEXT NOT NULL,
-                vtxindex INTEGER NOT NULL,
-                block_height INTEGER NOT NULL,
-                burn_header_hash TEXT NOT NULL,
-                sortition_id TEXT NOT NULL,
-                block_header_hash TEXT NOT NULL,
-                new_seed TEXT NOT NULL,
-                parent_block_ptr INTEGER NOT NULL,
-                parent_vtxindex INTEGER NOT NULL,
-                key_block_ptr INTEGER NOT NULL,
-                key_vtxindex INTEGER NOT NULL,
-                memo TEXT,
-                commit_outs TEXT,
-                burn_fee TEXT NOT NULL,
-                sunset_burn TEXT NOT NULL,
-                input TEXT NOT NULL,
-                apparent_sender TEXT NOT NULL,
-                burn_parent_modulus INTEGER NOT NULL,
-                punished TEXT DEFAULT NULL,
-                PRIMARY KEY(txid,sortition_id),
-                FOREIGN KEY(sortition_id) REFERENCES snapshots(sortition_id)
-            );
-
-            CREATE TABLE stack_stx (
-                txid TEXT NOT NULL,
-                vtxindex INTEGER NOT NULL,
-                block_height INTEGER NOT NULL,
-                burn_header_hash TEXT NOT NULL,
-                sender_addr TEXT NOT NULL,
-                reward_addr TEXT NOT NULL,
-                stacked_ustx TEXT NOT NULL,
-                num_cycles INTEGER NOT NULL,
-                signer_key TEXT DEFAULT NULL,
-                max_amount TEXT DEFAULT NULL,
-                auth_id INTEGER DEFAULT NULL,
-                PRIMARY KEY(txid,burn_header_hash)
-            );
-
-            CREATE TABLE transfer_stx (
-                txid TEXT NOT NULL,
-                vtxindex INTEGER NOT NULL,
-                block_height INTEGER NOT NULL,
-                burn_header_hash TEXT NOT NULL,
-                sender_addr TEXT NOT NULL,
-                recipient_addr TEXT NOT NULL,
-                transfered_ustx TEXT NOT NULL,
-                memo TEXT NOT NULL,
-                PRIMARY KEY(txid,burn_header_hash)
-            );
-
-            CREATE TABLE missed_commits (
-                txid TEXT NOT NULL,
-                input TEXT NOT NULL,
-                intended_sortition_id TEXT NOT NULL,
-                PRIMARY KEY(txid, intended_sortition_id)
-            );
-
-            CREATE TABLE db_config(version TEXT PRIMARY KEY);
-
-            CREATE TABLE epochs (
-                start_block_height INTEGER NOT NULL,
-                end_block_height INTEGER NOT NULL,
-                epoch_id INTEGER NOT NULL,
-                block_limit TEXT NOT NULL,
-                network_epoch INTEGER NOT NULL,
-                PRIMARY KEY(start_block_height,epoch_id)
-            );
-
-            CREATE TABLE block_commit_parents (
-                block_commit_txid TEXT NOT NULL,
-                block_commit_sortition_id TEXT NOT NULL,
-                parent_sortition_id TEXT NOT NULL,
-                PRIMARY KEY(block_commit_txid,block_commit_sortition_id),
-                FOREIGN KEY(block_commit_txid,block_commit_sortition_id)
-                    REFERENCES block_commits(txid,sortition_id)
-            );
-
-            CREATE TABLE delegate_stx (
-                txid TEXT NOT NULL,
-                vtxindex INTEGER NOT NULL,
-                block_height INTEGER NOT NULL,
-                burn_header_hash TEXT NOT NULL,
-                sender_addr TEXT NOT NULL,
-                delegate_to TEXT NOT NULL,
-                reward_addr TEXT NOT NULL,
-                delegated_ustx TEXT NOT NULL,
-                until_burn_height INTEGER,
-                PRIMARY KEY(txid,burn_header_hash)
-            );
-
-            CREATE TABLE preprocessed_reward_sets (
-                sortition_id TEXT PRIMARY KEY,
-                reward_set TEXT NOT NULL
-            );
-
-            CREATE TABLE stacks_chain_tips (
-                sortition_id TEXT PRIMARY KEY,
-                consensus_hash TEXT NOT NULL,
-                block_hash TEXT NOT NULL,
-                block_height INTEGER NOT NULL
-            );
-
-            CREATE TABLE vote_for_aggregate_key (
-                txid TEXT NOT NULL,
-                vtxindex INTEGER NOT NULL,
-                block_height INTEGER NOT NULL,
-                burn_header_hash TEXT NOT NULL,
-                sender_addr TEXT NOT NULL,
-                aggregate_key TEXT NOT NULL,
-                round INTEGER NOT NULL,
-                reward_cycle INTEGER NOT NULL,
-                signer_index INTEGER NOT NULL,
-                signer_key TEXT NOT NULL,
-                PRIMARY KEY(txid,burn_header_hash)
-            );
-            ",
+        for cmd in SORTITION_DB_INITIAL_SCHEMA {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SORTITION_DB_SCHEMA_2 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SORTITION_DB_SCHEMA_3 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SORTITION_DB_SCHEMA_4 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SORTITION_DB_SCHEMA_5 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SORTITION_DB_SCHEMA_6 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SORTITION_DB_SCHEMA_7 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SORTITION_DB_SCHEMA_8 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SORTITION_DB_SCHEMA_9 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SORTITION_DB_SCHEMA_10 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO db_config (version) VALUES ('10')",
+            [],
         )
         .unwrap();
-        conn.execute("INSERT INTO db_config (version) VALUES ('10')", [])
-            .unwrap();
         conn
     }
 
@@ -3902,5 +4413,1030 @@ mod tests {
             "nakamoto.sqlite sidecars should not cause validation failure: {v:?}"
         );
         assert!(v.no_extra_files, "no_extra_files should be true");
+    }
+
+    // -----------------------------------------------------------------------
+    // Burnchain auxiliary: burnchain.sqlite tests
+    // -----------------------------------------------------------------------
+
+    use crate::burnchains::bitcoin::spv::{
+        SPV_DB_VERSION, SPV_INITIAL_SCHEMA, SPV_SCHEMA_2, SPV_SCHEMA_3,
+    };
+    use crate::burnchains::db::{
+        BURNCHAIN_DB_INDEXES, BURNCHAIN_DB_MIGRATION_V2_TO_V3, BURNCHAIN_DB_SCHEMA_2,
+    };
+
+    /// Create a v3 burnchain.sqlite source (no affirmation_maps).
+    /// Replays the real schema: SCHEMA_2 then MIGRATION_V2_TO_V3, plus indexes.
+    fn create_burnchain_db_v3(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(BURNCHAIN_DB_SCHEMA_2).unwrap();
+        conn.execute("INSERT INTO db_config (version) VALUES ('2')", [])
+            .unwrap();
+        for idx in BURNCHAIN_DB_INDEXES {
+            conn.execute_batch(idx).unwrap();
+        }
+        conn.execute_batch(BURNCHAIN_DB_MIGRATION_V2_TO_V3).unwrap();
+        conn.execute("UPDATE db_config SET version = '3'", [])
+            .unwrap();
+        conn
+    }
+
+    /// Create a v2 burnchain.sqlite source (with affirmation_maps).
+    /// Uses the real v2 schema plus indexes; does NOT apply the v3 migration.
+    fn create_burnchain_db_v2(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(BURNCHAIN_DB_SCHEMA_2).unwrap();
+        conn.execute("INSERT INTO db_config (version) VALUES ('2')", [])
+            .unwrap();
+        for idx in BURNCHAIN_DB_INDEXES {
+            conn.execute_batch(idx).unwrap();
+        }
+        conn
+    }
+
+    /// Create a squashed sortition DB with canonical burn hashes in a
+    /// `snapshots` table.
+    fn create_squashed_sortition(
+        path: &std::path::Path,
+        canonical_hashes: &[(u32, &str)], // (block_height, burn_header_hash)
+    ) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+                block_height INTEGER NOT NULL,
+                burn_header_hash TEXT NOT NULL
+            )",
+        )
+        .unwrap();
+        for (height, hash) in canonical_hashes {
+            conn.execute(
+                "INSERT INTO snapshots (block_height, burn_header_hash) VALUES (?1, ?2)",
+                params![height, hash],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// Create a source headers.sqlite (SPV v3 schema with chain_work).
+    /// Replays the real SPV migration pipeline: INITIAL → SCHEMA_2 → SCHEMA_3.
+    fn create_spv_headers_db(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        for cmd in SPV_INITIAL_SCHEMA {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SPV_SCHEMA_2 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        for cmd in SPV_SCHEMA_3 {
+            conn.execute_batch(cmd).unwrap();
+        }
+        conn.execute(
+            &format!("INSERT INTO db_config (version) VALUES ('{SPV_DB_VERSION}')"),
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_burnchain_db_copy_and_validate() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src_burnchain.sqlite");
+        let dst_path = dir.path().join("dst_burnchain.sqlite");
+        let sort_path = dir.path().join("sortition.sqlite");
+
+        // Canonical hashes at heights 0, 1, 2.
+        let canonical = vec![(0, "hash_0"), (1, "hash_1"), (2, "hash_2")];
+        create_squashed_sortition(&sort_path, &canonical);
+
+        let src = create_burnchain_db_v3(&src_path);
+        // Insert canonical block headers.
+        for (h, hash) in &canonical {
+            src.execute(
+                "INSERT INTO burnchain_db_block_headers VALUES (?1, ?2, ?3, 0, 0)",
+                params![h, hash, format!("parent_{hash}")],
+            )
+            .unwrap();
+        }
+        // Insert a non-canonical block at height 1.
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (1, 'fork_hash_1', 'parent_fork', 0, 0)",
+            [],
+        )
+        .unwrap();
+        // Ops for canonical and non-canonical.
+        src.execute(
+            "INSERT INTO burnchain_db_block_ops VALUES ('hash_1', 'op1', 'tx1')",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_ops VALUES ('fork_hash_1', 'op_fork', 'tx_fork')",
+            [],
+        )
+        .unwrap();
+        // block_commit_metadata for canonical.
+        src.execute(
+            "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, anchor_block, anchor_block_descendant) \
+             VALUES ('hash_1', 'tx1', 1, 0, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        // block_commit_metadata for non-canonical.
+        src.execute(
+            "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, anchor_block, anchor_block_descendant) \
+             VALUES ('fork_hash_1', 'tx_fork', 1, 0, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        let stats = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(stats.block_headers_rows, 3); // 3 canonical
+        assert_eq!(stats.block_ops_rows, 1); // only hash_1's op
+        assert_eq!(stats.block_commit_metadata_rows, 1); // only canonical
+        assert_eq!(stats.affirmation_maps_rows, 0); // v3
+
+        let v = super::validate_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            2,
+        )
+        .unwrap();
+        assert!(v.is_valid(), "validation failed: {v:?}");
+    }
+
+    #[test]
+    fn test_burnchain_db_excludes_non_canonical_fork() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        // Only hash_a is canonical at height 1.
+        create_squashed_sortition(&sort_path, &[(0, "genesis"), (1, "hash_a")]);
+
+        let src = create_burnchain_db_v3(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'genesis', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (1, 'hash_a', 'genesis', 0, 0)",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (1, 'hash_b', 'genesis', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        let stats = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(stats.block_headers_rows, 2); // genesis + hash_a, not hash_b
+
+        // Verify hash_b is not in destination.
+        let dst = Connection::open(&dst_path).unwrap();
+        let count: i64 = dst
+            .query_row(
+                "SELECT COUNT(*) FROM burnchain_db_block_headers WHERE block_hash = 'hash_b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_burnchain_db_block_ops_follow_canonical_headers() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        create_squashed_sortition(&sort_path, &[(0, "canon")]);
+
+        let src = create_burnchain_db_v3(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'canon', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'fork', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_ops VALUES ('canon', 'op_c', 'tx_c')",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_ops VALUES ('fork', 'op_f', 'tx_f')",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        let stats = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(stats.block_ops_rows, 1);
+
+        let dst = Connection::open(&dst_path).unwrap();
+        let op: String = dst
+            .query_row("SELECT op FROM burnchain_db_block_ops", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(op, "op_c");
+    }
+
+    #[test]
+    fn test_burnchain_db_anchor_blocks_filtered() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1")]);
+
+        let src = create_burnchain_db_v3(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (1, 'h1', 'h0', 0, 0)",
+            [],
+        )
+        .unwrap();
+        // Anchor block for cycle 1 (referenced by canonical commit).
+        src.execute("INSERT INTO anchor_blocks VALUES (1)", [])
+            .unwrap();
+        // Anchor block for cycle 99 (not referenced by any canonical commit).
+        src.execute("INSERT INTO anchor_blocks VALUES (99)", [])
+            .unwrap();
+        // Canonical commit referencing anchor block cycle 1.
+        src.execute(
+            "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, anchor_block, anchor_block_descendant) \
+             VALUES ('h1', 'tx_a', 1, 0, 1, NULL)",
+            [],
+        )
+        .unwrap();
+        // Override for cycle 1 (should be copied) and cycle 99 (should not).
+        src.execute("INSERT INTO overrides VALUES (1, 'map_1')", [])
+            .unwrap();
+        src.execute("INSERT INTO overrides VALUES (99, 'map_99')", [])
+            .unwrap();
+        drop(src);
+
+        let stats = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(stats.anchor_blocks_rows, 1);
+        assert_eq!(stats.overrides_rows, 1);
+
+        let dst = Connection::open(&dst_path).unwrap();
+        let cycle: i64 = dst
+            .query_row("SELECT reward_cycle FROM anchor_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cycle, 1);
+        let override_map: String = dst
+            .query_row("SELECT affirmation_map FROM overrides", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(override_map, "map_1");
+    }
+
+    #[test]
+    fn test_burnchain_db_validate_detects_non_canonical_leak() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        create_squashed_sortition(&sort_path, &[(0, "h0")]);
+
+        let src = create_burnchain_db_v3(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        // Copy normally first.
+        super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            0,
+        )
+        .unwrap();
+
+        // Inject a non-canonical row into the destination.
+        let dst = Connection::open(&dst_path).unwrap();
+        dst.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'rogue', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(dst);
+
+        let v = super::validate_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            0,
+        )
+        .unwrap();
+        assert!(!v.is_valid(), "should detect non-canonical leak");
+        assert!(!v.no_extra_headers);
+    }
+
+    #[test]
+    fn test_burnchain_db_missing_source_is_error() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("nonexistent.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        create_squashed_sortition(&sort_path, &[(0, "h0")]);
+
+        let result = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            0,
+        );
+        // Should error because the source tables don't exist when ATTACHed.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_burnchain_db_affirmation_maps_preserved_v2() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1")]);
+
+        let src = create_burnchain_db_v2(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (1, 'h1', 'h0', 0, 0)",
+            [],
+        )
+        .unwrap();
+        // Affirmation map id=1 (id=0 already inserted by schema).
+        src.execute(
+            "INSERT INTO affirmation_maps (affirmation_id, weight, affirmation_map) VALUES (1, 1, 'p')",
+            [],
+        )
+        .unwrap();
+        // Affirmation map id=2 (not referenced by any canonical commit).
+        src.execute(
+            "INSERT INTO affirmation_maps (affirmation_id, weight, affirmation_map) VALUES (2, 2, 'pp')",
+            [],
+        )
+        .unwrap();
+        // Canonical commit referencing affirmation_id=1.
+        src.execute(
+            "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, affirmation_id, anchor_block, anchor_block_descendant) \
+             VALUES ('h1', 'tx1', 1, 0, 1, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        let stats = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            1,
+        )
+        .unwrap();
+
+        // Only affirmation_id=1 referenced by canonical commit.
+        assert_eq!(stats.affirmation_maps_rows, 1);
+
+        let v = super::validate_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(v.is_valid(), "v2 validation failed: {v:?}");
+        assert!(v.affirmation_maps_match);
+    }
+
+    #[test]
+    fn test_burnchain_db_v3_no_affirmation_maps() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        create_squashed_sortition(&sort_path, &[(0, "h0")]);
+
+        let src = create_burnchain_db_v3(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        let stats = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(stats.affirmation_maps_rows, 0);
+
+        let v = super::validate_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            0,
+        )
+        .unwrap();
+        assert!(v.is_valid(), "v3 validation failed: {v:?}");
+        assert!(v.affirmation_maps_match); // both absent = true
+    }
+
+    #[test]
+    fn test_burnchain_db_sortition_tip_mismatch_is_error() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        // Sortition tip is at height 5.
+        create_squashed_sortition(&sort_path, &[(0, "h0"), (5, "h5")]);
+
+        let src = create_burnchain_db_v3(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        // Pass expected_burn_height=10, but sortition tip is 5.
+        let result = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            10,
+        );
+        assert!(result.is_err(), "should fail on sortition tip mismatch");
+    }
+
+    #[test]
+    fn test_burnchain_db_fresh_output_dir() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+        // Nested non-existent directory.
+        let dst_path = dir
+            .path()
+            .join("deep")
+            .join("nested")
+            .join("burnchain.sqlite");
+
+        create_squashed_sortition(&sort_path, &[(0, "h0")]);
+
+        let src = create_burnchain_db_v3(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        let stats = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(stats.block_headers_rows, 1);
+        assert!(dst_path.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Burnchain auxiliary: headers.sqlite (SPV) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spv_headers_copy_and_validate() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src_headers.sqlite");
+        let dst_path = dir.path().join("dst_headers.sqlite");
+
+        let src = create_spv_headers_db(&src_path);
+        // Insert headers at heights 0..=5000.
+        for h in 0..=5000u32 {
+            src.execute(
+                "INSERT INTO headers VALUES (1, 'prev', 'merkle', 0, 0, 0, ?1, ?2)",
+                params![h, format!("hash_{h}")],
+            )
+            .unwrap();
+        }
+        // Insert chain_work for intervals 0, 1, 2.
+        src.execute("INSERT INTO chain_work VALUES (0, 'work_0')", [])
+            .unwrap();
+        src.execute("INSERT INTO chain_work VALUES (1, 'work_1')", [])
+            .unwrap();
+        src.execute("INSERT INTO chain_work VALUES (2, 'work_2')", [])
+            .unwrap();
+        drop(src);
+
+        let stats =
+            super::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 4500)
+                .unwrap()
+                .unwrap();
+
+        // Headers 0..=4500 = 4501 rows.
+        assert_eq!(stats.headers_rows, 4501);
+        // Interval 0: (0+1)*2016-1=2015 <= 4500 ✓
+        // Interval 1: (1+1)*2016-1=4031 <= 4500 ✓
+        // Interval 2: (2+1)*2016-1=6047 <= 4500 ✗
+        assert_eq!(stats.chain_work_rows, 2);
+
+        let v = super::validate_spv_headers(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            4500,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(v.is_valid(), "validation failed: {v:?}");
+    }
+
+    #[test]
+    fn test_spv_headers_chain_work_boundary_0() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+
+        let src = create_spv_headers_db(&src_path);
+        src.execute(
+            "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, 0, 'h0')",
+            [],
+        )
+        .unwrap();
+        src.execute("INSERT INTO chain_work VALUES (0, 'w0')", [])
+            .unwrap();
+        drop(src);
+
+        let stats =
+            super::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(stats.headers_rows, 1);
+        // (0+1)*2016-1 = 2015 > 0 → no intervals included.
+        assert_eq!(stats.chain_work_rows, 0);
+    }
+
+    #[test]
+    fn test_spv_headers_chain_work_boundary_2015() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+
+        let src = create_spv_headers_db(&src_path);
+        for h in 0..=2015u32 {
+            src.execute(
+                "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
+                params![h, format!("h{h}")],
+            )
+            .unwrap();
+        }
+        src.execute("INSERT INTO chain_work VALUES (0, 'w0')", [])
+            .unwrap();
+        src.execute("INSERT INTO chain_work VALUES (1, 'w1')", [])
+            .unwrap();
+        drop(src);
+
+        let stats =
+            super::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 2015)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(stats.headers_rows, 2016);
+        // (0+1)*2016-1 = 2015 <= 2015 ✓ → 1 interval.
+        assert_eq!(stats.chain_work_rows, 1);
+    }
+
+    #[test]
+    fn test_spv_headers_chain_work_boundary_2016() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+
+        let src = create_spv_headers_db(&src_path);
+        for h in 0..=2016u32 {
+            src.execute(
+                "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
+                params![h, format!("h{h}")],
+            )
+            .unwrap();
+        }
+        src.execute("INSERT INTO chain_work VALUES (0, 'w0')", [])
+            .unwrap();
+        src.execute("INSERT INTO chain_work VALUES (1, 'w1')", [])
+            .unwrap();
+        drop(src);
+
+        let stats =
+            super::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 2016)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(stats.headers_rows, 2017);
+        // (0+1)*2016-1 = 2015 <= 2016 ✓
+        // (1+1)*2016-1 = 4031 <= 2016 ✗
+        assert_eq!(stats.chain_work_rows, 1);
+    }
+
+    #[test]
+    fn test_spv_headers_chain_work_boundary_4031() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+
+        let src = create_spv_headers_db(&src_path);
+        for h in 0..=4031u32 {
+            src.execute(
+                "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
+                params![h, format!("h{h}")],
+            )
+            .unwrap();
+        }
+        src.execute("INSERT INTO chain_work VALUES (0, 'w0')", [])
+            .unwrap();
+        src.execute("INSERT INTO chain_work VALUES (1, 'w1')", [])
+            .unwrap();
+        src.execute("INSERT INTO chain_work VALUES (2, 'w2')", [])
+            .unwrap();
+        drop(src);
+
+        let stats =
+            super::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 4031)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(stats.headers_rows, 4032);
+        // (0+1)*2016-1 = 2015 <= 4031 ✓
+        // (1+1)*2016-1 = 4031 <= 4031 ✓
+        // (2+1)*2016-1 = 6047 <= 4031 ✗
+        assert_eq!(stats.chain_work_rows, 2);
+    }
+
+    #[test]
+    fn test_spv_headers_chain_work_boundary_4032() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+
+        let src = create_spv_headers_db(&src_path);
+        for h in 0..=4032u32 {
+            src.execute(
+                "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
+                params![h, format!("h{h}")],
+            )
+            .unwrap();
+        }
+        src.execute("INSERT INTO chain_work VALUES (0, 'w0')", [])
+            .unwrap();
+        src.execute("INSERT INTO chain_work VALUES (1, 'w1')", [])
+            .unwrap();
+        src.execute("INSERT INTO chain_work VALUES (2, 'w2')", [])
+            .unwrap();
+        drop(src);
+
+        let stats =
+            super::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 4032)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(stats.headers_rows, 4033);
+        // (2+1)*2016-1 = 6047 <= 4032 ✗ → still only 2 intervals.
+        assert_eq!(stats.chain_work_rows, 2);
+    }
+
+    #[test]
+    fn test_spv_headers_missing_source_returns_none() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("nonexistent.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+
+        let result =
+            super::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 100)
+                .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_spv_headers_validate_source_present_dest_missing_fails() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("nonexistent.sqlite");
+
+        create_spv_headers_db(&src_path);
+
+        let result = super::validate_spv_headers(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            100,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_spv_headers_validate_both_absent_passes() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("no_src.sqlite");
+        let dst_path = dir.path().join("no_dst.sqlite");
+
+        let result = super::validate_spv_headers(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            100,
+        )
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_burnchain_db_copy_fails_when_source_missing_canonical_hash() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        // Sortition says heights 0, 1, 2 are canonical.
+        create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1"), (2, "h2")]);
+
+        // But source burnchain.sqlite only has h0 and h1 — h2 is missing.
+        let src = create_burnchain_db_v3(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (1, 'h1', 'h0', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        let result = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            2,
+        );
+        assert!(
+            result.is_err(),
+            "should fail when source is missing a canonical burn hash"
+        );
+    }
+
+    #[test]
+    fn test_burnchain_db_validate_detects_missing_canonical_hash() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1")]);
+
+        let src = create_burnchain_db_v3(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (1, 'h1', 'h0', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        // Copy normally (source has all canonical hashes).
+        super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            1,
+        )
+        .unwrap();
+
+        // Now delete h1 from the destination to simulate incomplete copy.
+        let dst = Connection::open(&dst_path).unwrap();
+        dst.execute(
+            "DELETE FROM burnchain_db_block_headers WHERE block_hash = 'h1'",
+            [],
+        )
+        .unwrap();
+        drop(dst);
+
+        let v = super::validate_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(!v.is_valid(), "should detect missing canonical hash: {v:?}");
+        assert!(!v.canonical_complete);
+    }
+
+    #[test]
+    fn test_spv_headers_stale_destination_removed_when_source_absent() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("nonexistent.sqlite");
+        let dst_path = dir.path().join("stale_headers.sqlite");
+
+        // Create a stale destination file (simulates reused output dir).
+        std::fs::write(&dst_path, b"stale data").unwrap();
+        assert!(dst_path.exists());
+
+        let result =
+            super::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 100)
+                .unwrap();
+
+        assert!(result.is_none());
+        assert!(
+            !dst_path.exists(),
+            "stale destination should be removed when source is absent"
+        );
+    }
+
+    #[test]
+    fn test_burnchain_db_missing_source_does_not_create_file() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("nonexistent_burnchain.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        create_squashed_sortition(&sort_path, &[(0, "h0")]);
+
+        assert!(!src_path.exists());
+
+        let result = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            0,
+        );
+        assert!(result.is_err());
+        // Source path must not have been created by ATTACH.
+        assert!(
+            !src_path.exists(),
+            "missing source must not be created by ATTACH"
+        );
+    }
+
+    #[test]
+    fn test_burnchain_db_reused_output_dir() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+        let sort_path = dir.path().join("sort.sqlite");
+
+        create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1")]);
+
+        let src = create_burnchain_db_v3(&src_path);
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO burnchain_db_block_headers VALUES (1, 'h1', 'h0', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(src);
+
+        // First copy.
+        super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            1,
+        )
+        .unwrap();
+
+        // Second copy into the same destination (reused output dir).
+        let stats = super::copy_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(stats.block_headers_rows, 2);
+
+        // Validate to confirm no duplicate rows.
+        let v = super::validate_burnchain_db(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            sort_path.to_str().unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(
+            v.is_valid(),
+            "reused output dir should produce valid copy: {v:?}"
+        );
+    }
+
+    #[test]
+    fn test_spv_headers_reused_output_dir() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        let dst_path = dir.path().join("dst.sqlite");
+
+        let src = create_spv_headers_db(&src_path);
+        for h in 0..=10u32 {
+            src.execute(
+                "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
+                params![h, format!("h{h}")],
+            )
+            .unwrap();
+        }
+        drop(src);
+
+        // First copy.
+        super::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 10)
+            .unwrap()
+            .unwrap();
+
+        // Second copy into the same destination (reused output dir).
+        let stats =
+            super::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 10)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(stats.headers_rows, 11);
+
+        // Validate to confirm no duplicate rows.
+        let v =
+            super::validate_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 10)
+                .unwrap()
+                .unwrap();
+        assert!(
+            v.is_valid(),
+            "reused output dir should produce valid copy: {v:?}"
+        );
     }
 }
