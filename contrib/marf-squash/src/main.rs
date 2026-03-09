@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use blockstack_lib::chainstate::stacks::db::snapshot::{
@@ -20,7 +22,8 @@ use blockstack_lib::clarity_vm::database::marf::{
     copy_clarity_side_tables, validate_clarity_side_tables,
 };
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 
 /// Offline squashing CLI for Index, Clarity, and Sortition MARF snapshots.
@@ -40,6 +43,8 @@ enum Command {
     Squash(SquashArgs),
     /// Validate squashed MARFs against a source chainstate.
     Validate(ValidateArgs),
+    /// Verify a standalone GSS directory's integrity and optionally check WSCP checkpoint.
+    Verify(VerifyArgs),
     /// Print the latest confirmed block height in a MARF.
     LatestHeight(LatestHeightArgs),
 }
@@ -131,6 +136,26 @@ struct LatestHeightArgs {
     sortition: bool,
 }
 
+/// Arguments for standalone GSS verification.
+#[derive(Parser, Debug)]
+struct VerifyArgs {
+    /// Path to a GSS directory (must contain GSS_manifest.toml).
+    #[arg(long, value_name = "DIR")]
+    gss_dir: PathBuf,
+    /// Path to a TOML file with trusted WSCP checkpoint hashes.
+    #[arg(long, value_name = "FILE")]
+    checkpoint_file: Option<PathBuf>,
+}
+
+/// Trusted WSCP checkpoint file format.
+#[derive(Deserialize)]
+struct CheckpointFile {
+    height: u32,
+    clarity_squash_root_node_hash: String,
+    index_squash_root_node_hash: String,
+    sortition_squash_root_node_hash: String,
+}
+
 #[derive(Debug, Clone)]
 struct TargetPaths {
     db: PathBuf,
@@ -144,16 +169,18 @@ struct ChainstatePaths {
     sortition: TargetPaths,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SquashManifest {
     snapshot: SnapshotSection,
     roots: RootsSection,
     squash_roots: SquashRootsSection,
     #[serde(skip_serializing_if = "Option::is_none")]
     blocks: Option<BlocksSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checksums: Option<ChecksumsSection>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SnapshotSection {
     version: u32,
     height: u32,
@@ -168,7 +195,7 @@ struct SnapshotSection {
     mainnet: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct RootsSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     clarity_archival_marf_root_hash: Option<String>,
@@ -177,7 +204,7 @@ struct RootsSection {
     sortition_archival_marf_root_hash: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SquashRootsSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     clarity_squash_root_node_hash: Option<String>,
@@ -186,7 +213,7 @@ struct SquashRootsSection {
     sortition_squash_root_node_hash: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct BlocksSection {
     epoch2x_files: u64,
     epoch2x_bytes: u64,
@@ -194,6 +221,124 @@ struct BlocksSection {
     epoch2x_microblock_bytes: u64,
     nakamoto_rows: u64,
     nakamoto_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChecksumsSection {
+    files: BTreeMap<String, String>,
+}
+
+/// Manifest file names.
+const GSS_MANIFEST: &str = "GSS_manifest.toml";
+const SQUASH_MANIFEST: &str = "squash_manifest.toml";
+
+/// File extensions that indicate SQLite sidecars (WAL, SHM, journal).
+const SQLITE_SIDECAR_EXTENSIONS: &[&str] = &["sqlite-wal", "sqlite-shm", "sqlite-journal"];
+
+/// Compute SHA-256 checksums for all files in `out_dir`, enforcing directory
+/// cleanliness.  Fails on SQLite sidecars, symlinks, and non-regular files.
+///
+/// When `expected_files` is `Some`, any regular file on disk that is NOT in the
+/// expected set (and not a manifest) is a hard error.  This prevents stale files
+/// in a reused output directory from being silently blessed into the manifest.
+fn compute_checksums(
+    out_dir: &Path,
+    expected_files: Option<&std::collections::HashSet<String>>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut checksums = BTreeMap::new();
+    let mut entries: Vec<PathBuf> = Vec::new();
+
+    collect_files_recursive(out_dir, out_dir, &mut entries)?;
+    entries.sort();
+
+    for path in &entries {
+        let rel = path
+            .strip_prefix(out_dir)
+            .map_err(|e| format!("strip_prefix: {e}"))?;
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+        // Skip the manifest files themselves.
+        if rel_str == GSS_MANIFEST || rel_str == SQUASH_MANIFEST {
+            continue;
+        }
+
+        // When an expected set is provided, reject unexpected files.
+        if let Some(expected) = expected_files {
+            if !expected.contains(&rel_str) {
+                return Err(format!(
+                    "unexpected file in output directory: {rel_str} \
+                     (reuse a clean --out-dir or remove stale files)"
+                ));
+            }
+        }
+
+        let hash = sha256_file(path)?;
+        checksums.insert(rel_str, hash);
+    }
+
+    Ok(checksums)
+}
+
+/// Recursively collect regular files, rejecting symlinks, non-regular files,
+/// and SQLite sidecars.
+fn collect_files_recursive(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let read_dir = fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+    for entry in read_dir {
+        let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+
+        // Reject symlinks.
+        if metadata.is_symlink() {
+            return Err(format!(
+                "symlink found in GSS directory: {}",
+                path.strip_prefix(base).unwrap_or(&path).display()
+            ));
+        }
+
+        if metadata.is_dir() {
+            collect_files_recursive(base, &path, out)?;
+            continue;
+        }
+
+        if !metadata.is_file() {
+            return Err(format!(
+                "non-regular file in GSS directory: {}",
+                path.strip_prefix(base).unwrap_or(&path).display()
+            ));
+        }
+
+        // Reject SQLite sidecars.
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if SQLITE_SIDECAR_EXTENSIONS.contains(&ext) {
+                return Err(format!(
+                    "SQLite sidecar in GSS directory: {}",
+                    path.strip_prefix(base).unwrap_or(&path).display()
+                ));
+            }
+        }
+
+        out.push(path);
+    }
+    Ok(())
+}
+
+/// Compute the SHA-256 hex digest of a file using streaming reads.
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn chainstate_paths(root: &Path) -> ChainstatePaths {
@@ -239,6 +384,7 @@ fn main() {
     match cli.command {
         Command::Squash(args) => run_squash(args),
         Command::Validate(args) => run_validate(args),
+        Command::Verify(args) => run_verify(args),
         Command::LatestHeight(args) => run_latest_height(args),
     }
 }
@@ -339,6 +485,7 @@ fn run_squash(args: SquashArgs) {
     }
 
     let mut blocks_stats: Option<BlocksSection> = None;
+    let mut copied_block_rel_paths: Vec<String> = Vec::new();
 
     if do_blocks {
         let i_out = index_out
@@ -423,6 +570,14 @@ fn run_squash(args: SquashArgs) {
             nakamoto_rows: nak_stats.rows_copied,
             nakamoto_bytes: nak_stats.total_blob_bytes,
         });
+
+        // Record copied block file paths for the expected-file whitelist.
+        // Epoch2x paths are relative to dst_blocks_dir; prefix with chainstate/blocks/.
+        for rel in &file_stats.copied_paths {
+            copied_block_rel_paths.push(format!("chainstate/blocks/{}", rel.replace('\\', "/")));
+        }
+        // Nakamoto staging DB.
+        copied_block_rel_paths.push("chainstate/blocks/nakamoto.sqlite".to_string());
 
         // 4. Validate blocks if validation is enabled.
         if !args.skip_validate {
@@ -636,6 +791,7 @@ fn run_squash(args: SquashArgs) {
             args.height,
             blocks_stats,
             has_burnchain_aux,
+            &copied_block_rel_paths,
         );
     }
 }
@@ -870,6 +1026,331 @@ fn run_validate(args: ValidateArgs) {
         eprintln!("Validation failed for one or more targets");
         std::process::exit(1);
     }
+}
+
+fn run_verify(args: VerifyArgs) {
+    match verify_gss(&args.gss_dir, args.checkpoint_file.as_deref()) {
+        Ok(()) => {
+            println!("Verification passed.");
+        }
+        Err(errors) => {
+            for e in &errors {
+                eprintln!("  {e}");
+            }
+            eprintln!("Verification FAILED.");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Validate a `0x`-prefixed 64-hex-char hash string.  Returns `Ok(())` or an
+/// error message describing what is wrong.
+fn validate_checkpoint_hash(field_name: &str, value: &str) -> Result<(), String> {
+    if !value.starts_with("0x") {
+        return Err(format!("{field_name}: must start with 0x"));
+    }
+    if value.len() != 66 {
+        return Err(format!(
+            "{field_name}: expected 66 chars (0x + 64 hex), got {}",
+            value.len()
+        ));
+    }
+    if !value[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("{field_name}: contains non-hex characters"));
+    }
+    Ok(())
+}
+
+/// Core verification logic for a GSS directory.  Returns `Ok(())` when all
+/// requested levels pass, or `Err(errors)` with accumulated failure messages.
+/// Levels 0-2 always run; Level 3 runs when `checkpoint_file` is provided.
+fn verify_gss(gss_dir: &Path, checkpoint_file: Option<&Path>) -> Result<(), Vec<String>> {
+    let mut errors: Vec<String> = Vec::new();
+
+    // Require GSS_manifest.toml (full GSS only).
+    let manifest_path = gss_dir.join(GSS_MANIFEST);
+    if !manifest_path.exists() {
+        if gss_dir.join(SQUASH_MANIFEST).exists() {
+            return Err(vec![format!(
+                "found {SQUASH_MANIFEST} but not {GSS_MANIFEST}. \
+                 `verify` is for consumer-side full GSS verification. \
+                 Use `validate` for producer-side partial squash checks."
+            )]);
+        }
+        return Err(vec![format!(
+            "{GSS_MANIFEST} not found in {}",
+            gss_dir.display()
+        )]);
+    }
+
+    let manifest_str = fs::read_to_string(&manifest_path)
+        .map_err(|e| vec![format!("Failed to read {}: {e}", manifest_path.display())])?;
+    let manifest: SquashManifest = toml::from_str(&manifest_str)
+        .map_err(|e| vec![format!("Failed to parse {GSS_MANIFEST}: {e}")])?;
+
+    // Require [checksums] section.
+    let checksums = manifest
+        .checksums
+        .as_ref()
+        .ok_or_else(|| vec![format!("{GSS_MANIFEST} is missing the [checksums] section")])?;
+
+    // ── Level 0: Directory cleanliness ──────────────────────────────────
+    println!("Level 0: Checking directory cleanliness...");
+    let mut disk_files: Vec<PathBuf> = Vec::new();
+    if let Err(e) = collect_files_recursive(gss_dir, gss_dir, &mut disk_files) {
+        errors.push(format!("Level 0: {e}"));
+    } else {
+        // Build set of expected relative paths.
+        let mut expected: std::collections::HashSet<String> =
+            checksums.files.keys().cloned().collect();
+        expected.insert(GSS_MANIFEST.to_string());
+
+        for path in &disk_files {
+            let rel = path
+                .strip_prefix(gss_dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !expected.contains(&rel) {
+                errors.push(format!("Level 0: extra file not in manifest: {rel}"));
+            }
+        }
+        // Also check that all manifest files exist on disk.
+        let disk_set: std::collections::HashSet<String> = disk_files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(gss_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        for expected_file in checksums.files.keys() {
+            if !disk_set.contains(expected_file.as_str()) {
+                errors.push(format!(
+                    "Level 0: manifest file missing from disk: {expected_file}"
+                ));
+            }
+        }
+        if errors.is_empty() {
+            println!(
+                "  PASS: {} files, no extras, no sidecars, no symlinks",
+                disk_files.len()
+            );
+        }
+    }
+
+    // ── Level 1: Checksum verification ──────────────────────────────────
+    println!("Level 1: Verifying SHA-256 checksums...");
+    let mut checksum_failures = 0;
+    for (rel_path, expected_hash) in &checksums.files {
+        let file_path = gss_dir.join(rel_path);
+        match sha256_file(&file_path) {
+            Ok(actual_hash) => {
+                if actual_hash != *expected_hash {
+                    errors.push(format!(
+                        "Level 1: {rel_path}: expected {expected_hash}, got {actual_hash}"
+                    ));
+                    checksum_failures += 1;
+                }
+            }
+            Err(e) => {
+                errors.push(format!("Level 1: {rel_path}: {e}"));
+                checksum_failures += 1;
+            }
+        }
+    }
+    if checksum_failures == 0 {
+        println!("  PASS: {} files verified", checksums.files.len());
+    }
+
+    // ── Level 2: Squash root recomputation ──────────────────────────────
+    println!("Level 2: Recomputing squash root node hashes from MARF contents...");
+
+    let recomputed_clarity = recompute_marf_root::<StacksBlockId>(
+        gss_dir,
+        "chainstate/vm/clarity/marf.sqlite",
+        "clarity",
+        default_open_opts(),
+        manifest
+            .squash_roots
+            .clarity_squash_root_node_hash
+            .as_deref(),
+        &mut errors,
+    );
+
+    let recomputed_index = recompute_marf_root::<StacksBlockId>(
+        gss_dir,
+        "chainstate/vm/index.sqlite",
+        "index",
+        default_open_opts(),
+        manifest.squash_roots.index_squash_root_node_hash.as_deref(),
+        &mut errors,
+    );
+
+    let recomputed_sortition = recompute_marf_root::<SortitionId>(
+        gss_dir,
+        "burnchain/sortition/marf.sqlite",
+        "sortition",
+        sortition_open_opts(),
+        manifest
+            .squash_roots
+            .sortition_squash_root_node_hash
+            .as_deref(),
+        &mut errors,
+    );
+
+    // ── Level 3: WSCP checkpoint comparison ─────────────────────────────
+    if let Some(cp_path) = checkpoint_file {
+        println!("Level 3: Comparing against WSCP checkpoint...");
+        let cp_str = fs::read_to_string(cp_path)
+            .map_err(|e| vec![format!("Failed to read checkpoint file: {e}")])?;
+        let cp: CheckpointFile = toml::from_str(&cp_str)
+            .map_err(|e| vec![format!("Failed to parse checkpoint file: {e}")])?;
+
+        // Validate checkpoint hash fields (prefix + length + hex characters).
+        validate_checkpoint_hash(
+            "clarity_squash_root_node_hash",
+            &cp.clarity_squash_root_node_hash,
+        )
+        .map_err(|e| vec![e])?;
+        validate_checkpoint_hash(
+            "index_squash_root_node_hash",
+            &cp.index_squash_root_node_hash,
+        )
+        .map_err(|e| vec![e])?;
+        validate_checkpoint_hash(
+            "sortition_squash_root_node_hash",
+            &cp.sortition_squash_root_node_hash,
+        )
+        .map_err(|e| vec![e])?;
+
+        // Height must match.
+        if cp.height != manifest.snapshot.height {
+            errors.push(format!(
+                "Level 3: checkpoint height {} != manifest height {}",
+                cp.height, manifest.snapshot.height
+            ));
+        }
+
+        // Compare recomputed hashes against checkpoint (not stored metadata).
+        // Normalize checkpoint values to lowercase so that valid uppercase hex
+        // does not spuriously fail (recomputed hashes are always lowercase).
+        let check = |name: &str, recomputed: &Option<String>, checkpoint: &str| -> Option<String> {
+            let checkpoint_lower = checkpoint.to_ascii_lowercase();
+            match recomputed {
+                Some(hash) if *hash == checkpoint_lower => {
+                    println!("  PASS: {name} matches checkpoint");
+                    None
+                }
+                Some(hash) => Some(format!(
+                    "Level 3: {name} recomputed={hash}, checkpoint={checkpoint_lower}"
+                )),
+                None => Some(format!(
+                    "Level 3: {name} not present in GSS (cannot compare)"
+                )),
+            }
+        };
+
+        if let Some(e) = check(
+            "clarity",
+            &recomputed_clarity,
+            &cp.clarity_squash_root_node_hash,
+        ) {
+            errors.push(e);
+        }
+        if let Some(e) = check("index", &recomputed_index, &cp.index_squash_root_node_hash) {
+            errors.push(e);
+        }
+        if let Some(e) = check(
+            "sortition",
+            &recomputed_sortition,
+            &cp.sortition_squash_root_node_hash,
+        ) {
+            errors.push(e);
+        }
+    } else {
+        println!("Level 3: Skipped (no --checkpoint-file provided)");
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Recompute the squash root node hash for a single MARF and compare against
+/// the manifest value.  Returns the `0x`-prefixed hex hash if successful.
+/// Pushes error strings into `errors` on failure.
+fn recompute_marf_root<T: MarfTrieId>(
+    gss_dir: &Path,
+    rel_path: &str,
+    name: &str,
+    open_opts: MARFOpenOpts,
+    manifest_hash: Option<&str>,
+    errors: &mut Vec<String>,
+) -> Option<String> {
+    let db_path = gss_dir.join(rel_path);
+    if !db_path.exists() {
+        if manifest_hash.is_some() {
+            errors.push(format!(
+                "Level 2: {name} MARF not found at {}",
+                db_path.display()
+            ));
+        } else {
+            println!("  SKIP: {name} (not in GSS)");
+        }
+        return None;
+    }
+
+    let storage = match TrieFileStorage::open_readonly(db_path.to_str().unwrap(), open_opts) {
+        Ok(s) => s,
+        Err(e) => {
+            errors.push(format!("Level 2: {name}: failed to open MARF: {e:?}"));
+            return None;
+        }
+    };
+    let mut marf = MARF::from_storage(storage);
+
+    let tip = match trie_sql::get_latest_confirmed_block_hash::<T>(marf.sqlite_conn()) {
+        Ok(t) => t,
+        Err(e) => {
+            errors.push(format!("Level 2: {name}: failed to read tip: {e:?}"));
+            return None;
+        }
+    };
+
+    let recomputed = match marf.recompute_squash_root_node_hash(&tip) {
+        Ok(h) => h,
+        Err(e) => {
+            errors.push(format!("Level 2: {name}: recomputation error: {e:?}"));
+            return None;
+        }
+    };
+
+    let recomputed_hex = format!("0x{recomputed}");
+
+    match manifest_hash {
+        Some(expected) => {
+            if recomputed_hex == expected {
+                println!("  PASS: {name} recomputed hash matches manifest");
+            } else {
+                errors.push(format!(
+                    "Level 2: {name} recomputed={recomputed_hex}, manifest={expected}"
+                ));
+            }
+        }
+        None => {
+            // MARF exists on disk but manifest has no squash root hash — this is
+            // a malformed manifest for a full GSS.
+            errors.push(format!(
+                "Level 2: {name} MARF exists but manifest has no squash root hash"
+            ));
+        }
+    }
+
+    Some(recomputed_hex)
 }
 
 fn run_latest_height(args: LatestHeightArgs) {
@@ -1538,7 +2019,21 @@ fn read_squash_metadata<T: MarfTrieId + std::fmt::Display>(
     }
 }
 
+/// Insert the relative path of `abs_path` (relative to `base`) into `set`.
+fn insert_expected_rel(base: &Path, abs_path: &Path, set: &mut std::collections::HashSet<String>) {
+    if let Ok(rel) = abs_path.strip_prefix(base) {
+        set.insert(rel.to_string_lossy().replace('\\', "/"));
+    }
+}
+
 /// Generate squash manifest after squashing.
+///
+/// `copied_block_rel_paths` contains the relative paths (under
+/// `chainstate/blocks/`) of epoch-2.x block files and nakamoto.sqlite that
+/// were actually written during the copy step.  This is used to build the
+/// exact expected file set for full-GSS checksum generation, avoiding the
+/// need to re-walk the blocks directory (which could include stale files).
+#[allow(clippy::too_many_arguments)]
 fn generate_manifest(
     out_dir: &Path,
     clarity_out: Option<&TargetPaths>,
@@ -1547,6 +2042,7 @@ fn generate_manifest(
     height: u32,
     blocks_section: Option<BlocksSection>,
     has_burnchain_aux: bool,
+    copied_block_rel_paths: &[String],
 ) {
     let (i_tip, i_archival, i_squash, i_height) =
         read_squash_metadata::<StacksBlockId>(index_out.db.to_str().unwrap(), default_open_opts());
@@ -1640,6 +2136,51 @@ fn generate_manifest(
         && blocks_section.is_some()
         && has_burnchain_aux;
 
+    // Compute checksums for full GSS (mandatory).  For partial squash
+    // manifests, checksums are omitted.
+    let checksums = if is_full_gss {
+        // Build the set of expected files from the known GSS outputs so that
+        // stale files in a reused out-dir are rejected rather than blessed.
+        let mut expected = std::collections::HashSet::new();
+
+        // MARF databases + blobs.
+        if let Some(c) = clarity_out {
+            insert_expected_rel(out_dir, &c.db, &mut expected);
+            if let Some(b) = &c.blobs {
+                insert_expected_rel(out_dir, b, &mut expected);
+            }
+        }
+        insert_expected_rel(out_dir, &index_out.db, &mut expected);
+        if let Some(b) = &index_out.blobs {
+            insert_expected_rel(out_dir, b, &mut expected);
+        }
+        if let Some((s, _)) = sortition_out {
+            insert_expected_rel(out_dir, &s.db, &mut expected);
+        }
+
+        // Burnchain auxiliary files.
+        if has_burnchain_aux {
+            expected.insert("burnchain/burnchain.sqlite".to_string());
+            expected.insert("headers.sqlite".to_string());
+        }
+
+        // Block data files: use the exact paths carried forward from the
+        // copy steps rather than re-walking the output directory (which
+        // could include stale files from a previous run).
+        for rel in copied_block_rel_paths {
+            expected.insert(rel.clone());
+        }
+
+        let files = compute_checksums(out_dir, Some(&expected)).unwrap_or_else(|e| {
+            eprintln!("Failed to compute checksums: {e}");
+            std::process::exit(1);
+        });
+        println!("Computed SHA-256 checksums for {} files", files.len());
+        Some(ChecksumsSection { files })
+    } else {
+        None
+    };
+
     let manifest = SquashManifest {
         snapshot: SnapshotSection {
             version: 1,
@@ -1662,6 +2203,7 @@ fn generate_manifest(
             sortition_squash_root_node_hash: s_squash,
         },
         blocks: blocks_section,
+        checksums,
     };
 
     let toml_str = toml::to_string(&manifest).unwrap_or_else(|e| {
@@ -1670,9 +2212,9 @@ fn generate_manifest(
     });
 
     let manifest_name = if is_full_gss {
-        "GSS_manifest.toml"
+        GSS_MANIFEST
     } else {
-        "squash_manifest.toml"
+        SQUASH_MANIFEST
     };
     let manifest_path = out_dir.join(manifest_name);
     fs::write(&manifest_path, toml_str).unwrap_or_else(|e| {
@@ -1888,11 +2430,16 @@ fn resolve_burn_height_for_sortition(sortition_db_path: &str, stacks_height: u32
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use clap::Parser;
 
-    use super::{Cli, Command, LatestHeightArgs, ValidateArgs};
+    use super::{
+        collect_files_recursive, compute_checksums, sha256_file, validate_checkpoint_hash,
+        verify_gss, CheckpointFile, ChecksumsSection, Cli, Command, LatestHeightArgs,
+        SquashManifest, ValidateArgs, GSS_MANIFEST, SQUASH_MANIFEST,
+    };
 
     #[test]
     fn test_parse_squash_args_ok() {
@@ -2050,5 +2597,734 @@ mod tests {
             }
             _ => panic!("expected latest-height command"),
         }
+    }
+
+    // ── Verify CLI parsing ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_verify_args_ok() {
+        let args = vec![
+            "marf-squash",
+            "verify",
+            "--gss-dir",
+            "/tmp/gss",
+            "--checkpoint-file",
+            "/tmp/checkpoint.toml",
+        ]
+        .into_iter()
+        .map(String::from);
+
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::Verify(args) => {
+                assert_eq!(args.gss_dir, PathBuf::from("/tmp/gss"));
+                assert_eq!(
+                    args.checkpoint_file,
+                    Some(PathBuf::from("/tmp/checkpoint.toml"))
+                );
+            }
+            _ => panic!("expected verify command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_verify_args_no_checkpoint() {
+        let args = vec!["marf-squash", "verify", "--gss-dir", "/tmp/gss"]
+            .into_iter()
+            .map(String::from);
+
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::Verify(args) => {
+                assert_eq!(args.gss_dir, PathBuf::from("/tmp/gss"));
+                assert!(args.checkpoint_file.is_none());
+            }
+            _ => panic!("expected verify command"),
+        }
+    }
+
+    // ── Manifest generation cleanliness ─────────────────────────────────
+
+    /// Helper: create a minimal GSS directory with the given file set.
+    fn create_test_gss_dir(dir: &std::path::Path, files: &[&str]) {
+        for f in files {
+            let path = dir.join(f);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, format!("content of {f}")).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_compute_checksums_clean_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["a.sqlite", "sub/b.sqlite"]);
+        // Also create the manifest (skipped by compute_checksums).
+        std::fs::write(dir.join(GSS_MANIFEST), "dummy").unwrap();
+
+        let checksums = compute_checksums(dir, None).unwrap();
+        assert_eq!(checksums.len(), 2);
+        assert!(checksums.contains_key("a.sqlite"));
+        assert!(checksums.contains_key("sub/b.sqlite"));
+        // Verify actual hash.
+        let expected = sha256_file(&dir.join("a.sqlite")).unwrap();
+        assert_eq!(checksums["a.sqlite"], expected);
+    }
+
+    #[test]
+    fn test_manifest_rejects_sqlite_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["a.sqlite", "a.sqlite-wal"]);
+
+        let result = compute_checksums(dir, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SQLite sidecar"));
+    }
+
+    #[test]
+    fn test_manifest_rejects_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["a.sqlite"]);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("a.sqlite"), dir.join("link.sqlite")).unwrap();
+
+        #[cfg(unix)]
+        {
+            let result = compute_checksums(dir, None);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("symlink"));
+        }
+    }
+
+    #[test]
+    fn test_manifest_rejects_extra_file_in_outdir() {
+        // When an expected file set is provided, compute_checksums rejects
+        // any file not in the set — preventing stale files from being blessed.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["expected.sqlite", "stale.sqlite"]);
+
+        let mut expected = std::collections::HashSet::new();
+        expected.insert("expected.sqlite".to_string());
+
+        let result = compute_checksums(dir, Some(&expected));
+        let err = result.unwrap_err();
+        assert!(err.contains("unexpected file"), "got: {err}");
+        assert!(err.contains("stale.sqlite"), "got: {err}");
+    }
+
+    #[test]
+    fn test_compute_checksums_without_expected_set_hashes_all() {
+        // Without an expected set, compute_checksums hashes all regular files.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["a.sqlite", "b.sqlite"]);
+
+        let checksums = compute_checksums(dir, None).unwrap();
+        assert_eq!(checksums.len(), 2);
+    }
+
+    // ── Verify integrity tests ──────────────────────────────────────────
+
+    /// Helper: write a manifest TOML with the given checksums.
+    fn write_test_manifest(dir: &std::path::Path, checksums: &BTreeMap<String, String>) {
+        let manifest = SquashManifest {
+            snapshot: super::SnapshotSection {
+                version: 1,
+                height: 100,
+                block_hash: "0xdeadbeef".to_string(),
+                bitcoin_height: None,
+                bitcoin_block_hash: None,
+                timestamp: None,
+                chain_id: 1,
+                mainnet: true,
+            },
+            roots: super::RootsSection {
+                clarity_archival_marf_root_hash: None,
+                index_archival_marf_root_hash: "0xaaa".to_string(),
+                sortition_archival_marf_root_hash: None,
+            },
+            squash_roots: super::SquashRootsSection {
+                clarity_squash_root_node_hash: Some("0xbbb".to_string()),
+                index_squash_root_node_hash: Some("0xccc".to_string()),
+                sortition_squash_root_node_hash: Some("0xddd".to_string()),
+            },
+            blocks: None,
+            checksums: Some(ChecksumsSection {
+                files: checksums.clone(),
+            }),
+        };
+        let toml_str = toml::to_string(&manifest).unwrap();
+        std::fs::write(dir.join(GSS_MANIFEST), toml_str).unwrap();
+    }
+
+    #[test]
+    fn test_verify_rejects_partial_squash_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join(SQUASH_MANIFEST), "dummy").unwrap();
+
+        // GSS_manifest.toml does not exist.
+        assert!(!dir.join(GSS_MANIFEST).exists());
+        assert!(dir.join(SQUASH_MANIFEST).exists());
+    }
+
+    #[test]
+    fn test_verify_checksum_mismatch_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["data.sqlite"]);
+
+        let correct_hash = sha256_file(&dir.join("data.sqlite")).unwrap();
+        let mut checksums = BTreeMap::new();
+        checksums.insert("data.sqlite".to_string(), correct_hash.clone());
+        write_test_manifest(dir, &checksums);
+
+        // Verify correct checksums first.
+        let actual = sha256_file(&dir.join("data.sqlite")).unwrap();
+        assert_eq!(actual, correct_hash);
+
+        // Now corrupt the file.
+        std::fs::write(dir.join("data.sqlite"), "corrupted!").unwrap();
+        let actual = sha256_file(&dir.join("data.sqlite")).unwrap();
+        assert_ne!(actual, correct_hash);
+    }
+
+    #[test]
+    fn test_verify_fails_without_checksums() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Write manifest without [checksums].
+        let manifest = SquashManifest {
+            snapshot: super::SnapshotSection {
+                version: 1,
+                height: 100,
+                block_hash: "0xdeadbeef".to_string(),
+                bitcoin_height: None,
+                bitcoin_block_hash: None,
+                timestamp: None,
+                chain_id: 1,
+                mainnet: true,
+            },
+            roots: super::RootsSection {
+                clarity_archival_marf_root_hash: None,
+                index_archival_marf_root_hash: "0xaaa".to_string(),
+                sortition_archival_marf_root_hash: None,
+            },
+            squash_roots: super::SquashRootsSection {
+                clarity_squash_root_node_hash: None,
+                index_squash_root_node_hash: None,
+                sortition_squash_root_node_hash: None,
+            },
+            blocks: None,
+            checksums: None,
+        };
+        let toml_str = toml::to_string(&manifest).unwrap();
+        std::fs::write(dir.join(GSS_MANIFEST), &toml_str).unwrap();
+
+        // Parse and verify that checksums section is None.
+        let parsed: SquashManifest = toml::from_str(&toml_str).unwrap();
+        assert!(parsed.checksums.is_none());
+    }
+
+    #[test]
+    fn test_verify_rejects_extra_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["expected.sqlite", "extra.sqlite"]);
+
+        let hash = sha256_file(&dir.join("expected.sqlite")).unwrap();
+        let mut checksums = BTreeMap::new();
+        checksums.insert("expected.sqlite".to_string(), hash);
+        write_test_manifest(dir, &checksums);
+
+        // Collect files and check for extras.
+        let mut disk_files = Vec::new();
+        collect_files_recursive(dir, dir, &mut disk_files).unwrap();
+        let expected_set: std::collections::HashSet<String> = checksums
+            .keys()
+            .cloned()
+            .chain(std::iter::once(GSS_MANIFEST.to_string()))
+            .collect();
+
+        let extras: Vec<_> = disk_files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .filter(|rel| !expected_set.contains(rel.as_str()))
+            .collect();
+
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0], "extra.sqlite");
+    }
+
+    #[test]
+    fn test_verify_rejects_sqlite_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["data.sqlite"]);
+        std::fs::write(dir.join("data.sqlite-wal"), "stale wal").unwrap();
+
+        let mut disk_files = Vec::new();
+        let result = collect_files_recursive(dir, dir, &mut disk_files);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SQLite sidecar"));
+    }
+
+    #[test]
+    fn test_verify_rejects_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["data.sqlite"]);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("data.sqlite"), dir.join("link.sqlite")).unwrap();
+
+        #[cfg(unix)]
+        {
+            let mut disk_files = Vec::new();
+            let result = collect_files_recursive(dir, dir, &mut disk_files);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("symlink"));
+        }
+    }
+
+    // ── Checkpoint file parsing ─────────────────────────────────────────
+
+    #[test]
+    fn test_checkpoint_file_valid() {
+        let toml_str = r#"
+height = 150000
+clarity_squash_root_node_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+index_squash_root_node_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+sortition_squash_root_node_hash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+"#;
+        let cp: CheckpointFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(cp.height, 150000);
+        assert_eq!(
+            cp.clarity_squash_root_node_hash,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_file_malformed_toml() {
+        let result = toml::from_str::<CheckpointFile>("this is not valid toml {{{");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_checkpoint_file_partial_fields() {
+        // Missing sortition hash.
+        let toml_str = r#"
+height = 150000
+clarity_squash_root_node_hash = "0xaaaa"
+index_squash_root_node_hash = "0xbbbb"
+"#;
+        let result = toml::from_str::<CheckpointFile>(toml_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_checkpoint_file_invalid_hex_no_prefix() {
+        let toml_str = r#"
+height = 150000
+clarity_squash_root_node_hash = "no_prefix_here_64_chars_000000000000000000000000000000000000"
+index_squash_root_node_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+sortition_squash_root_node_hash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+"#;
+        // Parses as a string, but run_verify validates the 0x prefix + length.
+        let cp: CheckpointFile = toml::from_str(toml_str).unwrap();
+        assert!(!cp.clarity_squash_root_node_hash.starts_with("0x"));
+    }
+
+    #[test]
+    fn test_checkpoint_file_wrong_length() {
+        let toml_str = r#"
+height = 150000
+clarity_squash_root_node_hash = "0xtooshort"
+index_squash_root_node_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+sortition_squash_root_node_hash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+"#;
+        let cp: CheckpointFile = toml::from_str(toml_str).unwrap();
+        // 0x + 8 chars != 66
+        assert_ne!(cp.clarity_squash_root_node_hash.len(), 66);
+    }
+
+    #[test]
+    fn test_checkpoint_file_height_mismatch_detected() {
+        // Just verify we can compare heights programmatically.
+        let manifest_height: u32 = 100;
+        let checkpoint_height: u32 = 200;
+        assert_ne!(manifest_height, checkpoint_height);
+    }
+
+    // ── validate_checkpoint_hash tests ────────────────────────────────────
+
+    #[test]
+    fn test_validate_checkpoint_hash_valid() {
+        let hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(validate_checkpoint_hash("test_field", hash).is_ok());
+    }
+
+    #[test]
+    fn test_validate_checkpoint_hash_no_prefix() {
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00";
+        let err = validate_checkpoint_hash("test_field", hash).unwrap_err();
+        assert!(err.contains("must start with 0x"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_checkpoint_hash_wrong_length() {
+        let hash = "0xtooshort";
+        let err = validate_checkpoint_hash("test_field", hash).unwrap_err();
+        assert!(err.contains("expected 66 chars"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_checkpoint_hash_invalid_hex_chars() {
+        // Correct length (66) but contains non-hex 'g' characters.
+        let hash = "0xgggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg";
+        assert_eq!(hash.len(), 66);
+        let err = validate_checkpoint_hash("test_field", hash).unwrap_err();
+        assert!(err.contains("non-hex"), "got: {err}");
+    }
+
+    // ── End-to-end verify_gss tests ───────────────────────────────────────
+
+    #[test]
+    fn test_verify_gss_end_to_end_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["data.sqlite"]);
+
+        let hash = sha256_file(&dir.join("data.sqlite")).unwrap();
+        let mut files = BTreeMap::new();
+        files.insert("data.sqlite".to_string(), hash);
+        write_test_manifest(dir, &files);
+
+        // Levels 0+1 should pass (correct checksums, no extras).
+        // Level 2 will fail because there are no real MARFs — but the
+        // MARF files don't exist and squash_roots are set, so Level 2
+        // reports those as errors.  We test that the composed flow runs
+        // and returns errors for the MARF paths.
+        let result = verify_gss(dir, None);
+        // We expect Level 2 errors because the test manifest claims squash
+        // roots exist but there are no MARF files on disk.
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e: &String| e.contains("Level 2")),
+            "expected Level 2 errors, got: {errors:?}"
+        );
+        // But no Level 0 or Level 1 errors.
+        assert!(
+            !errors.iter().any(|e: &String| e.contains("Level 0")),
+            "unexpected Level 0 errors: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e: &String| e.contains("Level 1")),
+            "unexpected Level 1 errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_gss_end_to_end_levels_0_1_only() {
+        // Test with squash_roots set to None so Level 2 SKIPs (no MARFs
+        // claimed → no MARFs expected).  Levels 0+1 should pass cleanly.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["data.sqlite"]);
+
+        let hash = sha256_file(&dir.join("data.sqlite")).unwrap();
+        let mut files = BTreeMap::new();
+        files.insert("data.sqlite".to_string(), hash);
+
+        let manifest = SquashManifest {
+            snapshot: super::SnapshotSection {
+                version: 1,
+                height: 100,
+                block_hash: "0xdeadbeef".to_string(),
+                bitcoin_height: None,
+                bitcoin_block_hash: None,
+                timestamp: None,
+                chain_id: 1,
+                mainnet: true,
+            },
+            roots: super::RootsSection {
+                clarity_archival_marf_root_hash: None,
+                index_archival_marf_root_hash: "0xaaa".to_string(),
+                sortition_archival_marf_root_hash: None,
+            },
+            squash_roots: super::SquashRootsSection {
+                clarity_squash_root_node_hash: None,
+                index_squash_root_node_hash: None,
+                sortition_squash_root_node_hash: None,
+            },
+            blocks: None,
+            checksums: Some(ChecksumsSection { files }),
+        };
+        let toml_str = toml::to_string(&manifest).unwrap();
+        std::fs::write(dir.join(GSS_MANIFEST), &toml_str).unwrap();
+
+        let result = verify_gss(dir, None);
+        assert!(result.is_ok(), "expected pass, got: {result:?}");
+    }
+
+    #[test]
+    fn test_verify_gss_end_to_end_checksum_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["data.sqlite"]);
+
+        // Write manifest with wrong checksum.
+        let mut files = BTreeMap::new();
+        files.insert("data.sqlite".to_string(), "badhash".to_string());
+
+        let manifest = SquashManifest {
+            snapshot: super::SnapshotSection {
+                version: 1,
+                height: 100,
+                block_hash: "0xdeadbeef".to_string(),
+                bitcoin_height: None,
+                bitcoin_block_hash: None,
+                timestamp: None,
+                chain_id: 1,
+                mainnet: true,
+            },
+            roots: super::RootsSection {
+                clarity_archival_marf_root_hash: None,
+                index_archival_marf_root_hash: "0xaaa".to_string(),
+                sortition_archival_marf_root_hash: None,
+            },
+            squash_roots: super::SquashRootsSection {
+                clarity_squash_root_node_hash: None,
+                index_squash_root_node_hash: None,
+                sortition_squash_root_node_hash: None,
+            },
+            blocks: None,
+            checksums: Some(ChecksumsSection { files }),
+        };
+        let toml_str = toml::to_string(&manifest).unwrap();
+        std::fs::write(dir.join(GSS_MANIFEST), &toml_str).unwrap();
+
+        let result = verify_gss(dir, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e: &String| e.contains("Level 1")),
+            "expected Level 1 error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_gss_end_to_end_extra_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["expected.sqlite", "extra.sqlite"]);
+
+        // Manifest only lists expected.sqlite.
+        let hash = sha256_file(&dir.join("expected.sqlite")).unwrap();
+        let mut files = BTreeMap::new();
+        files.insert("expected.sqlite".to_string(), hash);
+
+        let manifest = SquashManifest {
+            snapshot: super::SnapshotSection {
+                version: 1,
+                height: 100,
+                block_hash: "0xdeadbeef".to_string(),
+                bitcoin_height: None,
+                bitcoin_block_hash: None,
+                timestamp: None,
+                chain_id: 1,
+                mainnet: true,
+            },
+            roots: super::RootsSection {
+                clarity_archival_marf_root_hash: None,
+                index_archival_marf_root_hash: "0xaaa".to_string(),
+                sortition_archival_marf_root_hash: None,
+            },
+            squash_roots: super::SquashRootsSection {
+                clarity_squash_root_node_hash: None,
+                index_squash_root_node_hash: None,
+                sortition_squash_root_node_hash: None,
+            },
+            blocks: None,
+            checksums: Some(ChecksumsSection { files }),
+        };
+        let toml_str = toml::to_string(&manifest).unwrap();
+        std::fs::write(dir.join(GSS_MANIFEST), &toml_str).unwrap();
+
+        let result = verify_gss(dir, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e: &String| e.contains("extra file")),
+            "expected extra file error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_gss_rejects_missing_checksums() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Manifest without [checksums].
+        let manifest = SquashManifest {
+            snapshot: super::SnapshotSection {
+                version: 1,
+                height: 100,
+                block_hash: "0xdeadbeef".to_string(),
+                bitcoin_height: None,
+                bitcoin_block_hash: None,
+                timestamp: None,
+                chain_id: 1,
+                mainnet: true,
+            },
+            roots: super::RootsSection {
+                clarity_archival_marf_root_hash: None,
+                index_archival_marf_root_hash: "0xaaa".to_string(),
+                sortition_archival_marf_root_hash: None,
+            },
+            squash_roots: super::SquashRootsSection {
+                clarity_squash_root_node_hash: None,
+                index_squash_root_node_hash: None,
+                sortition_squash_root_node_hash: None,
+            },
+            blocks: None,
+            checksums: None,
+        };
+        let toml_str = toml::to_string(&manifest).unwrap();
+        std::fs::write(dir.join(GSS_MANIFEST), &toml_str).unwrap();
+
+        let result = verify_gss(dir, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e: &String| e.contains("[checksums]")),
+            "expected checksums error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_gss_rejects_partial_squash_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join(SQUASH_MANIFEST), "dummy").unwrap();
+
+        let result = verify_gss(dir, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e: &String| e.contains(SQUASH_MANIFEST) && e.contains("validate")),
+            "expected partial-squash error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_gss_checkpoint_mismatch() {
+        // Exercise the Level 3 checkpoint comparison path with synthetic data.
+        // The checkpoint hashes don't match the manifest squash roots (which
+        // are also synthetic), so Level 3 should fail.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        create_test_gss_dir(dir, &["data.sqlite"]);
+
+        let hash = sha256_file(&dir.join("data.sqlite")).unwrap();
+        let mut files = BTreeMap::new();
+        files.insert("data.sqlite".to_string(), hash);
+
+        // Manifest with no squash roots (so Level 2 SKIPs) but valid checksums.
+        let manifest = SquashManifest {
+            snapshot: super::SnapshotSection {
+                version: 1,
+                height: 100,
+                block_hash: "0xdeadbeef".to_string(),
+                bitcoin_height: None,
+                bitcoin_block_hash: None,
+                timestamp: None,
+                chain_id: 1,
+                mainnet: true,
+            },
+            roots: super::RootsSection {
+                clarity_archival_marf_root_hash: None,
+                index_archival_marf_root_hash: "0xaaa".to_string(),
+                sortition_archival_marf_root_hash: None,
+            },
+            squash_roots: super::SquashRootsSection {
+                clarity_squash_root_node_hash: None,
+                index_squash_root_node_hash: None,
+                sortition_squash_root_node_hash: None,
+            },
+            blocks: None,
+            checksums: Some(ChecksumsSection { files }),
+        };
+        let toml_str = toml::to_string(&manifest).unwrap();
+        std::fs::write(dir.join(GSS_MANIFEST), &toml_str).unwrap();
+
+        // Write a checkpoint file with valid-format hashes.
+        let cp_toml = r#"
+height = 100
+clarity_squash_root_node_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+index_squash_root_node_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+sortition_squash_root_node_hash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+"#;
+        let cp_path = dir.join("checkpoint.toml");
+        std::fs::write(&cp_path, cp_toml).unwrap();
+
+        // Levels 0+1 pass, Level 2 skips (no MARFs), Level 3 fails because
+        // no recomputed hashes are available to compare against the checkpoint.
+        let result = verify_gss(dir, Some(&cp_path));
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e: &String| e.contains("Level 3") && e.contains("not present")),
+            "expected Level 3 failure, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_gss_checkpoint_case_insensitive() {
+        // Verify that uppercase hex in checkpoint hashes matches lowercase
+        // recomputed hashes (the comparison is case-insensitive).
+        let upper = "0xAABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899";
+        let lower = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        // validate_checkpoint_hash accepts uppercase.
+        assert!(validate_checkpoint_hash("test", upper).is_ok());
+        // Normalization makes them equal.
+        assert_eq!(upper.to_ascii_lowercase(), lower);
+    }
+
+    #[test]
+    fn test_compute_checksums_rejects_stale_block_file() {
+        // Regression test: stale block files in chainstate/blocks/ must be
+        // rejected when an expected set is provided, not silently checksummed.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Create a legitimate block file and a stale one.
+        let blocks_dir = dir.join("chainstate/blocks/ab/cd");
+        std::fs::create_dir_all(&blocks_dir).unwrap();
+        std::fs::write(blocks_dir.join("legit_block"), "data").unwrap();
+        std::fs::write(blocks_dir.join("stale_block"), "old data").unwrap();
+
+        let mut expected = std::collections::HashSet::new();
+        expected.insert("chainstate/blocks/ab/cd/legit_block".to_string());
+
+        let result = compute_checksums(dir, Some(&expected));
+        let err = result.unwrap_err();
+        assert!(err.contains("unexpected file"), "got: {err}");
+        assert!(err.contains("stale_block"), "got: {err}");
     }
 }

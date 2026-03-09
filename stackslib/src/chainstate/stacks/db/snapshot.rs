@@ -1189,6 +1189,8 @@ pub struct Epoch2BlockFileCopyStats {
     pub files_copied: u64,
     pub total_bytes: u64,
     pub genesis_skipped: u64,
+    /// Relative paths of the copied block files (relative to dst_blocks_dir).
+    pub copied_paths: Vec<String>,
 }
 
 /// Statistics for nakamoto staging block copy.
@@ -1545,6 +1547,9 @@ pub fn copy_epoch2_block_files(
 
         stats.files_copied += 1;
         stats.total_bytes += bytes_copied;
+        stats
+            .copied_paths
+            .push(rel_path.to_string_lossy().into_owned());
 
         if stats.files_copied % 1000 == 0 {
             info!(
@@ -2970,12 +2975,10 @@ mod tests {
     // ---------------------------------------------------------------
 
     use super::{copy_sortition_side_tables, validate_sortition_side_tables};
-
     use crate::chainstate::burn::db::sortdb::{
         SORTITION_DB_INITIAL_SCHEMA, SORTITION_DB_SCHEMA_10, SORTITION_DB_SCHEMA_2,
-        SORTITION_DB_SCHEMA_3, SORTITION_DB_SCHEMA_4, SORTITION_DB_SCHEMA_5,
-        SORTITION_DB_SCHEMA_6, SORTITION_DB_SCHEMA_7, SORTITION_DB_SCHEMA_8,
-        SORTITION_DB_SCHEMA_9,
+        SORTITION_DB_SCHEMA_3, SORTITION_DB_SCHEMA_4, SORTITION_DB_SCHEMA_5, SORTITION_DB_SCHEMA_6,
+        SORTITION_DB_SCHEMA_7, SORTITION_DB_SCHEMA_8, SORTITION_DB_SCHEMA_9,
     };
 
     /// Create a sortition source DB with the real schema (all migrations

@@ -708,6 +708,63 @@ impl<T: MarfTrieId> MARF<T> {
         Ok((nodes, source_to_idx))
     }
 
+    /// Recompute the `squash_root_node_hash` from the committed squash trie blob.
+    ///
+    /// BFS walks the trie, remaps child pointers to array indices, and
+    /// bottom-up recomputes content hashes.  Does **not** read stored SQL
+    /// metadata — this is a pure content hash derived solely from the
+    /// trie structure and leaf values on disk.
+    pub fn recompute_squash_root_node_hash(&mut self, block_hash: &T) -> Result<TrieHash, Error> {
+        let (mut nodes, source_to_idx) =
+            self.with_conn(|conn| Self::collect_all_nodes(conn, block_hash))?;
+
+        // Remap child pointers from (block_id, byte_offset) to array indices.
+        for idx in 0..nodes.len() {
+            let node = nodes
+                .get(idx)
+                .ok_or_else(|| Error::CorruptionError(format!("node index {idx} out of bounds")))?;
+            if node.0.is_leaf() {
+                continue;
+            }
+            let origin_block_id = node.2;
+            let child_ptrs: Vec<TriePtr> = node.0.ptrs().to_vec();
+            for (slot, ptr) in child_ptrs.iter().enumerate() {
+                if ptr.id() == TrieNodeID::Empty as u8 {
+                    continue;
+                }
+                let (child_block_id, read_ptr) = if is_backptr(ptr.id()) {
+                    (ptr.back_block(), ptr.from_backptr().ptr())
+                } else {
+                    (origin_block_id, ptr.ptr())
+                };
+                let source_key = (child_block_id, read_ptr);
+                if let Some(&child_idx) = source_to_idx.get(&source_key) {
+                    let node_mut = nodes.get_mut(idx).ok_or_else(|| {
+                        Error::CorruptionError(format!("node index {idx} out of bounds"))
+                    })?;
+                    let ptrs_mut = node_mut.0.ptrs_mut();
+                    let ptr_entry = ptrs_mut.get_mut(slot).ok_or_else(|| {
+                        Error::CorruptionError(format!("slot {slot} out of bounds at node {idx}"))
+                    })?;
+                    ptr_entry.ptr = child_idx as u64;
+                } else {
+                    return Err(Error::CorruptionError(format!(
+                        "recompute_squash_root_node_hash: unresolved child pointer \
+                         (block_id={child_block_id}, offset={read_ptr}) at node {idx} slot {slot}"
+                    )));
+                }
+            }
+        }
+
+        recompute_content_hashes(&mut nodes)?;
+
+        let empty_hash = TrieHash::from_data(&[]);
+        Ok(nodes
+            .first()
+            .map(|(_, hash, _)| *hash)
+            .unwrap_or(empty_hash))
+    }
+
     /// Remap pass: rewrite child pointers to Vec indices and annotate
     /// `back_block` for hash-preserving backpointer identity.
     ///
@@ -973,58 +1030,11 @@ impl<T: MarfTrieId> MARF<T> {
                 stats.squash_node_hash_present = true;
                 let start_node_hash = Instant::now();
                 info!("Validate: recomputing squash_root_node_hash from blob (BFS walk)...");
-                let (mut nodes, source_to_idx) = squashed
-                    .with_conn(|conn| Self::collect_all_nodes(conn, &squashed_block_at_height))?;
-                // Remap child pointers from blob offsets to array indices.
-                // collect_all_nodes returns nodes keyed by (block_id, ptr_offset)
-                // but recompute_content_hashes expects ptr fields to be array indices.
-                for idx in 0..nodes.len() {
-                    let node = nodes.get(idx).ok_or_else(|| {
-                        Error::CorruptionError(format!("node index {idx} out of bounds"))
-                    })?;
-                    if node.0.is_leaf() {
-                        continue;
-                    }
-                    let origin_block_id = node.2;
-                    let child_ptrs: Vec<TriePtr> = node.0.ptrs().to_vec();
-                    for (slot, ptr) in child_ptrs.iter().enumerate() {
-                        if ptr.id() == TrieNodeID::Empty as u8 {
-                            continue;
-                        }
-                        let (child_block_id, read_ptr) = if is_backptr(ptr.id()) {
-                            (ptr.back_block(), ptr.from_backptr().ptr())
-                        } else {
-                            (origin_block_id, ptr.ptr())
-                        };
-                        let source_key = (child_block_id, read_ptr);
-                        if let Some(&child_idx) = source_to_idx.get(&source_key) {
-                            let node_mut = nodes.get_mut(idx).ok_or_else(|| {
-                                Error::CorruptionError(format!("node index {idx} out of bounds"))
-                            })?;
-                            let ptrs_mut = node_mut.0.ptrs_mut();
-                            let ptr_entry = ptrs_mut.get_mut(slot).ok_or_else(|| {
-                                Error::CorruptionError(format!(
-                                    "slot {slot} out of bounds at node {idx}"
-                                ))
-                            })?;
-                            ptr_entry.ptr = child_idx as u64;
-                        } else {
-                            return Err(Error::CorruptionError(format!(
-                                "squash_root_node_hash validation: unresolved child pointer \
-                                 (block_id={child_block_id}, offset={read_ptr}) at node {idx} slot {slot}"
-                            )));
-                        }
-                    }
-                }
-                recompute_content_hashes(&mut nodes)?;
-                let recomputed_hash = nodes
-                    .first()
-                    .map(|(_, hash, _)| *hash)
-                    .unwrap_or(empty_hash);
+                let recomputed_hash =
+                    squashed.recompute_squash_root_node_hash(&squashed_block_at_height)?;
                 stats.squash_node_hash_matches = recomputed_hash == stored_hash;
                 info!(
-                    "Validate squash_root_node_hash: {} nodes, matches={}, {:?}",
-                    nodes.len(),
+                    "Validate squash_root_node_hash: matches={}, {:?}",
                     stats.squash_node_hash_matches,
                     start_node_hash.elapsed()
                 );
