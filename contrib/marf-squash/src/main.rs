@@ -2099,6 +2099,9 @@ fn generate_manifest(
     let timestamp = read_snapshot_timestamp(sortition_out, index_out, height);
 
     // Read bitcoin height + block hash from sortition DB if available.
+    // Note: `bh` is the MARF-internal sortition height (0-indexed from
+    // genesis sortition), NOT the actual Bitcoin block height.  We read the
+    // real Bitcoin height from the `burn_header_height` column in snapshots.
     let (bitcoin_height, bitcoin_block_hash) = if let Some((s_out, bh)) = &sortition_out {
         let conn = rusqlite::Connection::open(s_out.db.to_str().unwrap()).unwrap_or_else(|e| {
             eprintln!("Failed to open squashed sortition DB for bitcoin metadata: {e}");
@@ -2112,21 +2115,21 @@ fn generate_manifest(
             )
             .unwrap_or_else(|e| {
                 eprintln!(
-                    "Failed to read sortition ID at burn height {bh} from squashed sortition DB: {e}"
+                    "Failed to read sortition ID at MARF height {bh} from squashed sortition DB: {e}"
                 );
                 std::process::exit(1);
             });
-        let btc_hash: String = conn
+        let (real_btc_height, btc_hash): (u32, String) = conn
             .query_row(
-                "SELECT burn_header_hash FROM snapshots WHERE sortition_id = ?1",
+                "SELECT burn_header_height, burn_header_hash FROM snapshots WHERE sortition_id = ?1",
                 [&sort_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap_or_else(|e| {
-                eprintln!("Failed to read burn_header_hash for sortition_id {sort_id}: {e}");
+                eprintln!("Failed to read burn_header_height/hash for sortition_id {sort_id}: {e}");
                 std::process::exit(1);
             });
-        (Some(*bh), Some(format!("0x{btc_hash}")))
+        (Some(real_btc_height), Some(format!("0x{btc_hash}")))
     } else {
         (None, None)
     };
@@ -2414,7 +2417,7 @@ fn resolve_burn_height_for_sortition(sortition_db_path: &str, stacks_height: u32
         .with_conn(|conn| resolve_stacks_to_burn_height(conn, &tip, tip_height, stacks_height))
     {
         Ok(h) => {
-            eprintln!("Resolved Stacks height {stacks_height} to burn block height {h}");
+            eprintln!("Resolved Stacks height {stacks_height} to sortition MARF height {h}");
             h
         }
         Err(Error::NotFoundError) => {
