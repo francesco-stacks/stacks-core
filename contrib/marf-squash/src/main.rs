@@ -3,6 +3,9 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use blockstack_lib::burnchains::PoxConstants;
+use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
+use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
 use blockstack_lib::chainstate::stacks::db::snapshot::{
     copy_burnchain_db, copy_confirmed_epoch2_microblocks, copy_epoch2_block_files,
     copy_index_side_tables, copy_nakamoto_staging_blocks, copy_sortition_side_tables,
@@ -10,14 +13,14 @@ use blockstack_lib::chainstate::stacks::db::snapshot::{
     validate_index_side_tables, validate_microblock_streams, validate_nakamoto_staging_blocks,
     validate_sortition_side_tables, validate_spv_headers,
 };
+use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use blockstack_lib::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashValidationStats, MARF,
 };
-use blockstack_lib::chainstate::stacks::index::squash::resolve_stacks_height_to_sortition;
 use blockstack_lib::chainstate::stacks::index::storage::{
     TrieFileStorage, TrieHashCalculationMode,
 };
-use blockstack_lib::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
+use blockstack_lib::chainstate::stacks::index::{trie_sql, MarfTrieId};
 use blockstack_lib::clarity_vm::database::marf::{
     copy_clarity_side_tables, validate_clarity_side_tables,
 };
@@ -421,7 +424,8 @@ fn run_squash(args: SquashArgs) {
     // Resolve burn height for sortition if needed.
     let burn_height = if do_sortition {
         Some(resolve_burn_height_for_sortition(
-            paths.sortition.db.to_str().unwrap(),
+            &args.chainstate,
+            &paths.sortition.db,
             args.height,
         ))
     } else {
@@ -905,7 +909,8 @@ fn run_validate(args: ValidateArgs) {
 
     if do_sortition {
         let burn_height = resolve_burn_height_for_sortition(
-            source_paths.sortition.db.to_str().unwrap(),
+            &args.source_chainstate,
+            &source_paths.sortition.db,
             args.height,
         );
         if !validate_one(
@@ -1019,7 +1024,8 @@ fn run_validate(args: ValidateArgs) {
     let do_burnchain_aux = do_clarity && do_index && do_sortition && do_blocks;
     if do_burnchain_aux {
         let burn_height = resolve_burn_height_for_sortition(
-            source_paths.sortition.db.to_str().unwrap(),
+            &args.source_chainstate,
+            &source_paths.sortition.db,
             args.height,
         );
 
@@ -2379,48 +2385,131 @@ fn sortition_open_opts() -> MARFOpenOpts {
     open_opts
 }
 
-/// Resolve Stacks block height to the earliest canonical burn block height
-fn resolve_burn_height_for_sortition(sortition_db_path: &str, stacks_height: u32) -> u32 {
-    let open_opts = sortition_open_opts();
-    let src_storage =
-        TrieFileStorage::open_readonly(sortition_db_path, open_opts).unwrap_or_else(|e| {
-            eprintln!("Failed to open sortition MARF: {e:?}");
-            std::process::exit(1);
-        });
-    let mut marf = MARF::<SortitionId>::from_storage(src_storage);
-    let tip = trie_sql::get_latest_confirmed_block_hash::<SortitionId>(marf.sqlite_conn())
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to read sortition tip: {e:?}");
+/// Resolve Stacks block height to the sortition MARF height for the Bitcoin block
+/// whose tenure produced that Stacks block.
+///
+/// Uses the canonical Stacks tip from the sortition DB, resolves the canonical
+/// ancestor block at `stacks_height`, then reads `burn_header_height` from the
+/// block header. The sortition MARF height is `bitcoin_height - first_burn_height`.
+fn resolve_burn_height_for_sortition(
+    chainstate_root: &Path,
+    sortition_db_path: &Path,
+    stacks_height: u32,
+) -> u32 {
+    let chainstate_root_str = chainstate_root.to_str().unwrap_or_else(|| {
+        eprintln!(
+            "Chainstate path '{}' is not valid UTF-8",
+            chainstate_root.display()
+        );
+        std::process::exit(1);
+    });
+    let db_config =
+        StacksChainState::get_db_config_from_path(chainstate_root_str).unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to read chainstate DB config from '{}': {e:?}",
+                chainstate_root.display()
+            );
             std::process::exit(1);
         });
 
-    let resolved = marf
-        .with_conn(|conn| resolve_stacks_height_to_sortition(conn, stacks_height))
-        .unwrap_or_else(|e| match e {
-            Error::NotFoundError => {
-                eprintln!("No burn block found where canonical Stacks tip >= {stacks_height}");
-                std::process::exit(1);
-            }
-            _ => {
-                eprintln!("Fatal error resolving burn height: {e}");
-                std::process::exit(1);
-            }
-        });
+    let (chainstate, _) = StacksChainState::open(
+        db_config.mainnet,
+        db_config.chain_id,
+        chainstate_root_str,
+        None,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to open chainstate '{}': {e:?}",
+            chainstate_root.display()
+        );
+        std::process::exit(1);
+    });
 
-    let marf_height = marf
-        .with_conn(|conn| MARF::get_block_height(conn, &resolved.sortition_id, &tip))
+    let sortition_dir = sortition_db_path.parent().unwrap_or_else(|| {
+        eprintln!(
+            "Sortition DB path '{}' has no parent directory",
+            sortition_db_path.display()
+        );
+        std::process::exit(1);
+    });
+    let sortition_dir_str = sortition_dir.to_str().unwrap_or_else(|| {
+        eprintln!(
+            "Sortition DB directory '{}' is not valid UTF-8",
+            sortition_dir.display()
+        );
+        std::process::exit(1);
+    });
+    let pox_constants = if db_config.mainnet {
+        PoxConstants::mainnet_default()
+    } else {
+        PoxConstants::testnet_default()
+    };
+    let sortdb = SortitionDB::open(
+        sortition_dir_str,
+        false,
+        pox_constants,
+        Some(sortition_open_opts()),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to open sortition DB '{}': {e:?}",
+            sortition_dir.display()
+        );
+        std::process::exit(1);
+    });
+
+    // 1. Resolve the canonical tip, then walk back to the requested Stacks height.
+    let canonical_tip = {
+        let (consensus_hash, block_hash) =
+            SortitionDB::get_canonical_stacks_chain_tip_hash(sortdb.conn()).unwrap_or_else(|e| {
+                eprintln!("Failed to get canonical Stacks tip from sortition DB: {e:?}");
+                std::process::exit(1);
+            });
+        StacksBlockId::new(&consensus_hash, &block_hash)
+    };
+
+    let canonical_block_hash = chainstate
+        .index_conn()
+        .get_ancestor_block_hash(stacks_height.into(), &canonical_tip)
         .unwrap_or_else(|e| {
-            eprintln!("Failed to resolve MARF height for sortition: {e}");
+            eprintln!("Failed to resolve block at Stacks height {stacks_height}: {e:?}");
             std::process::exit(1);
         })
         .unwrap_or_else(|| {
-            eprintln!("Sortition not found in MARF");
+            eprintln!("No canonical block found at Stacks height {stacks_height}");
             std::process::exit(1);
         });
 
+    // 2. Read the burnchain height from the resolved block header.
+    let bitcoin_height =
+        NakamotoChainState::get_block_header(chainstate.db(), &canonical_block_hash)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to load canonical block header {canonical_block_hash}: {e:?}");
+                std::process::exit(1);
+            })
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "No block header found for canonical hash {canonical_block_hash} \
+                 at Stacks height {stacks_height}"
+                );
+                std::process::exit(1);
+            });
+    let bitcoin_height = u64::from(bitcoin_height.burn_header_height);
+
+    // 3. Compute sortition MARF height = bitcoin_height - first_burn_height.
+    let first_burn_height = sortdb.first_block_height;
+
+    if bitcoin_height < first_burn_height {
+        eprintln!("Bitcoin height {bitcoin_height} is below first burn height {first_burn_height}");
+        std::process::exit(1);
+    }
+
+    let marf_height = (bitcoin_height - first_burn_height) as u32;
+
     eprintln!(
-        "Resolved Stacks height {stacks_height} to Bitcoin height {} (sortition MARF height {marf_height})",
-        resolved.bitcoin_block_height
+        "Resolved Stacks height {stacks_height} (canonical block {canonical_block_hash}) \
+         to Bitcoin height {bitcoin_height} (sortition MARF height {marf_height})"
     );
     marf_height
 }
