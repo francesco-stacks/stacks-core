@@ -106,7 +106,7 @@ pub struct MARF<T: MarfTrieId> {
 }
 
 pub struct MarfTransaction<'a, T: MarfTrieId> {
-    storage: TrieStorageTransaction<'a, T>,
+    pub(crate) storage: TrieStorageTransaction<'a, T>,
     open_chain_tip: &'a mut Option<WriteChainTip<T>>,
 }
 
@@ -430,6 +430,20 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
 
     pub fn sqlite_tx_mut(&mut self) -> &mut Transaction<'a> {
         self.storage.sqlite_tx_mut()
+    }
+
+    /// Commit the SQL transaction without flushing TrieRAM to disk.
+    ///
+    /// Used by `squash_to_path` which writes the blob directly, bypassing
+    /// the normal TrieRAM flush path.
+    pub(crate) fn commit_squash(mut self) -> Result<(), Error> {
+        if self.storage.readonly() {
+            return Err(Error::ReadOnlyError);
+        }
+        self.open_chain_tip.take();
+        self.storage.drop_extending_trie();
+        self.storage.commit_tx();
+        Ok(())
     }
 
     /// Set squash metadata on the underlying storage connection.

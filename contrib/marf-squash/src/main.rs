@@ -13,7 +13,7 @@ use blockstack_lib::chainstate::stacks::db::snapshot::{
 use blockstack_lib::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashValidationStats, MARF,
 };
-use blockstack_lib::chainstate::stacks::index::squash::resolve_stacks_to_burn_height;
+use blockstack_lib::chainstate::stacks::index::squash::resolve_stacks_height_to_sortition;
 use blockstack_lib::chainstate::stacks::index::storage::{
     TrieFileStorage, TrieHashCalculationMode,
 };
@@ -2399,33 +2399,36 @@ fn resolve_burn_height_for_sortition(sortition_db_path: &str, stacks_height: u32
             eprintln!("Failed to read sortition tip: {e:?}");
             std::process::exit(1);
         });
-    let tip_height = marf
-        .with_conn(|conn| MARF::get_block_height_miner_tip(conn, &tip, &tip))
+
+    let resolved = marf
+        .with_conn(|conn| resolve_stacks_height_to_sortition(conn, stacks_height))
+        .unwrap_or_else(|e| match e {
+            Error::NotFoundError => {
+                eprintln!("No burn block found where canonical Stacks tip >= {stacks_height}");
+                std::process::exit(1);
+            }
+            _ => {
+                eprintln!("Fatal error resolving burn height: {e}");
+                std::process::exit(1);
+            }
+        });
+
+    let marf_height = marf
+        .with_conn(|conn| MARF::get_block_height(conn, &resolved.sortition_id, &tip))
         .unwrap_or_else(|e| {
-            eprintln!("Failed to read sortition tip height: {e:?}");
+            eprintln!("Failed to resolve MARF height for sortition: {e}");
             std::process::exit(1);
         })
         .unwrap_or_else(|| {
-            eprintln!("Sortition tip height not found");
+            eprintln!("Sortition not found in MARF");
             std::process::exit(1);
         });
 
-    match marf
-        .with_conn(|conn| resolve_stacks_to_burn_height(conn, &tip, tip_height, stacks_height))
-    {
-        Ok(h) => {
-            eprintln!("Resolved Stacks height {stacks_height} to burn block height {h}");
-            h
-        }
-        Err(Error::NotFoundError) => {
-            eprintln!("No burn block found where canonical Stacks tip >= {stacks_height}");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Fatal error resolving burn height: {e}");
-            std::process::exit(1);
-        }
-    }
+    eprintln!(
+        "Resolved Stacks height {stacks_height} to Bitcoin height {} (sortition MARF height {marf_height})",
+        resolved.bitcoin_block_height
+    );
+    marf_height
 }
 
 #[cfg(test)]

@@ -2303,7 +2303,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     }
 
     /// Run `cls` with a mutable reference to the inner trie blobs opt.
-    fn with_trie_blobs<F, R>(&mut self, cls: F) -> R
+    pub(crate) fn with_trie_blobs<F, R>(&mut self, cls: F) -> R
     where
         F: FnOnce(&Connection, &mut Option<&mut TrieFile>) -> R,
     {
@@ -2641,7 +2641,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
 }
 
 impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
-    fn current_ptr_format(&self) -> TriePtrFormat {
+    pub(crate) fn current_ptr_format(&self) -> TriePtrFormat {
         self.data.ptr_format
     }
 

@@ -19,29 +19,658 @@
 //! height H plus the metadata needed for ancestor hash lookups and
 //! block-height resolution.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read as _, Seek, SeekFrom};
+use std::io::{BufReader, BufWriter, Cursor, Read as _, Seek, SeekFrom, Write};
 use std::time::Instant;
 
-use rusqlite::{params, DatabaseName};
+use rusqlite::{params, DatabaseName, OptionalExtension};
 use stacks_common::types::chainstate::{
     SortitionId, StacksBlockId, TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE,
 };
 
-use crate::chainstate::stacks::index::bits::get_leaf_hash;
+use crate::chainstate::stacks::index::bits::{
+    get_leaf_hash, get_node_byte_len, write_nodetype_bytes,
+};
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, MARF,
 };
-use crate::chainstate::stacks::index::node::{is_backptr, TrieNodeID, TrieNodeType, TriePtr};
+use crate::chainstate::stacks::index::node::{
+    is_backptr, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID, TrieNodeType, TriePtr,
+    TriePtrFormat,
+};
 use crate::chainstate::stacks::index::storage::{
     SquashInfo, TrieFileStorage, TrieStorageConnection,
 };
 use crate::chainstate::stacks::index::trie::Trie;
-use crate::chainstate::stacks::index::{trie_sql, BlockMap, Error, MarfTrieId, TrieHasher};
+use crate::chainstate::stacks::index::{
+    trie_sql, BlockMap, Error, MARFValue, MarfTrieId, TrieHasher, TrieLeaf,
+};
 
-/// A collected trie node: `(node, hash, origin_block_id)`.
-type CollectedNode = (TrieNodeType, TrieHash, u32);
+// ---------------------------------------------------------------------------
+// NodeStore: disk-backed storage for collected trie nodes.
+//
+// Instead of holding all 50M+ collected nodes in a giant in-memory vector,
+// this stores the full node data in a temporary file and keeps only
+// lightweight per-node metadata in memory (~4 GB).
+// ---------------------------------------------------------------------------
+
+/// Tag bytes for node serialization to the temp file.
+const TAG_LEAF: u8 = 0;
+const TAG_NODE4: u8 = 1;
+const TAG_NODE16: u8 = 2;
+const TAG_NODE48: u8 = 3;
+const TAG_NODE256: u8 = 4;
+
+/// Serialize a single `TriePtr` to the writer.
+fn write_trie_ptr<W: Write>(w: &mut W, p: &TriePtr) -> Result<(), Error> {
+    w.write_all(&[p.id, p.chr])?;
+    w.write_all(&p.ptr.to_le_bytes())?;
+    w.write_all(&p.back_block.to_le_bytes())?;
+    Ok(())
+}
+
+/// Deserialize a single `TriePtr` from the reader.
+fn read_trie_ptr<R: std::io::Read>(r: &mut R) -> Result<TriePtr, Error> {
+    let mut buf2 = [0u8; 2];
+    r.read_exact(&mut buf2)?;
+    let mut buf8 = [0u8; 8];
+    r.read_exact(&mut buf8)?;
+    let ptr = u64::from_le_bytes(buf8);
+    let mut buf4 = [0u8; 4];
+    r.read_exact(&mut buf4)?;
+    let back_block = u32::from_le_bytes(buf4);
+    Ok(TriePtr {
+        id: buf2[0],
+        chr: buf2[1],
+        ptr,
+        back_block,
+    })
+}
+
+/// Serialize a `TrieNodeType` to the writer in a compact binary format.
+/// Format: [tag: u8] [path_len: u32] [path bytes] [variant data]
+pub(crate) fn serialize_node<W: Write>(w: &mut W, node: &TrieNodeType) -> Result<(), Error> {
+    match node {
+        TrieNodeType::Leaf(leaf) => {
+            w.write_all(&[TAG_LEAF])?;
+            w.write_all(&(leaf.path.len() as u32).to_le_bytes())?;
+            w.write_all(&leaf.path)?;
+            w.write_all(&leaf.data.0)?;
+        }
+        TrieNodeType::Node4(n) => {
+            w.write_all(&[TAG_NODE4])?;
+            w.write_all(&(n.path.len() as u32).to_le_bytes())?;
+            w.write_all(&n.path)?;
+            for p in &n.ptrs {
+                write_trie_ptr(w, p)?;
+            }
+        }
+        TrieNodeType::Node16(n) => {
+            w.write_all(&[TAG_NODE16])?;
+            w.write_all(&(n.path.len() as u32).to_le_bytes())?;
+            w.write_all(&n.path)?;
+            for p in &n.ptrs {
+                write_trie_ptr(w, p)?;
+            }
+        }
+        TrieNodeType::Node48(n) => {
+            w.write_all(&[TAG_NODE48])?;
+            w.write_all(&(n.path.len() as u32).to_le_bytes())?;
+            w.write_all(&n.path)?;
+            // Write the 256-byte indexes array
+            let indexes = n.indexes.map(|idx| idx as u8);
+            w.write_all(&indexes)?;
+            for p in &n.ptrs {
+                write_trie_ptr(w, p)?;
+            }
+        }
+        TrieNodeType::Node256(n) => {
+            w.write_all(&[TAG_NODE256])?;
+            w.write_all(&(n.path.len() as u32).to_le_bytes())?;
+            w.write_all(&n.path)?;
+            for p in &n.ptrs {
+                write_trie_ptr(w, p)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deserialize a `TrieNodeType` from the reader.
+pub(crate) fn deserialize_node<R: std::io::Read>(r: &mut R) -> Result<TrieNodeType, Error> {
+    let mut tag = [0u8; 1];
+    r.read_exact(&mut tag)?;
+    let mut path_len_buf = [0u8; 4];
+    r.read_exact(&mut path_len_buf)?;
+    let path_len = u32::from_le_bytes(path_len_buf) as usize;
+    let mut path = vec![0u8; path_len];
+    if path_len > 0 {
+        r.read_exact(&mut path)?;
+    }
+
+    match tag[0] {
+        TAG_LEAF => {
+            let mut data = [0u8; 40];
+            r.read_exact(&mut data)?;
+            Ok(TrieNodeType::Leaf(TrieLeaf {
+                path,
+                data: MARFValue(data),
+            }))
+        }
+        TAG_NODE4 => {
+            let mut ptrs = [TriePtr::default(); 4];
+            for p in ptrs.iter_mut() {
+                *p = read_trie_ptr(r)?;
+            }
+            Ok(TrieNodeType::Node4(TrieNode4 {
+                path,
+                ptrs,
+                cowptr: None,
+                patches: vec![],
+            }))
+        }
+        TAG_NODE16 => {
+            let mut ptrs = [TriePtr::default(); 16];
+            for p in ptrs.iter_mut() {
+                *p = read_trie_ptr(r)?;
+            }
+            Ok(TrieNodeType::Node16(TrieNode16 {
+                path,
+                ptrs,
+                cowptr: None,
+                patches: vec![],
+            }))
+        }
+        TAG_NODE48 => {
+            let mut indexes_u8 = [0u8; 256];
+            r.read_exact(&mut indexes_u8)?;
+            let indexes = indexes_u8.map(|idx| idx as i8);
+            let mut ptrs = [TriePtr::default(); 48];
+            for p in ptrs.iter_mut() {
+                *p = read_trie_ptr(r)?;
+            }
+            Ok(TrieNodeType::Node48(Box::new(TrieNode48 {
+                path,
+                indexes,
+                ptrs,
+                cowptr: None,
+                patches: vec![],
+            })))
+        }
+        TAG_NODE256 => {
+            let mut ptrs = [TriePtr::default(); 256];
+            for p in ptrs.iter_mut() {
+                *p = read_trie_ptr(r)?;
+            }
+            Ok(TrieNodeType::Node256(Box::new(TrieNode256 {
+                path,
+                ptrs,
+                cowptr: None,
+                patches: vec![],
+            })))
+        }
+        _ => Err(Error::CorruptionError(format!(
+            "NodeStore: invalid tag byte {0}",
+            tag[0]
+        ))),
+    }
+}
+
+/// Disk-backed store for collected trie nodes.
+///
+/// Full node data is serialized to a temporary file. Only lightweight
+/// per-node metadata (hash, block_id, file offset) is kept in memory.
+pub(crate) struct NodeStore {
+    /// Temp file holding serialized nodes (write handle).
+    writer: BufWriter<File>,
+    /// Path to the temp file (for re-opening as reader).
+    pub(crate) path: std::path::PathBuf,
+    /// Byte offset in the temp file for each node.
+    pub(crate) file_offsets: Vec<u64>,
+    /// Per-node hash.
+    hashes: Vec<TrieHash>,
+    /// Per-node origin block ID.
+    block_ids: Vec<u32>,
+}
+
+impl NodeStore {
+    pub(crate) fn new(dir: &str) -> Result<Self, Error> {
+        let pid = std::process::id();
+        // Try up to 16 times with atomic create_new to avoid collision.
+        for attempt in 0u32..16 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::path::PathBuf::from(format!(
+                "{}/.squash_nodes_{pid}_{nanos}_{attempt}.tmp",
+                dir
+            ));
+            match File::options().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(NodeStore {
+                        writer: BufWriter::with_capacity(1 << 20, file),
+                        path,
+                        file_offsets: Vec::new(),
+                        hashes: Vec::new(),
+                        block_ids: Vec::new(),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(Error::IOError(e)),
+            }
+        }
+        Err(Error::IOError(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to create unique NodeStore temp file after 16 attempts",
+        )))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.file_offsets.len()
+    }
+
+    /// Append a node. Returns the node's index.
+    pub(crate) fn push(
+        &mut self,
+        node: &TrieNodeType,
+        hash: TrieHash,
+        block_id: u32,
+    ) -> Result<usize, Error> {
+        let idx = self.file_offsets.len();
+        let offset = self.writer.stream_position().map_err(Error::IOError)?;
+        self.file_offsets.push(offset);
+        self.hashes.push(hash);
+        self.block_ids.push(block_id);
+        serialize_node(&mut self.writer, node)?;
+        Ok(idx)
+    }
+
+    /// Flush the writer and return a sequential reader over all nodes.
+    pub(crate) fn finish_writing(&mut self) -> Result<(), Error> {
+        self.writer.flush().map_err(Error::IOError)?;
+        Ok(())
+    }
+
+    /// Open a reader for random-access reads.
+    pub(crate) fn open_reader(&self) -> Result<BufReader<File>, Error> {
+        let file = File::open(&self.path).map_err(Error::IOError)?;
+        Ok(BufReader::with_capacity(1 << 20, file))
+    }
+
+    /// Read a node from the temp file using the given reader.
+    pub(crate) fn read_node_with(
+        &self,
+        reader: &mut BufReader<File>,
+        idx: usize,
+    ) -> Result<TrieNodeType, Error> {
+        let offset = *self.file_offsets.get(idx).ok_or_else(|| {
+            Error::CorruptionError(format!("NodeStore: index {idx} out of bounds"))
+        })?;
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(Error::IOError)?;
+        deserialize_node(reader)
+    }
+
+    pub(crate) fn hash(&self, idx: usize) -> TrieHash {
+        self.hashes.get(idx).copied().unwrap_or_else(|| {
+            panic!(
+                "NodeStore::hash: index {idx} out of bounds (len={})",
+                self.hashes.len()
+            )
+        })
+    }
+
+    pub(crate) fn set_hash(&mut self, idx: usize, hash: TrieHash) {
+        if let Some(slot) = self.hashes.get_mut(idx) {
+            *slot = hash;
+        } else {
+            panic!(
+                "NodeStore::set_hash: index {idx} out of bounds (len={})",
+                self.hashes.len()
+            );
+        }
+    }
+
+    pub(crate) fn block_id(&self, idx: usize) -> u32 {
+        self.block_ids.get(idx).copied().unwrap_or_else(|| {
+            panic!(
+                "NodeStore::block_id: index {idx} out of bounds (len={})",
+                self.block_ids.len()
+            )
+        })
+    }
+
+    /// Drop the block_ids Vec to free memory after remap.
+    fn drop_block_ids(&mut self) {
+        self.block_ids = Vec::new();
+    }
+
+    /// Clean up the temp file.
+    fn cleanup(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for NodeStore {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Remap child pointers in a `NodeStore` for the squashed trie layout.
+///
+/// For each non-leaf node, reads it from the temp file, remaps its child
+/// pointers from source (block_id, offset) to sequential indices, and
+/// writes the modified node back.
+fn remap_ptrs_for_squash(
+    store: &mut NodeStore,
+    source_to_idx: &HashMap<(u32, u64), usize>,
+    block_id_map: &HashMap<u32, u32>,
+) -> Result<(), Error> {
+    use crate::chainstate::stacks::index::node::clear_backptr;
+
+    let remap_start = Instant::now();
+    let node_count = store.len();
+    let mut reader = store.open_reader()?;
+
+    // We need a second file handle for writing back modified nodes,
+    // since BufReader and the underlying file share the same position.
+    let write_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&store.path)
+        .map_err(Error::IOError)?;
+    let mut writer = BufWriter::with_capacity(1 << 20, write_file);
+
+    for idx in 0..node_count {
+        if idx > 0 && idx % 500_000 == 0 {
+            info!(
+                "Squash pointer remap: processed {idx}/{node_count} nodes in {:?}",
+                remap_start.elapsed()
+            );
+        }
+
+        let mut node = store.read_node_with(&mut reader, idx)?;
+        let origin_block_id = store.block_id(idx);
+
+        if node.is_leaf() {
+            continue;
+        }
+
+        let ptrs = node.ptrs_mut();
+        for ptr in ptrs.iter_mut() {
+            if ptr.id() == TrieNodeID::Empty as u8 {
+                continue;
+            }
+
+            let (child_block_id, read_ptr_val, was_backptr) = if is_backptr(ptr.id()) {
+                (ptr.back_block(), ptr.from_backptr().ptr(), true)
+            } else {
+                (origin_block_id, ptr.ptr(), false)
+            };
+
+            let source_key = (child_block_id, read_ptr_val);
+            let child_idx = *source_to_idx.get(&source_key).ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "deep_copy: child {source_key:?} not in source_to_idx"
+                ))
+            })?;
+
+            ptr.ptr = child_idx as u64;
+            ptr.id = clear_backptr(ptr.id);
+
+            if was_backptr {
+                let squashed_id = block_id_map.get(&child_block_id).ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "deep_copy: block_id {child_block_id} not in block_id_map"
+                    ))
+                })?;
+                ptr.back_block = *squashed_id;
+            } else {
+                ptr.back_block = 0;
+            }
+        }
+
+        // Write modified node back to same position in temp file
+        let offset = *store.file_offsets.get(idx).ok_or_else(|| {
+            Error::CorruptionError(format!("remap: file_offsets index {idx} out of bounds"))
+        })?;
+        writer
+            .seek(SeekFrom::Start(offset))
+            .map_err(Error::IOError)?;
+        serialize_node(&mut writer, &node)?;
+    }
+    writer.flush().map_err(Error::IOError)?;
+
+    info!(
+        "Squash pointer remap complete: {node_count} nodes in {:?}",
+        remap_start.elapsed()
+    );
+    Ok(())
+}
+
+/// Simplified remap for validation: rewrite child pointers to array indices
+/// without block_id_map (sets back_block = 0, clears backptr flags).
+/// Used by `recompute_squash_root_node_hash`.
+fn remap_ptrs_for_hashing(
+    store: &mut NodeStore,
+    source_to_idx: &HashMap<(u32, u64), usize>,
+) -> Result<(), Error> {
+    use crate::chainstate::stacks::index::node::clear_backptr;
+
+    let remap_start = Instant::now();
+    let node_count = store.len();
+    let mut reader = store.open_reader()?;
+
+    let write_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&store.path)
+        .map_err(Error::IOError)?;
+    let mut writer = BufWriter::with_capacity(1 << 20, write_file);
+
+    for idx in 0..node_count {
+        if idx > 0 && idx % 500_000 == 0 {
+            info!(
+                "Hashing pointer remap: processed {idx}/{node_count} nodes in {:?}",
+                remap_start.elapsed()
+            );
+        }
+
+        let mut node = store.read_node_with(&mut reader, idx)?;
+        let origin_block_id = store.block_id(idx);
+
+        if node.is_leaf() {
+            continue;
+        }
+
+        let ptrs = node.ptrs_mut();
+        let mut modified = false;
+        for ptr in ptrs.iter_mut() {
+            if ptr.id() == TrieNodeID::Empty as u8 {
+                continue;
+            }
+
+            let (child_block_id, read_ptr_val) = if is_backptr(ptr.id()) {
+                (ptr.back_block(), ptr.from_backptr().ptr())
+            } else {
+                (origin_block_id, ptr.ptr())
+            };
+
+            let source_key = (child_block_id, read_ptr_val);
+            let child_idx = *source_to_idx.get(&source_key).ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "remap_ptrs_for_hashing: child {source_key:?} not in source_to_idx"
+                ))
+            })?;
+
+            ptr.ptr = child_idx as u64;
+            ptr.id = clear_backptr(ptr.id);
+            ptr.back_block = 0;
+            modified = true;
+        }
+
+        if modified {
+            let offset = *store.file_offsets.get(idx).ok_or_else(|| {
+                Error::CorruptionError(format!("remap: file_offsets index {idx} out of bounds"))
+            })?;
+            writer
+                .seek(SeekFrom::Start(offset))
+                .map_err(Error::IOError)?;
+            serialize_node(&mut writer, &node)?;
+        }
+    }
+    writer.flush().map_err(Error::IOError)?;
+
+    info!(
+        "Hashing pointer remap complete: {node_count} nodes in {:?}",
+        remap_start.elapsed()
+    );
+    Ok(())
+}
+
+/// Recompute content hashes using a `NodeStore`.
+///
+/// Leaf hashes are computed by reading each leaf from the temp file.
+/// Internal node hashes are computed bottom-up (reverse order) using
+/// the in-memory hashes Vec for child lookups and reading the node
+/// structure from the temp file.
+fn recompute_content_hashes(store: &mut NodeStore) -> Result<(), Error> {
+    let empty_hash = TrieHash::from_data(&[]);
+    let node_count = store.len();
+    let mut reader = store.open_reader()?;
+    let start = Instant::now();
+
+    // Pass 1: compute leaf hashes
+    for idx in 0..node_count {
+        let node = store.read_node_with(&mut reader, idx)?;
+        if let TrieNodeType::Leaf(ref leaf) = node {
+            store.set_hash(idx, get_leaf_hash(leaf));
+        }
+    }
+    info!(
+        "Recompute content hashes: leaf pass done in {:?}",
+        start.elapsed()
+    );
+
+    // Pass 2: internal nodes in reverse order
+    for idx in (0..node_count).rev() {
+        let node = store.read_node_with(&mut reader, idx)?;
+        if node.is_leaf() {
+            continue;
+        }
+
+        // Collect child hashes
+        let ptrs = node.ptrs();
+        let mut child_hashes = Vec::with_capacity(ptrs.len());
+        for child_ptr in ptrs {
+            if child_ptr.id() == TrieNodeID::Empty as u8 || is_backptr(child_ptr.id()) {
+                child_hashes.push(empty_hash);
+            } else {
+                let child_idx = child_ptr.ptr() as usize;
+                if child_idx >= node_count {
+                    return Err(Error::CorruptionError(format!(
+                        "Invalid child index {child_idx} at node {idx}"
+                    )));
+                }
+                child_hashes.push(store.hash(child_idx));
+            }
+        }
+
+        let new_hash = compute_node_hash(&node, &child_hashes);
+        store.set_hash(idx, new_hash);
+    }
+
+    info!(
+        "Recompute content hashes complete: {node_count} nodes in {:?}",
+        start.elapsed()
+    );
+    Ok(())
+}
+
+/// Compute per-node byte offsets within the serialized blob.
+///
+/// Returns `(blob_offsets, total_size)` where `blob_offsets[i]` is the byte
+/// position where node `i` starts in the blob (after the header).
+pub(crate) fn compute_blob_offsets(
+    store: &mut NodeStore,
+    ptr_format: TriePtrFormat,
+) -> Result<(Vec<u64>, u64), Error> {
+    let n = store.len();
+    let mut reader = store.open_reader()?;
+    let header_size = BLOCK_HEADER_HASH_ENCODED_SIZE as u64 + 4;
+    let mut blob_offsets: Vec<u64> = Vec::with_capacity(n);
+    let mut current_offset = header_size;
+
+    for idx in 0..n {
+        blob_offsets.push(current_offset);
+        let node = store.read_node_with(&mut reader, idx)?;
+        let byte_len = get_node_byte_len(&node, ptr_format) as u64;
+        current_offset += byte_len;
+    }
+    Ok((blob_offsets, current_offset))
+}
+
+/// Stream the squash blob into an arbitrary `Write + Seek` sink.
+///
+/// Reads nodes one-at-a-time from the NodeStore temp file, converts
+/// array-index child pointers to byte offsets, and serializes directly
+/// into `sink`. No intermediate `Vec<u8>` is allocated for the full blob.
+///
+/// The blob is written starting at the sink's current position.
+/// All internal offsets (header, node pointers) are relative to the blob
+/// start, not to the absolute file position, so this works correctly when
+/// appending to a `.blobs` file that already contains data.
+///
+/// Returns the number of bytes written.
+pub(crate) fn stream_squash_blob<T: MarfTrieId, F: Write + Seek>(
+    store: &mut NodeStore,
+    parent_hash: &T,
+    ptr_format: TriePtrFormat,
+    blob_offsets: &[u64],
+    sink: &mut F,
+) -> Result<u64, Error> {
+    let n = store.len();
+    let mut reader = store.open_reader()?;
+
+    // Record the base offset so all writes are relative to blob start.
+    let base = sink.stream_position().map_err(Error::IOError)?;
+
+    // Write header: parent block hash + zero identifier
+    sink.write_all(parent_hash.as_bytes())
+        .map_err(Error::IOError)?;
+    sink.seek(SeekFrom::Start(
+        base + BLOCK_HEADER_HASH_ENCODED_SIZE as u64,
+    ))
+    .map_err(Error::IOError)?;
+    sink.write_all(&0u32.to_le_bytes())
+        .map_err(Error::IOError)?;
+
+    for idx in 0..n {
+        let mut node = store.read_node_with(&mut reader, idx)?;
+        let hash = store.hash(idx);
+
+        // Convert array-index pointers to byte offsets (relative to blob start)
+        if !node.is_leaf() {
+            for ptr in node.ptrs_mut() {
+                if ptr.id() != TrieNodeID::Empty as u8 && !is_backptr(ptr.id()) {
+                    let child_idx = ptr.ptr() as usize;
+                    ptr.ptr = *blob_offsets.get(child_idx).ok_or_else(|| {
+                        Error::CorruptionError(format!(
+                            "blob write: child index {child_idx} out of bounds"
+                        ))
+                    })?;
+                }
+            }
+        }
+
+        write_nodetype_bytes(sink, &node, hash, ptr_format)?;
+    }
+
+    let end = sink.stream_position().map_err(Error::IOError)?;
+    Ok(end - base)
+}
 
 /// Per-height block metadata: `(height, block_hash, root_hash)`.
 type BlockInfo<T> = (u32, T, TrieHash);
@@ -142,76 +771,6 @@ fn compute_node_hash(node: &TrieNodeType, child_hashes: &[TrieHash]) -> TrieHash
     TrieHash(hasher.finalize().into())
 }
 
-/// Recompute all node hashes in `nodes` as **pure content hashes**.
-///
-/// The BFS collection pass stores archival hashes which may include skip-list
-/// information (for nodes that were trie roots in their original blocks).
-/// For proof consistency the blob must store deterministic content hashes -
-/// `H(consensus_bytes(node) || children_content_hashes)` - matching what the
-/// proof verifier computes bottom-up.
-///
-/// Processes in reverse BFS order (children before parents).
-fn recompute_content_hashes(nodes: &mut [CollectedNode]) -> Result<(), Error> {
-    let empty_hash = TrieHash::from_data(&[]);
-
-    // Leaf hashes depend only on their own data; compute them first.
-    for (node, hash, _) in nodes.iter_mut() {
-        if let TrieNodeType::Leaf(ref leaf) = node {
-            *hash = get_leaf_hash(leaf);
-        }
-    }
-
-    // Internal nodes in reverse order so every child hash is already final.
-    for idx in (0..nodes.len()).rev() {
-        let entry = nodes.get(idx).ok_or_else(|| {
-            Error::CorruptionError(format!(
-                "recompute_content_hashes: index {idx} out of bounds"
-            ))
-        })?;
-        if entry.0.is_leaf() {
-            continue;
-        }
-
-        let child_hashes = collect_child_hashes(nodes, idx, empty_hash)?;
-        let node_ref = &nodes.get(idx).expect("bounds already checked").0;
-        let new_hash = compute_node_hash(node_ref, &child_hashes);
-        nodes.get_mut(idx).expect("bounds already checked").1 = new_hash;
-    }
-
-    Ok(())
-}
-
-/// Gather the content hashes of every child of `nodes[idx]`.
-///
-/// Empty slots and backpointer children (which reference state outside the
-/// blob) contribute `empty_hash`.  Inline children contribute their already-
-/// computed hash from the `nodes` array.
-fn collect_child_hashes(
-    nodes: &[CollectedNode],
-    idx: usize,
-    empty_hash: TrieHash,
-) -> Result<Vec<TrieHash>, Error> {
-    let entry = nodes.get(idx).ok_or_else(|| {
-        Error::CorruptionError(format!("collect_child_hashes: index {idx} out of bounds"))
-    })?;
-    let ptrs = entry.0.ptrs();
-    let mut out = Vec::with_capacity(ptrs.len());
-    for child_ptr in ptrs {
-        if child_ptr.id() == TrieNodeID::Empty as u8 || is_backptr(child_ptr.id()) {
-            out.push(empty_hash);
-        } else {
-            let child_idx = child_ptr.ptr() as usize;
-            let (_, child_hash, _) = nodes.get(child_idx).ok_or_else(|| {
-                Error::CorruptionError(format!(
-                    "Invalid child index {child_idx} while recomputing squash hashes"
-                ))
-            })?;
-            out.push(*child_hash);
-        }
-    }
-    Ok(out)
-}
-
 fn read_proc_status_kib(field: &str) -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|line| line.starts_with(field))?;
@@ -281,7 +840,7 @@ pub struct SquashValidationStats {
     /// (a `TrieHash::from_data(&[])` value counts as absent).
     pub squash_node_hash_present: bool,
     /// Whether the stored `squash_root_node_hash` matches the value
-    /// recomputed from the committed squash trie blob (BFS walk + bottom-up hash).
+    /// recomputed from the committed squash trie blob (DFS walk + bottom-up hash).
     pub squash_node_hash_matches: bool,
 
     // --- Full leaf scan (only populated when full_leaf_scan = true) ---
@@ -504,6 +1063,14 @@ impl<T: MarfTrieId> MARF<T> {
         open_opts: MARFOpenOpts,
         height: u32,
     ) -> Result<SquashStats, Error> {
+        if open_opts.compress {
+            return Err(Error::CorruptionError(
+                "squash_to_path does not support compress=true; \
+                 the direct blob write path only emits uncompressed nodes"
+                    .to_string(),
+            ));
+        }
+
         let overall_start = Instant::now();
 
         // Step 1: bulk SQL block map
@@ -528,20 +1095,27 @@ impl<T: MarfTrieId> MARF<T> {
         let block_info =
             collect_per_height_metadata(&mut src, &tip, &block_map, &mut blob_reader, height)?;
 
-        // Step 3: BFS deep copy
-        log_memory_snapshot("before step 3 BFS");
+        // Step 3: DFS node collection
+        //
+        // Derive the temp directory from dst_path: use the parent directory.
+        let tmp_dir = std::path::Path::new(dst_path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("/tmp");
+        log_memory_snapshot("before step 3 DFS collection");
         let start = Instant::now();
-        let (mut nodes, source_to_idx) =
-            src.with_conn(|conn| MARF::<T>::collect_all_nodes(conn, &block_at_height))?;
-        let node_count = nodes.len() as u64;
+        let (mut node_store, source_to_idx) = src.with_conn(|conn| {
+            MARF::<T>::collect_reachable_nodes(conn, &block_at_height, tmp_dir)
+        })?;
+        let node_count = node_store.len() as u64;
         info!(
-            "Squash step 3 (BFS): {node_count} nodes in {:?}",
+            "Squash step 3 (DFS collection): {node_count} nodes in {:?}",
             start.elapsed()
         );
-        log_memory_snapshot("after step 3 BFS");
+        log_memory_snapshot("after step 3 DFS collection");
 
         // Open destination MARF and begin transaction
-        let mut dst = MARF::from_path(dst_path, open_opts)?;
+        let mut dst = MARF::from_path(dst_path, open_opts.clone())?;
         let mut tx = dst.begin_tx()?;
         tx.begin(&T::sentinel(), &block_at_height)?;
 
@@ -550,42 +1124,118 @@ impl<T: MarfTrieId> MARF<T> {
             insert_placeholder_blocks(tx.sqlite_tx(), &block_info, &block_at_height, &block_map)?;
         drop(block_map);
 
-        // Step 5a: remap pointers (in-memory)
+        // Step 5a: remap pointers (disk-backed)
         log_memory_snapshot("before step 5a remap");
         let start = Instant::now();
-        Self::deep_copy_remap(&mut nodes, &source_to_idx, &archival_to_squashed)?;
+        remap_ptrs_for_squash(&mut node_store, &source_to_idx, &archival_to_squashed)?;
         info!(
-            "Squash step 5a (remap): {node_count} nodes in {:?}",
+            "Squash step 5a (remap, disk-backed): {node_count} nodes in {:?}",
             start.elapsed()
         );
         drop(source_to_idx);
         drop(archival_to_squashed);
+        node_store.drop_block_ids(); // free ~200 MB
         log_memory_snapshot("after step 5a remap");
 
-        // Step 5b: recompute content hashes
+        // Step 5b: recompute content hashes (disk-backed)
         log_memory_snapshot("before step 5b content hashes");
         let start = Instant::now();
-        recompute_content_hashes(&mut nodes)?;
+        recompute_content_hashes(&mut node_store)?;
         info!(
-            "Squash step 5b (content hashes): {node_count} nodes in {:?}",
+            "Squash step 5b (content hashes, disk-backed): {node_count} nodes in {:?}",
             start.elapsed()
         );
         log_memory_snapshot("after step 5b content hashes");
 
-        let squash_root_node_hash = nodes
-            .first()
-            .map(|(_, hash, _)| *hash)
-            .ok_or_else(|| Error::CorruptionError("No nodes in squash trie".to_string()))?;
+        let squash_root_node_hash = if node_store.len() > 0 {
+            node_store.hash(0)
+        } else {
+            return Err(Error::CorruptionError(
+                "No nodes in squash trie".to_string(),
+            ));
+        };
 
-        let nodes = nodes
-            .into_iter()
-            .map(|(node, hash, _)| (node, hash))
-            .collect();
+        // Step 5c: compute blob offsets, then stream directly to destination
+        log_memory_snapshot("before step 5c blob write");
+        let start = Instant::now();
+        // Squashed MARFs always use V2U64 pointers (set when squash_info is detected on open).
+        let ptr_format = TriePtrFormat::V2U64;
+        let parent_hash = T::sentinel();
 
-        // Write nodes to TrieRAM
-        log_memory_snapshot("before TrieRAM write");
-        tx.write_nodes_direct_bulk(nodes)?;
-        log_memory_snapshot("after TrieRAM write");
+        let (blob_offsets, total_blob_size) = compute_blob_offsets(&mut node_store, ptr_format)?;
+        info!(
+            "Squash step 5c (offset computation): {} nodes, {total_blob_size} bytes in {:?}",
+            node_store.len(),
+            start.elapsed()
+        );
+
+        // Step 5d: stream blob directly into destination storage
+        let start = Instant::now();
+        let block_id = if open_opts.external_blobs {
+            // Stream directly into the external .blobs file (no Vec<u8> copy)
+            tx.storage.with_trie_blobs(|db, blobs| match blobs {
+                Some(trie_file) => {
+                    let offset = trie_sql::get_external_blobs_length(db)?;
+                    trie_file
+                        .seek(SeekFrom::Start(offset))
+                        .map_err(Error::IOError)?;
+                    let mut buf_writer = BufWriter::with_capacity(1 << 20, trie_file);
+                    stream_squash_blob(
+                        &mut node_store,
+                        &parent_hash,
+                        ptr_format,
+                        &blob_offsets,
+                        &mut buf_writer,
+                    )?;
+                    buf_writer.flush().map_err(Error::IOError)?;
+                    let trie_file = buf_writer.into_inner().map_err(|e| {
+                        Error::IOError(std::io::Error::other(format!(
+                            "failed to flush BufWriter: {e}"
+                        )))
+                    })?;
+                    trie_file.flush().map_err(Error::IOError)?;
+                    // Durably sync to disk before committing SQL metadata,
+                    // matching the guarantee from TrieFile::append_trie_blob.
+                    trie_file.sync_data().map_err(Error::IOError)?;
+                    trie_sql::write_external_trie_blob(
+                        db,
+                        &block_at_height,
+                        offset,
+                        total_blob_size,
+                    )
+                }
+                None => {
+                    // Fallback: no .blobs file available, write inline to SQLite
+                    let mut blob = Cursor::new(Vec::with_capacity(total_blob_size as usize));
+                    stream_squash_blob(
+                        &mut node_store,
+                        &parent_hash,
+                        ptr_format,
+                        &blob_offsets,
+                        &mut blob,
+                    )?;
+                    trie_sql::write_trie_blob(db, &block_at_height, &blob.into_inner())
+                }
+            })?
+        } else {
+            // Inline SQLite blob (used for sortition MARF / tests)
+            let mut blob = Cursor::new(Vec::with_capacity(total_blob_size as usize));
+            stream_squash_blob(
+                &mut node_store,
+                &parent_hash,
+                ptr_format,
+                &blob_offsets,
+                &mut blob,
+            )?;
+            trie_sql::write_trie_blob(tx.sqlite_tx(), &block_at_height, &blob.into_inner())?
+        };
+        info!(
+            "Squash step 5d (blob persist): block_id={block_id}, {total_blob_size} bytes in {:?}",
+            start.elapsed()
+        );
+        drop(blob_offsets);
+        drop(node_store); // free temp file + metadata
+        log_memory_snapshot("after step 5d blob persist");
 
         // Step 6: SQL metadata
         let source_root_hash = block_info
@@ -603,10 +1253,11 @@ impl<T: MarfTrieId> MARF<T> {
             block_hash: block_at_height.clone(),
         }));
 
-        // Step 7: commit
+        // Step 7: commit the SQL transaction (no TrieRAM flush needed)
         let start = Instant::now();
         info!("Squash commit: starting commit");
-        tx.commit()?;
+        // Commit the SQL transaction without flushing TrieRAM (we already wrote the blob directly)
+        tx.commit_squash()?;
         info!("Squash commit: finished in {:?}", start.elapsed());
 
         // Step 8: post-commit finalization
@@ -622,57 +1273,82 @@ impl<T: MarfTrieId> MARF<T> {
         })
     }
 
-    /// BFS collection pass: gather all trie nodes reachable from `block_hash`.
+    /// DFS collection pass: gather all trie nodes reachable from `block_hash`.
+    ///
+    /// Uses a disk-backed `NodeStore` to avoid holding ~50M full node objects
+    /// in memory (~20 GB). Only lightweight metadata (hashes, block_ids,
+    /// file offsets) is kept in RAM (~4 GB).
+    ///
+    /// Uses iterative DFS instead of BFS. The DFS stack holds at most
+    /// `trie_height` frames (~32), each with one node's child pointer list.
+    /// Total stack memory is ~128 KB, compared to the BFS frontier which
+    /// could hold millions of entries (~GBs) for wide, hash-distributed tries.
+    ///
+    /// Nodes are pushed in DFS preorder (parent before children), which is
+    /// all the remap and hash-recompute passes require.
     ///
     /// Returns:
-    /// - `nodes`: raw un-remapped nodes.  Index 0 is the root.
-    /// - `source_to_idx`: `(source_block_id, byte_offset) -> Vec index` map
+    /// - `node_store`: disk-backed node data + in-memory metadata.
+    /// - `source_to_idx`: `(source_block_id, byte_offset) -> node index` map
     ///   needed by the remap pass.
-    fn collect_all_nodes(
+    fn collect_reachable_nodes(
         source: &mut TrieStorageConnection<T>,
         block_hash: &T,
-    ) -> Result<(Vec<CollectedNode>, HashMap<(u32, u64), usize>), Error> {
+        tmp_dir: &str,
+    ) -> Result<(NodeStore, HashMap<(u32, u64), usize>), Error> {
         source.open_block(block_hash)?;
         let (root_node, root_hash) = Trie::read_root(source)?;
         let root_block_id = source.get_cur_block_identifier()?;
 
-        let mut nodes: Vec<CollectedNode> = Vec::new();
+        let mut store = NodeStore::new(tmp_dir)?;
         let mut source_to_idx: HashMap<(u32, u64), usize> = HashMap::new();
 
         let root_disk_ptr = TrieStorageConnection::<T>::root_ptr_disk();
         source_to_idx.insert((root_block_id, root_disk_ptr), 0);
-        nodes.push((root_node, root_hash, root_block_id));
 
-        let mut queue: VecDeque<usize> = VecDeque::new();
-        queue.push_back(0);
-        let bfs_start = Instant::now();
-        let mut bfs_processed: u64 = 0;
+        let root_is_leaf = root_node.is_leaf();
+        let root_ptrs: Vec<TriePtr> = if root_is_leaf {
+            vec![]
+        } else {
+            root_node.ptrs().to_vec()
+        };
+        store.push(&root_node, root_hash, root_block_id)?;
+
+        // DFS stack frame: holds remaining child pointers for one node.
+        // Stack depth is bounded by trie height (~32), so total memory is
+        // ~32 * max_ptrs * sizeof(TriePtr) ≈ 128 KB - negligible.
+        struct DfsFrame {
+            origin_block_id: u32,
+            child_ptrs: Vec<TriePtr>,
+            next_child: usize,
+        }
+
+        let mut stack: Vec<DfsFrame> = Vec::new();
+        if !root_is_leaf {
+            stack.push(DfsFrame {
+                origin_block_id: root_block_id,
+                child_ptrs: root_ptrs,
+                next_child: 0,
+            });
+        }
+
+        let dfs_start = Instant::now();
+        let mut nodes_collected: u64 = 1; // root already counted
         let mut last_log = Instant::now();
 
-        while let Some(current_idx) = queue.pop_front() {
-            bfs_processed += 1;
-            if last_log.elapsed().as_secs() >= 30 || bfs_processed % 500_000 == 0 {
-                info!(
-                    "Deep copy BFS: dequeued {bfs_processed} nodes, collected {} total, queue {}, {:?} elapsed",
-                    nodes.len(),
-                    queue.len(),
-                    bfs_start.elapsed()
-                );
-                last_log = Instant::now();
-            }
+        while !stack.is_empty() {
+            let stack_depth = stack.len();
+            let frame = stack.last_mut().expect("stack is non-empty");
+            // Scan this frame's remaining children for the next one to descend into.
+            let mut descend_frame: Option<DfsFrame> = None;
 
-            let entry = nodes.get(current_idx).ok_or_else(|| {
-                Error::CorruptionError(format!("deep_copy: BFS index {current_idx} out of bounds"))
-            })?;
-            let origin_block_id = entry.2;
+            while frame.next_child < frame.child_ptrs.len() {
+                let ptr = *frame
+                    .child_ptrs
+                    .get(frame.next_child)
+                    .expect("BUG: next_child within bounds");
+                frame.next_child += 1;
 
-            if entry.0.is_leaf() {
-                continue;
-            }
-
-            let child_ptrs: Vec<TriePtr> = entry.0.ptrs().to_vec();
-
-            for ptr in child_ptrs.iter() {
                 if ptr.id() == TrieNodeID::Empty as u8 {
                     continue;
                 }
@@ -680,7 +1356,7 @@ impl<T: MarfTrieId> MARF<T> {
                 let (child_block_id, read_ptr) = if is_backptr(ptr.id()) {
                     (ptr.back_block(), ptr.from_backptr())
                 } else {
-                    (origin_block_id, *ptr)
+                    (frame.origin_block_id, ptr)
                 };
 
                 let source_key = (child_block_id, read_ptr.ptr());
@@ -692,181 +1368,94 @@ impl<T: MarfTrieId> MARF<T> {
                 source.open_block_maybe_id(&child_bh, Some(child_block_id))?;
                 let (child_node, child_hash) = source.read_nodetype(&read_ptr)?;
 
-                let child_idx = nodes.len();
-                source_to_idx.insert(source_key, child_idx);
-                nodes.push((child_node, child_hash, child_block_id));
-                queue.push_back(child_idx);
+                let child_is_leaf = child_node.is_leaf();
+                let child_ptrs_vec: Vec<TriePtr> = if child_is_leaf {
+                    vec![]
+                } else {
+                    child_node.ptrs().to_vec()
+                };
+
+                source_to_idx.insert(source_key, store.len());
+                store.push(&child_node, child_hash, child_block_id)?;
+
+                nodes_collected += 1;
+                if last_log.elapsed().as_secs() >= 30 || nodes_collected % 500_000 == 0 {
+                    info!(
+                        "Deep copy DFS: collected {nodes_collected} nodes, stack depth {stack_depth}, {:?} elapsed",
+                        dfs_start.elapsed()
+                    );
+                    last_log = Instant::now();
+                }
+
+                // If internal node, descend into it (push frame and break).
+                // If leaf, continue scanning siblings.
+                if !child_is_leaf {
+                    descend_frame = Some(DfsFrame {
+                        origin_block_id: child_block_id,
+                        child_ptrs: child_ptrs_vec,
+                        next_child: 0,
+                    });
+                    break;
+                }
+            }
+
+            match descend_frame {
+                Some(new_frame) => stack.push(new_frame),
+                None => {
+                    // All children of this frame processed, backtrack.
+                    stack.pop();
+                }
             }
         }
 
+        store.finish_writing()?;
+
         info!(
-            "Deep copy BFS complete: {} nodes in {:?}",
-            nodes.len(),
-            bfs_start.elapsed()
+            "Deep copy DFS complete: {} nodes in {:?}",
+            store.len(),
+            dfs_start.elapsed()
         );
 
-        Ok((nodes, source_to_idx))
+        Ok((store, source_to_idx))
     }
 
     /// Recompute the `squash_root_node_hash` from the committed squash trie blob.
     ///
-    /// BFS walks the trie, remaps child pointers to array indices, and
-    /// bottom-up recomputes content hashes.  Does **not** read stored SQL
-    /// metadata — this is a pure content hash derived solely from the
+    /// DFS walks the trie, remaps child pointers to array indices, and
+    /// bottom-up recomputes content hashes.  Does not read stored SQL
+    /// metadata - this is a pure content hash derived solely from the
     /// trie structure and leaf values on disk.
+    ///
+    /// Uses the disk-backed `NodeStore` to avoid OOM on large tries
+    /// (~50M nodes).
     pub fn recompute_squash_root_node_hash(&mut self, block_hash: &T) -> Result<TrieHash, Error> {
-        let (mut nodes, source_to_idx) =
-            self.with_conn(|conn| Self::collect_all_nodes(conn, block_hash))?;
+        // Use a temp dir next to the MARF database for the spill file.
+        let tmp_dir = std::path::Path::new(self.get_db_path())
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
 
-        // Remap child pointers from (block_id, byte_offset) to array indices.
-        for idx in 0..nodes.len() {
-            let node = nodes
-                .get(idx)
-                .ok_or_else(|| Error::CorruptionError(format!("node index {idx} out of bounds")))?;
-            if node.0.is_leaf() {
-                continue;
-            }
-            let origin_block_id = node.2;
-            let child_ptrs: Vec<TriePtr> = node.0.ptrs().to_vec();
-            for (slot, ptr) in child_ptrs.iter().enumerate() {
-                if ptr.id() == TrieNodeID::Empty as u8 {
-                    continue;
-                }
-                let (child_block_id, read_ptr) = if is_backptr(ptr.id()) {
-                    (ptr.back_block(), ptr.from_backptr().ptr())
-                } else {
-                    (origin_block_id, ptr.ptr())
-                };
-                let source_key = (child_block_id, read_ptr);
-                if let Some(&child_idx) = source_to_idx.get(&source_key) {
-                    let node_mut = nodes.get_mut(idx).ok_or_else(|| {
-                        Error::CorruptionError(format!("node index {idx} out of bounds"))
-                    })?;
-                    let ptrs_mut = node_mut.0.ptrs_mut();
-                    let ptr_entry = ptrs_mut.get_mut(slot).ok_or_else(|| {
-                        Error::CorruptionError(format!("slot {slot} out of bounds at node {idx}"))
-                    })?;
-                    ptr_entry.ptr = child_idx as u64;
-                } else {
-                    return Err(Error::CorruptionError(format!(
-                        "recompute_squash_root_node_hash: unresolved child pointer \
-                         (block_id={child_block_id}, offset={read_ptr}) at node {idx} slot {slot}"
-                    )));
-                }
-            }
-        }
-
-        recompute_content_hashes(&mut nodes)?;
-
-        let empty_hash = TrieHash::from_data(&[]);
-        Ok(nodes
-            .first()
-            .map(|(_, hash, _)| *hash)
-            .unwrap_or(empty_hash))
-    }
-
-    /// Remap pass: rewrite child pointers to Vec indices and annotate
-    /// `back_block` for hash-preserving backpointer identity.
-    ///
-    /// Must be called after `collect_all_nodes` and after the
-    /// `block_id_map` (archival_id -> squashed_id) is built.
-    ///
-    /// ## Backpointer annotation rules
-    ///
-    /// - Children that were inline at the tip block have `back_block = 0`.
-    /// - Children that were backpointers to an ancestor block have
-    ///   `back_block = squashed_local_id` (looked up via `block_id_map`).
-    /// - All children have the backptr flag cleared (they are physically
-    ///   present in the single shared trie storage).
-    fn deep_copy_remap(
-        nodes: &mut [CollectedNode],
-        source_to_idx: &HashMap<(u32, u64), usize>,
-        block_id_map: &HashMap<u32, u32>,
-    ) -> Result<(), Error> {
-        use crate::chainstate::stacks::index::node::clear_backptr;
-
-        let remap_start = Instant::now();
-        let node_count = nodes.len();
-
-        for idx in 0..node_count {
-            if idx > 0 && idx % 500_000 == 0 {
-                info!(
-                    "Deep copy remap: processed {idx}/{node_count} nodes in {:?}",
-                    remap_start.elapsed()
-                );
-            }
-
-            let entry = nodes.get(idx).ok_or_else(|| {
-                Error::CorruptionError(format!("deep_copy remap: index {idx} out of bounds"))
-            })?;
-            let origin_block_id = entry.2;
-
-            if entry.0.is_leaf() {
-                continue;
-            }
-
-            let child_ptrs: Vec<TriePtr> = entry.0.ptrs().to_vec();
-
-            for (slot, ptr) in child_ptrs.iter().enumerate() {
-                if ptr.id() == TrieNodeID::Empty as u8 {
-                    continue;
-                }
-
-                let (child_block_id, read_ptr, was_backptr) = if is_backptr(ptr.id()) {
-                    (ptr.back_block(), ptr.from_backptr(), true)
-                } else {
-                    (origin_block_id, *ptr, false)
-                };
-
-                let source_key = (child_block_id, read_ptr.ptr());
-                let child_idx = *source_to_idx.get(&source_key).ok_or_else(|| {
-                    Error::CorruptionError(format!(
-                        "deep_copy: child {source_key:?} not in source_to_idx"
-                    ))
-                })?;
-
-                debug_assert!(
-                    child_idx < node_count,
-                    "remap: child_idx {child_idx} >= node_count {node_count}"
-                );
-
-                let p = nodes
-                    .get_mut(idx)
-                    .ok_or_else(|| {
-                        Error::CorruptionError(format!(
-                            "deep_copy remap: index {idx} out of bounds"
-                        ))
-                    })?
-                    .0
-                    .ptrs_mut()
-                    .get_mut(slot)
-                    .ok_or_else(|| {
-                        Error::CorruptionError(format!(
-                            "deep_copy remap: slot {slot} out of bounds for node at {idx}"
-                        ))
-                    })?;
-                p.ptr = child_idx as u64;
-                p.id = clear_backptr(p.id);
-
-                if was_backptr {
-                    let squashed_id = block_id_map.get(&child_block_id).ok_or_else(|| {
-                        Error::CorruptionError(format!(
-                            "deep_copy: block_id {child_block_id} not in block_id_map"
-                        ))
-                    })?;
-                    p.back_block = *squashed_id;
-                } else {
-                    p.back_block = 0;
-                }
-            }
-        }
+        let (mut store, source_to_idx) =
+            self.with_conn(|conn| Self::collect_reachable_nodes(conn, block_hash, &tmp_dir))?;
 
         info!(
-            "Deep copy remap complete: {node_count} nodes remapped in {:?}",
-            remap_start.elapsed()
+            "recompute_squash_root_node_hash: collected {} nodes, remapping...",
+            store.len()
         );
 
-        Ok(())
+        // Remap child pointers to array indices (simplified: no block_id_map needed)
+        remap_ptrs_for_hashing(&mut store, &source_to_idx)?;
+        drop(source_to_idx);
+
+        // Recompute content hashes bottom-up
+        recompute_content_hashes(&mut store)?;
+
+        let empty_hash = TrieHash::from_data(&[]);
+        if store.len() > 0 {
+            Ok(store.hash(0))
+        } else {
+            Ok(empty_hash)
+        }
     }
 
     /// Validate that a squashed MARF is consistent with the source MARF at
@@ -1029,7 +1618,7 @@ impl<T: MarfTrieId> MARF<T> {
             Some(stored_hash) if stored_hash != empty_hash => {
                 stats.squash_node_hash_present = true;
                 let start_node_hash = Instant::now();
-                info!("Validate: recomputing squash_root_node_hash from blob (BFS walk)...");
+                info!("Validate: recomputing squash_root_node_hash from blob (DFS walk)...");
                 let recomputed_hash =
                     squashed.recompute_squash_root_node_hash(&squashed_block_at_height)?;
                 stats.squash_node_hash_matches = recomputed_hash == stored_hash;
@@ -1128,30 +1717,40 @@ impl<T: MarfTrieId> MARF<T> {
     }
 }
 
-/// Resolve a Stacks block height to the earliest canonical burn block height
+/// Result of [`resolve_stacks_height_to_sortition`]: the SortitionId and
+/// Bitcoin block height of the earliest canonical sortition where
+/// `canonical_stacks_tip_height >= stacks_height`.
+pub struct ResolvedSortition {
+    /// The SortitionId of the matching snapshot.
+    pub sortition_id: SortitionId,
+    /// Bitcoin block height stored in the snapshots table.
+    pub bitcoin_block_height: u64,
+}
+
+/// Resolve a Stacks block height to the earliest canonical Bitcoin block
 /// where `canonical_stacks_tip_height >= stacks_height`.
 ///
-/// This walks the canonical burn chain via MARF pointers, querying the
-/// `snapshots` table at each height. Must live in `stackslib` because it
-/// needs `TrieStorageConnection::sqlite_conn()` which is `pub(crate)`.
-pub fn resolve_stacks_to_burn_height(
+/// Returns the matching `SortitionId` and Bitcoin block height.
+pub fn resolve_stacks_height_to_sortition(
     storage: &mut TrieStorageConnection<SortitionId>,
-    tip: &SortitionId,
-    tip_height: u32,
     stacks_height: u32,
-) -> Result<u32, Error> {
-    for h in 0..=tip_height {
-        let sort_id = MARF::get_block_at_height(storage, h, tip)?;
-        if let Some(sort_id) = sort_id {
-            let stacks_tip_h: i64 = storage.sqlite_conn().query_row(
-                "SELECT canonical_stacks_tip_height FROM snapshots WHERE sortition_id = ?1",
-                params![&sort_id],
-                |row| row.get(0),
-            )?;
-            if stacks_tip_h >= stacks_height as i64 {
-                return Ok(h);
-            }
-        }
-    }
-    Err(Error::NotFoundError)
+) -> Result<ResolvedSortition, Error> {
+    let row: Option<(SortitionId, i64)> = storage
+        .sqlite_conn()
+        .query_row(
+            "SELECT sortition_id, block_height FROM snapshots \
+             WHERE pox_valid = 1 AND canonical_stacks_tip_height >= ?1 \
+             ORDER BY block_height ASC LIMIT 1",
+            params![stacks_height as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| Error::SQLError(e))?;
+
+    let (sort_id, btc_height) = row.ok_or(Error::NotFoundError)?;
+
+    Ok(ResolvedSortition {
+        sortition_id: sort_id,
+        bitcoin_block_height: btc_height as u64,
+    })
 }

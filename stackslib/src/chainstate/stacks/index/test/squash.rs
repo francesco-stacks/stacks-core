@@ -14,6 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashSet;
+use std::io::Seek;
 use std::path::PathBuf;
 
 use stacks_common::types::chainstate::{SortitionId, StacksBlockId, TrieHash};
@@ -23,7 +24,7 @@ use super::marf::setup_marf;
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashStats, MARF, OWN_BLOCK_HEIGHT_KEY,
 };
-use crate::chainstate::stacks::index::squash::resolve_stacks_to_burn_height;
+use crate::chainstate::stacks::index::squash::resolve_stacks_height_to_sortition;
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{
     trie_sql, ClarityMarfTrieId, Error, MARFValue, TrieMerkleProof,
@@ -1155,25 +1156,38 @@ fn test_resolve_stacks_to_burn_height_basic() {
     marf.insert("k", MARFValue::from_value("v2")).unwrap();
     marf.commit().unwrap();
 
-    // Create the snapshots table (resolve reads canonical_stacks_tip_height from it).
+    // Create the snapshots table (resolve reads canonical_stacks_tip_height, block_height,
+    // and pox_valid).
     marf.sqlite_conn()
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS snapshots (
             sortition_id TEXT PRIMARY KEY,
-            canonical_stacks_tip_height INTEGER NOT NULL
+            canonical_stacks_tip_height INTEGER NOT NULL,
+            block_height INTEGER NOT NULL,
+            pox_valid INTEGER NOT NULL DEFAULT 1
         )",
         )
         .unwrap();
 
-    // Burn 0 → stacks tip 0, burn 1 → stacks tip 5, burn 2 → stacks tip 10.
+    // Burn 0 - stacks tip 0 (btc 800000), burn 1 - stacks tip 5 (btc 800001),
+    // burn 2 - stacks tip 10 (btc 800002).
     marf.sqlite_conn()
-        .execute("INSERT INTO snapshots VALUES (?1, 0)", params![&s0])
+        .execute(
+            "INSERT INTO snapshots VALUES (?1, 0, 800000, 1)",
+            params![&s0],
+        )
         .unwrap();
     marf.sqlite_conn()
-        .execute("INSERT INTO snapshots VALUES (?1, 5)", params![&s1])
+        .execute(
+            "INSERT INTO snapshots VALUES (?1, 5, 800001, 1)",
+            params![&s1],
+        )
         .unwrap();
     marf.sqlite_conn()
-        .execute("INSERT INTO snapshots VALUES (?1, 10)", params![&s2])
+        .execute(
+            "INSERT INTO snapshots VALUES (?1, 10, 800002, 1)",
+            params![&s2],
+        )
         .unwrap();
 
     let tip = trie_sql::get_latest_confirmed_block_hash::<SortitionId>(marf.sqlite_conn()).unwrap();
@@ -1181,24 +1195,32 @@ fn test_resolve_stacks_to_burn_height_basic() {
 
     // Resolve various stacks heights.
     let result: Result<(), Error> = marf.with_conn(|conn| {
-        // Stacks height 0 → burn block 0 (earliest where stacks_tip >= 0).
-        let bh = resolve_stacks_to_burn_height(conn, &s2, 2, 0).unwrap();
-        assert_eq!(bh, 0, "stacks 0 → burn 0");
+        // Stacks height 0 -> sort_id s0, btc 800000.
+        let resolved = resolve_stacks_height_to_sortition(conn, 0).unwrap();
+        assert_eq!(resolved.sortition_id, s0);
+        assert_eq!(resolved.bitcoin_block_height, 800000);
+        let mh = MARF::get_block_height(conn, &resolved.sortition_id, &s2)?.unwrap();
+        assert_eq!(mh, 0, "stacks 0 -> marf 0");
 
-        // Stacks height 3 → burn block 1 (stacks_tip=5 >= 3).
-        let bh = resolve_stacks_to_burn_height(conn, &s2, 2, 3).unwrap();
-        assert_eq!(bh, 1, "stacks 3 → burn 1");
+        // Stacks height 3 -> sort_id s1, btc 800001.
+        let resolved = resolve_stacks_height_to_sortition(conn, 3).unwrap();
+        assert_eq!(resolved.sortition_id, s1);
+        assert_eq!(resolved.bitcoin_block_height, 800001);
+        let mh = MARF::get_block_height(conn, &resolved.sortition_id, &s2)?.unwrap();
+        assert_eq!(mh, 1, "stacks 3 -> marf 1");
 
-        // Stacks height 5 → burn block 1 (stacks_tip=5 >= 5).
-        let bh = resolve_stacks_to_burn_height(conn, &s2, 2, 5).unwrap();
-        assert_eq!(bh, 1, "stacks 5 → burn 1");
+        // Stacks height 5 -> sort_id s1, btc 800001.
+        let resolved = resolve_stacks_height_to_sortition(conn, 5).unwrap();
+        assert_eq!(resolved.sortition_id, s1);
+        assert_eq!(resolved.bitcoin_block_height, 800001);
 
-        // Stacks height 10 → burn block 2.
-        let bh = resolve_stacks_to_burn_height(conn, &s2, 2, 10).unwrap();
-        assert_eq!(bh, 2, "stacks 10 → burn 2");
+        // Stacks height 10 -> sort_id s2, btc 800002.
+        let resolved = resolve_stacks_height_to_sortition(conn, 10).unwrap();
+        assert_eq!(resolved.sortition_id, s2);
+        assert_eq!(resolved.bitcoin_block_height, 800002);
 
-        // Stacks height 11 → NotFoundError (no burn block has stacks_tip >= 11).
-        let err = resolve_stacks_to_burn_height(conn, &s2, 2, 11);
+        // Stacks height 11 -> NotFoundError.
+        let err = resolve_stacks_height_to_sortition(conn, 11);
         assert!(
             matches!(err, Err(Error::NotFoundError)),
             "stacks 11 should not be found"
@@ -1207,4 +1229,368 @@ fn test_resolve_stacks_to_burn_height_basic() {
         Ok(())
     });
     result.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Targeted unit tests for the disk-backed squash mechanisms
+// ---------------------------------------------------------------------------
+
+use std::io::Cursor;
+
+use crate::chainstate::stacks::index::node::{
+    TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeType, TriePtr,
+};
+use crate::chainstate::stacks::index::squash::{
+    compute_blob_offsets, deserialize_node, serialize_node, stream_squash_blob, NodeStore,
+};
+use crate::chainstate::stacks::index::TrieLeaf;
+
+/// Helper: build a leaf node for tests.
+fn make_test_leaf(path: &[u8], value_byte: u8) -> TrieNodeType {
+    let mut data = [0u8; 40];
+    data[0] = value_byte;
+    TrieNodeType::Leaf(TrieLeaf {
+        path: path.to_vec(),
+        data: MARFValue(data),
+    })
+}
+
+/// Helper: build a Node4 with the given child pointers.
+fn make_test_node4(path: &[u8], ptrs: [TriePtr; 4]) -> TrieNodeType {
+    TrieNodeType::Node4(TrieNode4 {
+        path: path.to_vec(),
+        ptrs,
+        cowptr: None,
+        patches: vec![],
+    })
+}
+
+#[test]
+fn test_node_store_roundtrip_all_variants() {
+    let dir = tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    let mut store = NodeStore::new(dir_str).unwrap();
+
+    // Leaf
+    let leaf = make_test_leaf(&[1, 2, 3], 0xAA);
+    let leaf_hash = TrieHash::from_data(&[1]);
+    store.push(&leaf, leaf_hash, 10).unwrap();
+
+    // Node4
+    let n4 = make_test_node4(
+        &[4, 5],
+        [
+            TriePtr::new(1, b'a', 100),
+            TriePtr::default(),
+            TriePtr::default(),
+            TriePtr::default(),
+        ],
+    );
+    let n4_hash = TrieHash::from_data(&[2]);
+    store.push(&n4, n4_hash, 20).unwrap();
+
+    // Node16
+    let mut ptrs16 = [TriePtr::default(); 16];
+    ptrs16[0] = TriePtr::new(2, b'b', 200);
+    let n16 = TrieNodeType::Node16(TrieNode16 {
+        path: vec![6, 7, 8],
+        ptrs: ptrs16,
+        cowptr: None,
+        patches: vec![],
+    });
+    let n16_hash = TrieHash::from_data(&[3]);
+    store.push(&n16, n16_hash, 30).unwrap();
+
+    // Node48
+    let mut indexes48 = [-1i8; 256];
+    indexes48[b'c' as usize] = 0;
+    let mut ptrs48 = [TriePtr::default(); 48];
+    ptrs48[0] = TriePtr::new(3, b'c', 300);
+    let n48 = TrieNodeType::Node48(Box::new(TrieNode48 {
+        path: vec![9, 10],
+        indexes: indexes48,
+        ptrs: ptrs48,
+        cowptr: None,
+        patches: vec![],
+    }));
+    let n48_hash = TrieHash::from_data(&[4]);
+    store.push(&n48, n48_hash, 40).unwrap();
+
+    // Node256
+    let mut ptrs256 = [TriePtr::default(); 256];
+    ptrs256[b'd' as usize] = TriePtr::new(4, b'd', 400);
+    let n256 = TrieNodeType::Node256(Box::new(TrieNode256 {
+        path: vec![11],
+        ptrs: ptrs256,
+        cowptr: None,
+        patches: vec![],
+    }));
+    let n256_hash = TrieHash::from_data(&[5]);
+    store.push(&n256, n256_hash, 50).unwrap();
+
+    store.finish_writing().unwrap();
+    assert_eq!(store.len(), 5);
+
+    // Read back and verify
+    let mut reader = store.open_reader().unwrap();
+
+    // Leaf round-trip
+    let rt_leaf = store.read_node_with(&mut reader, 0).unwrap();
+    assert!(rt_leaf.is_leaf());
+    assert_eq!(rt_leaf.path_bytes(), &[1, 2, 3]);
+    assert_eq!(store.hash(0), leaf_hash);
+    assert_eq!(store.block_id(0), 10);
+
+    // Node4 round-trip
+    let rt_n4 = store.read_node_with(&mut reader, 1).unwrap();
+    assert_eq!(rt_n4.ptrs()[0].chr(), b'a');
+    assert_eq!(rt_n4.ptrs()[0].ptr(), 100);
+
+    // Node16 round-trip
+    let rt_n16 = store.read_node_with(&mut reader, 2).unwrap();
+    assert_eq!(rt_n16.ptrs()[0].chr(), b'b');
+    assert_eq!(rt_n16.ptrs()[0].ptr(), 200);
+
+    // Node48 round-trip
+    let rt_n48 = store.read_node_with(&mut reader, 3).unwrap();
+    assert_eq!(rt_n48.ptrs()[0].chr(), b'c');
+    assert_eq!(rt_n48.ptrs()[0].ptr(), 300);
+
+    // Node256 round-trip
+    let rt_n256 = store.read_node_with(&mut reader, 4).unwrap();
+    assert_eq!(rt_n256.ptrs()[b'd' as usize].chr(), b'd');
+    assert_eq!(rt_n256.ptrs()[b'd' as usize].ptr(), 400);
+}
+
+#[test]
+fn test_node_store_spill_file_cleaned_on_drop() {
+    let dir = tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    let spill_path;
+    {
+        let mut store = NodeStore::new(dir_str).unwrap();
+        spill_path = store.path.clone();
+
+        let leaf = make_test_leaf(&[1], 0x01);
+        store.push(&leaf, TrieHash::from_data(&[]), 0).unwrap();
+        store.finish_writing().unwrap();
+
+        // File should exist while store is alive
+        assert!(spill_path.exists(), "spill file should exist before drop");
+    }
+    // After drop, file should be cleaned up
+    assert!(
+        !spill_path.exists(),
+        "spill file should be removed after drop"
+    );
+}
+
+#[test]
+fn test_node_store_unique_temp_file_names() {
+    let dir = tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    let store1 = NodeStore::new(dir_str).unwrap();
+    // Ensure different nanos by adding a tiny sleep
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let store2 = NodeStore::new(dir_str).unwrap();
+
+    assert_ne!(
+        store1.path, store2.path,
+        "concurrent NodeStores should have different temp file paths"
+    );
+}
+
+#[test]
+fn test_serialize_deserialize_node_roundtrip() {
+    // Test the raw serialize/deserialize functions independently of NodeStore
+    let nodes: Vec<TrieNodeType> = vec![
+        make_test_leaf(&[1, 2, 3, 4], 0xFF),
+        make_test_node4(
+            &[10, 20],
+            [
+                TriePtr::new(1, b'x', 42),
+                TriePtr::new(1, b'y', 99),
+                TriePtr::default(),
+                TriePtr::default(),
+            ],
+        ),
+    ];
+
+    for original in &nodes {
+        let mut buf = Vec::new();
+        serialize_node(&mut buf, original).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let roundtripped = deserialize_node(&mut cursor).unwrap();
+
+        assert_eq!(original.path_bytes(), roundtripped.path_bytes());
+        assert_eq!(original.ptrs().len(), roundtripped.ptrs().len());
+        for (a, b) in original.ptrs().iter().zip(roundtripped.ptrs().iter()) {
+            assert_eq!(a.id(), b.id());
+            assert_eq!(a.chr(), b.chr());
+            assert_eq!(a.ptr(), b.ptr());
+            assert_eq!(a.back_block(), b.back_block());
+        }
+    }
+}
+
+#[test]
+fn test_stream_squash_blob_produces_readable_output() {
+    use stacks_common::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
+
+    use crate::chainstate::stacks::index::node::TriePtrFormat;
+
+    let dir = tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    let mut store = NodeStore::new(dir_str).unwrap();
+
+    // Build a minimal trie: root (Node4) -> child (Leaf)
+    let leaf = make_test_leaf(&[1, 2], 0xBB);
+    let leaf_hash = TrieHash::from_data(&[0xBB]);
+
+    let root = make_test_node4(
+        &[0],
+        [
+            TriePtr::new(1, b'a', 1), // points to index 1 (the leaf)
+            TriePtr::default(),
+            TriePtr::default(),
+            TriePtr::default(),
+        ],
+    );
+    let root_hash = TrieHash::from_data(&[0xAA]);
+
+    store.push(&root, root_hash, 0).unwrap();
+    store.push(&leaf, leaf_hash, 0).unwrap();
+    store.finish_writing().unwrap();
+
+    let ptr_format = TriePtrFormat::V2U64;
+    let parent_hash = StacksBlockId::sentinel();
+    let (blob_offsets, total_size) = compute_blob_offsets(&mut store, ptr_format).unwrap();
+    assert_eq!(blob_offsets.len(), 2);
+    assert!(total_size > 0);
+
+    let mut output = Cursor::new(Vec::new());
+    let bytes_written = stream_squash_blob(
+        &mut store,
+        &parent_hash,
+        ptr_format,
+        &blob_offsets,
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(bytes_written, total_size);
+
+    // Verify the blob starts with the parent hash + zero identifier
+    let blob = output.into_inner();
+    assert_eq!(&blob[..32], parent_hash.as_bytes());
+    assert_eq!(
+        &blob[BLOCK_HEADER_HASH_ENCODED_SIZE..BLOCK_HEADER_HASH_ENCODED_SIZE + 4],
+        &0u32.to_le_bytes()
+    );
+    // Verify the blob is the expected total size
+    assert_eq!(blob.len() as u64, total_size);
+}
+
+#[test]
+fn test_stream_squash_blob_at_nonzero_offset() {
+    use stacks_common::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
+
+    use crate::chainstate::stacks::index::node::TriePtrFormat;
+
+    let dir = tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    let mut store = NodeStore::new(dir_str).unwrap();
+
+    // Build a minimal trie: root (Node4) -> child (Leaf)
+    let leaf = make_test_leaf(&[1, 2], 0xBB);
+    let leaf_hash = TrieHash::from_data(&[0xBB]);
+
+    let root = make_test_node4(
+        &[0],
+        [
+            TriePtr::new(1, b'a', 1),
+            TriePtr::default(),
+            TriePtr::default(),
+            TriePtr::default(),
+        ],
+    );
+    let root_hash = TrieHash::from_data(&[0xAA]);
+
+    store.push(&root, root_hash, 0).unwrap();
+    store.push(&leaf, leaf_hash, 0).unwrap();
+    store.finish_writing().unwrap();
+
+    let ptr_format = TriePtrFormat::V2U64;
+    let parent_hash = StacksBlockId::sentinel();
+    let (blob_offsets, total_size) = compute_blob_offsets(&mut store, ptr_format).unwrap();
+
+    // Write to a sink that already has 1000 bytes of garbage prefix
+    let prefix_len: u64 = 1000;
+    let mut buf = vec![0xFFu8; prefix_len as usize];
+    let mut output = Cursor::new(&mut buf);
+    output.seek(std::io::SeekFrom::End(0)).unwrap();
+    assert_eq!(output.stream_position().unwrap(), prefix_len);
+
+    let bytes_written = stream_squash_blob(
+        &mut store,
+        &parent_hash,
+        ptr_format,
+        &blob_offsets,
+        &mut output,
+    )
+    .unwrap();
+
+    // bytes_written should be exactly total_size (not prefix + total_size)
+    assert_eq!(bytes_written, total_size);
+
+    // Total buffer should be prefix + blob
+    let total_buf = output.into_inner();
+    assert_eq!(total_buf.len() as u64, prefix_len + total_size);
+
+    // The prefix should be untouched
+    assert!(total_buf[..prefix_len as usize].iter().all(|&b| b == 0xFF));
+
+    // The blob header should be at the correct offset
+    let blob_start = prefix_len as usize;
+    assert_eq!(
+        &total_buf[blob_start..blob_start + 32],
+        parent_hash.as_bytes()
+    );
+    assert_eq!(
+        &total_buf[blob_start + BLOCK_HEADER_HASH_ENCODED_SIZE
+            ..blob_start + BLOCK_HEADER_HASH_ENCODED_SIZE + 4],
+        &0u32.to_le_bytes()
+    );
+}
+
+#[test]
+fn test_squash_rejects_compress_true() {
+    let dir = tempdir().unwrap();
+    let src_db_path = dir.path().join("index.sqlite");
+    let _ = setup_marf(src_db_path.to_str().unwrap(), 2, 1);
+
+    let dst_dir = dir.path().join("squashed");
+    std::fs::create_dir_all(&dst_dir).unwrap();
+    let dst_db_path = dst_dir.join("index.sqlite");
+
+    let mut open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    open_opts.compress = true;
+
+    let result = MARF::<StacksBlockId>::squash_to_path(
+        src_db_path.to_str().unwrap(),
+        dst_db_path.to_str().unwrap(),
+        open_opts,
+        1,
+    );
+    assert!(result.is_err(), "compress=true should be rejected");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("compress=true"),
+        "error should mention compress=true: {err_msg}"
+    );
 }
