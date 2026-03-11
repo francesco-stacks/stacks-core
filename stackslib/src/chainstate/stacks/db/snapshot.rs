@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 
+use crate::burnchains::PoxConstants;
 use crate::chainstate::stacks::index::Error;
 use crate::chainstate::stacks::StacksMicroblock;
 use crate::core::EMPTY_MICROBLOCK_PARENT_HASH;
@@ -23,15 +25,15 @@ pub struct IndexSideTableStats {
     pub transactions_rows: u64,
     /// Rows copied into `nakamoto_tenure_events` (canonical only).
     pub nakamoto_tenure_events_rows: u64,
-    /// Rows copied into `nakamoto_reward_sets` (full copy).
+    /// Rows copied into `nakamoto_reward_sets` (canonical only).
     pub nakamoto_reward_sets_rows: u64,
-    /// Rows copied into `signer_stats` (full copy).
+    /// Rows copied into `signer_stats` (filtered by max reward cycle).
     pub signer_stats_rows: u64,
-    /// Rows copied into `matured_rewards` (full copy).
+    /// Rows copied into `matured_rewards` (canonical only).
     pub matured_rewards_rows: u64,
-    /// Rows copied into `burnchain_txids` (full copy).
+    /// Rows copied into `burnchain_txids` (canonical only).
     pub burnchain_txids_rows: u64,
-    /// Rows copied into `epoch_transitions` (full copy).
+    /// Rows copied into `epoch_transitions` (canonical only).
     pub epoch_transitions_rows: u64,
     /// Rows copied into `staging_blocks` (canonical, processed, non-orphaned).
     pub staging_blocks_rows: u64,
@@ -50,12 +52,12 @@ pub struct IndexSideTableValidation {
     pub payments_count_match: bool,
     pub transactions_count_match: bool,
     pub nakamoto_tenure_events_count_match: bool,
-    /// "Copy all" tables: exact rowcount match (src == dst).
-    pub nakamoto_reward_sets_count_match: bool,
-    pub signer_stats_count_match: bool,
-    pub matured_rewards_count_match: bool,
-    pub burnchain_txids_count_match: bool,
-    pub epoch_transitions_count_match: bool,
+    /// Canonical-filtered tables: bidirectional full-row match.
+    pub nakamoto_reward_sets_match: bool,
+    pub signer_stats_match: bool,
+    pub matured_rewards_match: bool,
+    pub burnchain_txids_match: bool,
+    pub epoch_transitions_match: bool,
     /// staging_blocks: bidirectional full-row EXCEPT against canonical source rows.
     pub staging_blocks_match: bool,
     /// invalidated_microblocks_data: table exists and is empty (schema fidelity).
@@ -75,11 +77,11 @@ impl IndexSideTableValidation {
             && self.payments_count_match
             && self.transactions_count_match
             && self.nakamoto_tenure_events_count_match
-            && self.nakamoto_reward_sets_count_match
-            && self.signer_stats_count_match
-            && self.matured_rewards_count_match
-            && self.burnchain_txids_count_match
-            && self.epoch_transitions_count_match
+            && self.nakamoto_reward_sets_match
+            && self.signer_stats_match
+            && self.matured_rewards_match
+            && self.burnchain_txids_match
+            && self.epoch_transitions_match
             && self.staging_blocks_match
             && self.invalidated_microblocks_data_empty
             && self.transactions_no_extra_blocks
@@ -197,13 +199,61 @@ fn populate_canonical_blocks(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
+/// Derive the maximum reward cycle from the canonical squashed tip's burn height.
+///
+/// Returns `Ok(Some(cycle))` when nakamoto headers are present and the reward cycle
+/// can be computed, `Ok(None)` when no nakamoto headers exist (pre-epoch-3 chains
+/// where there are no `signer_stats` rows), or `Err` if the derivation fails
+/// (e.g. `tip_burn_height < first_burn_height`).
+///
+/// Squashing is only supported for epoch 3.x (Nakamoto). The `None` case exists
+/// only to handle test databases and pre-Nakamoto chains gracefully.
+fn derive_max_reward_cycle(
+    conn: &Connection,
+    first_burn_height: u64,
+    reward_cycle_len: u64,
+) -> Result<Option<u64>, Error> {
+    let tip_burn_height: Option<u64> = conn
+        .query_row(
+            "SELECT nh.burn_header_height \
+             FROM marf_squash_block_heights mh \
+             JOIN src.nakamoto_block_headers nh ON nh.index_block_hash = mh.block_hash \
+             ORDER BY mh.height DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(Error::SQLError)?
+        .map(|h| h as u64);
+
+    match tip_burn_height {
+        Some(tbh) => {
+            let cycle = PoxConstants::static_block_height_to_reward_cycle(
+                tbh,
+                first_burn_height,
+                reward_cycle_len,
+            )
+            .ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "cannot derive reward cycle: tip_burn_height={tbh}, \
+                     first_burn_height={first_burn_height}, reward_cycle_len={reward_cycle_len}"
+                ))
+            })?;
+            info!("  derive_max_reward_cycle: {cycle} (tip_burn_height={tbh})");
+            Ok(Some(cycle))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Copy required non-MARF tables from the source `index.sqlite` into the
 /// squashed destination. Only canonical rows (determined by the squashed MARF's
 /// `marf_squash_block_heights`) are included, excluding non-canonical fork data.
 pub fn copy_index_side_tables(
     src_path: &str,
     dst_path: &str,
-    height: u32,
+    first_burn_height: u64,
+    reward_cycle_len: u64,
 ) -> Result<IndexSideTableStats, Error> {
     let conn = Connection::open(dst_path).map_err(Error::SQLError)?;
 
@@ -220,7 +270,7 @@ pub fn copy_index_side_tables(
         return Err(e);
     }
 
-    let result = copy_tables_inner(&conn, height);
+    let result = copy_tables_inner(&conn, first_burn_height, reward_cycle_len);
 
     match result {
         Ok(stats) => {
@@ -237,20 +287,32 @@ pub fn copy_index_side_tables(
     }
 }
 
-fn copy_tables_inner(conn: &Connection, _height: u32) -> Result<IndexSideTableStats, Error> {
+fn copy_tables_inner(
+    conn: &Connection,
+    first_burn_height: u64,
+    reward_cycle_len: u64,
+) -> Result<IndexSideTableStats, Error> {
+    let total_start = Instant::now();
+
     // Copy db_config verbatim.
+    let t = Instant::now();
     conn.execute(
         "INSERT OR REPLACE INTO db_config SELECT * FROM src.db_config",
         [],
     )
     .map_err(Error::SQLError)?;
+    info!("  copy_side_tables: db_config done in {:?}", t.elapsed());
 
     // Build canonical block set from squash metadata.
-    // marf_squash_block_heights was populated during squash from the MARF's
-    // canonical chain walk (get_block_at_height for each height 0..H).
+    let t = Instant::now();
     populate_canonical_blocks(conn)?;
+    info!(
+        "  copy_side_tables: canonical_blocks temp table built in {:?}",
+        t.elapsed()
+    );
 
     // Copy only canonical block_headers (by index_block_hash, not by height).
+    let t = Instant::now();
     let block_headers_rows = conn
         .execute(
             "INSERT INTO block_headers SELECT * FROM src.block_headers \
@@ -258,7 +320,12 @@ fn copy_tables_inner(conn: &Connection, _height: u32) -> Result<IndexSideTableSt
             [],
         )
         .map_err(Error::SQLError)? as u64;
+    info!(
+        "  copy_side_tables: block_headers ({block_headers_rows} rows) in {:?}",
+        t.elapsed()
+    );
 
+    let t = Instant::now();
     let nakamoto_block_headers_rows = conn
         .execute(
             "INSERT INTO nakamoto_block_headers SELECT * FROM src.nakamoto_block_headers \
@@ -266,8 +333,13 @@ fn copy_tables_inner(conn: &Connection, _height: u32) -> Result<IndexSideTableSt
             [],
         )
         .map_err(Error::SQLError)? as u64;
+    info!(
+        "  copy_side_tables: nakamoto_block_headers ({nakamoto_block_headers_rows} rows) in {:?}",
+        t.elapsed()
+    );
 
     // payments: filter by index_block_hash (canonical blocks only).
+    let t = Instant::now();
     let payments_rows = conn
         .execute(
             "INSERT INTO payments SELECT * FROM src.payments \
@@ -275,8 +347,13 @@ fn copy_tables_inner(conn: &Connection, _height: u32) -> Result<IndexSideTableSt
             [],
         )
         .map_err(Error::SQLError)? as u64;
+    info!(
+        "  copy_side_tables: payments ({payments_rows} rows) in {:?}",
+        t.elapsed()
+    );
 
     // Identifier-filtered tables using the canonical block set.
+    let t = Instant::now();
     let transactions_rows = conn
         .execute(
             "INSERT INTO transactions \
@@ -285,7 +362,12 @@ fn copy_tables_inner(conn: &Connection, _height: u32) -> Result<IndexSideTableSt
             [],
         )
         .map_err(Error::SQLError)? as u64;
+    info!(
+        "  copy_side_tables: transactions ({transactions_rows} rows) in {:?}",
+        t.elapsed()
+    );
 
+    let t = Instant::now();
     let nakamoto_tenure_events_rows = conn
         .execute(
             "INSERT INTO nakamoto_tenure_events \
@@ -294,44 +376,89 @@ fn copy_tables_inner(conn: &Connection, _height: u32) -> Result<IndexSideTableSt
             [],
         )
         .map_err(Error::SQLError)? as u64;
+    info!(
+        "  copy_side_tables: nakamoto_tenure_events ({nakamoto_tenure_events_rows} rows) in {:?}",
+        t.elapsed()
+    );
 
-    // "Copy all" tables.
+    // Canonical-filtered tables (previously full-copy).
+    let t = Instant::now();
     let nakamoto_reward_sets_rows = conn
         .execute(
-            "INSERT INTO nakamoto_reward_sets SELECT * FROM src.nakamoto_reward_sets",
+            "INSERT INTO nakamoto_reward_sets SELECT * FROM src.nakamoto_reward_sets \
+             WHERE index_block_hash IN (SELECT index_block_hash FROM canonical_blocks)",
             [],
         )
         .map_err(Error::SQLError)? as u64;
+    info!(
+        "  copy_side_tables: nakamoto_reward_sets ({nakamoto_reward_sets_rows} rows) in {:?}",
+        t.elapsed()
+    );
 
-    let signer_stats_rows = conn
-        .execute(
-            "INSERT INTO signer_stats SELECT * FROM src.signer_stats",
-            [],
-        )
-        .map_err(Error::SQLError)? as u64;
+    let max_reward_cycle = derive_max_reward_cycle(conn, first_burn_height, reward_cycle_len)?;
 
+    let t = Instant::now();
+    let signer_stats_rows = match max_reward_cycle {
+        Some(cycle) => conn
+            .execute(
+                "INSERT INTO signer_stats SELECT * FROM src.signer_stats \
+                 WHERE reward_cycle <= ?1",
+                params![cycle as i64],
+            )
+            .map_err(Error::SQLError)? as u64,
+        None => conn
+            .execute(
+                "INSERT INTO signer_stats SELECT * FROM src.signer_stats",
+                [],
+            )
+            .map_err(Error::SQLError)? as u64,
+    };
+    info!(
+        "  copy_side_tables: signer_stats ({signer_stats_rows} rows) in {:?}",
+        t.elapsed()
+    );
+
+    let t = Instant::now();
     let matured_rewards_rows = conn
         .execute(
-            "INSERT INTO matured_rewards SELECT * FROM src.matured_rewards",
+            "INSERT INTO matured_rewards SELECT * FROM src.matured_rewards \
+             WHERE child_index_block_hash IN (SELECT index_block_hash FROM canonical_blocks)",
             [],
         )
         .map_err(Error::SQLError)? as u64;
+    info!(
+        "  copy_side_tables: matured_rewards ({matured_rewards_rows} rows) in {:?}",
+        t.elapsed()
+    );
 
+    let t = Instant::now();
     let burnchain_txids_rows = conn
         .execute(
-            "INSERT INTO burnchain_txids SELECT * FROM src.burnchain_txids",
+            "INSERT INTO burnchain_txids SELECT * FROM src.burnchain_txids \
+             WHERE index_block_hash IN (SELECT index_block_hash FROM canonical_blocks)",
             [],
         )
         .map_err(Error::SQLError)? as u64;
+    info!(
+        "  copy_side_tables: burnchain_txids ({burnchain_txids_rows} rows) in {:?}",
+        t.elapsed()
+    );
 
+    let t = Instant::now();
     let epoch_transitions_rows = conn
         .execute(
-            "INSERT INTO epoch_transitions SELECT * FROM src.epoch_transitions",
+            "INSERT INTO epoch_transitions SELECT * FROM src.epoch_transitions \
+             WHERE block_id IN (SELECT index_block_hash FROM canonical_blocks)",
             [],
         )
         .map_err(Error::SQLError)? as u64;
+    info!(
+        "  copy_side_tables: epoch_transitions ({epoch_transitions_rows} rows) in {:?}",
+        t.elapsed()
+    );
 
     // Canonical staging_blocks rows (needed for /v2/blocks serving and parent linkage).
+    let t = Instant::now();
     let staging_blocks_rows = conn
         .execute(
             "INSERT INTO staging_blocks \
@@ -342,9 +469,18 @@ fn copy_tables_inner(conn: &Connection, _height: u32) -> Result<IndexSideTableSt
             [],
         )
         .map_err(Error::SQLError)? as u64;
+    info!(
+        "  copy_side_tables: staging_blocks ({staging_blocks_rows} rows) in {:?}",
+        t.elapsed()
+    );
 
     conn.execute_batch("DROP TABLE IF EXISTS canonical_blocks")
         .map_err(Error::SQLError)?;
+
+    info!(
+        "  copy_side_tables: all tables done in {:?}",
+        total_start.elapsed()
+    );
 
     Ok(IndexSideTableStats {
         block_headers_rows,
@@ -366,7 +502,8 @@ fn copy_tables_inner(conn: &Connection, _height: u32) -> Result<IndexSideTableSt
 pub fn validate_index_side_tables(
     src_path: &str,
     dst_path: &str,
-    _height: u32,
+    first_burn_height: u64,
+    reward_cycle_len: u64,
 ) -> Result<IndexSideTableValidation, Error> {
     let conn = Connection::open(dst_path).map_err(Error::SQLError)?;
     conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
@@ -530,8 +667,6 @@ pub fn validate_index_side_tables(
            AND s.processed = 1 AND s.orphaned = 0",
     );
 
-    let _ = conn.execute_batch("DROP TABLE IF EXISTS val_canonical_blocks");
-
     // Schema-fidelity tables should be empty.
     let invalidated_microblocks_data_empty = conn
         .query_row(
@@ -542,32 +677,51 @@ pub fn validate_index_side_tables(
         .unwrap_or(1)
         == 0;
 
-    // "Copy all" tables: exact rowcount match.
-    let nakamoto_reward_sets_count_match = count_match(
+    // Canonical-filtered tables: bidirectional full-row EXCEPT match.
+    let nakamoto_reward_sets_match = full_row_except_match(
         &conn,
-        "SELECT COUNT(*) FROM src.nakamoto_reward_sets",
-        "SELECT COUNT(*) FROM nakamoto_reward_sets",
+        "SELECT * FROM nakamoto_reward_sets",
+        "SELECT * FROM src.nakamoto_reward_sets \
+         WHERE index_block_hash IN (SELECT index_block_hash FROM val_canonical_blocks)",
     );
-    let signer_stats_count_match = count_match(
+
+    let max_reward_cycle = derive_max_reward_cycle(&conn, first_burn_height, reward_cycle_len)?;
+
+    let signer_stats_match = match max_reward_cycle {
+        Some(cycle) => full_row_except_match(
+            &conn,
+            "SELECT * FROM signer_stats",
+            &format!("SELECT * FROM src.signer_stats WHERE reward_cycle <= {cycle}"),
+        ),
+        None => full_row_except_match(
+            &conn,
+            "SELECT * FROM signer_stats",
+            "SELECT * FROM src.signer_stats",
+        ),
+    };
+
+    let matured_rewards_match = full_row_except_match(
         &conn,
-        "SELECT COUNT(*) FROM src.signer_stats",
-        "SELECT COUNT(*) FROM signer_stats",
+        "SELECT * FROM matured_rewards",
+        "SELECT * FROM src.matured_rewards \
+         WHERE child_index_block_hash IN (SELECT index_block_hash FROM val_canonical_blocks)",
     );
-    let matured_rewards_count_match = count_match(
+
+    let burnchain_txids_match = full_row_except_match(
         &conn,
-        "SELECT COUNT(*) FROM src.matured_rewards",
-        "SELECT COUNT(*) FROM matured_rewards",
+        "SELECT * FROM burnchain_txids",
+        "SELECT * FROM src.burnchain_txids \
+         WHERE index_block_hash IN (SELECT index_block_hash FROM val_canonical_blocks)",
     );
-    let burnchain_txids_count_match = count_match(
+
+    let epoch_transitions_match = full_row_except_match(
         &conn,
-        "SELECT COUNT(*) FROM src.burnchain_txids",
-        "SELECT COUNT(*) FROM burnchain_txids",
+        "SELECT * FROM epoch_transitions",
+        "SELECT * FROM src.epoch_transitions \
+         WHERE block_id IN (SELECT index_block_hash FROM val_canonical_blocks)",
     );
-    let epoch_transitions_count_match = count_match(
-        &conn,
-        "SELECT COUNT(*) FROM src.epoch_transitions",
-        "SELECT COUNT(*) FROM epoch_transitions",
-    );
+
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS val_canonical_blocks");
 
     conn.execute_batch("DETACH DATABASE src")
         .map_err(Error::SQLError)?;
@@ -580,11 +734,11 @@ pub fn validate_index_side_tables(
         payments_count_match,
         transactions_count_match,
         nakamoto_tenure_events_count_match,
-        nakamoto_reward_sets_count_match,
-        signer_stats_count_match,
-        matured_rewards_count_match,
-        burnchain_txids_count_match,
-        epoch_transitions_count_match,
+        nakamoto_reward_sets_match,
+        signer_stats_match,
+        matured_rewards_match,
+        burnchain_txids_match,
+        epoch_transitions_match,
         staging_blocks_match,
         invalidated_microblocks_data_empty,
         transactions_no_extra_blocks,
@@ -2846,7 +3000,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO nakamoto_reward_sets (index_block_hash, reward_set) VALUES ('ibh_rs','{}')",
+            "INSERT INTO nakamoto_reward_sets (index_block_hash, reward_set) VALUES ('ibh1','{}')",
             [],
         )
         .unwrap();
@@ -2858,7 +3012,7 @@ mod tests {
 
         // Copy: only canonical blocks ibh1 and ibh2 should be included.
         let stats =
-            copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 2)
+            copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
                 .unwrap();
 
         assert_eq!(stats.block_headers_rows, 2, "2 canonical block_headers");
@@ -2871,9 +3025,13 @@ mod tests {
         assert_eq!(stats.nakamoto_reward_sets_rows, 1);
 
         // Validate.
-        let validation =
-            validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 2)
-                .unwrap();
+        let validation = validate_index_side_tables(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
 
         assert!(
             validation.is_valid(),
@@ -2910,7 +3068,7 @@ mod tests {
         create_dest_db_with_canonical_blocks(&dst_path, &["ibh1_canonical"]);
 
         let stats =
-            copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 1)
+            copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
                 .unwrap();
 
         // Only canonical block should be copied, not the fork.
@@ -2918,9 +3076,13 @@ mod tests {
         assert_eq!(stats.transactions_rows, 1, "only canonical transactions");
 
         // Validate passes - fork rows excluded.
-        let validation =
-            validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 1)
-                .unwrap();
+        let validation = validate_index_side_tables(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
         assert!(
             validation.is_valid(),
             "validation should pass without fork rows: {validation:?}"
@@ -2942,7 +3104,7 @@ mod tests {
         create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
 
         let _stats =
-            copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 1)
+            copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
                 .unwrap();
 
         // Inject a transaction for a block NOT in the canonical set.
@@ -2955,9 +3117,13 @@ mod tests {
             .unwrap();
         }
 
-        let validation =
-            validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 1)
-                .unwrap();
+        let validation = validate_index_side_tables(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
 
         assert!(
             !validation.transactions_no_extra_blocks,
@@ -3529,7 +3695,7 @@ mod tests {
         create_dest_db_with_canonical_blocks(&dst_path, &["ibh1", "ibh2"]);
 
         let stats =
-            copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 2)
+            copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
                 .unwrap();
 
         // Only 2 staging_blocks rows for canonical blocks.
@@ -3572,12 +3738,17 @@ mod tests {
         let dst_path = dir.path().join("dst.sqlite");
         create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
 
-        copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 1).unwrap();
+        copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
 
         // Validation should pass initially.
-        let v =
-            validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 1)
-                .unwrap();
+        let v = validate_index_side_tables(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
         assert!(v.staging_blocks_match);
 
         // Now corrupt a column in destination staging_blocks.
@@ -3591,9 +3762,13 @@ mod tests {
         drop(dst_conn);
 
         // Validation should now fail.
-        let v =
-            validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 1)
-                .unwrap();
+        let v = validate_index_side_tables(
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
         assert!(!v.staging_blocks_match, "should detect column drift: {v:?}");
     }
 
@@ -3699,7 +3874,8 @@ mod tests {
         let dst_path = dir.path().join("dst.sqlite");
         create_dest_db_with_canonical_blocks(&dst_path, &[]);
 
-        copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0).unwrap();
+        copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
 
         let dst_conn = Connection::open(&dst_path).unwrap();
 
@@ -5224,7 +5400,7 @@ mod tests {
         // Sortition says heights 0, 1, 2 are canonical.
         create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1"), (2, "h2")]);
 
-        // But source burnchain.sqlite only has h0 and h1 — h2 is missing.
+        // But source burnchain.sqlite only has h0 and h1 - h2 is missing.
         let src = create_burnchain_db_v3(&src_path);
         src.execute(
             "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",

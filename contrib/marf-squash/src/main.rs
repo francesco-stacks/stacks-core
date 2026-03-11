@@ -21,6 +21,10 @@ use blockstack_lib::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
 use blockstack_lib::clarity_vm::database::marf::{
     copy_clarity_side_tables, validate_clarity_side_tables,
 };
+use blockstack_lib::core::{
+    BITCOIN_MAINNET_FIRST_BLOCK_HEIGHT, BITCOIN_TESTNET_FIRST_BLOCK_HEIGHT,
+    POX_REWARD_CYCLE_LENGTH, POX_TESTNET_CYCLE_LENGTH,
+};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -410,7 +414,6 @@ fn run_squash(args: SquashArgs) {
         std::process::exit(1);
     }
 
-    let mut all_valid = true;
     let mut clarity_out = None;
     let mut index_out = None;
     let mut sortition_out = None;
@@ -425,55 +428,55 @@ fn run_squash(args: SquashArgs) {
         None
     };
 
+    // ── Phase 1: Squash & Copy ──────────────────────────────────────────
+
     if do_clarity {
         let out = target_out_paths(&args.out_dir, &paths.clarity.db);
-        if !squash_one(
+        squash_and_copy_one(
             "clarity",
             &paths.clarity,
             &out,
             args.height,
-            args.skip_validate,
-            args.full,
             SideTableMode::Clarity,
             default_open_opts(),
-        ) {
-            all_valid = false;
-        }
+        );
         clarity_out = Some(out);
     }
 
+    // Derive PoX constants from the source index DB (needed for index side-table filtering).
+    let (first_burn_height, reward_cycle_len) = if do_index {
+        index_pox_constants(&paths.index.db)
+    } else {
+        (0, 1)
+    };
+
     if do_index {
         let out = target_out_paths(&args.out_dir, &paths.index.db);
-        if !squash_one(
+        squash_and_copy_one(
             "index",
             &paths.index,
             &out,
             args.height,
-            args.skip_validate,
-            args.full,
-            SideTableMode::Index(args.height),
+            SideTableMode::Index {
+                first_burn_height,
+                reward_cycle_len,
+            },
             default_open_opts(),
-        ) {
-            all_valid = false;
-        }
+        );
         index_out = Some(out);
     }
 
     if do_sortition {
         let bh = burn_height.unwrap();
         let out = target_out_paths_sortition(&args.out_dir, &paths.sortition.db);
-        if !squash_one(
+        squash_and_copy_one(
             "sortition",
             &paths.sortition,
             &out,
             bh,
-            args.skip_validate,
-            args.full,
             SideTableMode::Sortition,
             sortition_open_opts(),
-        ) {
-            all_valid = false;
-        }
+        );
         sortition_out = Some((out, bh));
     }
 
@@ -486,6 +489,12 @@ fn run_squash(args: SquashArgs) {
 
     let mut blocks_stats: Option<BlocksSection> = None;
     let mut copied_block_rel_paths: Vec<String> = Vec::new();
+
+    // These variables are needed by both the copy and validation phases for blocks.
+    let src_blocks_dir = args.chainstate.join("chainstate/blocks");
+    let dst_blocks_dir = args.out_dir.join("chainstate/blocks");
+    let src_nakamoto = args.chainstate.join("chainstate/blocks/nakamoto.sqlite");
+    let dst_nakamoto = dst_blocks_dir.join("nakamoto.sqlite");
 
     if do_blocks {
         let i_out = index_out
@@ -512,8 +521,6 @@ fn run_squash(args: SquashArgs) {
         };
 
         // 2. Copy epoch 2.x block files.
-        let src_blocks_dir = args.chainstate.join("chainstate/blocks");
-        let dst_blocks_dir = args.out_dir.join("chainstate/blocks");
         println!("Copying epoch 2.x block files...");
         let file_stats = match copy_epoch2_block_files(
             dst_index_path,
@@ -534,8 +541,6 @@ fn run_squash(args: SquashArgs) {
         };
 
         // 3. Copy nakamoto staging blocks.
-        let src_nakamoto = args.chainstate.join("chainstate/blocks/nakamoto.sqlite");
-        let dst_nakamoto = dst_blocks_dir.join("nakamoto.sqlite");
         if !src_nakamoto.exists() {
             eprintln!(
                 "Source nakamoto.sqlite not found at {}; required for --blocks",
@@ -578,9 +583,124 @@ fn run_squash(args: SquashArgs) {
         }
         // Nakamoto staging DB.
         copied_block_rel_paths.push("chainstate/blocks/nakamoto.sqlite".to_string());
+    }
 
-        // 4. Validate blocks if validation is enabled.
-        if !args.skip_validate {
+    // Burnchain auxiliary files: burnchain.sqlite + headers.sqlite.
+    // Only when producing a complete GSS (all three MARFs + blocks).
+    let do_burnchain_aux = do_clarity && do_index && do_sortition && do_blocks;
+    let mut has_burnchain_aux = false;
+
+    // These variables are needed by both the copy and validation phases for burnchain.
+    let src_bc_db = args.chainstate.join("burnchain/burnchain.sqlite");
+    let dst_bc_db = args.out_dir.join("burnchain/burnchain.sqlite");
+    let squashed_sort = args.out_dir.join("burnchain/sortition/marf.sqlite");
+    let src_hdr = args.chainstate.join("headers.sqlite");
+    let dst_hdr = args.out_dir.join("headers.sqlite");
+
+    if do_burnchain_aux {
+        let bh = burn_height.expect("burn_height resolved when do_sortition=true");
+
+        println!("Copying burnchain.sqlite (canonical only)...");
+        match copy_burnchain_db(
+            src_bc_db.to_str().unwrap(),
+            dst_bc_db.to_str().unwrap(),
+            squashed_sort.to_str().unwrap(),
+            bh,
+        ) {
+            Ok(bc_stats) => {
+                println!(
+                    "  block_headers={}, block_ops={}, commit_metadata={}, anchor_blocks={}, overrides={}, affirmation_maps={}",
+                    bc_stats.block_headers_rows, bc_stats.block_ops_rows,
+                    bc_stats.block_commit_metadata_rows, bc_stats.anchor_blocks_rows,
+                    bc_stats.overrides_rows, bc_stats.affirmation_maps_rows
+                );
+            }
+            Err(e) => {
+                eprintln!("Failed to copy burnchain.sqlite: {e:?}");
+                std::process::exit(1);
+            }
+        }
+
+        println!("Copying headers.sqlite (SPV, up to burn height {bh})...");
+        match copy_spv_headers(src_hdr.to_str().unwrap(), dst_hdr.to_str().unwrap(), bh) {
+            Ok(Some(spv_stats)) => {
+                println!(
+                    "  headers={}, chain_work={}",
+                    spv_stats.headers_rows, spv_stats.chain_work_rows
+                );
+            }
+            Ok(None) => {
+                println!("  headers.sqlite not found in source (will be rebuilt on startup)");
+            }
+            Err(e) => {
+                eprintln!("Failed to copy headers.sqlite: {e:?}");
+                std::process::exit(1);
+            }
+        };
+
+        has_burnchain_aux = true;
+    }
+
+    // ── Phase 2: Validation ─────────────────────────────────────────────
+
+    let mut all_valid = true;
+
+    if !args.skip_validate {
+        println!("--- Validation phase ---");
+
+        if do_clarity
+            && !validate_one(
+                "clarity",
+                &paths.clarity,
+                clarity_out.as_ref().unwrap(),
+                args.height,
+                args.full,
+                SideTableMode::Clarity,
+                default_open_opts(),
+            )
+        {
+            all_valid = false;
+        }
+
+        if do_index
+            && !validate_one(
+                "index",
+                &paths.index,
+                index_out.as_ref().unwrap(),
+                args.height,
+                args.full,
+                SideTableMode::Index {
+                    first_burn_height,
+                    reward_cycle_len,
+                },
+                default_open_opts(),
+            )
+        {
+            all_valid = false;
+        }
+
+        if do_sortition {
+            let bh = burn_height.unwrap();
+            if !validate_one(
+                "sortition",
+                &paths.sortition,
+                &sortition_out.as_ref().unwrap().0,
+                bh,
+                args.full,
+                SideTableMode::Sortition,
+                sortition_open_opts(),
+            ) {
+                all_valid = false;
+            }
+        }
+
+        if do_blocks {
+            let i_out = index_out
+                .as_ref()
+                .expect("--blocks requires --index; index_out must be set");
+            let src_index_path = paths.index.db.to_str().unwrap();
+            let dst_index_path = i_out.db.to_str().unwrap();
+
             println!("Validating block data...");
             let mut blocks_valid = true;
 
@@ -660,118 +780,57 @@ fn run_squash(args: SquashArgs) {
                 all_valid = false;
             }
         }
-    }
 
-    // Burnchain auxiliary files: burnchain.sqlite + headers.sqlite.
-    // Only when producing a complete GSS (all three MARFs + blocks).
-    let do_burnchain_aux = do_clarity && do_index && do_sortition && do_blocks;
-    let mut has_burnchain_aux = false;
+        if do_burnchain_aux {
+            let bh = burn_height.expect("burn_height resolved when do_sortition=true");
 
-    if do_burnchain_aux {
-        let bh = burn_height.expect("burn_height resolved when do_sortition=true");
-
-        let src_bc_db = args.chainstate.join("burnchain/burnchain.sqlite");
-        let dst_bc_db = args.out_dir.join("burnchain/burnchain.sqlite");
-        let squashed_sort = args.out_dir.join("burnchain/sortition/marf.sqlite");
-
-        println!("Copying burnchain.sqlite (canonical only)...");
-        match copy_burnchain_db(
-            src_bc_db.to_str().unwrap(),
-            dst_bc_db.to_str().unwrap(),
-            squashed_sort.to_str().unwrap(),
-            bh,
-        ) {
-            Ok(bc_stats) => {
-                println!(
-                    "  block_headers={}, block_ops={}, commit_metadata={}, anchor_blocks={}, overrides={}, affirmation_maps={}",
-                    bc_stats.block_headers_rows, bc_stats.block_ops_rows,
-                    bc_stats.block_commit_metadata_rows, bc_stats.anchor_blocks_rows,
-                    bc_stats.overrides_rows, bc_stats.affirmation_maps_rows
-                );
-
-                let src_hdr = args.chainstate.join("headers.sqlite");
-                let dst_hdr = args.out_dir.join("headers.sqlite");
-
-                println!("Copying headers.sqlite (SPV, up to burn height {bh})...");
-                match copy_spv_headers(src_hdr.to_str().unwrap(), dst_hdr.to_str().unwrap(), bh) {
-                    Ok(Some(spv_stats)) => {
-                        println!(
-                            "  headers={}, chain_work={}",
-                            spv_stats.headers_rows, spv_stats.chain_work_rows
-                        );
-                    }
-                    Ok(None) => {
-                        println!(
-                            "  headers.sqlite not found in source (will be rebuilt on startup)"
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to copy headers.sqlite: {e:?}");
-                        std::process::exit(1);
-                    }
-                };
-
-                has_burnchain_aux = true;
-
-                // Validate burnchain aux if validation is enabled.
-                if !args.skip_validate {
-                    println!("Validating burnchain auxiliary files...");
-                    match validate_burnchain_db(
-                        src_bc_db.to_str().unwrap(),
-                        dst_bc_db.to_str().unwrap(),
-                        squashed_sort.to_str().unwrap(),
-                        bh,
-                    ) {
-                        Ok(v) => {
-                            println!("  bc_block_headers_match: {}", v.block_headers_match);
-                            println!("  bc_block_ops_match: {}", v.block_ops_match);
-                            println!(
-                                "  bc_commit_metadata_match: {}",
-                                v.block_commit_metadata_match
-                            );
-                            println!("  bc_anchor_blocks_match: {}", v.anchor_blocks_match);
-                            println!("  bc_overrides_match: {}", v.overrides_match);
-                            println!("  bc_db_config_match: {}", v.db_config_match);
-                            println!("  bc_no_extra_headers: {}", v.no_extra_headers);
-                            println!("  bc_canonical_complete: {}", v.canonical_complete);
-                            println!("  bc_affirmation_maps_match: {}", v.affirmation_maps_match);
-                            if !v.is_valid() {
-                                all_valid = false;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("  burnchain.sqlite validation error: {e:?}");
-                            all_valid = false;
-                        }
-                    }
-
-                    match validate_spv_headers(
-                        src_hdr.to_str().unwrap(),
-                        dst_hdr.to_str().unwrap(),
-                        bh,
-                    ) {
-                        Ok(Some(v)) => {
-                            println!("  spv_headers_match: {}", v.headers_match);
-                            println!("  spv_chain_work_match: {}", v.chain_work_match);
-                            println!("  spv_db_config_match: {}", v.db_config_match);
-                            println!("  spv_no_extra_headers: {}", v.no_extra_headers);
-                            if !v.is_valid() {
-                                all_valid = false;
-                            }
-                        }
-                        Ok(None) => {
-                            println!("  headers.sqlite: both absent, skipped");
-                        }
-                        Err(e) => {
-                            eprintln!("  headers.sqlite validation error: {e:?}");
-                            all_valid = false;
-                        }
+            println!("Validating burnchain auxiliary files...");
+            match validate_burnchain_db(
+                src_bc_db.to_str().unwrap(),
+                dst_bc_db.to_str().unwrap(),
+                squashed_sort.to_str().unwrap(),
+                bh,
+            ) {
+                Ok(v) => {
+                    println!("  bc_block_headers_match: {}", v.block_headers_match);
+                    println!("  bc_block_ops_match: {}", v.block_ops_match);
+                    println!(
+                        "  bc_commit_metadata_match: {}",
+                        v.block_commit_metadata_match
+                    );
+                    println!("  bc_anchor_blocks_match: {}", v.anchor_blocks_match);
+                    println!("  bc_overrides_match: {}", v.overrides_match);
+                    println!("  bc_db_config_match: {}", v.db_config_match);
+                    println!("  bc_no_extra_headers: {}", v.no_extra_headers);
+                    println!("  bc_canonical_complete: {}", v.canonical_complete);
+                    println!("  bc_affirmation_maps_match: {}", v.affirmation_maps_match);
+                    if !v.is_valid() {
+                        all_valid = false;
                     }
                 }
+                Err(e) => {
+                    eprintln!("  burnchain.sqlite validation error: {e:?}");
+                    all_valid = false;
+                }
             }
-            Err(e) => {
-                eprintln!("Failed to copy burnchain.sqlite: {e:?}");
-                std::process::exit(1);
+
+            match validate_spv_headers(src_hdr.to_str().unwrap(), dst_hdr.to_str().unwrap(), bh) {
+                Ok(Some(v)) => {
+                    println!("  spv_headers_match: {}", v.headers_match);
+                    println!("  spv_chain_work_match: {}", v.chain_work_match);
+                    println!("  spv_db_config_match: {}", v.db_config_match);
+                    println!("  spv_no_extra_headers: {}", v.no_extra_headers);
+                    if !v.is_valid() {
+                        all_valid = false;
+                    }
+                }
+                Ok(None) => {
+                    println!("  headers.sqlite: both absent, skipped");
+                }
+                Err(e) => {
+                    eprintln!("  headers.sqlite validation error: {e:?}");
+                    all_valid = false;
+                }
             }
         }
     }
@@ -826,18 +885,22 @@ fn run_validate(args: ValidateArgs) {
         all_valid = false;
     }
 
-    if do_index
-        && !validate_one(
+    if do_index {
+        let (first_burn_height, reward_cycle_len) = index_pox_constants(&source_paths.index.db);
+        if !validate_one(
             "index",
             &source_paths.index,
             &squashed_paths.index,
             args.height,
             args.full,
-            SideTableMode::Index(args.height),
+            SideTableMode::Index {
+                first_burn_height,
+                reward_cycle_len,
+            },
             default_open_opts(),
-        )
-    {
-        all_valid = false;
+        ) {
+            all_valid = false;
+        }
     }
 
     if do_sortition {
@@ -1342,7 +1405,7 @@ fn recompute_marf_root<T: MarfTrieId>(
             }
         }
         None => {
-            // MARF exists on disk but manifest has no squash root hash — this is
+            // MARF exists on disk but manifest has no squash root hash - this is
             // a malformed manifest for a full GSS.
             errors.push(format!(
                 "Level 2: {name} MARF exists but manifest has no squash root hash"
@@ -1436,25 +1499,55 @@ fn run_latest_height(args: LatestHeightArgs) {
     println!("{height}");
 }
 
+/// Read `mainnet` from the index DB's `db_config` table and derive PoX constants.
+fn index_pox_constants(index_db_path: &Path) -> (u64, u64) {
+    let conn = rusqlite::Connection::open(index_db_path).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to open index DB '{}' for db_config: {e}",
+            index_db_path.display()
+        );
+        std::process::exit(1);
+    });
+    let mainnet: bool = conn
+        .query_row("SELECT mainnet FROM db_config LIMIT 1", [], |row| {
+            row.get::<_, i64>(0).map(|v| v != 0)
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read db_config.mainnet: {e}");
+            std::process::exit(1);
+        });
+    if mainnet {
+        (
+            BITCOIN_MAINNET_FIRST_BLOCK_HEIGHT,
+            POX_REWARD_CYCLE_LENGTH as u64,
+        )
+    } else {
+        (
+            BITCOIN_TESTNET_FIRST_BLOCK_HEIGHT,
+            POX_TESTNET_CYCLE_LENGTH as u64,
+        )
+    }
+}
+
 #[derive(Clone)]
 enum SideTableMode {
     Clarity,
-    Index(u32),
+    Index {
+        first_burn_height: u64,
+        reward_cycle_len: u64,
+    },
     Sortition,
 }
 
-/// Squash a single MARF target. Returns `true` if validation passed (or was skipped).
-#[allow(clippy::too_many_arguments)]
-fn squash_one(
+/// Squash a single MARF target and copy its side tables. Exits on error.
+fn squash_and_copy_one(
     label: &str,
     source: &TargetPaths,
     out: &TargetPaths,
     height: u32,
-    skip_validate: bool,
-    full: bool,
     side_table_mode: SideTableMode,
     open_opts: MARFOpenOpts,
-) -> bool {
+) {
     if let Some(ref blobs) = source.blobs {
         ensure_blobs_match(source.db.to_str().unwrap(), blobs.to_str().unwrap());
     }
@@ -1474,7 +1567,7 @@ fn squash_one(
         match MARF::<SortitionId>::squash_to_path(
             source.db.to_str().unwrap(),
             out.db.to_str().unwrap(),
-            open_opts.clone(),
+            open_opts,
             height,
         ) {
             Ok(stats) => stats,
@@ -1487,7 +1580,7 @@ fn squash_one(
         match MARF::<StacksBlockId>::squash_to_path(
             source.db.to_str().unwrap(),
             out.db.to_str().unwrap(),
-            open_opts.clone(),
+            open_opts,
             height,
         ) {
             Ok(stats) => stats,
@@ -1519,10 +1612,17 @@ fn squash_one(
                 }
             }
         }
-        SideTableMode::Index(h) => {
+        SideTableMode::Index {
+            first_burn_height,
+            reward_cycle_len,
+        } => {
             println!("Copying index side tables...");
-            match copy_index_side_tables(source.db.to_str().unwrap(), out.db.to_str().unwrap(), *h)
-            {
+            match copy_index_side_tables(
+                source.db.to_str().unwrap(),
+                out.db.to_str().unwrap(),
+                *first_burn_height,
+                *reward_cycle_len,
+            ) {
                 Ok(st) => {
                     println!(
                         "Index side-table copy complete: block_headers={}, nakamoto_headers={}, payments={}, transactions={}, tenure_events={}, reward_sets={}, signer_stats={}, matured_rewards={}, burnchain_txids={}, epoch_transitions={}, staging_blocks={}",
@@ -1564,76 +1664,7 @@ fn squash_one(
         }
     }
 
-    let validation = if skip_validate {
-        None
-    } else {
-        Some(validate_or_exit(
-            source.db.to_str().unwrap(),
-            source.blobs.as_deref().map(|p| p.to_str().unwrap()),
-            out.db.to_str().unwrap(),
-            out.blobs.as_deref().map(|p| p.to_str().unwrap()),
-            open_opts,
-            height,
-            full,
-            is_sortition,
-        ))
-    };
-
-    let (side_table_validation, clarity_side_err) = if !skip_validate
-        && matches!(side_table_mode, SideTableMode::Clarity)
-    {
-        match validate_clarity_side_tables(source.db.to_str().unwrap(), out.db.to_str().unwrap()) {
-            Ok(v) => (Some(v), false),
-            Err(e) => {
-                eprintln!("Clarity side-table validation failed: {e:?}");
-                (None, true)
-            }
-        }
-    } else {
-        (None, false)
-    };
-
-    let index_side_valid = if !skip_validate {
-        if let SideTableMode::Index(h) = &side_table_mode {
-            match validate_index_side_tables(
-                source.db.to_str().unwrap(),
-                out.db.to_str().unwrap(),
-                *h,
-            ) {
-                Ok(v) => {
-                    print_index_side_table_validation(&v);
-                    v.is_valid()
-                }
-                Err(e) => {
-                    eprintln!("Warning: index side-table validation failed: {e:?}");
-                    false
-                }
-            }
-        } else {
-            true
-        }
-    } else {
-        true
-    };
-
-    let sortition_side_valid = if !skip_validate
-        && matches!(side_table_mode, SideTableMode::Sortition)
-    {
-        match validate_sortition_side_tables(source.db.to_str().unwrap(), out.db.to_str().unwrap())
-        {
-            Ok(v) => {
-                print_sortition_side_table_validation(&v);
-                v.is_valid()
-            }
-            Err(e) => {
-                eprintln!("Warning: sortition side-table validation failed: {e:?}");
-                false
-            }
-        }
-    } else {
-        true
-    };
-
+    // Size savings summary.
     let original_db_size = fs::metadata(&source.db).map(|m| m.len()).unwrap_or(0);
     let original_blobs_size = source
         .blobs
@@ -1671,41 +1702,6 @@ fn squash_one(
     if let Some(ref blobs) = out.blobs {
         println!("Output blobs: {}", blobs.display());
     }
-    let marf_valid = match validation {
-        Some(ref v) => {
-            print_validation(v);
-            v.is_valid()
-        }
-        None => {
-            println!("Validation skipped");
-            true
-        }
-    };
-    let side_valid = if let Some(ref sv) = side_table_validation {
-        println!("Side-table validation:");
-        println!(
-            "  data_table rows: src={}, dst={}, match={}",
-            sv.src_data_table_rows, sv.dst_data_table_rows, sv.required_data_keys_present
-        );
-        println!(
-            "  metadata_table rows: src={}, dst={}, match={}",
-            sv.src_metadata_table_rows, sv.dst_metadata_table_rows, sv.required_metadata_present
-        );
-        if sv.sample_contracts_checked > 0 {
-            println!(
-                "  sample check: {} contracts checked, {} missing in trie, {} missing in data_table",
-                sv.sample_contracts_checked,
-                sv.sample_contracts_missing_in_trie,
-                sv.sample_contracts_missing_in_data_table
-            );
-        }
-        println!("Side-table valid: {}", sv.is_valid());
-        sv.is_valid()
-    } else {
-        !clarity_side_err
-    };
-
-    marf_valid && side_valid && index_side_valid && sortition_side_valid
 }
 
 /// Validate a single MARF target. Returns `true` if all validations passed.
@@ -1771,11 +1767,16 @@ fn validate_one(
         true
     };
 
-    let index_side_valid = if let SideTableMode::Index(h) = &side_table_mode {
+    let index_side_valid = if let SideTableMode::Index {
+        first_burn_height,
+        reward_cycle_len,
+    } = &side_table_mode
+    {
         match validate_index_side_tables(
             source.db.to_str().unwrap(),
             squashed.db.to_str().unwrap(),
-            *h,
+            *first_burn_height,
+            *reward_cycle_len,
         ) {
             Ok(v) => {
                 print_index_side_table_validation(&v);
@@ -1913,22 +1914,13 @@ fn print_index_side_table_validation(
         v.nakamoto_tenure_events_count_match
     );
     println!(
-        "  nakamoto_reward_sets_count_match: {}",
-        v.nakamoto_reward_sets_count_match
+        "  nakamoto_reward_sets_match: {}",
+        v.nakamoto_reward_sets_match
     );
-    println!("  signer_stats_count_match: {}", v.signer_stats_count_match);
-    println!(
-        "  matured_rewards_count_match: {}",
-        v.matured_rewards_count_match
-    );
-    println!(
-        "  burnchain_txids_count_match: {}",
-        v.burnchain_txids_count_match
-    );
-    println!(
-        "  epoch_transitions_count_match: {}",
-        v.epoch_transitions_count_match
-    );
+    println!("  signer_stats_match: {}", v.signer_stats_match);
+    println!("  matured_rewards_match: {}", v.matured_rewards_match);
+    println!("  burnchain_txids_match: {}", v.burnchain_txids_match);
+    println!("  epoch_transitions_match: {}", v.epoch_transitions_match);
     println!("  staging_blocks_match: {}", v.staging_blocks_match);
     println!(
         "  invalidated_microblocks_data_empty: {}",
@@ -2099,6 +2091,9 @@ fn generate_manifest(
     let timestamp = read_snapshot_timestamp(sortition_out, index_out, height);
 
     // Read bitcoin height + block hash from sortition DB if available.
+    // Note: `bh` is the MARF-internal sortition height (0-indexed from
+    // genesis sortition), NOT the actual Bitcoin block height.  We read the
+    // real Bitcoin height from the `burn_header_height` column in snapshots.
     let (bitcoin_height, bitcoin_block_hash) = if let Some((s_out, bh)) = &sortition_out {
         let conn = rusqlite::Connection::open(s_out.db.to_str().unwrap()).unwrap_or_else(|e| {
             eprintln!("Failed to open squashed sortition DB for bitcoin metadata: {e}");
@@ -2112,21 +2107,21 @@ fn generate_manifest(
             )
             .unwrap_or_else(|e| {
                 eprintln!(
-                    "Failed to read sortition ID at burn height {bh} from squashed sortition DB: {e}"
+                    "Failed to read sortition ID at MARF height {bh} from squashed sortition DB: {e}"
                 );
                 std::process::exit(1);
             });
-        let btc_hash: String = conn
+        let (real_btc_height, btc_hash): (u32, String) = conn
             .query_row(
-                "SELECT burn_header_hash FROM snapshots WHERE sortition_id = ?1",
+                "SELECT burn_header_height, burn_header_hash FROM snapshots WHERE sortition_id = ?1",
                 [&sort_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap_or_else(|e| {
-                eprintln!("Failed to read burn_header_hash for sortition_id {sort_id}: {e}");
+                eprintln!("Failed to read burn_header_height/hash for sortition_id {sort_id}: {e}");
                 std::process::exit(1);
             });
-        (Some(*bh), Some(format!("0x{btc_hash}")))
+        (Some(real_btc_height), Some(format!("0x{btc_hash}")))
     } else {
         (None, None)
     };
@@ -2385,7 +2380,6 @@ fn sortition_open_opts() -> MARFOpenOpts {
 }
 
 /// Resolve Stacks block height to the earliest canonical burn block height
-/// where `canonical_stacks_tip_height >= stacks_height`.
 fn resolve_burn_height_for_sortition(sortition_db_path: &str, stacks_height: u32) -> u32 {
     let open_opts = sortition_open_opts();
     let src_storage =
@@ -2706,7 +2700,7 @@ mod tests {
     #[test]
     fn test_manifest_rejects_extra_file_in_outdir() {
         // When an expected file set is provided, compute_checksums rejects
-        // any file not in the set — preventing stale files from being blessed.
+        // any file not in the set - preventing stale files from being blessed.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         create_test_gss_dir(dir, &["expected.sqlite", "stale.sqlite"]);
@@ -3015,7 +3009,7 @@ sortition_squash_root_node_hash = "0xccccccccccccccccccccccccccccccccccccccccccc
         write_test_manifest(dir, &files);
 
         // Levels 0+1 should pass (correct checksums, no extras).
-        // Level 2 will fail because there are no real MARFs — but the
+        // Level 2 will fail because there are no real MARFs - but the
         // MARF files don't exist and squash_roots are set, so Level 2
         // reports those as errors.  We test that the composed flow runs
         // and returns errors for the MARF paths.
