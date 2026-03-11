@@ -27,7 +27,7 @@ use rusqlite::Connection;
 use crate::chainstate::stacks::index::bits::{
     read_hash_bytes, read_nodetype_at_head, read_nodetype_at_head_nohash,
 };
-use crate::chainstate::stacks::index::node::{TrieNodeType, TriePtr, TriePtrFormat};
+use crate::chainstate::stacks::index::node::{TrieNodeType, TriePtr};
 use crate::chainstate::stacks::index::storage::NodeHashReader;
 #[cfg(test)]
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
@@ -335,8 +335,7 @@ impl<'a> TrieFileNodeHashReader<'a> {
 impl NodeHashReader for TrieFileNodeHashReader<'_> {
     fn read_node_hash_bytes<W: Write>(&mut self, ptr: &TriePtr, w: &mut W) -> Result<(), Error> {
         let trie_offset = self.file.get_trie_offset(self.db, self.block_id)?;
-        self.file
-            .seek(SeekFrom::Start(trie_offset + (ptr.ptr() as u64)))?;
+        self.file.seek(SeekFrom::Start(trie_offset + (ptr.ptr())))?;
         let hash_buff = read_hash_bytes(self.file)?;
         w.write_all(&hash_buff).map_err(|e| e.into())
     }
@@ -371,7 +370,7 @@ impl TrieFile {
         ptr: &TriePtr,
     ) -> Result<TrieHash, Error> {
         let offset = self.get_trie_offset(db, block_id)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
+        self.seek(SeekFrom::Start(offset + (ptr.ptr())))?;
         let hash_buff = read_hash_bytes(self)?;
         Ok(TrieHash(hash_buff))
     }
@@ -383,11 +382,10 @@ impl TrieFile {
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
-        ptr_format: TriePtrFormat,
     ) -> Result<(TrieNodeType, TrieHash), Error> {
         let offset = self.get_trie_offset(db, block_id)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
-        read_nodetype_at_head(self, ptr.id(), ptr_format)
+        self.seek(SeekFrom::Start(offset + (ptr.ptr())))?;
+        read_nodetype_at_head(self, ptr.id())
     }
 
     /// Obtain a TrieNodeType, given its block ID and pointer
@@ -396,11 +394,10 @@ impl TrieFile {
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
-        ptr_format: TriePtrFormat,
     ) -> Result<TrieNodeType, Error> {
         let offset = self.get_trie_offset(db, block_id)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
-        read_nodetype_at_head_nohash(self, ptr.id(), ptr_format)
+        self.seek(SeekFrom::Start(offset + (ptr.ptr())))?;
+        read_nodetype_at_head_nohash(self, ptr.id())
     }
 
     /// Obtain a TrieHash for a node, given the node's block's hash (used only in testing)
@@ -412,7 +409,7 @@ impl TrieFile {
         ptr: &TriePtr,
     ) -> Result<TrieHash, Error> {
         let (offset, _length) = trie_sql::get_external_trie_offset_length_by_bhh(db, bhh)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
+        self.seek(SeekFrom::Start(offset + (ptr.ptr())))?;
         let hash_buff = read_hash_bytes(self)?;
         Ok(TrieHash(hash_buff))
     }

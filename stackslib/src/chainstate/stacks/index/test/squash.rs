@@ -1441,8 +1441,6 @@ fn test_serialize_deserialize_node_roundtrip() {
 fn test_stream_squash_blob_produces_readable_output() {
     use stacks_common::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
 
-    use crate::chainstate::stacks::index::node::TriePtrFormat;
-
     let dir = tempdir().unwrap();
     let dir_str = dir.path().to_str().unwrap();
 
@@ -1467,21 +1465,14 @@ fn test_stream_squash_blob_produces_readable_output() {
     store.push(&leaf, leaf_hash, 0).unwrap();
     store.finish_writing().unwrap();
 
-    let ptr_format = TriePtrFormat::V2U64;
     let parent_hash = StacksBlockId::sentinel();
-    let (blob_offsets, total_size) = compute_blob_offsets(&mut store, ptr_format).unwrap();
+    let (blob_offsets, total_size) = compute_blob_offsets(&mut store).unwrap();
     assert_eq!(blob_offsets.len(), 2);
     assert!(total_size > 0);
 
     let mut output = Cursor::new(Vec::new());
-    let bytes_written = stream_squash_blob(
-        &mut store,
-        &parent_hash,
-        ptr_format,
-        &blob_offsets,
-        &mut output,
-    )
-    .unwrap();
+    let bytes_written =
+        stream_squash_blob(&mut store, &parent_hash, &blob_offsets, &mut output).unwrap();
     assert_eq!(bytes_written, total_size);
 
     // Verify the blob starts with the parent hash + zero identifier
@@ -1498,8 +1489,6 @@ fn test_stream_squash_blob_produces_readable_output() {
 #[test]
 fn test_stream_squash_blob_at_nonzero_offset() {
     use stacks_common::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
-
-    use crate::chainstate::stacks::index::node::TriePtrFormat;
 
     let dir = tempdir().unwrap();
     let dir_str = dir.path().to_str().unwrap();
@@ -1525,9 +1514,8 @@ fn test_stream_squash_blob_at_nonzero_offset() {
     store.push(&leaf, leaf_hash, 0).unwrap();
     store.finish_writing().unwrap();
 
-    let ptr_format = TriePtrFormat::V2U64;
     let parent_hash = StacksBlockId::sentinel();
-    let (blob_offsets, total_size) = compute_blob_offsets(&mut store, ptr_format).unwrap();
+    let (blob_offsets, total_size) = compute_blob_offsets(&mut store).unwrap();
 
     // Write to a sink that already has 1000 bytes of garbage prefix
     let prefix_len: u64 = 1000;
@@ -1536,14 +1524,8 @@ fn test_stream_squash_blob_at_nonzero_offset() {
     output.seek(std::io::SeekFrom::End(0)).unwrap();
     assert_eq!(output.stream_position().unwrap(), prefix_len);
 
-    let bytes_written = stream_squash_blob(
-        &mut store,
-        &parent_hash,
-        ptr_format,
-        &blob_offsets,
-        &mut output,
-    )
-    .unwrap();
+    let bytes_written =
+        stream_squash_blob(&mut store, &parent_hash, &blob_offsets, &mut output).unwrap();
 
     // bytes_written should be exactly total_size (not prefix + total_size)
     assert_eq!(bytes_written, total_size);

@@ -37,7 +37,6 @@ use crate::chainstate::stacks::index::marf::{
 };
 use crate::chainstate::stacks::index::node::{
     is_backptr, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID, TrieNodeType, TriePtr,
-    TriePtrFormat,
 };
 use crate::chainstate::stacks::index::storage::{
     SquashInfo, TrieFileStorage, TrieStorageConnection,
@@ -593,10 +592,7 @@ fn recompute_content_hashes(store: &mut NodeStore) -> Result<(), Error> {
 ///
 /// Returns `(blob_offsets, total_size)` where `blob_offsets[i]` is the byte
 /// position where node `i` starts in the blob (after the header).
-pub(crate) fn compute_blob_offsets(
-    store: &mut NodeStore,
-    ptr_format: TriePtrFormat,
-) -> Result<(Vec<u64>, u64), Error> {
+pub(crate) fn compute_blob_offsets(store: &mut NodeStore) -> Result<(Vec<u64>, u64), Error> {
     let n = store.len();
     let mut reader = store.open_reader()?;
     let header_size = BLOCK_HEADER_HASH_ENCODED_SIZE as u64 + 4;
@@ -606,7 +602,7 @@ pub(crate) fn compute_blob_offsets(
     for idx in 0..n {
         blob_offsets.push(current_offset);
         let node = store.read_node_with(&mut reader, idx)?;
-        let byte_len = get_node_byte_len(&node, ptr_format) as u64;
+        let byte_len = get_node_byte_len(&node) as u64;
         current_offset += byte_len;
     }
     Ok((blob_offsets, current_offset))
@@ -627,7 +623,6 @@ pub(crate) fn compute_blob_offsets(
 pub(crate) fn stream_squash_blob<T: MarfTrieId, F: Write + Seek>(
     store: &mut NodeStore,
     parent_hash: &T,
-    ptr_format: TriePtrFormat,
     blob_offsets: &[u64],
     sink: &mut F,
 ) -> Result<u64, Error> {
@@ -665,7 +660,7 @@ pub(crate) fn stream_squash_blob<T: MarfTrieId, F: Write + Seek>(
             }
         }
 
-        write_nodetype_bytes(sink, &node, hash, ptr_format)?;
+        write_nodetype_bytes(sink, &node, hash)?;
     }
 
     let end = sink.stream_position().map_err(Error::IOError)?;
@@ -1158,11 +1153,9 @@ impl<T: MarfTrieId> MARF<T> {
         // Step 5c: compute blob offsets, then stream directly to destination
         log_memory_snapshot("before step 5c blob write");
         let start = Instant::now();
-        // Squashed MARFs always use V2U64 pointers (set when squash_info is detected on open).
-        let ptr_format = TriePtrFormat::V2U64;
         let parent_hash = T::sentinel();
 
-        let (blob_offsets, total_blob_size) = compute_blob_offsets(&mut node_store, ptr_format)?;
+        let (blob_offsets, total_blob_size) = compute_blob_offsets(&mut node_store)?;
         info!(
             "Squash step 5c (offset computation): {} nodes, {total_blob_size} bytes in {:?}",
             node_store.len(),
@@ -1183,7 +1176,6 @@ impl<T: MarfTrieId> MARF<T> {
                     stream_squash_blob(
                         &mut node_store,
                         &parent_hash,
-                        ptr_format,
                         &blob_offsets,
                         &mut buf_writer,
                     )?;
@@ -1207,26 +1199,14 @@ impl<T: MarfTrieId> MARF<T> {
                 None => {
                     // Fallback: no .blobs file available, write inline to SQLite
                     let mut blob = Cursor::new(Vec::with_capacity(total_blob_size as usize));
-                    stream_squash_blob(
-                        &mut node_store,
-                        &parent_hash,
-                        ptr_format,
-                        &blob_offsets,
-                        &mut blob,
-                    )?;
+                    stream_squash_blob(&mut node_store, &parent_hash, &blob_offsets, &mut blob)?;
                     trie_sql::write_trie_blob(db, &block_at_height, &blob.into_inner())
                 }
             })?
         } else {
             // Inline SQLite blob (used for sortition MARF / tests)
             let mut blob = Cursor::new(Vec::with_capacity(total_blob_size as usize));
-            stream_squash_blob(
-                &mut node_store,
-                &parent_hash,
-                ptr_format,
-                &blob_offsets,
-                &mut blob,
-            )?;
+            stream_squash_blob(&mut node_store, &parent_hash, &blob_offsets, &mut blob)?;
             trie_sql::write_trie_blob(tx.sqlite_tx(), &block_at_height, &blob.into_inner())?
         };
         info!(
