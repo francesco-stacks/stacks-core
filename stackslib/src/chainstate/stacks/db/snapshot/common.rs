@@ -31,34 +31,6 @@ pub struct TableCopySpec {
     pub source_sql: String,
 }
 
-/// How a table should be validated after copy.
-pub enum ValidationMode {
-    /// Bidirectional - full row equality.
-    ExactRowsEq,
-    /// Count equality only (cheaper for large tables).
-    CountEq,
-    /// No extra rows in destination beyond what source has.
-    NoExtraRows,
-    /// Table must be empty in destination.
-    MustBeEmpty,
-}
-
-/// A spec for validating a single table after copy.
-pub struct TableValidationSpec {
-    pub table: &'static str,
-    /// Filtered SELECT for the source side.
-    pub src_sql: String,
-    /// SELECT for the destination side (often just `"SELECT * FROM {table}"`).
-    pub dst_sql: String,
-    pub mode: ValidationMode,
-}
-
-/// Result of validating a single table.
-pub struct TableValidationResult {
-    pub table: &'static str,
-    pub passed: bool,
-}
-
 /// Clone table and index schemas from the source DB (via `sqlite_master`) into the
 /// destination connection. This avoids duplicating any CREATE TABLE / ALTER TABLE /
 /// CREATE INDEX statements and is always in sync with whatever migration version the
@@ -160,13 +132,6 @@ pub fn full_row_except_match(conn: &Connection, dst_sql: &str, src_sql: &str) ->
     extra_in_dst == 0 && extra_in_src == 0
 }
 
-/// Check count equality between two SQL queries.
-pub fn count_match(conn: &Connection, src_sql: &str, dst_sql: &str) -> bool {
-    let src_count: i64 = conn.query_row(src_sql, [], |row| row.get(0)).unwrap_or(-1);
-    let dst_count: i64 = conn.query_row(dst_sql, [], |row| row.get(0)).unwrap_or(-2);
-    src_count == dst_count
-}
-
 /// Execute a slice of copy specs inside the current transaction.
 /// Returns a vec of (table_name, rows_copied).
 pub fn execute_copy_specs(
@@ -187,53 +152,6 @@ pub fn execute_copy_specs(
         results.push((spec.table, rows));
     }
     Ok(results)
-}
-
-/// Execute a slice of validation specs.
-/// Returns a vec of per-table results.
-pub fn execute_validation_specs(
-    conn: &Connection,
-    specs: &[TableValidationSpec],
-) -> Vec<TableValidationResult> {
-    specs
-        .iter()
-        .map(|spec| {
-            let passed = match spec.mode {
-                ValidationMode::ExactRowsEq => {
-                    full_row_except_match(conn, &spec.dst_sql, &spec.src_sql)
-                }
-                ValidationMode::CountEq => count_match(conn, &spec.src_sql, &spec.dst_sql),
-                ValidationMode::NoExtraRows => {
-                    // Check no rows in dst that aren't in src
-                    let extra: i64 = conn
-                        .query_row(
-                            &format!(
-                                "SELECT COUNT(*) FROM ({} EXCEPT {})",
-                                spec.dst_sql, spec.src_sql
-                            ),
-                            [],
-                            |row| row.get(0),
-                        )
-                        .unwrap_or(1);
-                    extra == 0
-                }
-                ValidationMode::MustBeEmpty => {
-                    let count: i64 = conn
-                        .query_row(
-                            &format!("SELECT COUNT(*) FROM ({})", spec.dst_sql),
-                            [],
-                            |row| row.get(0),
-                        )
-                        .unwrap_or(1);
-                    count == 0
-                }
-            };
-            TableValidationResult {
-                table: spec.table,
-                passed,
-            }
-        })
-        .collect()
 }
 
 /// Check an optional table's match status.
