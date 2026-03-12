@@ -2405,17 +2405,14 @@ fn resolve_burn_height_for_sortition(
                     std::process::exit(1);
                 });
         let mut marf = MARF::from_storage(storage);
-        let tip =
-            trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to get index MARF tip: {e:?}");
-                    std::process::exit(1);
-                });
+        let tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to get index MARF tip: {e:?}");
+                std::process::exit(1);
+            });
         marf.get_bhh_at_height(&tip, stacks_height)
             .unwrap_or_else(|e| {
-                eprintln!(
-                    "Failed to resolve block at Stacks height {stacks_height}: {e:?}"
-                );
+                eprintln!("Failed to resolve block at Stacks height {stacks_height}: {e:?}");
                 std::process::exit(1);
             })
             .unwrap_or_else(|| {
@@ -2471,9 +2468,7 @@ fn resolve_burn_height_for_sortition(
     };
 
     if bitcoin_height < first_burn_height {
-        eprintln!(
-            "Bitcoin height {bitcoin_height} is below first burn height {first_burn_height}"
-        );
+        eprintln!("Bitcoin height {bitcoin_height} is below first burn height {first_burn_height}");
         std::process::exit(1);
     }
 

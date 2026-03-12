@@ -1153,7 +1153,12 @@ impl<T: MarfTrieId> MARF<T> {
         log_memory_snapshot("before pointer remap");
         info!("[{label}] [5/8] Remap trie pointers: {node_count} nodes...");
         let start = Instant::now();
-        remap_ptrs_for_squash(&mut node_store, &source_to_idx, &archival_to_squashed, label)?;
+        remap_ptrs_for_squash(
+            &mut node_store,
+            &source_to_idx,
+            &archival_to_squashed,
+            label,
+        )?;
         info!(
             "[{label}] [5/8] Remap trie pointers: {node_count} nodes in {}",
             fmt_duration(start.elapsed())
