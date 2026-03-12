@@ -17,7 +17,7 @@ use blockstack_lib::chainstate::stacks::index::storage::{
     TrieFileStorage, TrieHashCalculationMode,
 };
 use blockstack_lib::chainstate::stacks::index::{trie_sql, MarfTrieId};
-use blockstack_lib::clarity_vm::database::marf::{
+use blockstack_lib::clarity_vm::database::snapshot::{
     copy_clarity_side_tables, validate_clarity_side_tables,
 };
 use blockstack_lib::core::{
@@ -418,8 +418,10 @@ fn run_squash(args: SquashArgs) {
     let mut index_out = None;
     let mut sortition_out = None;
 
-    // Resolve burn height for sortition if needed.
-    let burn_height = if do_sortition {
+    // Resolve burn heights for sortition if needed.
+    // marf_height = bitcoin_height - first_burn_height (for MARF squash/validate)
+    // bitcoin_height = actual Bitcoin block height (for burnchain.sqlite and SPV)
+    let burn_heights = if do_sortition {
         Some(resolve_burn_height_for_sortition(
             paths.sortition.db.to_str().unwrap(),
             paths.index.db.to_str().unwrap(),
@@ -468,17 +470,17 @@ fn run_squash(args: SquashArgs) {
     }
 
     if do_sortition {
-        let bh = burn_height.unwrap();
+        let (marf_height, _) = burn_heights.unwrap();
         let out = target_out_paths_sortition(&args.out_dir, &paths.sortition.db);
         squash_and_copy_one(
             "sortition",
             &paths.sortition,
             &out,
-            bh,
+            marf_height,
             SideTableMode::Sortition,
             sortition_open_opts(),
         );
-        sortition_out = Some((out, bh));
+        sortition_out = Some((out, marf_height));
     }
 
     // Block preservation: requires --index.
@@ -599,46 +601,16 @@ fn run_squash(args: SquashArgs) {
     let dst_hdr = args.out_dir.join("headers.sqlite");
 
     if do_burnchain_aux {
-        let bh = burn_height.expect("burn_height resolved when do_sortition=true");
-
-        println!("Copying burnchain.sqlite (canonical only)...");
-        match copy_burnchain_db(
-            src_bc_db.to_str().unwrap(),
-            dst_bc_db.to_str().unwrap(),
-            squashed_sort.to_str().unwrap(),
-            bh,
-        ) {
-            Ok(bc_stats) => {
-                println!(
-                    "  block_headers={}, block_ops={}, commit_metadata={}, anchor_blocks={}, overrides={}, affirmation_maps={}",
-                    bc_stats.block_headers_rows, bc_stats.block_ops_rows,
-                    bc_stats.block_commit_metadata_rows, bc_stats.anchor_blocks_rows,
-                    bc_stats.overrides_rows, bc_stats.affirmation_maps_rows
-                );
-            }
-            Err(e) => {
-                eprintln!("Failed to copy burnchain.sqlite: {e:?}");
-                std::process::exit(1);
-            }
-        }
-
-        println!("Copying headers.sqlite (SPV, up to burn height {bh})...");
-        match copy_spv_headers(src_hdr.to_str().unwrap(), dst_hdr.to_str().unwrap(), bh) {
-            Ok(Some(spv_stats)) => {
-                println!(
-                    "  headers={}, chain_work={}",
-                    spv_stats.headers_rows, spv_stats.chain_work_rows
-                );
-            }
-            Ok(None) => {
-                println!("  headers.sqlite not found in source (will be rebuilt on startup)");
-            }
-            Err(e) => {
-                eprintln!("Failed to copy headers.sqlite: {e:?}");
-                std::process::exit(1);
-            }
-        };
-
+        let (_, bitcoin_height) =
+            burn_heights.expect("burn_heights resolved when do_sortition=true");
+        copy_burnchain_aux_files(
+            &src_bc_db,
+            &dst_bc_db,
+            &squashed_sort,
+            &src_hdr,
+            &dst_hdr,
+            bitcoin_height,
+        );
         has_burnchain_aux = true;
     }
 
@@ -681,12 +653,12 @@ fn run_squash(args: SquashArgs) {
         }
 
         if do_sortition {
-            let bh = burn_height.unwrap();
+            let (marf_height, _) = burn_heights.unwrap();
             if !validate_one(
                 "sortition",
                 &paths.sortition,
                 &sortition_out.as_ref().unwrap().0,
-                bh,
+                marf_height,
                 args.full,
                 SideTableMode::Sortition,
                 sortition_open_opts(),
@@ -699,139 +671,30 @@ fn run_squash(args: SquashArgs) {
             let i_out = index_out
                 .as_ref()
                 .expect("--blocks requires --index; index_out must be set");
-            let src_index_path = paths.index.db.to_str().unwrap();
-            let dst_index_path = i_out.db.to_str().unwrap();
-
-            println!("Validating block data...");
-            let mut blocks_valid = true;
-
-            // Microblock validation.
-            match validate_microblock_streams(src_index_path, dst_index_path) {
-                Ok(v) => {
-                    println!("  microblocks_match: {}", v.staging_microblocks_match);
-                    println!(
-                        "  microblocks_data_match: {}",
-                        v.staging_microblocks_data_match
-                    );
-                    println!(
-                        "  microblocks_no_extra: {}",
-                        v.staging_microblocks_no_extra_rows
-                    );
-                    if !v.is_valid() {
-                        blocks_valid = false;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  Microblock validation error: {e:?}");
-                    blocks_valid = false;
-                }
-            }
-
-            // Nakamoto validation - required for --blocks.
-            if !dst_nakamoto.exists() {
-                eprintln!(
-                    "  Destination nakamoto.sqlite missing at {}",
-                    dst_nakamoto.display()
-                );
-                blocks_valid = false;
-            } else {
-                match validate_nakamoto_staging_blocks(
-                    src_nakamoto.to_str().unwrap(),
-                    dst_nakamoto.to_str().unwrap(),
-                    dst_index_path,
-                ) {
-                    Ok(v) => {
-                        println!("  nakamoto_metadata_match: {}", v.metadata_match);
-                        println!("  nakamoto_no_extra_blocks: {}", v.no_extra_blocks);
-                        println!("  nakamoto_blob_bytes_match: {}", v.blob_bytes_match);
-                        println!("  nakamoto_db_version_match: {}", v.db_version_match);
-                        println!("  nakamoto_schema_match: {}", v.schema_match);
-                        if !v.is_valid() {
-                            blocks_valid = false;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("  Nakamoto validation error: {e:?}");
-                        blocks_valid = false;
-                    }
-                }
-            }
-
-            // Epoch 2.x file validation.
-            match validate_epoch2_block_files(
-                dst_index_path,
-                src_blocks_dir.to_str().unwrap(),
-                dst_blocks_dir.to_str().unwrap(),
+            if !validate_block_data(
+                paths.index.db.to_str().unwrap(),
+                i_out.db.to_str().unwrap(),
+                &src_blocks_dir,
+                &dst_blocks_dir,
+                &src_nakamoto,
+                &dst_nakamoto,
             ) {
-                Ok(v) => {
-                    println!("  epoch2x_all_files_present: {}", v.all_files_present);
-                    println!("  epoch2x_no_extra_files: {}", v.no_extra_files);
-                    println!("  epoch2x_all_bytes_match: {}", v.all_bytes_match);
-                    if !v.is_valid() {
-                        blocks_valid = false;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  Epoch 2.x file validation error: {e:?}");
-                    blocks_valid = false;
-                }
-            }
-
-            if !blocks_valid {
                 all_valid = false;
             }
         }
 
         if do_burnchain_aux {
-            let bh = burn_height.expect("burn_height resolved when do_sortition=true");
-
-            println!("Validating burnchain auxiliary files...");
-            match validate_burnchain_db(
-                src_bc_db.to_str().unwrap(),
-                dst_bc_db.to_str().unwrap(),
-                squashed_sort.to_str().unwrap(),
-                bh,
+            let (_, bitcoin_height) =
+                burn_heights.expect("burn_heights resolved when do_sortition=true");
+            if !validate_burnchain_aux_files(
+                &src_bc_db,
+                &dst_bc_db,
+                &squashed_sort,
+                &src_hdr,
+                &dst_hdr,
+                bitcoin_height,
             ) {
-                Ok(v) => {
-                    println!("  bc_block_headers_match: {}", v.block_headers_match);
-                    println!("  bc_block_ops_match: {}", v.block_ops_match);
-                    println!(
-                        "  bc_commit_metadata_match: {}",
-                        v.block_commit_metadata_match
-                    );
-                    println!("  bc_anchor_blocks_match: {}", v.anchor_blocks_match);
-                    println!("  bc_overrides_match: {}", v.overrides_match);
-                    println!("  bc_db_config_match: {}", v.db_config_match);
-                    println!("  bc_no_extra_headers: {}", v.no_extra_headers);
-                    println!("  bc_canonical_complete: {}", v.canonical_complete);
-                    println!("  bc_affirmation_maps_match: {}", v.affirmation_maps_match);
-                    if !v.is_valid() {
-                        all_valid = false;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  burnchain.sqlite validation error: {e:?}");
-                    all_valid = false;
-                }
-            }
-
-            match validate_spv_headers(src_hdr.to_str().unwrap(), dst_hdr.to_str().unwrap(), bh) {
-                Ok(Some(v)) => {
-                    println!("  spv_headers_match: {}", v.headers_match);
-                    println!("  spv_chain_work_match: {}", v.chain_work_match);
-                    println!("  spv_db_config_match: {}", v.db_config_match);
-                    println!("  spv_no_extra_headers: {}", v.no_extra_headers);
-                    if !v.is_valid() {
-                        all_valid = false;
-                    }
-                }
-                Ok(None) => {
-                    println!("  headers.sqlite: both absent, skipped");
-                }
-                Err(e) => {
-                    eprintln!("  headers.sqlite validation error: {e:?}");
-                    all_valid = false;
-                }
+                all_valid = false;
             }
         }
     }
@@ -905,7 +768,7 @@ fn run_validate(args: ValidateArgs) {
     }
 
     if do_sortition {
-        let burn_height = resolve_burn_height_for_sortition(
+        let (marf_height, _) = resolve_burn_height_for_sortition(
             source_paths.sortition.db.to_str().unwrap(),
             source_paths.index.db.to_str().unwrap(),
             args.height,
@@ -914,7 +777,7 @@ fn run_validate(args: ValidateArgs) {
             "sortition",
             &source_paths.sortition,
             &squashed_paths.sortition,
-            burn_height,
+            marf_height,
             args.full,
             SideTableMode::Sortition,
             sortition_open_opts(),
@@ -930,97 +793,30 @@ fn run_validate(args: ValidateArgs) {
         std::process::exit(1);
     }
     if do_blocks {
-        println!("Validating block data...");
-
-        let src_index = source_paths.index.db.to_str().unwrap();
-        let dst_index = squashed_paths.index.db.to_str().unwrap();
-
-        // Microblock validation.
-        match validate_microblock_streams(src_index, dst_index) {
-            Ok(v) => {
-                println!("  microblocks_match: {}", v.staging_microblocks_match);
-                println!(
-                    "  microblocks_data_match: {}",
-                    v.staging_microblocks_data_match
-                );
-                println!(
-                    "  microblocks_no_extra: {}",
-                    v.staging_microblocks_no_extra_rows
-                );
-                if !v.is_valid() {
-                    all_valid = false;
-                }
-            }
-            Err(e) => {
-                eprintln!("  Microblock validation error: {e:?}");
-                all_valid = false;
-            }
-        }
-
-        // Nakamoto validation.
         let src_nakamoto = args
             .source_chainstate
             .join("chainstate/blocks/nakamoto.sqlite");
         let dst_nakamoto = args
             .squashed_chainstate
             .join("chainstate/blocks/nakamoto.sqlite");
-        if !dst_nakamoto.exists() || !src_nakamoto.exists() {
-            eprintln!(
-                "  nakamoto.sqlite missing (src={}, dst={}); required for --blocks validation",
-                src_nakamoto.exists(),
-                dst_nakamoto.exists()
-            );
-            all_valid = false;
-        } else {
-            match validate_nakamoto_staging_blocks(
-                src_nakamoto.to_str().unwrap(),
-                dst_nakamoto.to_str().unwrap(),
-                dst_index,
-            ) {
-                Ok(v) => {
-                    println!("  nakamoto_metadata_match: {}", v.metadata_match);
-                    println!("  nakamoto_no_extra_blocks: {}", v.no_extra_blocks);
-                    println!("  nakamoto_blob_bytes_match: {}", v.blob_bytes_match);
-                    println!("  nakamoto_db_version_match: {}", v.db_version_match);
-                    println!("  nakamoto_schema_match: {}", v.schema_match);
-                    if !v.is_valid() {
-                        all_valid = false;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  Nakamoto validation error: {e:?}");
-                    all_valid = false;
-                }
-            }
-        }
-
-        // Epoch 2.x file validation.
         let src_blocks_dir = args.source_chainstate.join("chainstate/blocks");
         let dst_blocks_dir = args.squashed_chainstate.join("chainstate/blocks");
-        match validate_epoch2_block_files(
-            dst_index,
-            src_blocks_dir.to_str().unwrap(),
-            dst_blocks_dir.to_str().unwrap(),
+        if !validate_block_data(
+            source_paths.index.db.to_str().unwrap(),
+            squashed_paths.index.db.to_str().unwrap(),
+            &src_blocks_dir,
+            &dst_blocks_dir,
+            &src_nakamoto,
+            &dst_nakamoto,
         ) {
-            Ok(v) => {
-                println!("  epoch2x_all_files_present: {}", v.all_files_present);
-                println!("  epoch2x_no_extra_files: {}", v.no_extra_files);
-                println!("  epoch2x_all_bytes_match: {}", v.all_bytes_match);
-                if !v.is_valid() {
-                    all_valid = false;
-                }
-            }
-            Err(e) => {
-                eprintln!("  Epoch 2.x file validation error: {e:?}");
-                all_valid = false;
-            }
+            all_valid = false;
         }
     }
 
     // Burnchain auxiliary validation.
     let do_burnchain_aux = do_clarity && do_index && do_sortition && do_blocks;
     if do_burnchain_aux {
-        let burn_height = resolve_burn_height_for_sortition(
+        let (_, bitcoin_height) = resolve_burn_height_for_sortition(
             source_paths.sortition.db.to_str().unwrap(),
             source_paths.index.db.to_str().unwrap(),
             args.height,
@@ -1031,60 +827,18 @@ fn run_validate(args: ValidateArgs) {
         let squashed_sort = args
             .squashed_chainstate
             .join("burnchain/sortition/marf.sqlite");
-
-        println!("Validating burnchain auxiliary files...");
-        match validate_burnchain_db(
-            src_bc_db.to_str().unwrap(),
-            dst_bc_db.to_str().unwrap(),
-            squashed_sort.to_str().unwrap(),
-            burn_height,
-        ) {
-            Ok(v) => {
-                println!("  bc_block_headers_match: {}", v.block_headers_match);
-                println!("  bc_block_ops_match: {}", v.block_ops_match);
-                println!(
-                    "  bc_commit_metadata_match: {}",
-                    v.block_commit_metadata_match
-                );
-                println!("  bc_anchor_blocks_match: {}", v.anchor_blocks_match);
-                println!("  bc_overrides_match: {}", v.overrides_match);
-                println!("  bc_db_config_match: {}", v.db_config_match);
-                println!("  bc_no_extra_headers: {}", v.no_extra_headers);
-                println!("  bc_canonical_complete: {}", v.canonical_complete);
-                println!("  bc_affirmation_maps_match: {}", v.affirmation_maps_match);
-                if !v.is_valid() {
-                    all_valid = false;
-                }
-            }
-            Err(e) => {
-                eprintln!("  burnchain.sqlite validation error: {e:?}");
-                all_valid = false;
-            }
-        }
-
         let src_hdr = args.source_chainstate.join("headers.sqlite");
         let dst_hdr = args.squashed_chainstate.join("headers.sqlite");
-        match validate_spv_headers(
-            src_hdr.to_str().unwrap(),
-            dst_hdr.to_str().unwrap(),
-            burn_height,
+
+        if !validate_burnchain_aux_files(
+            &src_bc_db,
+            &dst_bc_db,
+            &squashed_sort,
+            &src_hdr,
+            &dst_hdr,
+            bitcoin_height,
         ) {
-            Ok(Some(v)) => {
-                println!("  spv_headers_match: {}", v.headers_match);
-                println!("  spv_chain_work_match: {}", v.chain_work_match);
-                println!("  spv_db_config_match: {}", v.db_config_match);
-                println!("  spv_no_extra_headers: {}", v.no_extra_headers);
-                if !v.is_valid() {
-                    all_valid = false;
-                }
-            }
-            Ok(None) => {
-                println!("  headers.sqlite: both absent, skipped");
-            }
-            Err(e) => {
-                eprintln!("  headers.sqlite validation error: {e:?}");
-                all_valid = false;
-            }
+            all_valid = false;
         }
     }
 
@@ -1942,6 +1696,216 @@ fn print_index_side_table_validation(
     println!("  Index side-table valid: {}", v.is_valid());
 }
 
+/// Validate block data (microblocks, nakamoto, epoch 2.x files) against source.
+/// Returns `true` if all checks pass.
+fn validate_block_data(
+    src_index: &str,
+    dst_index: &str,
+    src_blocks_dir: &Path,
+    dst_blocks_dir: &Path,
+    src_nakamoto: &Path,
+    dst_nakamoto: &Path,
+) -> bool {
+    println!("Validating block data...");
+    let mut valid = true;
+
+    // Microblock validation.
+    match validate_microblock_streams(src_index, dst_index) {
+        Ok(v) => {
+            println!("  microblocks_match: {}", v.staging_microblocks_match);
+            println!(
+                "  microblocks_data_match: {}",
+                v.staging_microblocks_data_match
+            );
+            println!(
+                "  microblocks_no_extra: {}",
+                v.staging_microblocks_no_extra_rows
+            );
+            if !v.is_valid() {
+                valid = false;
+            }
+        }
+        Err(e) => {
+            eprintln!("  Microblock validation error: {e:?}");
+            valid = false;
+        }
+    }
+
+    // Nakamoto validation.
+    if !dst_nakamoto.exists() || !src_nakamoto.exists() {
+        eprintln!(
+            "  nakamoto.sqlite missing (src={}, dst={})",
+            src_nakamoto.exists(),
+            dst_nakamoto.exists()
+        );
+        valid = false;
+    } else {
+        match validate_nakamoto_staging_blocks(
+            src_nakamoto.to_str().unwrap(),
+            dst_nakamoto.to_str().unwrap(),
+            dst_index,
+        ) {
+            Ok(v) => {
+                println!("  nakamoto_metadata_match: {}", v.metadata_match);
+                println!("  nakamoto_no_extra_blocks: {}", v.no_extra_blocks);
+                println!("  nakamoto_blob_bytes_match: {}", v.blob_bytes_match);
+                println!("  nakamoto_db_version_match: {}", v.db_version_match);
+                println!("  nakamoto_schema_match: {}", v.schema_match);
+                if !v.is_valid() {
+                    valid = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("  Nakamoto validation error: {e:?}");
+                valid = false;
+            }
+        }
+    }
+
+    // Epoch 2.x file validation.
+    match validate_epoch2_block_files(
+        dst_index,
+        src_blocks_dir.to_str().unwrap(),
+        dst_blocks_dir.to_str().unwrap(),
+    ) {
+        Ok(v) => {
+            println!("  epoch2x_all_files_present: {}", v.all_files_present);
+            println!("  epoch2x_no_extra_files: {}", v.no_extra_files);
+            println!("  epoch2x_all_bytes_match: {}", v.all_bytes_match);
+            if !v.is_valid() {
+                valid = false;
+            }
+        }
+        Err(e) => {
+            eprintln!("  Epoch 2.x file validation error: {e:?}");
+            valid = false;
+        }
+    }
+
+    valid
+}
+
+/// Validate burnchain auxiliary files (burnchain.sqlite + headers.sqlite).
+/// Returns `true` if all checks pass.
+fn validate_burnchain_aux_files(
+    src_bc_db: &Path,
+    dst_bc_db: &Path,
+    squashed_sort: &Path,
+    src_hdr: &Path,
+    dst_hdr: &Path,
+    burn_height: u32,
+) -> bool {
+    println!("Validating burnchain auxiliary files...");
+    let mut valid = true;
+
+    match validate_burnchain_db(
+        src_bc_db.to_str().unwrap(),
+        dst_bc_db.to_str().unwrap(),
+        squashed_sort.to_str().unwrap(),
+        burn_height,
+    ) {
+        Ok(v) => {
+            println!("  bc_block_headers_match: {}", v.block_headers_match);
+            println!("  bc_block_ops_match: {}", v.block_ops_match);
+            println!(
+                "  bc_commit_metadata_match: {}",
+                v.block_commit_metadata_match
+            );
+            println!("  bc_anchor_blocks_match: {}", v.anchor_blocks_match);
+            println!("  bc_overrides_match: {}", v.overrides_match);
+            println!("  bc_db_config_match: {}", v.db_config_match);
+            println!("  bc_no_extra_headers: {}", v.no_extra_headers);
+            println!("  bc_canonical_complete: {}", v.canonical_complete);
+            println!("  bc_affirmation_maps_match: {}", v.affirmation_maps_match);
+            if !v.is_valid() {
+                valid = false;
+            }
+        }
+        Err(e) => {
+            eprintln!("  burnchain.sqlite validation error: {e:?}");
+            valid = false;
+        }
+    }
+
+    match validate_spv_headers(
+        src_hdr.to_str().unwrap(),
+        dst_hdr.to_str().unwrap(),
+        burn_height,
+    ) {
+        Ok(Some(v)) => {
+            println!("  spv_headers_match: {}", v.headers_match);
+            println!("  spv_chain_work_match: {}", v.chain_work_match);
+            println!("  spv_db_config_match: {}", v.db_config_match);
+            println!("  spv_no_extra_headers: {}", v.no_extra_headers);
+            if !v.is_valid() {
+                valid = false;
+            }
+        }
+        Ok(None) => {
+            println!("  headers.sqlite: both absent, skipped");
+        }
+        Err(e) => {
+            eprintln!("  headers.sqlite validation error: {e:?}");
+            valid = false;
+        }
+    }
+
+    valid
+}
+
+/// Copy burnchain auxiliary files (burnchain.sqlite + headers.sqlite).
+/// Exits on error.
+fn copy_burnchain_aux_files(
+    src_bc_db: &Path,
+    dst_bc_db: &Path,
+    squashed_sort: &Path,
+    src_hdr: &Path,
+    dst_hdr: &Path,
+    burn_height: u32,
+) {
+    println!("Copying burnchain.sqlite (canonical only)...");
+    match copy_burnchain_db(
+        src_bc_db.to_str().unwrap(),
+        dst_bc_db.to_str().unwrap(),
+        squashed_sort.to_str().unwrap(),
+        burn_height,
+    ) {
+        Ok(bc_stats) => {
+            println!(
+                "  block_headers={}, block_ops={}, commit_metadata={}, anchor_blocks={}, overrides={}, affirmation_maps={}",
+                bc_stats.block_headers_rows, bc_stats.block_ops_rows,
+                bc_stats.block_commit_metadata_rows, bc_stats.anchor_blocks_rows,
+                bc_stats.overrides_rows, bc_stats.affirmation_maps_rows
+            );
+        }
+        Err(e) => {
+            eprintln!("Failed to copy burnchain.sqlite: {e:?}");
+            std::process::exit(1);
+        }
+    }
+
+    println!("Copying headers.sqlite (SPV, up to burn height {burn_height})...");
+    match copy_spv_headers(
+        src_hdr.to_str().unwrap(),
+        dst_hdr.to_str().unwrap(),
+        burn_height,
+    ) {
+        Ok(Some(spv_stats)) => {
+            println!(
+                "  headers={}, chain_work={}",
+                spv_stats.headers_rows, spv_stats.chain_work_rows
+            );
+        }
+        Ok(None) => {
+            println!("  headers.sqlite not found in source (will be rebuilt on startup)");
+        }
+        Err(e) => {
+            eprintln!("Failed to copy headers.sqlite: {e:?}");
+            std::process::exit(1);
+        }
+    };
+}
+
 fn print_sortition_side_table_validation(
     v: &blockstack_lib::chainstate::stacks::db::snapshot::SortitionSideTableValidation,
 ) {
@@ -2384,18 +2348,20 @@ fn sortition_open_opts() -> MARFOpenOpts {
     open_opts
 }
 
-/// Resolve Stacks block height to the sortition MARF height for the Bitcoin block
-/// whose tenure produced that Stacks block.
+/// Resolve Stacks block height to both the sortition MARF height and the actual
+/// Bitcoin block height for the tenure that produced that Stacks block.
+///
+/// Returns `(marf_height, bitcoin_height)` where:
+/// - `marf_height` = bitcoin_height - first_burn_height (for MARF squash/validate)
+/// - `bitcoin_height` = the actual Bitcoin block height (for burnchain.sqlite and SPV)
 ///
 /// Uses the index MARF to find the canonical block hash at `stacks_height`, then
 /// looks up `burn_header_height` from `nakamoto_block_headers` for that exact block.
-/// Both lookups use raw SQLite so they are unaffected by any schema-version checks.
-/// The sortition MARF height is `bitcoin_height - first_burn_height`.
 fn resolve_burn_height_for_sortition(
     sortition_db_path: &str,
     index_db_path: &str,
     stacks_height: u32,
-) -> u32 {
+) -> (u32, u32) {
     // 1. Open the index MARF and resolve the canonical block hash at this height.
     let canonical_block_hash = {
         let storage =
@@ -2478,7 +2444,7 @@ fn resolve_burn_height_for_sortition(
         "Resolved Stacks height {stacks_height} (canonical block {canonical_block_hash}) \
          to Bitcoin height {bitcoin_height} (sortition MARF height {marf_height})"
     );
-    marf_height
+    (marf_height, bitcoin_height as u32)
 }
 
 #[cfg(test)]

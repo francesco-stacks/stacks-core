@@ -37,6 +37,7 @@ use crate::util_lib::db::{DBConn, Error as DBError, FromColumn, FromRow};
 
 pub mod ephemeral;
 pub mod marf;
+pub mod snapshot;
 
 #[cfg(test)]
 mod tests;
