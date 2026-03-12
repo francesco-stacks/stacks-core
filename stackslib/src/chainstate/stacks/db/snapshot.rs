@@ -1,15 +1,28 @@
+// Copyright (C) 2026 Stacks Open Internet Foundation
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 
 use crate::burnchains::PoxConstants;
 use crate::chainstate::stacks::index::Error;
-use crate::chainstate::stacks::StacksMicroblock;
 use crate::core::EMPTY_MICROBLOCK_PARENT_HASH;
 
 /// Row-count statistics returned by [`copy_index_side_tables`].
@@ -1356,144 +1369,43 @@ pub struct NakamotoBlockCopyStats {
     pub total_blob_bytes: u64,
 }
 
-/// Walk backward through a confirmed microblock stream in the source DB,
-/// faithfully reproducing the semantics of
-/// `StacksChainState::inner_load_microblock_stream_fork(processed_only=true)`
-/// at blocks.rs:1159-1251.
+/// Return the hashes of all confirmed microblocks in the stream that descends
+/// from `parent_ibh`, up to and including `max_seq`.
 ///
-/// Returns `Ok(Some(hashes))` if the stream is valid and should be copied,
-/// `Ok(None)` if the stream should be skipped (mirrors runtime `Ok(None)`),
-/// or `Err` for hard errors (mirrors runtime panics/asserts).
-fn walk_confirmed_microblock_stream(
+/// Queries `src.staging_microblocks` metadata only — no blob data is loaded.
+/// This relies on the existing invariant that processed, non-orphaned
+/// microblocks for a given parent form a contiguous `0..=max_seq` sequence, so
+/// a set-based lookup by `index_block_hash` and `sequence` is equivalent to
+/// walking the stream from the tip.
+///
+/// No existing public function provides this set-based lookup without loading
+/// blob data, so this raw SQL query is intentional.
+fn get_confirmed_microblock_hashes(
     conn: &Connection,
-    parent_consensus_hash: &ConsensusHash,
-    parent_anchored_block_hash: &BlockHeaderHash,
-    tip_microblock_hash: &BlockHeaderHash,
-) -> Result<Option<Vec<BlockHeaderHash>>, Error> {
-    let mut collected = vec![];
-    let mut mblock_hash = tip_microblock_hash.clone();
-    let mut last_seq = u16::MAX;
+    parent_ibh: &StacksBlockId,
+    max_seq: u32,
+) -> Result<Vec<BlockHeaderHash>, Error> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT microblock_hash \
+             FROM src.staging_microblocks \
+             WHERE index_block_hash = ?1 \
+               AND sequence <= ?2 \
+               AND processed = 1 \
+               AND orphaned = 0 \
+             ORDER BY sequence ASC",
+        )
+        .map_err(Error::SQLError)?;
 
-    loop {
-        // Load payload from source staging_microblocks_data - mirrors blocks.rs:1172
-        // Distinguish "no row" / "empty blob" (skip stream) from real DB errors (propagate).
-        let mblock_data_result: Result<Vec<u8>, rusqlite::Error> = conn.query_row(
-            "SELECT block_data FROM src.staging_microblocks_data WHERE block_hash = ?1",
-            params![mblock_hash],
-            |row| row.get(0),
-        );
+    let hashes = stmt
+        .query_map(params![parent_ibh, max_seq], |row| {
+            row.get::<_, BlockHeaderHash>(0)
+        })
+        .map_err(Error::SQLError)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Error::SQLError)?;
 
-        let mblock_data = match mblock_data_result {
-            Ok(data) if !data.is_empty() => data,
-            Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => {
-                // Missing or empty payload - runtime returns Ok(None) at blocks.rs:1191
-                warn!(
-                    "Microblock stream walk: missing payload for {} (parent {}/{}), skipping stream",
-                    &mblock_hash, parent_consensus_hash, parent_anchored_block_hash
-                );
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(Error::SQLError(e));
-            }
-        };
-
-        // Deserialize - runtime panics at blocks.rs:1175-1180
-        let microblock =
-            StacksMicroblock::consensus_deserialize(&mut &mblock_data[..]).map_err(|e| {
-                Error::CorruptionError(format!(
-                    "CORRUPTION: failed to parse microblock data for {}/{}-{}: {:?}",
-                    parent_consensus_hash, parent_anchored_block_hash, &mblock_hash, e
-                ))
-            })?;
-
-        // Check processed status - runtime returns Ok(None) at blocks.rs:1204
-        let index_microblock_hash =
-            StacksBlockId::new(parent_consensus_hash, &microblock.block_hash());
-        let is_processed: bool = match conn.query_row(
-            "SELECT 1 FROM src.staging_microblocks \
-             WHERE index_microblock_hash = ?1 AND processed = 1 AND orphaned = 0",
-            params![index_microblock_hash],
-            |_| Ok(()),
-        ) {
-            Ok(()) => true,
-            Err(rusqlite::Error::QueryReturnedNoRows) => false,
-            Err(e) => return Err(Error::SQLError(e)),
-        };
-
-        if !is_processed {
-            warn!(
-                "Microblock stream walk: microblock {} is not processed, skipping stream",
-                &microblock.block_hash()
-            );
-            return Ok(None);
-        }
-
-        // Verify sequence contiguity - runtime asserts at blocks.rs:1219-1228
-        if last_seq < u16::MAX
-            && microblock.header.sequence < u16::MAX
-            && microblock.header.sequence + 1 != last_seq
-        {
-            return Err(Error::CorruptionError(format!(
-                "BUG: microblock {} has sequence {} (expected {})",
-                microblock.block_hash(),
-                microblock.header.sequence,
-                last_seq.saturating_sub(1)
-            )));
-        }
-
-        // Verify hash consistency - runtime asserts at blocks.rs:1229
-        if mblock_hash != microblock.block_hash() {
-            return Err(Error::CorruptionError(format!(
-                "BUG: microblock hash mismatch: expected {}, got {}",
-                mblock_hash,
-                microblock.block_hash()
-            )));
-        }
-
-        collected.push(mblock_hash.clone());
-        mblock_hash = microblock.header.prev_block.clone();
-        last_seq = microblock.header.sequence;
-
-        if mblock_hash == *parent_anchored_block_hash {
-            break;
-        }
-    }
-
-    collected.reverse();
-
-    // Verify sequence starts at 0 - runtime returns Ok(None) at blocks.rs:1243-1248
-    // We need to check the first microblock's sequence. Re-query it.
-    if let Some(first_hash) = collected.first() {
-        let first_data: Vec<u8> = conn
-            .query_row(
-                "SELECT block_data FROM src.staging_microblocks_data WHERE block_hash = ?1",
-                params![first_hash],
-                |row| row.get(0),
-            )
-            .map_err(|e| {
-                Error::CorruptionError(format!(
-                    "Failed to re-read first microblock {}: {:?}",
-                    first_hash, e
-                ))
-            })?;
-        let first_mblock =
-            StacksMicroblock::consensus_deserialize(&mut &first_data[..]).map_err(|e| {
-                Error::CorruptionError(format!(
-                    "CORRUPTION: failed to re-parse first microblock {}: {:?}",
-                    first_hash, e
-                ))
-            })?;
-        if first_mblock.header.sequence != 0 {
-            warn!(
-                "Microblock stream walk: first microblock {} has sequence {} (expected 0), skipping stream",
-                first_hash, first_mblock.header.sequence
-            );
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(collected))
+    Ok(hashes)
 }
 
 /// Copy confirmed canonical epoch-2 microblock streams from `src_index_path`
@@ -1548,19 +1460,23 @@ pub fn copy_confirmed_epoch2_microblocks(
             continue;
         }
 
-        match walk_confirmed_microblock_stream(&conn, parent_ch, parent_bh, parent_mblock_hash)? {
-            Some(hashes) => {
-                let parent_ibh = StacksBlockId::new(parent_ch, parent_bh);
-                selected_parents.insert(parent_ibh);
-                for h in hashes {
-                    selected_hashes.insert(h);
-                }
-                stats.streams_copied += 1;
-            }
-            None => {
-                stats.streams_skipped += 1;
-            }
+        let parent_ibh = StacksBlockId::new(parent_ch, parent_bh);
+        let hashes = get_confirmed_microblock_hashes(&conn, &parent_ibh, *parent_mblock_seq)?;
+
+        if hashes.is_empty() {
+            warn!(
+                "No confirmed microblocks found for parent {}/{} (tip {}, seq {}), skipping stream",
+                parent_ch, parent_bh, parent_mblock_hash, parent_mblock_seq
+            );
+            stats.streams_skipped += 1;
+            continue;
         }
+
+        selected_parents.insert(parent_ibh);
+        for h in hashes {
+            selected_hashes.insert(h);
+        }
+        stats.streams_copied += 1;
     }
 
     if !selected_hashes.is_empty() {
@@ -1862,10 +1778,9 @@ pub fn validate_microblock_streams(
         if *parent_mblock_hash == EMPTY_MICROBLOCK_PARENT_HASH && *parent_mblock_seq == 0 {
             continue;
         }
-        if let Some(hashes) =
-            walk_confirmed_microblock_stream(&conn, parent_ch, parent_bh, parent_mblock_hash)?
-        {
-            let parent_ibh = StacksBlockId::new(parent_ch, parent_bh);
+        let parent_ibh = StacksBlockId::new(parent_ch, parent_bh);
+        let hashes = get_confirmed_microblock_hashes(&conn, &parent_ibh, *parent_mblock_seq)?;
+        if !hashes.is_empty() {
             selected_parents.insert(parent_ibh);
             for h in hashes {
                 selected_hashes.insert(h);
