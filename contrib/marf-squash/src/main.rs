@@ -3,9 +3,6 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use blockstack_lib::burnchains::PoxConstants;
-use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
-use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
 use blockstack_lib::chainstate::stacks::db::snapshot::{
     copy_burnchain_db, copy_confirmed_epoch2_microblocks, copy_epoch2_block_files,
     copy_index_side_tables, copy_nakamoto_staging_blocks, copy_sortition_side_tables,
@@ -13,7 +10,6 @@ use blockstack_lib::chainstate::stacks::db::snapshot::{
     validate_index_side_tables, validate_microblock_streams, validate_nakamoto_staging_blocks,
     validate_sortition_side_tables, validate_spv_headers,
 };
-use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use blockstack_lib::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashValidationStats, MARF,
 };
@@ -29,6 +25,7 @@ use blockstack_lib::core::{
     POX_REWARD_CYCLE_LENGTH, POX_TESTNET_CYCLE_LENGTH,
 };
 use clap::{Parser, Subcommand};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
@@ -424,8 +421,8 @@ fn run_squash(args: SquashArgs) {
     // Resolve burn height for sortition if needed.
     let burn_height = if do_sortition {
         Some(resolve_burn_height_for_sortition(
-            &args.chainstate,
-            &paths.sortition.db,
+            paths.sortition.db.to_str().unwrap(),
+            paths.index.db.to_str().unwrap(),
             args.height,
         ))
     } else {
@@ -533,8 +530,8 @@ fn run_squash(args: SquashArgs) {
         ) {
             Ok(st) => {
                 println!(
-                    "Epoch 2.x block files copied: files={}, bytes={}, genesis_skipped={}",
-                    st.files_copied, st.total_bytes, st.genesis_skipped
+                    "Epoch 2.x block files copied: files={}, bytes={}, genesis_skipped={}, missing_pruned={}",
+                    st.files_copied, st.total_bytes, st.genesis_skipped, st.files_missing
                 );
                 st
             }
@@ -909,8 +906,8 @@ fn run_validate(args: ValidateArgs) {
 
     if do_sortition {
         let burn_height = resolve_burn_height_for_sortition(
-            &args.source_chainstate,
-            &source_paths.sortition.db,
+            source_paths.sortition.db.to_str().unwrap(),
+            source_paths.index.db.to_str().unwrap(),
             args.height,
         );
         if !validate_one(
@@ -1024,8 +1021,8 @@ fn run_validate(args: ValidateArgs) {
     let do_burnchain_aux = do_clarity && do_index && do_sortition && do_blocks;
     if do_burnchain_aux {
         let burn_height = resolve_burn_height_for_sortition(
-            &args.source_chainstate,
-            &source_paths.sortition.db,
+            source_paths.sortition.db.to_str().unwrap(),
+            source_paths.index.db.to_str().unwrap(),
             args.height,
         );
 
@@ -1575,6 +1572,7 @@ fn squash_and_copy_one(
             out.db.to_str().unwrap(),
             open_opts,
             height,
+            label,
         ) {
             Ok(stats) => stats,
             Err(e) => {
@@ -1588,6 +1586,7 @@ fn squash_and_copy_one(
             out.db.to_str().unwrap(),
             open_opts,
             height,
+            label,
         ) {
             Ok(stats) => stats,
             Err(e) => {
@@ -2388,120 +2387,93 @@ fn sortition_open_opts() -> MARFOpenOpts {
 /// Resolve Stacks block height to the sortition MARF height for the Bitcoin block
 /// whose tenure produced that Stacks block.
 ///
-/// Uses the canonical Stacks tip from the sortition DB, resolves the canonical
-/// ancestor block at `stacks_height`, then reads `burn_header_height` from the
-/// block header. The sortition MARF height is `bitcoin_height - first_burn_height`.
+/// Uses the index MARF to find the canonical block hash at `stacks_height`, then
+/// looks up `burn_header_height` from `nakamoto_block_headers` for that exact block.
+/// Both lookups use raw SQLite so they are unaffected by any schema-version checks.
+/// The sortition MARF height is `bitcoin_height - first_burn_height`.
 fn resolve_burn_height_for_sortition(
-    chainstate_root: &Path,
-    sortition_db_path: &Path,
+    sortition_db_path: &str,
+    index_db_path: &str,
     stacks_height: u32,
 ) -> u32 {
-    let chainstate_root_str = chainstate_root.to_str().unwrap_or_else(|| {
-        eprintln!(
-            "Chainstate path '{}' is not valid UTF-8",
-            chainstate_root.display()
-        );
-        std::process::exit(1);
-    });
-    let db_config =
-        StacksChainState::get_db_config_from_path(chainstate_root_str).unwrap_or_else(|e| {
-            eprintln!(
-                "Failed to read chainstate DB config from '{}': {e:?}",
-                chainstate_root.display()
-            );
-            std::process::exit(1);
-        });
-
-    let (chainstate, _) = StacksChainState::open(
-        db_config.mainnet,
-        db_config.chain_id,
-        chainstate_root_str,
-        None,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!(
-            "Failed to open chainstate '{}': {e:?}",
-            chainstate_root.display()
-        );
-        std::process::exit(1);
-    });
-
-    let sortition_dir = sortition_db_path.parent().unwrap_or_else(|| {
-        eprintln!(
-            "Sortition DB path '{}' has no parent directory",
-            sortition_db_path.display()
-        );
-        std::process::exit(1);
-    });
-    let sortition_dir_str = sortition_dir.to_str().unwrap_or_else(|| {
-        eprintln!(
-            "Sortition DB directory '{}' is not valid UTF-8",
-            sortition_dir.display()
-        );
-        std::process::exit(1);
-    });
-    let pox_constants = if db_config.mainnet {
-        PoxConstants::mainnet_default()
-    } else {
-        PoxConstants::testnet_default()
-    };
-    let sortdb = SortitionDB::open(
-        sortition_dir_str,
-        false,
-        pox_constants,
-        Some(sortition_open_opts()),
-    )
-    .unwrap_or_else(|e| {
-        eprintln!(
-            "Failed to open sortition DB '{}': {e:?}",
-            sortition_dir.display()
-        );
-        std::process::exit(1);
-    });
-
-    // 1. Resolve the canonical tip, then walk back to the requested Stacks height.
-    let canonical_tip = {
-        let (consensus_hash, block_hash) =
-            SortitionDB::get_canonical_stacks_chain_tip_hash(sortdb.conn()).unwrap_or_else(|e| {
-                eprintln!("Failed to get canonical Stacks tip from sortition DB: {e:?}");
-                std::process::exit(1);
-            });
-        StacksBlockId::new(&consensus_hash, &block_hash)
-    };
-
-    let canonical_block_hash = chainstate
-        .index_conn()
-        .get_ancestor_block_hash(stacks_height.into(), &canonical_tip)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to resolve block at Stacks height {stacks_height}: {e:?}");
-            std::process::exit(1);
-        })
-        .unwrap_or_else(|| {
-            eprintln!("No canonical block found at Stacks height {stacks_height}");
-            std::process::exit(1);
-        });
-
-    // 2. Read the burnchain height from the resolved block header.
-    let bitcoin_height =
-        NakamotoChainState::get_block_header(chainstate.db(), &canonical_block_hash)
+    // 1. Open the index MARF and resolve the canonical block hash at this height.
+    let canonical_block_hash = {
+        let storage =
+            TrieFileStorage::<StacksBlockId>::open_readonly(index_db_path, default_open_opts())
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to open index MARF: {e:?}");
+                    std::process::exit(1);
+                });
+        let mut marf = MARF::from_storage(storage);
+        let tip =
+            trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to get index MARF tip: {e:?}");
+                    std::process::exit(1);
+                });
+        marf.get_bhh_at_height(&tip, stacks_height)
             .unwrap_or_else(|e| {
-                eprintln!("Failed to load canonical block header {canonical_block_hash}: {e:?}");
+                eprintln!(
+                    "Failed to resolve block at Stacks height {stacks_height}: {e:?}"
+                );
                 std::process::exit(1);
             })
             .unwrap_or_else(|| {
-                eprintln!(
-                    "No block header found for canonical hash {canonical_block_hash} \
-                 at Stacks height {stacks_height}"
-                );
+                eprintln!("No canonical block found at Stacks height {stacks_height}");
                 std::process::exit(1);
-            });
-    let bitcoin_height = u64::from(bitcoin_height.burn_header_height);
+            })
+    };
+
+    // 2. Look up burn_header_height for this exact canonical block.
+    let bitcoin_height: u64 = {
+        let conn = rusqlite::Connection::open_with_flags(
+            index_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to open index DB: {e}");
+            std::process::exit(1);
+        });
+        conn.query_row(
+            "SELECT burn_header_height FROM nakamoto_block_headers \
+             WHERE index_block_hash = ?1",
+            params![canonical_block_hash.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "No nakamoto block found for canonical hash {canonical_block_hash} \
+                 at Stacks height {stacks_height}: {e}"
+            );
+            std::process::exit(1);
+        }) as u64
+    };
 
     // 3. Compute sortition MARF height = bitcoin_height - first_burn_height.
-    let first_burn_height = sortdb.first_block_height;
+    let first_burn_height: u64 = {
+        let conn = rusqlite::Connection::open_with_flags(
+            sortition_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to open sortition DB: {e}");
+            std::process::exit(1);
+        });
+        conn.query_row(
+            "SELECT MIN(block_height) FROM snapshots WHERE pox_valid = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read first burn height from sortition DB: {e}");
+            std::process::exit(1);
+        }) as u64
+    };
 
     if bitcoin_height < first_burn_height {
-        eprintln!("Bitcoin height {bitcoin_height} is below first burn height {first_burn_height}");
+        eprintln!(
+            "Bitcoin height {bitcoin_height} is below first burn height {first_burn_height}"
+        );
         std::process::exit(1);
     }
 

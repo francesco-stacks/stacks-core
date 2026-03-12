@@ -380,9 +380,7 @@ fn dump_consume_large_offset_sets_u64_ptr_bit() {
         .truncate(true)
         .open(&path)
         .expect("create temp trie dump");
-    let end_offset = trie
-        .dump_consume_for_test(&mut file)
-        .expect("dump large trie");
+    let end_offset = trie.dump_consume(&mut file).expect("dump large trie");
     assert!(end_offset > u64::from(u32::MAX));
 
     let last_node_size = per_node_size;

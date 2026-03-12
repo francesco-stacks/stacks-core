@@ -43,6 +43,7 @@ fn squash_helper(src_path: &str, dst_dir: &std::path::Path, height: u32) -> (Pat
         dst_db_path.to_str().unwrap(),
         open_opts,
         height,
+        "test",
     )
     .unwrap();
     (dst_db_path, stats)
@@ -1089,6 +1090,7 @@ fn test_squash_internal_blobs_roundtrip() {
         dst_db_path.to_str().unwrap(),
         open_opts.clone(),
         1,
+        "test",
     )
     .unwrap();
 
@@ -1568,6 +1570,7 @@ fn test_squash_rejects_compress_true() {
         dst_db_path.to_str().unwrap(),
         open_opts,
         1,
+        "test",
     );
     assert!(result.is_err(), "compress=true should be rejected");
     let err_msg = format!("{}", result.unwrap_err());

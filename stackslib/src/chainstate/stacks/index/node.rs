@@ -53,16 +53,16 @@ impl error::Error for CursorError {
 }
 
 // All numeric values of a Trie node when encoded.
-// They are all 4-bit numbers.
+// They are all 4-bit numbers
 // * the 8th bit is used to indicate whether or not the value
-//   identifies a back-pointer to be followed.
+// identifies a back-pointer to be followed.
 // * the 7th bit is used to indicate whether or not the ptrs
-//   are compressed. This bit is cleared on read.
+// are compressed. This bit is cleared on read.
 // * the 6th bit is used to indicate whether or not the pointer
-//   stores a u64 offset.
+// stores a u64 offset.
 // * the 5th bit is used to indicate that a compressed non-backptr
-//   pointer carries an annotation payload (`back_block`).
-//   This bit is wire-format metadata and is cleared on read.
+// pointer carries an annotation payload (`back_block`).
+// This bit is wire-format metadata and is cleared on read.
 define_u8_enum!(TrieNodeID {
     Empty = 0,
     Leaf = 1,

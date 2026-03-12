@@ -1343,6 +1343,8 @@ pub struct Epoch2BlockFileCopyStats {
     pub files_copied: u64,
     pub total_bytes: u64,
     pub genesis_skipped: u64,
+    /// Number of block files present in the index but missing from disk (pruned by source node).
+    pub files_missing: u64,
     /// Relative paths of the copied block files (relative to dst_blocks_dir).
     pub copied_paths: Vec<String>,
 }
@@ -1633,7 +1635,7 @@ pub fn copy_confirmed_epoch2_microblocks(
 ///
 /// Uses the squashed `index.sqlite` at `squashed_index_path` to enumerate
 /// canonical `block_headers` rows. Skips height 0 (genesis block has no flat file).
-/// Hard-errors if any source file is missing for height > 0.
+/// Skips files that are absent on disk (pruned by the source node) with a warning.
 pub fn copy_epoch2_block_files(
     squashed_index_path: &str,
     src_blocks_dir: &str,
@@ -1672,12 +1674,15 @@ pub fn copy_epoch2_block_files(
         let dst_path = Path::new(dst_blocks_dir).join(&rel_path);
 
         if !src_path.exists() {
-            return Err(Error::CorruptionError(format!(
-                "Missing source block file for height {} hash {}: {}",
+            // Block was pruned from the source node; skip with a warning.
+            warn!(
+                "Source block file missing (pruned?) for height {} hash {}: {}",
                 block_height,
                 index_block_hash,
                 src_path.display()
-            )));
+            );
+            stats.files_missing += 1;
+            continue;
         }
 
         if let Some(parent) = dst_path.parent() {
@@ -2115,6 +2120,11 @@ pub fn validate_epoch2_block_files(
         let rel_path = index_block_hash_to_rel_path(index_block_hash);
         let src_path = Path::new(src_blocks_dir).join(&rel_path);
         let dst_path = Path::new(dst_blocks_dir).join(&rel_path);
+
+        // If the source file was pruned, the copy also won't have it — skip.
+        if !src_path.exists() {
+            continue;
+        }
 
         expected_files.insert(rel_path);
 

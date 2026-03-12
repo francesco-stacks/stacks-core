@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read as _, Seek, SeekFrom, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, DatabaseName, OptionalExtension};
 use stacks_common::types::chainstate::{
@@ -45,6 +45,18 @@ use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
     trie_sql, BlockMap, Error, MARFValue, MarfTrieId, TrieHasher, TrieLeaf,
 };
+
+/// Format a `Duration` as `X.YZ secs` or `X min Y.ZW secs`.
+fn fmt_duration(d: Duration) -> String {
+    let total_centis = d.as_millis() / 10;
+    let mins = total_centis / 6000;
+    let secs = (total_centis % 6000) as f64 / 100.0;
+    if mins == 0 {
+        format!("{secs:.2} secs")
+    } else {
+        format!("{mins} min {secs:.2} secs")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // NodeStore: disk-backed storage for collected trie nodes.
@@ -368,6 +380,7 @@ fn remap_ptrs_for_squash(
     store: &mut NodeStore,
     source_to_idx: &HashMap<(u32, u64), usize>,
     block_id_map: &HashMap<u32, u32>,
+    label: &str,
 ) -> Result<(), Error> {
     use crate::chainstate::stacks::index::node::clear_backptr;
 
@@ -384,10 +397,10 @@ fn remap_ptrs_for_squash(
     let mut writer = BufWriter::with_capacity(1 << 20, write_file);
 
     for idx in 0..node_count {
-        if idx > 0 && idx % 500_000 == 0 {
+        if idx > 0 && idx % 1_000_000 == 0 {
             info!(
-                "Squash pointer remap: processed {idx}/{node_count} nodes in {:?}",
-                remap_start.elapsed()
+                "[{label}] [5/8] Remap trie pointers: {idx}/{node_count} nodes in {}",
+                fmt_duration(remap_start.elapsed())
             );
         }
 
@@ -443,10 +456,6 @@ fn remap_ptrs_for_squash(
     }
     writer.flush().map_err(Error::IOError)?;
 
-    info!(
-        "Squash pointer remap complete: {node_count} nodes in {:?}",
-        remap_start.elapsed()
-    );
     Ok(())
 }
 
@@ -470,10 +479,10 @@ fn remap_ptrs_for_hashing(
     let mut writer = BufWriter::with_capacity(1 << 20, write_file);
 
     for idx in 0..node_count {
-        if idx > 0 && idx % 500_000 == 0 {
+        if idx > 0 && idx % 1_000_000 == 0 {
             info!(
-                "Hashing pointer remap: processed {idx}/{node_count} nodes in {:?}",
-                remap_start.elapsed()
+                "Hashing pointer remap: processed {idx}/{node_count} nodes in {}",
+                fmt_duration(remap_start.elapsed())
             );
         }
 
@@ -523,8 +532,8 @@ fn remap_ptrs_for_hashing(
     writer.flush().map_err(Error::IOError)?;
 
     info!(
-        "Hashing pointer remap complete: {node_count} nodes in {:?}",
-        remap_start.elapsed()
+        "Hashing pointer remap complete: {node_count} nodes in {}",
+        fmt_duration(remap_start.elapsed())
     );
     Ok(())
 }
@@ -549,8 +558,8 @@ fn recompute_content_hashes(store: &mut NodeStore) -> Result<(), Error> {
         }
     }
     info!(
-        "Recompute content hashes: leaf pass done in {:?}",
-        start.elapsed()
+        "Trie hash: leaf pass done in {}",
+        fmt_duration(start.elapsed())
     );
 
     // Pass 2: internal nodes in reverse order
@@ -582,8 +591,8 @@ fn recompute_content_hashes(store: &mut NodeStore) -> Result<(), Error> {
     }
 
     info!(
-        "Recompute content hashes complete: {node_count} nodes in {:?}",
-        start.elapsed()
+        "Trie hash: {node_count} nodes in {}",
+        fmt_duration(start.elapsed())
     );
     Ok(())
 }
@@ -891,6 +900,7 @@ fn collect_per_height_metadata<T: MarfTrieId>(
     block_map: &HashMap<T, (u32, u64)>,
     blob_reader: &mut BlobReader,
     height: u32,
+    label: &str,
 ) -> Result<Vec<BlockInfo<T>>, Error> {
     let mut block_info: Vec<BlockInfo<T>> = Vec::with_capacity((height + 1) as usize);
     let mut last_log = Instant::now();
@@ -917,18 +927,18 @@ fn collect_per_height_metadata<T: MarfTrieId>(
 
         if last_log.elapsed().as_secs() >= 30 || (h > 0 && h % 100_000 == 0) {
             info!(
-                "Squash step 2 (per-height metadata): {}/{} heights in {:?}",
+                "[{label}] [2/8] Build height index: {}/{} heights in {}",
                 h + 1,
                 height + 1,
-                start.elapsed()
+                fmt_duration(start.elapsed())
             );
             last_log = Instant::now();
         }
     }
     info!(
-        "Squash step 2 (per-height metadata): {} heights in {:?}",
+        "[{label}] [2/8] Build height index: {} heights in {}",
         height + 1,
-        start.elapsed()
+        fmt_duration(start.elapsed())
     );
 
     Ok(block_info)
@@ -942,6 +952,7 @@ fn insert_placeholder_blocks<T: MarfTrieId>(
     block_info: &[BlockInfo<T>],
     block_at_height: &T,
     block_map: &HashMap<T, (u32, u64)>,
+    label: &str,
 ) -> Result<HashMap<u32, u32>, Error> {
     let start = Instant::now();
     let mut archival_to_squashed: HashMap<u32, u32> = HashMap::new();
@@ -962,15 +973,16 @@ fn insert_placeholder_blocks<T: MarfTrieId>(
         archival_to_squashed.insert(*archival_id, squashed_id);
         if *h % 100_000 == 0 && *h > 0 {
             info!(
-                "Squash placeholders: inserted {h} entries in {:?}",
-                start.elapsed()
+                "[{label}] [4/8] Register placeholder blocks: {h} of {} in {}",
+                block_info.len(),
+                fmt_duration(start.elapsed())
             );
         }
     }
     info!(
-        "Squash step 4 (placeholders): {} entries in {:?}",
+        "[{label}] [4/8] Register placeholder blocks: {} entries in {}",
         archival_to_squashed.len(),
-        start.elapsed()
+        fmt_duration(start.elapsed())
     );
     Ok(archival_to_squashed)
 }
@@ -995,9 +1007,9 @@ fn persist_squash_metadata<T: MarfTrieId>(
         stmt_bh.execute(params![bh.to_string(), *h as i64])?;
     }
     info!(
-        "Squash step 6 (SQL metadata): {} root hashes + block heights in {:?}",
+        "Squash: wrote {} root hashes and block heights in {}",
         block_info.len(),
-        start.elapsed()
+        fmt_duration(start.elapsed())
     );
     Ok(())
 }
@@ -1030,8 +1042,9 @@ fn finalize_shared_blob_offsets<T: MarfTrieId>(
     conn.execute_batch("COMMIT")
         .map_err(|e| Error::CorruptionError(format!("COMMIT: {e}")))?;
     info!(
-        "Squash step 8 (blob update): {updated} rows in {:?}",
-        start.elapsed()
+        "Squash: updated {} placeholder blob offsets in {}",
+        updated,
+        fmt_duration(start.elapsed())
     );
     Ok(updated)
 }
@@ -1057,6 +1070,7 @@ impl<T: MarfTrieId> MARF<T> {
         dst_path: &str,
         open_opts: MARFOpenOpts,
         height: u32,
+        label: &str,
     ) -> Result<SquashStats, Error> {
         if open_opts.compress {
             return Err(Error::CorruptionError(
@@ -1080,67 +1094,85 @@ impl<T: MarfTrieId> MARF<T> {
         let start = Instant::now();
         let block_map = collect_block_map(&src)?;
         info!(
-            "Squash step 1 (bulk SQL): {} entries in {:?}",
+            "[{label}] [1/8] Load block map: {} entries in {}",
             block_map.len(),
-            start.elapsed()
+            fmt_duration(start.elapsed())
         );
 
-        // Step 2: per-height metadata
+        // [2/8] Build height index
+        info!(
+            "[{label}] [2/8] Build height index: reading {} heights...",
+            height + 1
+        );
         let mut blob_reader = BlobReader::new(src_path, open_opts.external_blobs)?;
-        let block_info =
-            collect_per_height_metadata(&mut src, &tip, &block_map, &mut blob_reader, height)?;
+        let block_info = collect_per_height_metadata(
+            &mut src,
+            &tip,
+            &block_map,
+            &mut blob_reader,
+            height,
+            label,
+        )?;
 
-        // Step 3: DFS node collection
+        // [3/8] Collect trie nodes (DFS walk)
         //
         // Derive the temp directory from dst_path: use the parent directory.
         let tmp_dir = std::path::Path::new(dst_path)
             .parent()
             .and_then(|p| p.to_str())
             .unwrap_or("/tmp");
-        log_memory_snapshot("before step 3 DFS collection");
+        log_memory_snapshot("before trie DFS");
+        info!("[{label}] [3/8] Collect trie nodes: starting DFS...");
         let start = Instant::now();
         let (mut node_store, source_to_idx) = src.with_conn(|conn| {
             MARF::<T>::collect_reachable_nodes(conn, &block_at_height, tmp_dir)
         })?;
         let node_count = node_store.len() as u64;
         info!(
-            "Squash step 3 (DFS collection): {node_count} nodes in {:?}",
-            start.elapsed()
+            "[{label}] [3/8] Collect trie nodes: {node_count} nodes in {}",
+            fmt_duration(start.elapsed())
         );
-        log_memory_snapshot("after step 3 DFS collection");
+        log_memory_snapshot("after trie DFS");
 
         // Open destination MARF and begin transaction
         let mut dst = MARF::from_path(dst_path, open_opts.clone())?;
         let mut tx = dst.begin_tx()?;
         tx.begin(&T::sentinel(), &block_at_height)?;
 
-        // Step 4: placeholder marf_data rows
-        let archival_to_squashed =
-            insert_placeholder_blocks(tx.sqlite_tx(), &block_info, &block_at_height, &block_map)?;
+        // [4/8] Register placeholder blocks
+        let archival_to_squashed = insert_placeholder_blocks(
+            tx.sqlite_tx(),
+            &block_info,
+            &block_at_height,
+            &block_map,
+            label,
+        )?;
         drop(block_map);
 
-        // Step 5a: remap pointers (disk-backed)
-        log_memory_snapshot("before step 5a remap");
+        // [5/8] Remap trie pointers (disk-backed)
+        log_memory_snapshot("before pointer remap");
+        info!("[{label}] [5/8] Remap trie pointers: {node_count} nodes...");
         let start = Instant::now();
-        remap_ptrs_for_squash(&mut node_store, &source_to_idx, &archival_to_squashed)?;
+        remap_ptrs_for_squash(&mut node_store, &source_to_idx, &archival_to_squashed, label)?;
         info!(
-            "Squash step 5a (remap, disk-backed): {node_count} nodes in {:?}",
-            start.elapsed()
+            "[{label}] [5/8] Remap trie pointers: {node_count} nodes in {}",
+            fmt_duration(start.elapsed())
         );
         drop(source_to_idx);
         drop(archival_to_squashed);
         node_store.drop_block_ids(); // free ~200 MB
-        log_memory_snapshot("after step 5a remap");
+        log_memory_snapshot("after pointer remap");
 
-        // Step 5b: recompute content hashes (disk-backed)
-        log_memory_snapshot("before step 5b content hashes");
+        // [6/8] Recompute node hashes (disk-backed)
+        log_memory_snapshot("before hash recompute");
+        info!("[{label}] [6/8] Recompute node hashes: {node_count} nodes...");
         let start = Instant::now();
         recompute_content_hashes(&mut node_store)?;
         info!(
-            "Squash step 5b (content hashes, disk-backed): {node_count} nodes in {:?}",
-            start.elapsed()
+            "[{label}] [6/8] Recompute node hashes: {node_count} nodes in {}",
+            fmt_duration(start.elapsed())
         );
-        log_memory_snapshot("after step 5b content hashes");
+        log_memory_snapshot("after hash recompute");
 
         let squash_root_node_hash = if node_store.len() > 0 {
             node_store.hash(0)
@@ -1150,20 +1182,13 @@ impl<T: MarfTrieId> MARF<T> {
             ));
         };
 
-        // Step 5c: compute blob offsets, then stream directly to destination
-        log_memory_snapshot("before step 5c blob write");
+        // [7/8] Write trie blob (compute offsets + stream to destination)
+        log_memory_snapshot("before blob write");
+        info!("[{label}] [7/8] Write trie blob: {node_count} nodes...");
         let start = Instant::now();
         let parent_hash = T::sentinel();
 
         let (blob_offsets, total_blob_size) = compute_blob_offsets(&mut node_store)?;
-        info!(
-            "Squash step 5c (offset computation): {} nodes, {total_blob_size} bytes in {:?}",
-            node_store.len(),
-            start.elapsed()
-        );
-
-        // Step 5d: stream blob directly into destination storage
-        let start = Instant::now();
         let block_id = if open_opts.external_blobs {
             // Stream directly into the external .blobs file (no Vec<u8> copy)
             tx.storage.with_trie_blobs(|db, blobs| match blobs {
@@ -1204,27 +1229,28 @@ impl<T: MarfTrieId> MARF<T> {
                 }
             })?
         } else {
-            // Inline SQLite blob (used for sortition MARF / tests)
+            // Inline SQLite blob (used for sortition MARF and tests)
             let mut blob = Cursor::new(Vec::with_capacity(total_blob_size as usize));
             stream_squash_blob(&mut node_store, &parent_hash, &blob_offsets, &mut blob)?;
             trie_sql::write_trie_blob(tx.sqlite_tx(), &block_at_height, &blob.into_inner())?
         };
         info!(
-            "Squash step 5d (blob persist): block_id={block_id}, {total_blob_size} bytes in {:?}",
-            start.elapsed()
+            "[{label}] [7/8] Write trie blob: block_id={block_id}, {total_blob_size} bytes in {}",
+            fmt_duration(start.elapsed())
         );
         drop(blob_offsets);
         drop(node_store); // free temp file + metadata
-        log_memory_snapshot("after step 5d blob persist");
+        log_memory_snapshot("after blob write");
 
-        // Step 6: SQL metadata
+        // [8/8] Persist metadata & commit
+        let step8_start = Instant::now();
         let source_root_hash = block_info
             .iter()
             .find(|(_, bh, _)| bh == &block_at_height)
             .map(|(_, _, rh)| *rh)
             .ok_or(Error::NotFoundError)?;
         persist_squash_metadata(tx.sqlite_tx(), &block_info, &source_root_hash, height)?;
-        info!("Squash blob content root hash: {squash_root_node_hash}");
+        info!("[{label}] Squash root hash: {squash_root_node_hash}");
 
         tx.set_squash_info(Some(SquashInfo {
             archival_marf_root_hash: source_root_hash,
@@ -1233,19 +1259,20 @@ impl<T: MarfTrieId> MARF<T> {
             block_hash: block_at_height.clone(),
         }));
 
-        // Step 7: commit the SQL transaction (no TrieRAM flush needed)
-        let start = Instant::now();
-        info!("Squash commit: starting commit");
         // Commit the SQL transaction without flushing TrieRAM (we already wrote the blob directly)
         tx.commit_squash()?;
-        info!("Squash commit: finished in {:?}", start.elapsed());
 
-        // Step 8: post-commit finalization
+        // Post-commit: share blob offsets across placeholder blocks
         finalize_shared_blob_offsets(&mut dst, &block_at_height, &squash_root_node_hash)?;
 
         info!(
-            "Squash complete: {node_count} nodes, total time {:?}",
-            overall_start.elapsed()
+            "[{label}] [8/8] Persist metadata & commit: finished in {}",
+            fmt_duration(step8_start.elapsed())
+        );
+
+        info!(
+            "[{label}] Squash complete: {node_count} nodes, total time {}",
+            fmt_duration(overall_start.elapsed())
         );
 
         Ok(SquashStats {
@@ -1359,10 +1386,10 @@ impl<T: MarfTrieId> MARF<T> {
                 store.push(&child_node, child_hash, child_block_id)?;
 
                 nodes_collected += 1;
-                if last_log.elapsed().as_secs() >= 30 || nodes_collected % 500_000 == 0 {
+                if last_log.elapsed().as_secs() >= 30 || nodes_collected % 1_000_000 == 0 {
                     info!(
-                        "Deep copy DFS: collected {nodes_collected} nodes, stack depth {stack_depth}, {:?} elapsed",
-                        dfs_start.elapsed()
+                        "Trie DFS: {nodes_collected} nodes, stack depth {stack_depth}, {} elapsed",
+                        fmt_duration(dfs_start.elapsed())
                     );
                     last_log = Instant::now();
                 }
@@ -1391,9 +1418,9 @@ impl<T: MarfTrieId> MARF<T> {
         store.finish_writing()?;
 
         info!(
-            "Deep copy DFS complete: {} nodes in {:?}",
+            "Trie DFS: {} nodes in {}",
             store.len(),
-            dfs_start.elapsed()
+            fmt_duration(dfs_start.elapsed())
         );
 
         Ok((store, source_to_idx))
@@ -1534,18 +1561,18 @@ impl<T: MarfTrieId> MARF<T> {
             }
             if last_log.elapsed().as_secs() >= 30 || (h > 0 && h % 100_000 == 0) {
                 info!(
-                    "Validate per-height: {}/{} heights in {:?}",
+                    "Validate per-height: {}/{} heights in {}",
                     h + 1,
                     height + 1,
-                    start_root_hashes.elapsed()
+                    fmt_duration(start_root_hashes.elapsed())
                 );
                 last_log = Instant::now();
             }
         }
         info!(
-            "Validate: collected {} source root hashes in {:?}",
+            "Validate: collected {} source root hashes in {}",
             source_root_hashes.len(),
-            start_root_hashes.elapsed()
+            fmt_duration(start_root_hashes.elapsed())
         );
 
         let squashed_root_hashes: HashMap<u32, TrieHash> =
@@ -1565,11 +1592,11 @@ impl<T: MarfTrieId> MARF<T> {
             }
         }
         info!(
-            "Validate per-height root hashes: {} checked, {} missing, {} mismatched in {:?}",
+            "Validate per-height root hashes: {} checked, {} missing, {} mismatched in {}",
             source_root_hashes.len(),
             stats.root_hash_missing,
             stats.root_hash_mismatches,
-            start_root_hashes.elapsed()
+            fmt_duration(start_root_hashes.elapsed())
         );
 
         let expected_squash_root = match source_root_hashes.get(&height).copied() {
@@ -1603,9 +1630,9 @@ impl<T: MarfTrieId> MARF<T> {
                     squashed.recompute_squash_root_node_hash(&squashed_block_at_height)?;
                 stats.squash_node_hash_matches = recomputed_hash == stored_hash;
                 info!(
-                    "Validate squash_root_node_hash: matches={}, {:?}",
+                    "Validate squash_root_node_hash: matches={}, {}",
                     stats.squash_node_hash_matches,
-                    start_node_hash.elapsed()
+                    fmt_duration(start_node_hash.elapsed())
                 );
             }
             _ => {
@@ -1644,8 +1671,8 @@ impl<T: MarfTrieId> MARF<T> {
                             checked += 1;
                             if checked % 100_000 == 0 {
                                 info!(
-                                    "Validate leaf scan (source->squashed): checked {checked} keys in {:?}",
-                                    start_pass_a.elapsed()
+                                    "Validate leaf scan (source->squashed): checked {checked} keys in {}",
+                                    fmt_duration(start_pass_a.elapsed())
                                 );
                             }
                             match squashed_value {
@@ -1677,8 +1704,8 @@ impl<T: MarfTrieId> MARF<T> {
                         checked += 1;
                         if checked % 100_000 == 0 {
                             info!(
-                                "Validate leaf scan (squashed->source): checked {checked} keys in {:?}",
-                                start_pass_b.elapsed()
+                                "Validate leaf scan (squashed->source): checked {checked} keys in {}",
+                                fmt_duration(start_pass_b.elapsed())
                             );
                         }
                         if src_value.is_none() {

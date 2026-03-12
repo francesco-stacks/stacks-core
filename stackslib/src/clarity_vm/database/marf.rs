@@ -1256,30 +1256,6 @@ impl<'a> WritableMarfStore for Box<dyn WritableMarfStore + 'a> {}
 // Clarity MARF squash helpers
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if the MARF database at `db_path` contains Clarity
-/// side-storage tables (`data_table` and `metadata_table`).
-///
-/// Used by the squash tooling to auto-detect whether the source MARF is a
-/// Clarity MARF (as opposed to an Index MARF or Sortition MARF) and decide
-/// whether to run the side-table copy step.
-pub fn has_clarity_side_tables(db_path: &str) -> Result<bool, Error> {
-    let conn = Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(Error::SQLError)?;
-
-    let exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='data_table'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
-
-    Ok(exists)
-}
-
 /// Copy Clarity side-storage tables (`data_table`, `metadata_table`) from a
 /// source MARF database to a squashed MARF database.
 ///

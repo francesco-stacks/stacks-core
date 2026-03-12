@@ -26,7 +26,7 @@ use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue};
 use crate::clarity_vm::clarity::ClarityMarfStoreTransaction;
 use crate::clarity_vm::database::marf::{
-    copy_clarity_side_tables, has_clarity_side_tables, validate_clarity_side_tables, MarfedKV,
+    copy_clarity_side_tables, validate_clarity_side_tables, MarfedKV,
 };
 
 /// Build a Clarity MARF with N blocks of data and a single contract.
@@ -113,10 +113,6 @@ fn clarity_marf_db_path(dir: &std::path::Path) -> PathBuf {
     dir.join("marf.sqlite")
 }
 
-fn clarity_marf_blobs_path(dir: &std::path::Path) -> PathBuf {
-    dir.join("marf.sqlite.blobs")
-}
-
 /// Squash a Clarity MARF and copy side tables.  Returns the squashed db path.
 fn squash_clarity_marf(
     src_dir: &std::path::Path,
@@ -133,6 +129,7 @@ fn squash_clarity_marf(
         dst_db.to_str().unwrap(),
         open_opts,
         height,
+        "test",
     )
     .unwrap();
 
@@ -142,38 +139,6 @@ fn squash_clarity_marf(
     assert!(stats.data_table_rows > 0, "Expected data_table rows > 0");
 
     dst_db
-}
-
-#[test]
-fn test_has_clarity_side_tables_detects_clarity_marf() {
-    let dir = tempdir().unwrap();
-    let src_dir = dir.path().join("src");
-    let blocks = build_clarity_marf(&src_dir, 3, "test-contract", "");
-    assert!(!blocks.is_empty());
-
-    let db_path = clarity_marf_db_path(&src_dir);
-    assert!(
-        has_clarity_side_tables(db_path.to_str().unwrap()).unwrap(),
-        "Should detect Clarity side tables"
-    );
-}
-
-#[test]
-fn test_has_clarity_side_tables_false_for_index_marf() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("index.sqlite");
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut marf = MARF::<StacksBlockId>::from_path(db_path.to_str().unwrap(), open_opts).unwrap();
-    let b1 = StacksBlockId::from_bytes(&[1u8; 32]).unwrap();
-    marf.begin(&StacksBlockId::sentinel(), &b1).unwrap();
-    marf.insert("k1", MARFValue::from_value("v1")).unwrap();
-    marf.commit().unwrap();
-    drop(marf);
-
-    assert!(
-        !has_clarity_side_tables(db_path.to_str().unwrap()).unwrap(),
-        "Index MARF should not have Clarity side tables"
-    );
 }
 
 #[test]
@@ -340,6 +305,7 @@ fn test_mismatched_clarity_db_causes_data_read_failure() {
         dst_db.to_str().unwrap(),
         open_opts,
         3,
+        "test",
     )
     .unwrap();
 
@@ -389,6 +355,7 @@ fn test_validate_clarity_side_tables_detects_mismatch() {
         dst_db.to_str().unwrap(),
         open_opts,
         3,
+        "test",
     )
     .unwrap();
 

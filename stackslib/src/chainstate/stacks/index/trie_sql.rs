@@ -185,19 +185,6 @@ pub fn update_squash_root_node_hash(conn: &Connection, hash: &TrieHash) -> Resul
     Ok(())
 }
 
-/// Write a single per-height root hash into the out-of-trie SQL table.
-pub fn write_squash_archival_marf_root_hash(
-    conn: &Connection,
-    height: u32,
-    marf_root_hash: &TrieHash,
-) -> Result<(), Error> {
-    conn.execute(
-        "INSERT OR REPLACE INTO marf_squash_archival_marf_roots (height, marf_root_hash) VALUES (?1, ?2)",
-        params![height as i64, marf_root_hash.as_bytes().to_vec()],
-    )?;
-    Ok(())
-}
-
 /// Read the stored root hash for a given height from the SQL table.
 /// Returns `None` if the height is not present (archival MARF or height
 /// outside the squashed range).
@@ -252,6 +239,7 @@ pub fn read_squash_block_height<T: MarfTrieId>(
 /// Read the block hash for a given height from the squash block-heights table.
 /// This is the reverse lookup: height → block_hash.
 /// Returns `None` if the height is not in the squashed range.
+#[cfg(test)]
 pub fn read_squash_block_height_reverse<T: MarfTrieId>(
     conn: &Connection,
     height: u32,
@@ -265,24 +253,6 @@ pub fn read_squash_block_height_reverse<T: MarfTrieId>(
         .optional()?;
 
     Ok(result)
-}
-
-/// Insert a placeholder `marf_data` entry for a historical block in a squashed MARF.
-///
-/// Used during `squash_to_path` to pre-populate the block → local-ID mapping
-/// that `get_block_hash_caching` relies on.  The returned `block_id` is stored
-/// in the squashed trie's `back_block` annotations so that
-/// `inner_write_children_hashes` can recover the original `StacksBlockId`.
-///
-/// The caller is expected to update `external_offset` / `external_length` to
-/// the shared squash trie storage's location after the squash commit.
-pub fn write_placeholder_block_entry<T: MarfTrieId>(
-    conn: &Connection,
-    block_hash: &T,
-    external_offset: u64,
-    external_length: u64,
-) -> Result<u32, Error> {
-    write_external_trie_blob(conn, block_hash, external_offset, external_length)
 }
 
 /// Bulk-read all confirmed block entries from `marf_data`.
