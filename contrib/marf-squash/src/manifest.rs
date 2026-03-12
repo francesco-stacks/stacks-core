@@ -1,0 +1,326 @@
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+
+use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
+use blockstack_lib::chainstate::stacks::index::{trie_sql, MarfTrieId};
+use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
+
+use crate::cli::{
+    BlocksSection, ChecksumsSection, RootsSection, SnapshotSection, SquashManifest,
+    SquashRootsSection, TargetPaths, GSS_MANIFEST,
+};
+use crate::util::{compute_checksums, default_open_opts, format_timestamp, sortition_open_opts};
+
+/// Read squash metadata from a just-squashed MARF DB.
+/// Returns (tip, archival_root_hash, squash_root_node_hash, height).
+pub fn read_squash_metadata<T: MarfTrieId + std::fmt::Display>(
+    db_path: &str,
+    open_opts: MARFOpenOpts,
+) -> (T, String, Option<String>, u32) {
+    let marf = MARF::<T>::from_path(db_path, open_opts).unwrap_or_else(|e| {
+        eprintln!("Failed to open squashed MARF for manifest: {e:?}");
+        std::process::exit(1);
+    });
+    let tip =
+        trie_sql::get_latest_confirmed_block_hash::<T>(marf.sqlite_conn()).unwrap_or_else(|e| {
+            eprintln!("Failed to read latest block hash: {e:?}");
+            std::process::exit(1);
+        });
+    let squash_info = trie_sql::read_squash_info(marf.sqlite_conn()).unwrap_or_else(|e| {
+        eprintln!("Failed to read squash info: {e:?}");
+        std::process::exit(1);
+    });
+    match squash_info {
+        Some((archival_hash, squash_hash, height)) => (
+            tip,
+            format!("0x{archival_hash}"),
+            squash_hash.map(|h| format!("0x{h}")),
+            height,
+        ),
+        None => {
+            eprintln!("No squash info found in DB");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Insert the relative path of `abs_path` (relative to `base`) into `set`.
+fn insert_expected_rel(base: &Path, abs_path: &Path, set: &mut HashSet<String>) {
+    if let Ok(rel) = abs_path.strip_prefix(base) {
+        set.insert(rel.to_string_lossy().replace('\\', "/"));
+    }
+}
+
+/// Read the burn_header_timestamp for the snapshot at the squash height.
+/// When sortition DB is available, uses the explicit burn_height to look up
+/// the canonical sortition ID rather than re-deriving from MAX(height).
+pub fn read_snapshot_timestamp(
+    sortition_out: Option<(&TargetPaths, u32)>,
+    index_out: &TargetPaths,
+    height: u32,
+) -> Option<String> {
+    // Try sortition DB first, using the explicit burn_height.
+    if let Some((s_out, burn_height)) = sortition_out {
+        let conn = rusqlite::Connection::open(s_out.db.to_str().unwrap()).ok()?;
+        let sort_id: Option<String> = conn
+            .query_row(
+                "SELECT block_hash FROM marf_squash_block_heights WHERE height = ?1",
+                [burn_height],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(sid) = sort_id {
+            let ts: Option<i64> = conn
+                .query_row(
+                    "SELECT burn_header_timestamp FROM snapshots WHERE sortition_id = ?1",
+                    [&sid],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(ts) = ts {
+                return Some(format_timestamp(ts));
+            }
+        }
+    }
+
+    // Fallback: try index DB block_headers, then nakamoto_block_headers.
+    let conn = rusqlite::Connection::open(index_out.db.to_str().unwrap()).ok()?;
+    let ibh: Option<String> = conn
+        .query_row(
+            "SELECT block_hash FROM marf_squash_block_heights WHERE height = ?1",
+            [height],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(ibh) = ibh {
+        // Try epoch 2.x headers first.
+        let ts: Option<i64> = conn
+            .query_row(
+                "SELECT burn_header_timestamp FROM block_headers WHERE index_block_hash = ?1",
+                [&ibh],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(ts) = ts {
+            return Some(format_timestamp(ts));
+        }
+        // Try Nakamoto headers.
+        let ts: Option<i64> = conn
+            .query_row(
+                "SELECT burn_header_timestamp FROM nakamoto_block_headers WHERE index_block_hash = ?1",
+                [&ibh],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(ts) = ts {
+            return Some(format_timestamp(ts));
+        }
+    }
+
+    None
+}
+
+/// Generate squash manifest after squashing.
+///
+/// `copied_block_rel_paths` contains the relative paths (under
+/// `chainstate/blocks/`) of epoch-2.x block files and nakamoto.sqlite that
+/// were actually written during the copy step.  This is used to build the
+/// exact expected file set for full-GSS checksum generation, avoiding the
+/// need to re-walk the blocks directory (which could include stale files).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_manifest(
+    out_dir: &Path,
+    clarity_out: Option<&TargetPaths>,
+    index_out: &TargetPaths,
+    sortition_out: Option<(&TargetPaths, u32)>,
+    height: u32,
+    blocks_section: Option<BlocksSection>,
+    has_burnchain_aux: bool,
+    copied_block_rel_paths: &[String],
+) {
+    let (i_tip, i_archival, i_squash, i_height) =
+        read_squash_metadata::<StacksBlockId>(index_out.db.to_str().unwrap(), default_open_opts());
+
+    if i_height != height {
+        eprintln!("Manifest error: Index squash height {i_height} != requested {height}");
+        std::process::exit(1);
+    }
+
+    let (c_archival, c_squash) = if let Some(c_out) = clarity_out {
+        let (c_tip, c_arch, c_sq, c_h) =
+            read_squash_metadata::<StacksBlockId>(c_out.db.to_str().unwrap(), default_open_opts());
+        if c_h != height {
+            eprintln!("Manifest error: Clarity squash height {c_h} != requested {height}");
+            std::process::exit(1);
+        }
+        if c_tip != i_tip {
+            eprintln!("Manifest error: Clarity tip {c_tip} != Index tip {i_tip}");
+            std::process::exit(1);
+        }
+        (Some(c_arch), c_sq)
+    } else {
+        (None, None)
+    };
+
+    let (s_archival, s_squash) = if let Some((s_out, _bh)) = &sortition_out {
+        let (_s_tip, s_arch, s_sq, _s_h) =
+            read_squash_metadata::<SortitionId>(s_out.db.to_str().unwrap(), sortition_open_opts());
+        (Some(s_arch), s_sq)
+    } else {
+        (None, None)
+    };
+
+    // Read db_config from the squashed index DB.
+    let (chain_id, mainnet) = {
+        let conn = rusqlite::Connection::open(index_out.db.to_str().unwrap()).unwrap_or_else(|e| {
+            eprintln!("Failed to open index DB for db_config: {e}");
+            std::process::exit(1);
+        });
+        let row: (i64, i64) = conn
+            .query_row(
+                "SELECT chain_id, mainnet FROM db_config LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to read db_config: {e}");
+                std::process::exit(1);
+            });
+        (row.0 as u32, row.1 != 0)
+    };
+
+    // Read timestamp from sortition snapshots if available, else from index headers.
+    let timestamp = read_snapshot_timestamp(sortition_out, index_out, height);
+
+    // Read bitcoin height + block hash from sortition DB if available.
+    // Note: `bh` is the MARF-internal sortition height (0-indexed from
+    // genesis sortition), NOT the actual Bitcoin block height.  We read the
+    // real Bitcoin height from the `burn_header_height` column in snapshots.
+    let (bitcoin_height, bitcoin_block_hash) = if let Some((s_out, bh)) = &sortition_out {
+        let conn = rusqlite::Connection::open(s_out.db.to_str().unwrap()).unwrap_or_else(|e| {
+            eprintln!("Failed to open squashed sortition DB for bitcoin metadata: {e}");
+            std::process::exit(1);
+        });
+        let sort_id: String = conn
+            .query_row(
+                "SELECT block_hash FROM marf_squash_block_heights WHERE height = ?1",
+                [bh],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "Failed to read sortition ID at MARF height {bh} from squashed sortition DB: {e}"
+                );
+                std::process::exit(1);
+            });
+        let (real_btc_height, btc_hash): (u32, String) = conn
+            .query_row(
+                "SELECT burn_header_height, burn_header_hash FROM snapshots WHERE sortition_id = ?1",
+                [&sort_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to read burn_header_height/hash for sortition_id {sort_id}: {e}");
+                std::process::exit(1);
+            });
+        (Some(real_btc_height), Some(format!("0x{btc_hash}")))
+    } else {
+        (None, None)
+    };
+
+    let is_full_gss = clarity_out.is_some()
+        && sortition_out.is_some()
+        && blocks_section.is_some()
+        && has_burnchain_aux;
+
+    // Compute checksums for full GSS (mandatory).  For partial squash
+    // manifests, checksums are omitted.
+    let checksums = if is_full_gss {
+        // Build the set of expected files from the known GSS outputs so that
+        // stale files in a reused out-dir are rejected rather than blessed.
+        let mut expected = HashSet::new();
+
+        // MARF databases + blobs.
+        if let Some(c) = clarity_out {
+            insert_expected_rel(out_dir, &c.db, &mut expected);
+            if let Some(b) = &c.blobs {
+                insert_expected_rel(out_dir, b, &mut expected);
+            }
+        }
+        insert_expected_rel(out_dir, &index_out.db, &mut expected);
+        if let Some(b) = &index_out.blobs {
+            insert_expected_rel(out_dir, b, &mut expected);
+        }
+        if let Some((s, _)) = sortition_out {
+            insert_expected_rel(out_dir, &s.db, &mut expected);
+        }
+
+        // Burnchain auxiliary files.
+        if has_burnchain_aux {
+            expected.insert("burnchain/burnchain.sqlite".to_string());
+            expected.insert("headers.sqlite".to_string());
+        }
+
+        // Block data files: use the exact paths carried forward from the
+        // copy steps rather than re-walking the output directory (which
+        // could include stale files from a previous run).
+        for rel in copied_block_rel_paths {
+            expected.insert(rel.clone());
+        }
+
+        let files = compute_checksums(out_dir, Some(&expected)).unwrap_or_else(|e| {
+            eprintln!("Failed to compute checksums: {e}");
+            std::process::exit(1);
+        });
+        println!("Computed SHA-256 checksums for {} files", files.len());
+        Some(ChecksumsSection { files })
+    } else {
+        None
+    };
+
+    let manifest = SquashManifest {
+        snapshot: SnapshotSection {
+            version: 1,
+            height,
+            block_hash: format!("0x{i_tip}"),
+            bitcoin_height,
+            bitcoin_block_hash,
+            timestamp,
+            chain_id,
+            mainnet,
+        },
+        roots: RootsSection {
+            clarity_archival_marf_root_hash: c_archival,
+            index_archival_marf_root_hash: i_archival,
+            sortition_archival_marf_root_hash: s_archival,
+        },
+        squash_roots: SquashRootsSection {
+            clarity_squash_root_node_hash: c_squash,
+            index_squash_root_node_hash: i_squash,
+            sortition_squash_root_node_hash: s_squash,
+        },
+        blocks: blocks_section,
+        checksums,
+    };
+
+    let toml_str = toml::to_string(&manifest).unwrap_or_else(|e| {
+        eprintln!("Failed to serialize manifest: {e}");
+        std::process::exit(1);
+    });
+
+    if !is_full_gss {
+        println!("Skipping manifest generation (partial squash).");
+        return;
+    }
+
+    let manifest_path = out_dir.join(GSS_MANIFEST);
+    fs::write(&manifest_path, toml_str).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to write manifest to '{}': {e}",
+            manifest_path.display()
+        );
+        std::process::exit(1);
+    });
+    println!("Manifest written to {}", manifest_path.display());
+}
