@@ -121,22 +121,22 @@ pub fn read_snapshot_timestamp(
     None
 }
 
-/// Generate squash manifest after squashing.
+/// Generate the GSS manifest. Only called for a complete GSS (all MARFs +
+/// blocks + bitcoin aux).
 ///
 /// `copied_block_rel_paths` contains the relative paths (under
 /// `chainstate/blocks/`) of epoch-2.x block files and nakamoto.sqlite that
 /// were actually written during the copy step.  This is used to build the
-/// exact expected file set for full-GSS checksum generation, avoiding the
-/// need to re-walk the blocks directory (which could include stale files).
+/// exact expected file set for checksum generation, avoiding the need to
+/// re-walk the blocks directory (which could include stale files).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_manifest(
     out_dir: &Path,
-    clarity_out: Option<&TargetPaths>,
+    clarity_out: &TargetPaths,
     index_out: &TargetPaths,
-    sortition_out: Option<(&TargetPaths, u32)>,
+    sortition_out: (&TargetPaths, u32),
     height: u32,
-    blocks_section: Option<BlocksSection>,
-    has_burnchain_aux: bool,
+    blocks_section: BlocksSection,
     copied_block_rel_paths: &[String],
 ) {
     let (i_tip, i_archival, i_squash, i_height) =
@@ -147,29 +147,22 @@ pub fn generate_manifest(
         std::process::exit(1);
     }
 
-    let (c_archival, c_squash) = if let Some(c_out) = clarity_out {
-        let (c_tip, c_arch, c_sq, c_h) =
-            read_squash_metadata::<StacksBlockId>(c_out.db.to_str().unwrap(), default_open_opts());
-        if c_h != height {
-            eprintln!("Manifest error: Clarity squash height {c_h} != requested {height}");
-            std::process::exit(1);
-        }
-        if c_tip != i_tip {
-            eprintln!("Manifest error: Clarity tip {c_tip} != Index tip {i_tip}");
-            std::process::exit(1);
-        }
-        (Some(c_arch), c_sq)
-    } else {
-        (None, None)
-    };
+    let (c_tip, c_archival, c_squash, c_h) = read_squash_metadata::<StacksBlockId>(
+        clarity_out.db.to_str().unwrap(),
+        default_open_opts(),
+    );
+    if c_h != height {
+        eprintln!("Manifest error: Clarity squash height {c_h} != requested {height}");
+        std::process::exit(1);
+    }
+    if c_tip != i_tip {
+        eprintln!("Manifest error: Clarity tip {c_tip} != Index tip {i_tip}");
+        std::process::exit(1);
+    }
 
-    let (s_archival, s_squash) = if let Some((s_out, _bh)) = &sortition_out {
-        let (_s_tip, s_arch, s_sq, _s_h) =
-            read_squash_metadata::<SortitionId>(s_out.db.to_str().unwrap(), sortition_open_opts());
-        (Some(s_arch), s_sq)
-    } else {
-        (None, None)
-    };
+    let (s_out, _) = &sortition_out;
+    let (_s_tip, s_archival, s_squash, _s_h) =
+        read_squash_metadata::<SortitionId>(s_out.db.to_str().unwrap(), sortition_open_opts());
 
     // Read db_config from the squashed index DB.
     let (chain_id, mainnet) = {
@@ -190,14 +183,15 @@ pub fn generate_manifest(
         (row.0 as u32, row.1 != 0)
     };
 
-    // Read timestamp from sortition snapshots if available, else from index headers.
-    let timestamp = read_snapshot_timestamp(sortition_out, index_out, height);
+    // Read timestamp from sortition snapshots, falling back to index headers.
+    let timestamp = read_snapshot_timestamp(Some(sortition_out), index_out, height);
 
-    // Read bitcoin height + block hash from sortition DB if available.
+    // Read bitcoin height + block hash from sortition DB.
     // Note: `bh` is the MARF-internal sortition height (0-indexed from
     // genesis sortition), NOT the actual Bitcoin block height.  We read the
     // real Bitcoin height from the `burn_header_height` column in snapshots.
-    let (bitcoin_height, bitcoin_block_hash) = if let Some((s_out, bh)) = &sortition_out {
+    let (bitcoin_height, bitcoin_block_hash) = {
+        let (s_out, bh) = &sortition_out;
         let conn = rusqlite::Connection::open(s_out.db.to_str().unwrap()).unwrap_or_else(|e| {
             eprintln!("Failed to open squashed sortition DB for bitcoin metadata: {e}");
             std::process::exit(1);
@@ -216,7 +210,7 @@ pub fn generate_manifest(
             });
         let (real_btc_height, btc_hash): (u32, String) = conn
             .query_row(
-                "SELECT burn_header_height, burn_header_hash FROM snapshots WHERE sortition_id = ?1",
+                "SELECT block_height, burn_header_hash FROM snapshots WHERE sortition_id = ?1",
                 [&sort_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -224,95 +218,68 @@ pub fn generate_manifest(
                 eprintln!("Failed to read burn_header_height/hash for sortition_id {sort_id}: {e}");
                 std::process::exit(1);
             });
-        (Some(real_btc_height), Some(format!("0x{btc_hash}")))
-    } else {
-        (None, None)
+        (real_btc_height, format!("0x{btc_hash}"))
     };
 
-    let is_full_gss = clarity_out.is_some()
-        && sortition_out.is_some()
-        && blocks_section.is_some()
-        && has_burnchain_aux;
+    // Build the set of expected files so that stale files in a reused
+    // out-dir are rejected rather than blessed into the manifest.
+    let mut expected = HashSet::new();
 
-    // Compute checksums for full GSS (mandatory).  For partial squash
-    // manifests, checksums are omitted.
-    let checksums = if is_full_gss {
-        // Build the set of expected files from the known GSS outputs so that
-        // stale files in a reused out-dir are rejected rather than blessed.
-        let mut expected = HashSet::new();
+    // MARF databases + blobs.
+    insert_expected_rel(out_dir, &clarity_out.db, &mut expected);
+    if let Some(b) = &clarity_out.blobs {
+        insert_expected_rel(out_dir, b, &mut expected);
+    }
+    insert_expected_rel(out_dir, &index_out.db, &mut expected);
+    if let Some(b) = &index_out.blobs {
+        insert_expected_rel(out_dir, b, &mut expected);
+    }
+    insert_expected_rel(out_dir, &sortition_out.0.db, &mut expected);
 
-        // MARF databases + blobs.
-        if let Some(c) = clarity_out {
-            insert_expected_rel(out_dir, &c.db, &mut expected);
-            if let Some(b) = &c.blobs {
-                insert_expected_rel(out_dir, b, &mut expected);
-            }
-        }
-        insert_expected_rel(out_dir, &index_out.db, &mut expected);
-        if let Some(b) = &index_out.blobs {
-            insert_expected_rel(out_dir, b, &mut expected);
-        }
-        if let Some((s, _)) = sortition_out {
-            insert_expected_rel(out_dir, &s.db, &mut expected);
-        }
+    // Bitcoin auxiliary files.
+    expected.insert("burnchain/burnchain.sqlite".to_string());
+    expected.insert("headers.sqlite".to_string());
 
-        // Burnchain auxiliary files.
-        if has_burnchain_aux {
-            expected.insert("burnchain/burnchain.sqlite".to_string());
-            expected.insert("headers.sqlite".to_string());
-        }
+    // Block data files.
+    for rel in copied_block_rel_paths {
+        expected.insert(rel.clone());
+    }
 
-        // Block data files: use the exact paths carried forward from the
-        // copy steps rather than re-walking the output directory (which
-        // could include stale files from a previous run).
-        for rel in copied_block_rel_paths {
-            expected.insert(rel.clone());
-        }
-
-        let files = compute_checksums(out_dir, Some(&expected)).unwrap_or_else(|e| {
-            eprintln!("Failed to compute checksums: {e}");
-            std::process::exit(1);
-        });
-        println!("Computed SHA-256 checksums for {} files", files.len());
-        Some(ChecksumsSection { files })
-    } else {
-        None
-    };
+    let files = compute_checksums(out_dir, Some(&expected)).unwrap_or_else(|e| {
+        eprintln!("Failed to compute checksums: {e}");
+        std::process::exit(1);
+    });
+    println!("Computed SHA-256 checksums for {} files", files.len());
 
     let manifest = SquashManifest {
         snapshot: SnapshotSection {
             version: 1,
             height,
             block_hash: format!("0x{i_tip}"),
-            bitcoin_height,
-            bitcoin_block_hash,
+            bitcoin_height: Some(bitcoin_height),
+            bitcoin_block_hash: Some(bitcoin_block_hash),
             timestamp,
             chain_id,
             mainnet,
         },
         roots: RootsSection {
-            clarity_archival_marf_root_hash: c_archival,
+            clarity_archival_marf_root_hash: Some(c_archival),
             index_archival_marf_root_hash: i_archival,
-            sortition_archival_marf_root_hash: s_archival,
+            sortition_archival_marf_root_hash: Some(s_archival),
         },
         squash_roots: SquashRootsSection {
             clarity_squash_root_node_hash: c_squash,
             index_squash_root_node_hash: i_squash,
             sortition_squash_root_node_hash: s_squash,
         },
-        blocks: blocks_section,
-        checksums,
+        blocks: Some(blocks_section),
+        checksums: Some(ChecksumsSection { files }),
     };
 
     let toml_str = toml::to_string(&manifest).unwrap_or_else(|e| {
         eprintln!("Failed to serialize manifest: {e}");
         std::process::exit(1);
     });
-
-    if !is_full_gss {
-        println!("Skipping manifest generation (partial squash).");
-        return;
-    }
 
     let manifest_path = out_dir.join(GSS_MANIFEST);
     fs::write(&manifest_path, toml_str).unwrap_or_else(|e| {

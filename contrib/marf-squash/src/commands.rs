@@ -9,8 +9,8 @@ use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 use crate::cli::{BlocksSection, LatestHeightArgs, SquashArgs, ValidateArgs, VerifyArgs};
 use crate::manifest::generate_manifest;
 use crate::ops::{
-    copy_burnchain_aux_files, squash_and_copy_one, validate_block_data,
-    validate_burnchain_aux_files, validate_one, SideTableMode,
+    copy_bitcoin_aux_files, squash_and_copy_one, validate_bitcoin_aux_files, validate_block_data,
+    validate_one, SideTableMode,
 };
 use crate::util::{
     chainstate_paths, default_open_opts, ensure_blobs_match, ensure_targets_selected,
@@ -25,6 +25,7 @@ pub fn run_squash(args: SquashArgs) {
         args.index,
         args.sortition,
         args.blocks,
+        args.bitcoin,
         args.all,
     );
 
@@ -38,7 +39,7 @@ pub fn run_squash(args: SquashArgs) {
 
     // Resolve burn heights for sortition if needed.
     // marf_height = bitcoin_height - first_burn_height (for MARF squash/validate)
-    // bitcoin_height = actual Bitcoin block height (for burnchain.sqlite and SPV)
+    // bitcoin_height = actual Bitcoin block height (for bitcoin aux DBs and SPV)
     let burn_heights = if do_sortition {
         Some(resolve_burn_height_for_sortition(
             paths.sortition.db.to_str().unwrap(),
@@ -118,6 +119,15 @@ pub fn run_squash(args: SquashArgs) {
     let dst_nakamoto = dst_blocks_dir.join("nakamoto.sqlite");
 
     if do_blocks {
+        // Ensure destination blocks directory exists before any copy step.
+        std::fs::create_dir_all(&dst_blocks_dir).unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to create blocks dir {}: {e}",
+                dst_blocks_dir.display()
+            );
+            std::process::exit(1);
+        });
+
         let i_out = index_out
             .as_ref()
             .expect("--blocks requires --index; index_out must be set");
@@ -206,22 +216,24 @@ pub fn run_squash(args: SquashArgs) {
         copied_block_rel_paths.push("chainstate/blocks/nakamoto.sqlite".to_string());
     }
 
-    // Burnchain auxiliary files: burnchain.sqlite + headers.sqlite.
-    // Only when producing a complete GSS (all three MARFs + blocks).
-    let do_burnchain_aux = do_clarity && do_index && do_sortition && do_blocks;
-    let mut has_burnchain_aux = false;
-
-    // These variables are needed by both the copy and validation phases for burnchain.
+    // Bitcoin auxiliary files: burnchain.sqlite + headers.sqlite.
+    // Requires --sortition (or --all) for the squashed sortition DB and burn heights.
+    let do_bitcoin_aux = args.bitcoin || args.all;
+    if do_bitcoin_aux && !do_sortition {
+        eprintln!("--bitcoin requires --sortition (or --all)");
+        std::process::exit(1);
+    }
+    // These variables are needed by both the copy and validation phases for bitcoin aux.
     let src_bc_db = args.chainstate.join("burnchain/burnchain.sqlite");
     let dst_bc_db = args.out_dir.join("burnchain/burnchain.sqlite");
     let squashed_sort = args.out_dir.join("burnchain/sortition/marf.sqlite");
     let src_hdr = args.chainstate.join("headers.sqlite");
     let dst_hdr = args.out_dir.join("headers.sqlite");
 
-    if do_burnchain_aux {
+    if do_bitcoin_aux {
         let (_, bitcoin_height) =
             burn_heights.expect("burn_heights resolved when do_sortition=true");
-        copy_burnchain_aux_files(
+        copy_bitcoin_aux_files(
             &src_bc_db,
             &dst_bc_db,
             &squashed_sort,
@@ -229,7 +241,6 @@ pub fn run_squash(args: SquashArgs) {
             &dst_hdr,
             bitcoin_height,
         );
-        has_burnchain_aux = true;
     }
 
     // Phase 2: Validation
@@ -301,10 +312,10 @@ pub fn run_squash(args: SquashArgs) {
             }
         }
 
-        if do_burnchain_aux {
+        if do_bitcoin_aux {
             let (_, bitcoin_height) =
                 burn_heights.expect("burn_heights resolved when do_sortition=true");
-            if !validate_burnchain_aux_files(
+            if !validate_bitcoin_aux_files(
                 &src_bc_db,
                 &dst_bc_db,
                 &squashed_sort,
@@ -322,16 +333,16 @@ pub fn run_squash(args: SquashArgs) {
         std::process::exit(1);
     }
 
-    // Generate manifest when index is included.
-    if let Some(ref i_out) = index_out {
+    // Generate manifest only for a complete GSS (all MARFs + blocks + bitcoin aux).
+    if do_clarity && do_index && do_sortition && do_blocks && do_bitcoin_aux {
+        let (sort_paths, sort_height) = sortition_out.unwrap();
         generate_manifest(
             &args.out_dir,
-            clarity_out.as_ref(),
-            i_out,
-            sortition_out.as_ref().map(|(p, bh)| (p, *bh)),
+            clarity_out.as_ref().unwrap(),
+            index_out.as_ref().unwrap(),
+            (&sort_paths, sort_height),
             args.height,
-            blocks_stats,
-            has_burnchain_aux,
+            blocks_stats.unwrap(),
             &copied_block_rel_paths,
         );
     }
@@ -343,6 +354,7 @@ pub fn run_validate(args: ValidateArgs) {
         args.index,
         args.sortition,
         args.blocks,
+        args.bitcoin,
         args.all,
     );
 
@@ -431,9 +443,13 @@ pub fn run_validate(args: ValidateArgs) {
         }
     }
 
-    // Burnchain auxiliary validation.
-    let do_burnchain_aux = do_clarity && do_index && do_sortition && do_blocks;
-    if do_burnchain_aux {
+    // Bitcoin auxiliary validation.
+    let do_bitcoin_aux = args.bitcoin || args.all;
+    if do_bitcoin_aux && !do_sortition {
+        eprintln!("--bitcoin requires --sortition (or --all)");
+        std::process::exit(1);
+    }
+    if do_bitcoin_aux {
         let (_, bitcoin_height) = resolve_burn_height_for_sortition(
             source_paths.sortition.db.to_str().unwrap(),
             source_paths.index.db.to_str().unwrap(),
@@ -448,7 +464,7 @@ pub fn run_validate(args: ValidateArgs) {
         let src_hdr = args.source_chainstate.join("headers.sqlite");
         let dst_hdr = args.squashed_chainstate.join("headers.sqlite");
 
-        if !validate_burnchain_aux_files(
+        if !validate_bitcoin_aux_files(
             &src_bc_db,
             &dst_bc_db,
             &squashed_sort,

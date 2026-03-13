@@ -55,6 +55,10 @@ pub struct SquashArgs {
     /// Requires --index (or --all).
     #[arg(long)]
     pub blocks: bool,
+    /// Copy Bitcoin auxiliary files (burnchain.sqlite + headers.sqlite).
+    /// Requires --sortition (or --all).
+    #[arg(long)]
+    pub bitcoin: bool,
     /// Skip validation to speed up size measurements.
     #[arg(long = "skip-validate")]
     pub skip_validate: bool,
@@ -91,6 +95,9 @@ pub struct ValidateArgs {
     /// Validate block data (epoch 2.x files, confirmed microblocks, nakamoto.sqlite).
     #[arg(long)]
     pub blocks: bool,
+    /// Validate Bitcoin auxiliary files (burnchain.sqlite + headers.sqlite).
+    #[arg(long)]
+    pub bitcoin: bool,
     /// Run full leaf-by-leaf comparison (slow, O(leaf_count)).
     /// By default, validation uses the fast hash-based check.
     #[arg(long)]

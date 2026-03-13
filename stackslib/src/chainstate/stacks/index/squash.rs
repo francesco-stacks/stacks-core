@@ -608,12 +608,49 @@ pub(crate) fn compute_blob_offsets(store: &mut NodeStore) -> Result<(Vec<u64>, u
     let mut blob_offsets: Vec<u64> = Vec::with_capacity(n);
     let mut current_offset = header_size;
 
+    // Pass 1: compute offsets using original (array-index) pointer values.
     for idx in 0..n {
         blob_offsets.push(current_offset);
         let node = store.read_node_with(&mut reader, idx)?;
         let byte_len = get_node_byte_len(&node) as u64;
         current_offset += byte_len;
     }
+
+    // If the blob fits in 4 GiB, no pointer will switch to u64 encoding.
+    if current_offset <= u32::MAX as u64 {
+        return Ok((blob_offsets, current_offset));
+    }
+
+    // Pass 2+: recompute with blob-offset pointer values until stable.
+    loop {
+        let prev_total = current_offset;
+        current_offset = header_size;
+
+        for idx in 0..n {
+            blob_offsets[idx] = current_offset;
+            let mut node = store.read_node_with(&mut reader, idx)?;
+
+            // Simulate the pointer replacement that stream_squash_blob will do.
+            if !node.is_leaf() {
+                for ptr in node.ptrs_mut() {
+                    if ptr.id() != TrieNodeID::Empty as u8 && !is_backptr(ptr.id()) {
+                        let child_idx = ptr.ptr() as usize;
+                        if let Some(&offset) = blob_offsets.get(child_idx) {
+                            ptr.ptr = offset;
+                        }
+                    }
+                }
+            }
+
+            let byte_len = get_node_byte_len(&node) as u64;
+            current_offset += byte_len;
+        }
+
+        if current_offset == prev_total {
+            break;
+        }
+    }
+
     Ok((blob_offsets, current_offset))
 }
 

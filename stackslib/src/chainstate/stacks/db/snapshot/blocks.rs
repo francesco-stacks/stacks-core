@@ -21,6 +21,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 
 use super::common::{clone_schemas_from_source, full_row_except_match};
+use crate::chainstate::stacks::db::blocks::index_block_hash_to_rel_path;
 use crate::chainstate::stacks::index::Error;
 use crate::core::EMPTY_MICROBLOCK_PARENT_HASH;
 
@@ -98,15 +99,6 @@ impl Epoch2BlockFileValidation {
     pub fn is_valid(&self) -> bool {
         self.all_files_present && self.no_extra_files && self.all_bytes_match
     }
-}
-
-/// Convert a `StacksBlockId` to a relative path `{XX}/{YY}/{hash}` matching
-/// `StacksChainState::get_index_block_pathbuf` at blocks.rs:413.
-fn index_block_hash_to_rel_path(hash: &StacksBlockId) -> PathBuf {
-    let hex = hash.to_hex();
-    let xx = &hex[0..2];
-    let yy = &hex[2..4];
-    PathBuf::from(xx).join(yy).join(&hex)
 }
 
 /// Return the hashes of confirmed microblocks descending from `parent_ibh`.

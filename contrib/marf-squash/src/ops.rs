@@ -556,9 +556,9 @@ pub fn validate_block_data(
     valid
 }
 
-/// Validate burnchain auxiliary files (burnchain.sqlite + headers.sqlite).
+/// Validate Bitcoin auxiliary files (burnchain.sqlite + headers.sqlite).
 /// Returns `true` if all checks pass.
-pub fn validate_burnchain_aux_files(
+pub fn validate_bitcoin_aux_files(
     src_bc_db: &Path,
     dst_bc_db: &Path,
     squashed_sort: &Path,
@@ -566,7 +566,7 @@ pub fn validate_burnchain_aux_files(
     dst_hdr: &Path,
     burn_height: u32,
 ) -> bool {
-    println!("Validating burnchain auxiliary files...");
+    println!("Validating Bitcoin auxiliary files...");
     let mut valid = true;
 
     match validate_burnchain_db(
@@ -624,9 +624,9 @@ pub fn validate_burnchain_aux_files(
     valid
 }
 
-/// Copy burnchain auxiliary files (burnchain.sqlite + headers.sqlite).
+/// Copy Bitcoin auxiliary files (burnchain.sqlite + headers.sqlite).
 /// Exits on error.
-pub fn copy_burnchain_aux_files(
+pub fn copy_bitcoin_aux_files(
     src_bc_db: &Path,
     dst_bc_db: &Path,
     squashed_sort: &Path,

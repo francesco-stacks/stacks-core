@@ -2,7 +2,7 @@
 
 Offline CLI for producing Genesis State Snapshots (GSS) from a Stacks node's
 chainstate. Squashes the three MARFs (Clarity, Index, Sortition), copies
-canonical block data and burnchain auxiliary files, generates a manifest with
+canonical block data and Bitcoin auxiliary files, generates a manifest with
 SHA-256 checksums, and provides offline verification against WSCP checkpoints.
 
 ## Build
@@ -36,7 +36,7 @@ marf-squash squash \
 
 `--all` squashes all three MARFs (Clarity, Index, Sortition). `--blocks` copies
 canonical block data (epoch 2.x files, confirmed microblocks, nakamoto.sqlite).
-When all three MARFs and blocks are included, burnchain auxiliary files
+When all three MARFs and blocks are included, Bitcoin auxiliary files
 (burnchain.sqlite, headers.sqlite) are also copied and a `GSS_manifest.toml` is
 generated with SHA-256 checksums for every artifact.
 

@@ -166,12 +166,13 @@ pub fn ensure_targets_selected(
     index: bool,
     sortition: bool,
     blocks: bool,
+    bitcoin: bool,
     all: bool,
 ) {
     let (c, i, s) = selected_targets(clarity, index, sortition, all);
-    if !c && !i && !s && !blocks {
+    if !c && !i && !s && !blocks && !bitcoin {
         eprintln!(
-            "Must specify at least one target: --clarity, --index, --sortition, --blocks, or --all"
+            "Must specify at least one target: --clarity, --index, --sortition, --blocks, --bitcoin, or --all"
         );
         std::process::exit(1);
     }
@@ -300,7 +301,7 @@ pub fn index_pox_constants(index_db_path: &Path) -> (u64, u64) {
 ///
 /// Returns `(marf_height, bitcoin_height)` where:
 /// - `marf_height` = bitcoin_height - first_burn_height (for MARF squash/validate)
-/// - `bitcoin_height` = the actual Bitcoin block height (for burnchain.sqlite and SPV)
+/// - `bitcoin_height` = the actual Bitcoin block height (for Bitcoin auxiliary DBs and SPV)
 ///
 /// Uses the index MARF to find the canonical block hash at `stacks_height`, then
 /// looks up `burn_header_height` from `nakamoto_block_headers` for that exact block.
