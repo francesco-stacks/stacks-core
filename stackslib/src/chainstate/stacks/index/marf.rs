@@ -13,6 +13,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+use std::collections::BTreeMap;
 use std::ops::DerefMut;
 #[cfg(any(test, feature = "testing"))]
 use std::sync::LazyLock;
@@ -21,19 +22,20 @@ use std::time::Instant;
 #[cfg(any(test, feature = "testing"))]
 use clarity::util::tests::TestFlag;
 use rusqlite::{Connection, Transaction};
-use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
+use stacks_common::types::chainstate::{TRIEHASH_ENCODED_SIZE, TrieHash};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 pub use super::squash::{
-    SquashStats, SquashValidationStats, MARF_SQUASHED_BLOCK_ROOT_HASH_KEY, MARF_SQUASH_HEIGHT_KEY,
-    MARF_SQUASH_ROOT_KEY,
+    MARF_SQUASH_HEIGHT_KEY, MARF_SQUASH_ROOT_KEY, MARF_SQUASHED_BLOCK_ROOT_HASH_KEY, SquashStats,
+    SquashValidationStats,
 };
 use super::storage::ReopenedTrieStorageConnection;
 use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
 use crate::chainstate::stacks::index::node::{
-    clear_backptr, is_backptr, node_copy_update_ptrs, set_backptr, CursorError, TrieCowPtr,
-    TrieCursor, TrieNode256, TrieNodeID, TrieNodeType, TriePtr,
+    CursorError, TrieCowPtr, TrieCursor, TrieNode4, TrieNode16, TrieNode256, TrieNodeID,
+    TrieNodeType, TriePtr, clear_backptr, is_backptr, node_copy_update_ptrs, set_backptr,
 };
+use crate::chainstate::stacks::index::squashed_sql::{self, SquashedStateRow};
 use crate::chainstate::stacks::index::storage::{
     SquashInfo, TrieFileStorage, TrieHashCalculationMode, TrieStorageConnection,
     TrieStorageTransaction,
@@ -809,9 +811,7 @@ impl<T: MarfTrieId> MARF<T> {
             Some(ptr) => {
                 trace!(
                     "Walk backptrs for {:?} to {:?} from {:?}",
-                    cursor,
-                    &ptr,
-                    &start_node
+                    cursor, &ptr, &start_node
                 );
 
                 // this node had a child for this chr at one point
@@ -872,12 +872,242 @@ impl<T: MarfTrieId> MARF<T> {
 
         trace!(
             "Copied child 0x{:02x} to {:?}: ptr={:?} child={:?}",
-            chr,
-            &cur_block_hash,
-            &child_ptr,
-            &child_node
+            chr, &cur_block_hash, &child_ptr, &child_node
         );
         Ok((child_node, child_hash, child_ptr, child_block_hash))
+    }
+
+    fn hash_materialized_node(
+        storage: &mut TrieStorageTransaction<T>,
+        node: &TrieNodeType,
+        child_hashes: &[TrieHash],
+    ) -> TrieHash {
+        match node {
+            TrieNodeType::Leaf(leaf) => get_leaf_hash(leaf),
+            TrieNodeType::Node4(data) => get_node_hash(data, child_hashes, storage),
+            TrieNodeType::Node16(data) => get_node_hash(data, child_hashes, storage),
+            TrieNodeType::Node48(data) => get_node_hash(data.as_ref(), child_hashes, storage),
+            TrieNodeType::Node256(data) => get_node_hash(data.as_ref(), child_hashes, storage),
+        }
+    }
+
+    fn infer_squashed_subtrie_node_id(
+        rows: &[SquashedStateRow],
+        prefix_len: usize,
+    ) -> Result<u8, Error> {
+        if rows.is_empty() {
+            return Err(Error::NotFoundError);
+        }
+
+        if rows.len() == 1 {
+            return Ok(TrieNodeID::Leaf as u8);
+        }
+
+        let first = rows.first().ok_or(Error::NotFoundError)?.path.as_bytes();
+        let mut common_len = 0usize;
+        'outer: while prefix_len + common_len < TRIEHASH_ENCODED_SIZE {
+            let expected = first.get(prefix_len + common_len).copied().ok_or_else(|| {
+                Error::CorruptionError("Invalid squashed-state row prefix".into())
+            })?;
+            for row in rows.iter().skip(1) {
+                if row
+                    .path
+                    .as_bytes()
+                    .get(prefix_len + common_len)
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::CorruptionError("Invalid squashed-state row prefix".into())
+                    })?
+                    != expected
+                {
+                    break 'outer;
+                }
+            }
+            common_len += 1;
+        }
+
+        let mut child_count = 0usize;
+        let mut last_chr = None;
+        for row in rows {
+            let chr = row
+                .path
+                .as_bytes()
+                .get(prefix_len + common_len)
+                .copied()
+                .ok_or_else(|| {
+                    Error::CorruptionError("Invalid squashed-state row child path".into())
+                })?;
+            if last_chr != Some(chr) {
+                child_count += 1;
+                last_chr = Some(chr);
+            }
+        }
+
+        let node_id = match child_count {
+            0 => TrieNodeID::Leaf as u8,
+            1..=4 => TrieNodeID::Node4 as u8,
+            5..=16 => TrieNodeID::Node16 as u8,
+            17..=48 => TrieNodeID::Node48 as u8,
+            _ => TrieNodeID::Node256 as u8,
+        };
+        Ok(node_id)
+    }
+
+    fn write_squashed_rows_as_subtrie(
+        storage: &mut TrieStorageTransaction<T>,
+        rows: &[SquashedStateRow],
+        prefix_len: usize,
+        owner_block_id: u32,
+    ) -> Result<(TrieNodeType, TrieHash, u64), Error> {
+        if rows.is_empty() {
+            return Err(Error::NotFoundError);
+        }
+
+        if rows.len() == 1 {
+            let row = rows.first().ok_or(Error::NotFoundError)?;
+            let path = row
+                .path
+                .as_bytes()
+                .get(prefix_len..)
+                .ok_or_else(|| Error::CorruptionError("Invalid squashed-state leaf prefix".into()))?
+                .to_vec();
+            let leaf = TrieLeaf::from_value(&path, row.value.clone());
+            let node = TrieNodeType::Leaf(leaf);
+            let hash = Self::hash_materialized_node(storage, &node, &[]);
+            let ptr = storage.last_ptr()?;
+            storage.write_nodetype(ptr, &node, hash)?;
+            return Ok((node, hash, ptr));
+        }
+
+        let first = rows.first().ok_or(Error::NotFoundError)?.path.as_bytes();
+        let mut common_len = 0usize;
+        'outer: while prefix_len + common_len < TRIEHASH_ENCODED_SIZE {
+            let expected = first.get(prefix_len + common_len).copied().ok_or_else(|| {
+                Error::CorruptionError("Invalid squashed-state node prefix".into())
+            })?;
+            for row in rows.iter().skip(1) {
+                if row
+                    .path
+                    .as_bytes()
+                    .get(prefix_len + common_len)
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::CorruptionError("Invalid squashed-state node prefix".into())
+                    })?
+                    != expected
+                {
+                    break 'outer;
+                }
+            }
+            common_len += 1;
+        }
+
+        let node_path = first
+            .get(prefix_len..(prefix_len + common_len))
+            .ok_or_else(|| Error::CorruptionError("Invalid squashed-state node prefix".into()))?
+            .to_vec();
+
+        let mut groups: BTreeMap<u8, Vec<SquashedStateRow>> = BTreeMap::new();
+        for row in rows.iter().cloned() {
+            let chr = row
+                .path
+                .as_bytes()
+                .get(prefix_len + common_len)
+                .copied()
+                .ok_or_else(|| {
+                    Error::CorruptionError("Invalid squashed-state child prefix".into())
+                })?;
+            groups.entry(chr).or_default().push(row);
+        }
+
+        let mut child_ptrs = Vec::with_capacity(groups.len());
+        let mut child_hashes = Vec::with_capacity(groups.len());
+        for (chr, group_rows) in groups.into_iter() {
+            let source_block_id = group_rows
+                .first()
+                .ok_or_else(|| Error::CorruptionError("Empty squashed-state child group".into()))?
+                .source_block_id;
+            let single_source = group_rows
+                .iter()
+                .all(|row| row.source_block_id == source_block_id);
+            if single_source && source_block_id != owner_block_id {
+                let child_id =
+                    Self::infer_squashed_subtrie_node_id(&group_rows, prefix_len + common_len + 1)?;
+                let block_hash = storage
+                    .get_block_from_local_id(source_block_id)?
+                    .clone()
+                    .to_bytes();
+                child_ptrs.push(TriePtr::new_squashptr(child_id, chr, 0, source_block_id));
+                child_hashes.push(TrieHash(block_hash));
+            } else {
+                let (child_node, child_hash, child_offset) = Self::write_squashed_rows_as_subtrie(
+                    storage,
+                    &group_rows,
+                    prefix_len + common_len + 1,
+                    group_rows
+                        .iter()
+                        .map(|row| row.source_block_id)
+                        .max()
+                        .unwrap_or(owner_block_id),
+                )?;
+                child_ptrs.push(TriePtr::new(child_node.id(), chr, child_offset));
+                child_hashes.push(child_hash);
+            }
+        }
+
+        let mut node = match child_ptrs.len() {
+            0 => {
+                return Err(Error::CorruptionError(
+                    "Materialized squashed subtree had no children".into(),
+                ));
+            }
+            1..=4 => TrieNodeType::Node4(TrieNode4::new(&node_path)),
+            5..=16 => TrieNodeType::Node16(TrieNode16::new(&node_path)),
+            17..=48 => TrieNodeType::Node48(Box::new(
+                crate::chainstate::stacks::index::node::TrieNode48::new(&node_path),
+            )),
+            _ => TrieNodeType::Node256(Box::new(TrieNode256::new(&node_path))),
+        };
+
+        for child_ptr in child_ptrs.iter() {
+            let inserted = node.insert(child_ptr);
+            if !inserted {
+                return Err(Error::CorruptionError(
+                    "Failed to insert child into materialized squashed subtree".into(),
+                ));
+            }
+        }
+
+        let hash = Self::hash_materialized_node(storage, &node, &child_hashes);
+        let ptr = storage.last_ptr()?;
+        storage.write_nodetype(ptr, &node, hash)?;
+        Ok((node, hash, ptr))
+    }
+
+    fn node_child_copy_from_squashed(
+        storage: &mut TrieStorageTransaction<T>,
+        squashptr: &TriePtr,
+        chr: u8,
+        cursor: &TrieCursor<T>,
+    ) -> Result<(TrieNodeType, TrieHash, TriePtr, T), Error> {
+        let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
+        let source_block_hash = storage
+            .get_block_from_local_id(squashptr.back_block())?
+            .clone();
+        let prefix = cursor.path.as_bytes().get(..cursor.tell()).ok_or_else(|| {
+            Error::CorruptionError("Invalid cursor prefix while materializing squashptr".into())
+        })?;
+        let rows = squashed_sql::read_squashed_state_prefix(storage.sqlite_conn(), prefix)?;
+        let (child_node, child_hash, child_offset) = Self::write_squashed_rows_as_subtrie(
+            storage,
+            &rows,
+            prefix.len(),
+            squashptr.back_block(),
+        )?;
+
+        storage.open_block_maybe_id(&cur_block_hash, cur_block_id)?;
+        let child_ptr = TriePtr::new(child_node.id(), chr, child_offset);
+        Ok((child_node, child_hash, child_ptr, source_block_hash))
     }
 
     /// Copy the root node from the previous Trie to this Trie, updating its ptrs.
@@ -992,8 +1222,7 @@ impl<T: MarfTrieId> MARF<T> {
                             {
                                 trace!(
                                     "Out-of-path but encountered at {:?}: {:?}",
-                                    &node_ptr,
-                                    &node
+                                    &node_ptr, &node
                                 );
                                 error!("Out-of-path but encountered a non-leaf");
                                 return Err(Error::CorruptionError(
@@ -1024,7 +1253,10 @@ impl<T: MarfTrieId> MARF<T> {
                                 }
                                 CursorError::ChrNotFound => {
                                     // end-of-node-path but no such child -- not even a backptr.
-                                    trace!("ChrNotFound encountered at {:?} -- we're done (node not found)", storage.get_cur_block());
+                                    trace!(
+                                        "ChrNotFound encountered at {:?} -- we're done (node not found)",
+                                        storage.get_cur_block()
+                                    );
                                     storage.open_block_maybe_id(block_hash, block_id)?;
                                     return Ok(cursor);
                                 }
@@ -1047,6 +1279,26 @@ impl<T: MarfTrieId> MARF<T> {
                                     );
 
                                     // keep walking
+                                    node = next_node;
+                                    node_ptr = next_node_ptr;
+
+                                    storage.open_block_maybe_id(block_hash, block_id)?;
+                                }
+                                CursorError::SquashptrEncountered(ptr) => {
+                                    storage.open_block_maybe_id(block_hash, block_id)?;
+                                    let (next_node, _, next_node_ptr, next_node_block_hash) =
+                                        MARF::node_child_copy_from_squashed(
+                                            storage,
+                                            &ptr,
+                                            ptr.chr(),
+                                            &cursor,
+                                        )?;
+
+                                    cursor.repair_backptr_finish(
+                                        &next_node_ptr,
+                                        next_node_block_hash,
+                                    );
+
                                     node = next_node;
                                     node_ptr = next_node_ptr;
 
@@ -1144,6 +1396,10 @@ impl<T: MarfTrieId> MARF<T> {
                                     // keep going
                                     node = next_node;
                                     continue;
+                                }
+                                CursorError::SquashptrEncountered(_ptr) => {
+                                    storage.bench_mut().marf_walk_from_finish();
+                                    return Err(Error::NotFoundError);
                                 }
                             }
                         }
@@ -1338,6 +1594,10 @@ impl<T: MarfTrieId> MARF<T> {
         let path = TrieHash::from_key(key);
 
         let result = MARF::get_path(storage, block_hash, &path).or_else(|e| match e {
+            Error::NotFoundError if storage.squash_info().is_some() => Ok(
+                squashed_sql::get_squashed_state_row(storage.sqlite_conn(), &path)?
+                    .map(|row| TrieLeaf::from_value(&[], row.value)),
+            ),
             Error::NotFoundError => Ok(None),
             _ => Err(e),
         });
@@ -1363,6 +1623,10 @@ impl<T: MarfTrieId> MARF<T> {
         let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
 
         let result = MARF::get_path(storage, block_hash, path).or_else(|e| match e {
+            Error::NotFoundError if storage.squash_info().is_some() => Ok(
+                squashed_sql::get_squashed_state_row(storage.sqlite_conn(), path)?
+                    .map(|row| TrieLeaf::from_value(&[], row.value)),
+            ),
             Error::NotFoundError => Ok(None),
             _ => Err(e),
         });
@@ -1832,6 +2096,23 @@ impl<T: MarfTrieId> MARF<T> {
     where
         F: FnMut(TrieHash, MARFValue) -> Result<(), Error>,
     {
+        Self::for_each_leaf_with_source_block(
+            storage,
+            block_hash,
+            |path, value, _source_block_id| handle_leaf(path, value),
+        )
+    }
+
+    /// Walk all leaves in the trie at `block_hash`, yielding full paths, values, and the source
+    /// block ID of the leaf as resolved through backpointers.
+    pub(crate) fn for_each_leaf_with_source_block<F>(
+        storage: &mut TrieStorageConnection<T>,
+        block_hash: &T,
+        mut handle_leaf: F,
+    ) -> Result<u64, Error>
+    where
+        F: FnMut(TrieHash, MARFValue, u32) -> Result<(), Error>,
+    {
         let (original_block_hash, original_block_id) = storage.get_cur_block_and_id();
         let result = Self::inner_each_leaf(storage, block_hash, &mut handle_leaf);
 
@@ -1856,7 +2137,7 @@ impl<T: MarfTrieId> MARF<T> {
         handle_leaf: &mut F,
     ) -> Result<u64, Error>
     where
-        F: FnMut(TrieHash, MARFValue) -> Result<(), Error>,
+        F: FnMut(TrieHash, MARFValue, u32) -> Result<(), Error>,
     {
         storage.open_block(block_hash)?;
         let (root_node, _root_hash) = Trie::read_root(storage)?;
@@ -1884,7 +2165,12 @@ impl<T: MarfTrieId> MARF<T> {
                     let path = TrieHash::from_bytes(&full_prefix).ok_or_else(|| {
                         Error::CorruptionError("Failed to decode leaf path".to_string())
                     })?;
-                    handle_leaf(path, leaf.data)?;
+                    let source_block_id = block_id.ok_or_else(|| {
+                        Error::CorruptionError(
+                            "Resolved leaf without a source block identifier".to_string(),
+                        )
+                    })?;
+                    handle_leaf(path, leaf.data, source_block_id)?;
                     Ok(true)
                 }
                 _ => {

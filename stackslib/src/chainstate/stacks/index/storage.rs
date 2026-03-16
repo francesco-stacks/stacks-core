@@ -33,7 +33,8 @@ use crate::chainstate::stacks::index::cache::*;
 use crate::chainstate::stacks::index::file::{TrieFile, TrieFileNodeHashReader};
 use crate::chainstate::stacks::index::marf::MARFOpenOpts;
 use crate::chainstate::stacks::index::node::{
-    is_backptr, set_backptr, TrieCowPtr, TrieNode, TrieNodeID, TrieNodePatch, TrieNodeType, TriePtr,
+    is_backptr, is_squashptr, set_backptr, TrieCowPtr, TrieNode, TrieNodeID, TrieNodePatch,
+    TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::profile::TrieBenchmark;
 use crate::chainstate::stacks::index::trie::Trie;
@@ -846,7 +847,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
             // count get_nodetype load time for write_children_hashes_same_block benchmark, but
             // only if that code path will be exercised.
             for ptr in node.ptrs().iter() {
-                if !is_backptr(ptr.id()) && !ptr.is_empty() {
+                if !is_backptr(ptr.id()) && !is_squashptr(ptr.id()) && !ptr.is_empty() {
                     if let Some(start_node_time) = start_node_time.take() {
                         // count the time taken to load the root node in this case,
                         // but only do so once.
@@ -870,7 +871,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                     storage_tx
                         .bench
                         .write_children_hashes_empty_finish(start_time);
-                } else if !is_backptr(ptr.id()) {
+                } else if !is_backptr(ptr.id()) && !is_squashptr(ptr.id()) {
                     // hash is the hash of this node's children
                     let node_hash = self.calculate_node_hashes(storage_tx, ptr.ptr())?;
 
@@ -965,7 +966,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
             // queue each child
             if !node.is_leaf() {
                 for ptr in node.ptrs().iter() {
-                    if !ptr.is_empty() && !is_backptr(ptr.id) {
+                    if !ptr.is_empty() && !is_backptr(ptr.id) && !is_squashptr(ptr.id) {
                         let idx = u32::try_from(ptr.ptr()).map_err(|_| {
                             Error::CorruptionError(format!(
                                 "In-memory node index {} exceeds u32::MAX",
@@ -1015,7 +1016,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 if !next_node.is_leaf() {
                     let ptrs = next_node.ptrs_mut();
                     for ptr in ptrs.iter_mut() {
-                        if !ptr.is_empty() && !is_backptr(ptr.id) {
+                        if !ptr.is_empty() && !is_backptr(ptr.id) && !is_squashptr(ptr.id) {
                             let next_offset = *offsets.get(i).ok_or_else(|| {
                                 Error::CorruptionError("Miscalculated dump_consume offsets".into())
                             })?;
@@ -1204,7 +1205,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 let mut num_new_nodes = 0;
                 if !node.is_leaf() {
                     for ptr in node.ptrs().iter() {
-                        if !ptr.is_empty() && !is_backptr(ptr.id) {
+                        if !ptr.is_empty() && !is_backptr(ptr.id) && !is_squashptr(ptr.id) {
                             num_new_nodes += 1;
                         }
                     }
@@ -1215,7 +1216,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
             // queue each child
             if !node.is_leaf() {
                 for ptr in node.ptrs().iter() {
-                    if !ptr.is_empty() && !is_backptr(ptr.id) {
+                    if !ptr.is_empty() && !is_backptr(ptr.id) && !is_squashptr(ptr.id) {
                         let idx = u32::try_from(ptr.ptr()).map_err(|_| {
                             Error::CorruptionError(format!(
                                 "In-memory node index {} exceeds u32::MAX",
@@ -1265,7 +1266,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
             for node_data_ptr in node_data.iter_mut() {
                 if let Some(patch) = node_data_ptr.patch_mut() {
                     for ptr in patch.ptr_diff.iter_mut() {
-                        if !ptr.is_empty() && !is_backptr(ptr.id) {
+                        if !ptr.is_empty() && !is_backptr(ptr.id) && !is_squashptr(ptr.id) {
                             let next_offset = *offsets.get(i).ok_or_else(|| {
                                 Error::CorruptionError(
                                     "Miscalculated dump_compressed_consume offsets".into(),
@@ -1291,7 +1292,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                     if !next_node.is_leaf() {
                         let ptrs = next_node.ptrs_mut();
                         for ptr in ptrs.iter_mut() {
-                            if !ptr.is_empty() && !is_backptr(ptr.id) {
+                            if !ptr.is_empty() && !is_backptr(ptr.id) && !is_squashptr(ptr.id) {
                                 let next_offset = *offsets.get(i).ok_or_else(|| {
                                     Error::CorruptionError(
                                         "Miscalculated dump_compressed_consume offsets".into(),
@@ -1353,7 +1354,10 @@ impl<T: MarfTrieId> TrieRAM<T> {
         if let TrieNodeType::Node256(ref mut data) = root_node {
             // queue children in the same order we stored them
             for ptr in data.ptrs.iter_mut() {
-                if ptr.id() != TrieNodeID::Empty as u8 && !is_backptr(ptr.id()) {
+                if ptr.id() != TrieNodeID::Empty as u8
+                    && !is_backptr(ptr.id())
+                    && !is_squashptr(ptr.id())
+                {
                     frontier.push_back(*ptr);
 
                     // fix up ptrs
@@ -1389,7 +1393,10 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 };
 
                 for ptr in ptrs {
-                    if ptr.id() != TrieNodeID::Empty as u8 && !is_backptr(ptr.id()) {
+                    if ptr.id() != TrieNodeID::Empty as u8
+                        && !is_backptr(ptr.id())
+                        && !is_squashptr(ptr.id())
+                    {
                         frontier.push_back(*ptr);
 
                         // fix up ptrs
@@ -3134,7 +3141,7 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
                 w.write_all(TrieHash::EMPTY.as_bytes())?;
 
                 bench.write_children_hashes_empty_finish(start_time);
-            } else if !is_backptr(ptr.id()) {
+            } else if !is_backptr(ptr.id()) && !is_squashptr(ptr.id()) {
                 // hash is in the same block as this node
                 let start_time = bench.write_children_hashes_same_block_start();
 
@@ -3150,8 +3157,8 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
 
                 bench.write_children_hashes_same_block_finish(start_time);
             } else {
-                // hash is in a different block altogether, so we just use the ancestor block hash.  The
-                // ptr.ptr() value points to the actual node in the ancestor block.
+                // Hash is resolved by block identity instead of inline node hash.
+                // This applies both to ordinary backpointers and squash-pointers.
                 let start_time = bench.write_children_hashes_ancestor_block_start();
 
                 let block_hash = map.get_block_hash_caching(ptr.back_block())?;

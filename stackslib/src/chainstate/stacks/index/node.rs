@@ -33,6 +33,7 @@ use crate::util::hash::to_hex;
 pub enum CursorError {
     PathDiverged,
     BackptrEncountered(TriePtr),
+    SquashptrEncountered(TriePtr),
     ChrNotFound,
 }
 
@@ -41,6 +42,7 @@ impl fmt::Display for CursorError {
         match *self {
             CursorError::PathDiverged => write!(f, "Path diverged"),
             CursorError::BackptrEncountered(_) => write!(f, "Back-pointer encountered"),
+            CursorError::SquashptrEncountered(_) => write!(f, "Squash-pointer encountered"),
             CursorError::ChrNotFound => write!(f, "Node child not found"),
         }
     }
@@ -60,9 +62,8 @@ impl error::Error for CursorError {
 // are compressed. This bit is cleared on read.
 // * the 6th bit is used to indicate whether or not the pointer
 // stores a u64 offset.
-// * the 5th bit is used to indicate that a compressed non-backptr
-// pointer carries an annotation payload (`back_block`).
-// This bit is wire-format metadata and is cleared on read.
+// * the 5th bit is used to indicate that this pointer targets the
+// squashed SQL state.  Such pointers carry `back_block` on disk.
 define_u8_enum!(TrieNodeID {
     Empty = 0,
     Leaf = 1,
@@ -103,26 +104,25 @@ pub fn clear_compressed(id: u8) -> u8 {
     id & 0xbf
 }
 
-/// Is this compressed inline pointer flagged to carry `back_block` payload bytes?
-/// This bit is wire-format-only metadata and is cleared after decoding.
-pub fn has_inline_back_block(id: u8) -> bool {
+/// Is this pointer a squash-pointer into the squashed SQL state?
+pub fn is_squashptr(id: u8) -> bool {
     id & 0x10 != 0
 }
 
-/// Set the compressed inline `back_block` payload bit.
-pub fn set_inline_back_block(id: u8) -> u8 {
+/// Set the squash-pointer bit.
+pub fn set_squashptr(id: u8) -> u8 {
     id | 0x10
 }
 
-/// Clear the compressed inline `back_block` payload bit.
-pub fn clear_inline_back_block(id: u8) -> u8 {
+/// Clear the squash-pointer bit.
+pub fn clear_squashptr(id: u8) -> u8 {
     id & 0xef
 }
 
 /// True if a compressed pointer with this encoded id includes a back_block payload.
 #[inline]
 fn has_back_block_payload_bytes(id: u8) -> bool {
-    is_backptr(id) || has_inline_back_block(id)
+    is_backptr(id) || is_squashptr(id)
 }
 
 /// Is this pointer encoded with a u64 offset?
@@ -140,7 +140,7 @@ pub const fn clear_u64_ptr(id: u8) -> u8 {
     id & 0xdf
 }
 
-/// Clear all control bits (backptr, compressed, u64-pointer, annotation)
+/// Clear all control bits (backptr, compressed, u64-pointer, squashptr)
 pub fn clear_ctrl_bits(id: u8) -> u8 {
     id & 0x0f
 }
@@ -420,9 +420,12 @@ impl<T: TrieNode, M: BlockMap> ConsensusSerializable<M> for T {
 ///   `back_block` is the `marf_data` row ID of that block, and `ptr` is the byte offset
 ///   within that block's trie storage.
 ///
-/// * Inline (`id & 0x80 == 0`): the child lives in the same trie storage.
-///   `back_block` is normally 0. In a squashed MARF, a non-zero `back_block` is a
-///   squash annotation: it records the original archival block ID.
+/// * Inline (`id & 0x80 == 0`, `id & 0x10 == 0`): the child lives in the same trie storage.
+///   `back_block` is 0.
+///
+/// * Squash-pointer (`id & 0x10 != 0`, `id & 0x80 == 0`): the child resolves into the
+///   squashed SQL state. `back_block` stores the source block identifier used for
+///   consensus hashing, while `ptr` is reserved for squash-local addressing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TriePtr {
     /// Node type ID of the child (see [`TrieNodeID`]). Bit 0x80 marks a back-pointer.
@@ -477,6 +480,16 @@ impl TriePtr {
     pub fn new_backptr(id: u8, chr: u8, ptr: u64, back_block: u32) -> TriePtr {
         TriePtr {
             id: set_backptr(id),
+            chr,
+            ptr,
+            back_block,
+        }
+    }
+
+    #[inline]
+    pub fn new_squashptr(id: u8, chr: u8, ptr: u64, back_block: u32) -> TriePtr {
+        TriePtr {
+            id: set_squashptr(id),
             chr,
             ptr,
             back_block,
@@ -573,19 +586,14 @@ impl TriePtr {
 
     #[inline]
     pub fn write_bytes_compressed<W: Write>(&self, w: &mut W) -> Result<(), Error> {
-        // Preserve squash annotation payload on disk for inline pointers that
-        // carry a non-zero back_block, without changing backptr semantics.
-        let mut encoded_id = set_compressed(self.encoded_id());
-        if !is_backptr(self.id()) && self.back_block() != 0 {
-            encoded_id = set_inline_back_block(encoded_id);
-        }
+        let encoded_id = set_compressed(self.encoded_id());
         w.write_all(&[encoded_id, self.chr()])?;
         if is_u64_ptr(encoded_id) {
             w.write_all(&self.ptr().to_be_bytes())?;
         } else {
             w.write_all(&(self.ptr() as u32).to_be_bytes())?;
         }
-        if is_backptr(self.id()) || self.back_block() != 0 {
+        if is_backptr(self.id()) || is_squashptr(self.id()) {
             w.write_all(&self.back_block().to_be_bytes())?;
         }
         Ok(())
@@ -598,9 +606,14 @@ impl TriePtr {
         block_map: &mut M,
         w: &mut W,
     ) -> Result<(), Error> {
-        w.write_all(&[self.id(), self.chr()])?;
+        let consensus_id = if is_squashptr(self.id()) {
+            set_backptr(clear_squashptr(self.id()))
+        } else {
+            self.id()
+        };
+        w.write_all(&[consensus_id, self.chr()])?;
 
-        if is_backptr(self.id()) {
+        if is_backptr(self.id()) || is_squashptr(self.id()) {
             w.write_all(
                 block_map
                     .get_block_hash_caching(self.back_block())
@@ -647,17 +660,13 @@ impl TriePtr {
     ///
     /// A compressed TriePtr stores `back_block` bytes if either:
     /// * it is a back-pointer (`is_backptr(id)`), or
-    /// * it is an inline pointer with back_block payload
-    ///   (`has_inline_back_block(id)`).
-    ///
-    /// The annotation bit is wire metadata and is cleared on read.
+    /// * it is a squash-pointer (`is_squashptr(id)`).
     #[inline]
     #[allow(clippy::indexing_slicing)]
     pub fn from_bytes_compressed(bytes: &[u8]) -> TriePtr {
         let encoded_id = clear_compressed(bytes[0]);
         assert!(bytes.len() >= TriePtr::compressed_size_for_id(encoded_id));
-        let has_annotation = has_inline_back_block(encoded_id);
-        let id = clear_u64_ptr(clear_inline_back_block(encoded_id));
+        let id = clear_u64_ptr(encoded_id);
         let chr = bytes[1];
         let ptr = if is_u64_ptr(encoded_id) {
             u64::from_be_bytes([
@@ -667,7 +676,7 @@ impl TriePtr {
             u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as u64
         };
 
-        let back_block = if is_backptr(id) || has_annotation {
+        let back_block = if is_backptr(id) || is_squashptr(id) {
             let back_block_offset = TriePtr::encoded_size_compressed_for_id(encoded_id);
             assert!(bytes.len() >= back_block_offset + 4);
             u32::from_be_bytes([
@@ -695,8 +704,7 @@ impl TriePtr {
     pub fn read_bytes_compressed<R: Read>(fd: &mut R) -> Result<TriePtr, codec_error> {
         let id_bits: u8 = read_next(fd)?;
         let encoded_id = clear_compressed(id_bits);
-        let has_annotation = has_inline_back_block(encoded_id);
-        let id = clear_u64_ptr(clear_inline_back_block(encoded_id));
+        let id = clear_u64_ptr(encoded_id);
         let chr: u8 = read_next(fd)?;
         let ptr = if is_u64_ptr(encoded_id) {
             let hi: [u8; 4] = read_next(fd)?;
@@ -706,7 +714,7 @@ impl TriePtr {
             let ptr_be_bytes: [u8; 4] = read_next(fd)?;
             u32::from_be_bytes(ptr_be_bytes) as u64
         };
-        let back_block = if is_backptr(id) || has_annotation {
+        let back_block = if is_backptr(id) || is_squashptr(id) {
             let bytes: [u8; 4] = read_next(fd)?;
             u32::from_be_bytes(bytes)
         } else {
@@ -731,7 +739,7 @@ impl TriePtr {
     #[inline]
     pub fn compressed_size(&self) -> usize {
         let encoded_id = self.encoded_id();
-        if !is_backptr(self.id) && self.back_block != 0 {
+        if is_squashptr(self.id) {
             Self::encoded_size_for_id(encoded_id)
         } else {
             Self::compressed_size_for_id(encoded_id)
@@ -740,7 +748,7 @@ impl TriePtr {
 
     /// Returns the size, in bytes, that a node occupies on disk, taking compression into account.
     /// Pointers without a `back_block` payload omit it, while backpointers and
-    /// inline-annotation pointers store it.
+    /// squash-pointers store it.
     #[inline]
     pub fn compressed_size_for_id(node_id: u8) -> usize {
         if !has_back_block_payload_bytes(node_id) {
@@ -833,10 +841,9 @@ impl<T: MarfTrieId> TrieCursor<T> {
     /// Otherwise, if we reach the end of the path, return None.  If the path diverges or a node
     /// cannot be found, then return an Err.
     ///
-    /// This method does not follow back-pointers, and will return Err if a back-pointer is
-    /// reached.  The caller will need to manually call walk() on the last node visited to get the
-    /// back-pointer, shunt to the node it points to, and then call walk_backptr_step_backptr() to
-    /// record the back-pointer that was followed.  Once the back-pointer has been followed,
+    /// This method does not follow back-pointers or squash-pointers, and will return Err if one is
+    /// reached.  The caller will need to manually resolve the pointer and then repair the cursor.
+    /// Once the pointer has been followed,
     /// caller should call walk_backptr_step_finish().  This is specifically relevant to the MARF,
     /// not to the individual tries.
     pub fn walk(
@@ -885,11 +892,14 @@ impl<T: MarfTrieId> TrieCursor<T> {
 
             let do_walk = match &ptr_opt {
                 Some(ptr) => {
-                    if !is_backptr(ptr.id()) {
+                    if !is_backptr(ptr.id()) && !is_squashptr(ptr.id()) {
                         // not going to follow a back-pointer
                         self.node_ptrs.push(*ptr);
                         self.block_hashes.push(block_hash.clone());
                         true
+                    } else if is_squashptr(ptr.id()) {
+                        self.last_error = Some(CursorError::SquashptrEncountered(*ptr));
+                        false
                     } else {
                         // the caller will need to follow the backptr, and call
                         // repair_backptr_step_backptr() for each node visited, and then repair_backptr_finish()
@@ -1388,13 +1398,18 @@ impl StacksMessageCodec for TrieNodePatch {
     }
 }
 
-/// Turn each non-empty, non-backptr in `ptrs` into a backptr.
-/// If `back_block` is already non-zero (squash annotation), it is preserved;
-/// otherwise it is set to `child_block_id`.
+/// Turn each non-empty, non-backptr, non-squashptr in `ptrs` into a backptr.
+/// Existing squash-pointers are preserved. Inline pointers with a non-zero
+/// `back_block` are also preserved for compatibility with the current
+/// squashed-trie annotation format while the new squash-pointer pipeline is
+/// being phased in.
 pub(crate) fn node_copy_update_ptrs(ptrs: &mut [TriePtr], child_block_id: u32) {
     for pointer in ptrs.iter_mut() {
         // if the node is empty, do nothing, if it's a back pointer
-        if pointer.id() == TrieNodeID::Empty as u8 || is_backptr(pointer.id()) {
+        if pointer.id() == TrieNodeID::Empty as u8
+            || is_backptr(pointer.id())
+            || is_squashptr(pointer.id())
+        {
             continue;
         }
         if pointer.back_block == 0 {

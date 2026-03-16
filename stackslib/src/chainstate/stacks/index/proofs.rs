@@ -28,14 +28,14 @@ use crate::chainstate::stacks::index::bits::{
 };
 use crate::chainstate::stacks::index::marf::MARF;
 use crate::chainstate::stacks::index::node::{
-    is_backptr, ConsensusSerializable, CursorError, TrieCursor, TrieNode, TrieNodeID, TrieNodeType,
-    TriePtr,
+    is_backptr, is_squashptr, ConsensusSerializable, CursorError, TrieCursor, TrieNode, TrieNodeID,
+    TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
     trie_sql, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, ProofTrieNode,
-    ProofTriePtr, TrieMerkleProof, TrieMerkleProofType,
+    ProofTriePtr, SqlProofBridge, TrieMerkleProof, TrieMerkleProofType,
 };
 
 impl<T: MarfTrieId> ConsensusSerializable<()> for ProofTrieNode<T> {
@@ -60,7 +60,7 @@ impl<T: MarfTrieId> ProofTriePtr<T> {
     ) -> Result<ProofTriePtr<T>, Error> {
         let id = other.id;
         let chr = other.chr;
-        let back_block = if is_backptr(id) {
+        let back_block = if is_backptr(id) || is_squashptr(id) {
             block_map
                 .get_block_hash_caching(other.back_block)?
                 .clone()
@@ -101,7 +101,7 @@ impl<T: MarfTrieId> ProofTrieNode<T> {
 }
 
 define_u8_enum!( TrieMerkleProofTypeIndicator {
-    Node4 = 0, Node16 = 1, Node48 = 2, Node256 = 3, Leaf = 4, Shunt = 5
+    Node4 = 0, Node16 = 1, Node48 = 2, Node256 = 3, Leaf = 4, Shunt = 5, SqlBridge = 6
 });
 
 impl<T: ClarityMarfTrieId> PartialEq for TrieMerkleProofType<T> {
@@ -131,6 +131,10 @@ impl<T: ClarityMarfTrieId> PartialEq for TrieMerkleProofType<T> {
                 TrieMerkleProofType::Shunt((ref idx_1, ref hashes_1)),
                 TrieMerkleProofType::Shunt((ref idx_2, ref hashes_2)),
             ) => idx_1 == idx_2 && hashes_1 == hashes_2,
+            (
+                TrieMerkleProofType::SqlBridge(ref left),
+                TrieMerkleProofType::SqlBridge(ref right),
+            ) => left == right,
             (_, _) => false,
         }
     }
@@ -198,6 +202,11 @@ impl<T: MarfTrieId> fmt::Debug for TrieMerkleProofType<T> {
                 f,
                 "TrieMerkleProofType::Shunt(idx={}, hashes={:?})",
                 idx, hashes
+            ),
+            TrieMerkleProofType::SqlBridge(ref bridge) => write!(
+                f,
+                "TrieMerkleProofType::SqlBridge(source_block={:?}, trusted_sql_commitment={:?}, archival_marf_root={:?})",
+                bridge.source_block, bridge.trusted_sql_commitment, bridge.archival_marf_root
             ),
         }
     }
@@ -281,6 +290,7 @@ impl<T: MarfTrieId> StacksMessageCodec for TrieMerkleProofType<T> {
             TrieMerkleProofType::Node256(_) => TrieMerkleProofTypeIndicator::Node256,
             TrieMerkleProofType::Leaf(_) => TrieMerkleProofTypeIndicator::Leaf,
             TrieMerkleProofType::Shunt(_) => TrieMerkleProofTypeIndicator::Shunt,
+            TrieMerkleProofType::SqlBridge(_) => TrieMerkleProofTypeIndicator::SqlBridge,
         } as u8;
 
         type_byte.consensus_serialize(fd)?;
@@ -306,6 +316,7 @@ impl<T: MarfTrieId> StacksMessageCodec for TrieMerkleProofType<T> {
                 id.consensus_serialize(fd)?;
                 hashes.consensus_serialize(fd)
             }
+            TrieMerkleProofType::SqlBridge(bridge) => bridge.consensus_serialize(fd),
         }
     }
 
@@ -337,9 +348,28 @@ impl<T: MarfTrieId> StacksMessageCodec for TrieMerkleProofType<T> {
                 let hashes = read_next(fd)?;
                 TrieMerkleProofType::Shunt((id, hashes))
             }
+            TrieMerkleProofTypeIndicator::SqlBridge => {
+                TrieMerkleProofType::SqlBridge(read_next(fd)?)
+            }
         };
 
         Ok(codec)
+    }
+}
+
+impl<T: MarfTrieId> StacksMessageCodec for SqlProofBridge<T> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
+        self.source_block.consensus_serialize(fd)?;
+        self.trusted_sql_commitment.consensus_serialize(fd)?;
+        self.archival_marf_root.consensus_serialize(fd)
+    }
+
+    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<SqlProofBridge<T>, codec_error> {
+        Ok(SqlProofBridge {
+            source_block: read_next(fd)?,
+            trusted_sql_commitment: read_next(fd)?,
+            archival_marf_root: read_next(fd)?,
+        })
     }
 }
 
@@ -476,8 +506,8 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         Ok(proof_node)
     }
 
-    /// Make the initial shunt proof in a MARF merkle proof, for a node that isn't a backptr.
-    /// This is a one-item list of a TrieMerkleProofType::Shunt proof entry.
+    /// Make the initial proof bridge in a MARF merkle proof, for a node that isn't a backptr.
+    /// This is either a normal shunt head or a SQL bridge when the proof originates in squashed SQL state.
     /// The storage handle must be opened to the block we care about.
     fn make_initial_shunt_proof(
         storage: &mut TrieStorageConnection<T>,
@@ -511,8 +541,18 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                 "Squash shunt proof: height={block_height}, archival_trie_hash={archival_trie_hash:?}"
             );
 
-            let backptr_proof = TrieMerkleProofType::Shunt((-1, vec![archival_trie_hash]));
-            return Ok(vec![backptr_proof]);
+            let trusted_sql_commitment = storage
+                .squash_info()
+                .ok_or_else(|| {
+                    Error::CorruptionError("Missing squash info for SQL proof bridge".into())
+                })?
+                .squash_root_node_hash;
+            let bridge = TrieMerkleProofType::SqlBridge(SqlProofBridge {
+                source_block: cur_block,
+                trusted_sql_commitment,
+                archival_marf_root: archival_trie_hash,
+            });
+            return Ok(vec![bridge]);
         }
 
         let backptr_ancestor_hashes = Trie::get_trie_ancestor_hashes_bytes(storage)?;
@@ -711,8 +751,20 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                         "Intermediate squash shunt: height={prev_height}, archival_trie_hash={archival_trie:?}"
                     );
 
-                    let squash_shunt = TrieMerkleProofType::Shunt((-1, vec![archival_trie]));
-                    proof.push(squash_shunt);
+                    let trusted_sql_commitment = storage
+                        .squash_info()
+                        .ok_or_else(|| {
+                            Error::CorruptionError(
+                                "Missing squash info for intermediate SQL proof bridge".into(),
+                            )
+                        })?
+                        .squash_root_node_hash;
+                    let bridge = TrieMerkleProofType::SqlBridge(SqlProofBridge {
+                        source_block: block_header.clone(),
+                        trusted_sql_commitment,
+                        archival_marf_root: archival_trie,
+                    });
+                    proof.push(bridge);
 
                     if !found_backptr {
                         trace!(
@@ -811,10 +863,9 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
 
     /// Verify the head of a shunt proof.
     ///
-    /// `trusted_squash_node_hashes` contains the set of squash trie root-node
-    /// hashes that the verifier trusts. When a squash shunt (idx=-1) is
-    /// encountered, the `node_root_hash` (computed from the segment proof)
-    /// must be in this set for the proof to be accepted.
+    /// `trusted_squash_node_hashes` contains the set of trusted SQL commitments
+    /// for squashed snapshots. When a SQL bridge is encountered, the segment-derived
+    /// root must match the bridge commitment and be present in this trusted set.
     fn verify_shunt_proof_head(
         node_root_hash: &TrieHash,
         shunt_proof_head: &TrieMerkleProofType<T>,
@@ -822,35 +873,26 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     ) -> Option<TrieHash> {
         // ancestor hashes are always the first item
         let hash = match shunt_proof_head {
-            TrieMerkleProofType::Shunt((ref idx, ref hashes)) => {
-                if *idx == -1 {
-                    // Squash shunt: the segment proof verified the
-                    // key/value inside the squash trie. Check the squash trie's
-                    // content hash against the trusted set before
-                    // accepting.
-                    if hashes.len() != 1 {
-                        trace!("Squash shunt must have exactly one hash (the archival trie hash)");
-                        return None;
-                    }
-                    if !trusted_squash_node_hashes.contains(node_root_hash) {
-                        eprintln!(
-                            "DEBUG Squash shunt rejected: node_root_hash {node_root_hash:?} not in trusted set {trusted_squash_node_hashes:?}"                        );
-                        trace!(
-                            "Squash shunt rejected: node_root_hash {node_root_hash:?} not in trusted set"
-                        );
-                        return None;
-                    }
-                    let archival_trie_hash = hashes
-                        .first()
-                        .expect("Squash shunt must have exactly one hash (the archival trie hash)");
+            TrieMerkleProofType::SqlBridge(bridge) => {
+                if *node_root_hash != bridge.trusted_sql_commitment {
                     trace!(
-                        "Squash shunt proof head: using archival trie hash {archival_trie_hash:?}",
+                        "SQL bridge rejected: node_root_hash {node_root_hash:?} != trusted_sql_commitment {:?}",
+                        bridge.trusted_sql_commitment
                     );
-                    return Some(*archival_trie_hash);
+                    return None;
                 }
-
+                if !trusted_squash_node_hashes.contains(&bridge.trusted_sql_commitment) {
+                    trace!(
+                        "SQL bridge rejected: trusted_sql_commitment {:?} not in trusted set",
+                        bridge.trusted_sql_commitment
+                    );
+                    return None;
+                }
+                return Some(bridge.archival_marf_root);
+            }
+            TrieMerkleProofType::Shunt((ref idx, ref hashes)) => {
                 if *idx != 0 {
-                    trace!("First shunt proof entry must have idx == 0 or -1");
+                    trace!("First shunt proof entry must have idx == 0");
                     return None;
                 }
 
@@ -891,6 +933,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     fn verify_shunt_proof_tail(
         initial_hash: &TrieHash,
         shunt_proof: &[TrieMerkleProofType<T>],
+        trusted_squash_node_hashes: &HashSet<TrieHash>,
     ) -> Option<TrieHash> {
         let mut hash = *initial_hash;
 
@@ -898,21 +941,18 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         // segment proof for that)
         for proof_node in shunt_proof.iter() {
             hash = match proof_node {
-                TrieMerkleProofType::Shunt((ref idx, ref hashes)) => {
-                    if *idx == -1 {
-                        // Squash shunt: use the archival trie hash directly.
-                        if hashes.len() != 1 {
-                            trace!("Squash shunt in tail must have exactly one hash");
-                            return None;
-                        }
-                        let archival_trie_hash = hashes.first().expect(
-                            "Squash shunt must have exactly one hash (the archival trie hash)",
-                        );
+                TrieMerkleProofType::SqlBridge(bridge) => {
+                    if !trusted_squash_node_hashes.contains(&bridge.trusted_sql_commitment) {
                         trace!(
-                            "Squash shunt in tail: using archival trie hash {archival_trie_hash:?}",
+                            "SQL bridge in tail rejected: trusted_sql_commitment {:?} not in trusted set",
+                            bridge.trusted_sql_commitment
                         );
-                        *archival_trie_hash
-                    } else if *idx == 0 {
+                        return None;
+                    }
+                    bridge.archival_marf_root
+                }
+                TrieMerkleProofType::Shunt((ref idx, ref hashes)) => {
+                    if *idx == 0 {
                         trace!("Invalid shunt proof tail: idx == 0");
                         return None;
                     } else {
@@ -1168,7 +1208,10 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             // next segment proof
             let mut j = i + 1;
             while let Some(proof_step) = proof.get(j) {
-                if let TrieMerkleProofType::Shunt(_) = proof_step {
+                if matches!(
+                    proof_step,
+                    TrieMerkleProofType::Shunt(_) | TrieMerkleProofType::SqlBridge(_)
+                ) {
                     break;
                 }
                 j += 1
@@ -1232,7 +1275,10 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
 
             j = i + 1;
             while let Some(proof_step) = proof.get(j) {
-                if let TrieMerkleProofType::Shunt(_) = proof_step {
+                if matches!(
+                    proof_step,
+                    TrieMerkleProofType::Shunt(_) | TrieMerkleProofType::SqlBridge(_)
+                ) {
                     j += 1;
                 } else {
                     break;
@@ -1291,7 +1337,10 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         // verify the very first segment proof
         let mut j = i + 1;
         while let Some(proof_step) = proof.get(j) {
-            if let TrieMerkleProofType::Shunt(_) = proof_step {
+            if matches!(
+                proof_step,
+                TrieMerkleProofType::Shunt(_) | TrieMerkleProofType::SqlBridge(_)
+            ) {
                 break;
             }
             j += 1
@@ -1350,7 +1399,10 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         };
 
         // next proof item should be part of a segment proof
-        if let TrieMerkleProofType::Shunt(_) = segment_proof_head {
+        if matches!(
+            segment_proof_head,
+            TrieMerkleProofType::Shunt(_) | TrieMerkleProofType::SqlBridge(_)
+        ) {
             test_debug!(
                 "Malformed proof -- exepcted segment proof following first shunt proof head at {}",
                 i
@@ -1362,7 +1414,10 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             // find the next segment proof
             j = i + 1;
             while let Some(proof_step) = proof.get(j) {
-                if let TrieMerkleProofType::Shunt(_) = proof_step {
+                if matches!(
+                    proof_step,
+                    TrieMerkleProofType::Shunt(_) | TrieMerkleProofType::SqlBridge(_)
+                ) {
                     break;
                 }
                 j += 1
@@ -1393,6 +1448,8 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                         break;
                     }
                     j += 1
+                } else if matches!(proof_step, TrieMerkleProofType::SqlBridge(_)) {
+                    j += 1
                 } else {
                     break;
                 }
@@ -1410,9 +1467,11 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             trace!(
                 "verify shunt proof tail in range {i}..{j} initial hash = {trie_hash:?}: {shunt_proof_tail:?}",
             );
-            let Some(penultimate_trie_hash) =
-                TrieMerkleProof::verify_shunt_proof_tail(&trie_hash, shunt_proof_tail)
-            else {
+            let Some(penultimate_trie_hash) = TrieMerkleProof::verify_shunt_proof_tail(
+                &trie_hash,
+                shunt_proof_tail,
+                trusted_squash_node_hashes,
+            ) else {
                 test_debug!("Unable to verify shunt proof tail");
                 return false;
             };
@@ -1549,6 +1608,9 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                                     // we're done -- we found a backptr
                                     trace!("Found backptr {:?}", &ptr);
                                     return Ok((cursor, node, ptr));
+                                }
+                                CursorError::SquashptrEncountered(_ptr) => {
+                                    return Err(Error::NotFoundError);
                                 }
                             }
                         }

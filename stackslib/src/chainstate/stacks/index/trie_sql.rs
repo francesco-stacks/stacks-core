@@ -25,6 +25,7 @@ use crate::chainstate::stacks::index::bits::{
     read_node_hash_bytes as bits_read_node_hash_bytes, read_nodetype, read_nodetype_nohash,
 };
 use crate::chainstate::stacks::index::node::{TrieNodeType, TriePtr};
+use crate::chainstate::stacks::index::squashed_sql::SQL_MARF_SQUASHED_STATE_TABLE;
 #[cfg(test)]
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
@@ -95,6 +96,14 @@ CREATE TABLE IF NOT EXISTS marf_squash_block_heights (
     block_hash TEXT PRIMARY KEY,
     height INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS marf_squashed_roots (
+    block_id INTEGER PRIMARY KEY,
+    block_hash TEXT UNIQUE NOT NULL,
+    height INTEGER NOT NULL,
+    root_hash BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS index_marf_squashed_roots_height
+    ON marf_squashed_roots(height);
 ";
 
 pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
@@ -104,6 +113,7 @@ pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
     tx.execute_batch(SQL_MARF_MINED_TABLE)?;
     tx.execute_batch(SQL_EXTENSION_LOCKS_TABLE)?;
     tx.execute_batch(SQL_MARF_SQUASH_TABLES)?;
+    tx.execute_batch(SQL_MARF_SQUASHED_STATE_TABLE)?;
 
     tx.commit().map_err(|e| e.into())
 }
@@ -234,6 +244,51 @@ pub fn read_squash_block_height<T: MarfTrieId>(
         .optional()?;
 
     Ok(result.map(|h| h as u32))
+}
+
+pub fn write_squashed_root<T: MarfTrieId>(
+    conn: &Connection,
+    block_id: u32,
+    block_hash: &T,
+    height: u32,
+    root_hash: &TrieHash,
+) -> Result<(), Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO marf_squashed_roots (block_id, block_hash, height, root_hash)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            block_id as i64,
+            block_hash.to_string(),
+            height as i64,
+            root_hash.as_bytes().to_vec()
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn read_squashed_root_by_block_id(
+    conn: &Connection,
+    block_id: u32,
+) -> Result<Option<TrieHash>, Error> {
+    let result: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT root_hash FROM marf_squashed_roots WHERE block_id = ?1",
+            params![block_id as i64],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match result {
+        Some(bytes) => {
+            let hash_bytes = bytes.get(..TRIEHASH_ENCODED_SIZE).ok_or_else(|| {
+                Error::CorruptionError("Squashed root hash bytes too short".to_string())
+            })?;
+            Ok(Some(TrieHash::from_bytes(hash_bytes).ok_or_else(|| {
+                Error::CorruptionError("Invalid squashed root hash bytes".to_string())
+            })?))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Read the block hash for a given height from the squash block-heights table.

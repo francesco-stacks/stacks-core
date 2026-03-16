@@ -25,6 +25,7 @@ use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashStats, MARF, OWN_BLOCK_HEIGHT_KEY,
 };
 use crate::chainstate::stacks::index::squash::resolve_stacks_height_to_sortition;
+use crate::chainstate::stacks::index::squashed_sql;
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{
     trie_sql, ClarityMarfTrieId, Error, MARFValue, TrieMerkleProof,
@@ -80,6 +81,19 @@ fn test_squash_to_path_outputs_data() {
     assert_eq!(k1, MARFValue::from_value("v1_at_1"));
     let own_height = dst.get(&blocks[1], OWN_BLOCK_HEIGHT_KEY).unwrap().unwrap();
     assert_eq!(own_height, MARFValue::from(1u32));
+
+    let squashed_row =
+        squashed_sql::get_squashed_state_row(dst.sqlite_conn(), &TrieHash::from_key("k1"))
+            .unwrap()
+            .expect("missing squashed-state row for k1");
+    assert_eq!(squashed_row.value, MARFValue::from_value("v1_at_1"));
+    assert!(squashed_row.source_block_id > 0);
+
+    let root_hash =
+        trie_sql::read_squashed_root_by_block_id(dst.sqlite_conn(), squashed_row.source_block_id)
+            .unwrap()
+            .expect("missing squashed root row");
+    assert_ne!(root_hash, TrieHash::EMPTY);
 }
 
 #[test]

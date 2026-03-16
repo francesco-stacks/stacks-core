@@ -34,6 +34,7 @@ pub mod node;
 pub mod profile;
 pub mod proofs;
 pub mod squash;
+pub mod squashed_sql;
 pub mod storage;
 pub mod trie;
 pub mod trie_sql;
@@ -63,6 +64,14 @@ pub enum TrieMerkleProofType<T> {
     Node256((u8, ProofTrieNode<T>, [TrieHash; 255])),
     Leaf((u8, TrieLeaf)),
     Shunt((i64, Vec<TrieHash>)),
+    SqlBridge(SqlProofBridge<T>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlProofBridge<T> {
+    pub source_block: T,
+    pub trusted_sql_commitment: TrieHash,
+    pub archival_marf_root: TrieHash,
 }
 
 /// Merkle Proof Trie Pointers have a different structure

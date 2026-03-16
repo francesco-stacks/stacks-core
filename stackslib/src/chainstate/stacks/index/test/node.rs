@@ -5136,16 +5136,15 @@ fn trieptr_compressed_roundtrip_non_backptr() {
 }
 
 #[test]
-fn trieptr_compressed_roundtrip_inline_back_block_payload_u32() {
-    let mut ptr = TriePtr::new(TrieNodeID::Node16 as u8, 0x21, 777);
-    ptr.back_block = 42;
+fn trieptr_compressed_roundtrip_squashptr_u32() {
+    let ptr = TriePtr::new_squashptr(TrieNodeID::Node16 as u8, 0x21, 777, 42);
 
     let mut bytes = vec![];
     ptr.write_bytes_compressed(&mut bytes).unwrap();
 
     assert_eq!(10, bytes.len());
     assert_eq!(
-        set_compressed(set_inline_back_block(TrieNodeID::Node16 as u8)),
+        set_compressed(set_squashptr(TrieNodeID::Node16 as u8)),
         bytes[0]
     );
     assert_eq!(ptr, TriePtr::from_bytes_compressed(&bytes));
@@ -5156,16 +5155,15 @@ fn trieptr_compressed_roundtrip_inline_back_block_payload_u32() {
 }
 
 #[test]
-fn trieptr_compressed_roundtrip_inline_back_block_payload_u64() {
-    let mut ptr = TriePtr::new(TrieNodeID::Node16 as u8, 0x22, u64::from(u32::MAX) + 9);
-    ptr.back_block = 314;
+fn trieptr_compressed_roundtrip_squashptr_u64() {
+    let ptr = TriePtr::new_squashptr(TrieNodeID::Node16 as u8, 0x22, u64::from(u32::MAX) + 9, 314);
 
     let mut bytes = vec![];
     ptr.write_bytes_compressed(&mut bytes).unwrap();
 
     assert_eq!(14, bytes.len());
     assert_eq!(
-        set_compressed(set_inline_back_block(set_u64_ptr(TrieNodeID::Node16 as u8))),
+        set_compressed(set_squashptr(set_u64_ptr(TrieNodeID::Node16 as u8))),
         bytes[0]
     );
     assert_eq!(ptr, TriePtr::from_bytes_compressed(&bytes));
@@ -5303,18 +5301,18 @@ fn test_node_copy_update_ptrs_preserves_nonzero_back_block() {
     assert_eq!(ptrs[0].chr(), 0x10);
     assert_eq!(ptrs[0].ptr(), 100);
 
-    // Inline pointer with back_block != 0 (squash annotation) - should be preserved
-    let mut ptrs = [TriePtr {
-        id: TrieNodeID::Node4 as u8,
-        chr: 0x20,
-        ptr: 200,
-        back_block: 99,
-    }];
+    // Squash-pointer should be preserved as a squash-pointer.
+    let mut ptrs = [TriePtr::new_squashptr(
+        TrieNodeID::Node4 as u8,
+        0x20,
+        200,
+        99,
+    )];
     node_copy_update_ptrs(&mut ptrs, 42);
-    assert!(is_backptr(ptrs[0].id()));
+    assert!(is_squashptr(ptrs[0].id()));
     assert_eq!(
         ptrs[0].back_block, 99,
-        "squash annotation must be preserved"
+        "squash pointer source block must be preserved"
     );
     assert_eq!(ptrs[0].chr(), 0x20);
     assert_eq!(ptrs[0].ptr(), 200);
