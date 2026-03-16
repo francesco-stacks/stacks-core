@@ -144,7 +144,7 @@ pub struct CheckpointFile {
 #[derive(Debug, Clone)]
 pub struct TargetPaths {
     pub db: PathBuf,
-    pub blobs: Option<PathBuf>, // None for sortition (internal blobs)
+    pub blobs: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

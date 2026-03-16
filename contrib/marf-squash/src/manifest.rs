@@ -10,7 +10,9 @@ use crate::cli::{
     BlocksSection, ChecksumsSection, RootsSection, SnapshotSection, SquashManifest,
     SquashRootsSection, TargetPaths, GSS_MANIFEST,
 };
-use crate::util::{compute_checksums, default_open_opts, format_timestamp, sortition_open_opts};
+use crate::util::{
+    compute_checksums, format_timestamp, sortition_open_opts_for_path, squash_marf_open_opts,
+};
 
 /// Read squash metadata from a just-squashed MARF DB.
 /// Returns (tip, archival_root_hash, squash_root_node_hash, height).
@@ -139,8 +141,10 @@ pub fn generate_manifest(
     blocks_section: BlocksSection,
     copied_block_rel_paths: &[String],
 ) {
-    let (i_tip, i_archival, i_squash, i_height) =
-        read_squash_metadata::<StacksBlockId>(index_out.db.to_str().unwrap(), default_open_opts());
+    let (i_tip, i_archival, i_squash, i_height) = read_squash_metadata::<StacksBlockId>(
+        index_out.db.to_str().unwrap(),
+        squash_marf_open_opts(),
+    );
 
     if i_height != height {
         eprintln!("Manifest error: Index squash height {i_height} != requested {height}");
@@ -149,7 +153,7 @@ pub fn generate_manifest(
 
     let (c_tip, c_archival, c_squash, c_h) = read_squash_metadata::<StacksBlockId>(
         clarity_out.db.to_str().unwrap(),
-        default_open_opts(),
+        squash_marf_open_opts(),
     );
     if c_h != height {
         eprintln!("Manifest error: Clarity squash height {c_h} != requested {height}");
@@ -161,8 +165,10 @@ pub fn generate_manifest(
     }
 
     let (s_out, _) = &sortition_out;
-    let (_s_tip, s_archival, s_squash, _s_h) =
-        read_squash_metadata::<SortitionId>(s_out.db.to_str().unwrap(), sortition_open_opts());
+    let (_s_tip, s_archival, s_squash, _s_h) = read_squash_metadata::<SortitionId>(
+        s_out.db.to_str().unwrap(),
+        sortition_open_opts_for_path(&s_out.db),
+    );
 
     // Read db_config from the squashed index DB.
     let (chain_id, mainnet) = {
@@ -235,6 +241,9 @@ pub fn generate_manifest(
         insert_expected_rel(out_dir, b, &mut expected);
     }
     insert_expected_rel(out_dir, &sortition_out.0.db, &mut expected);
+    if let Some(b) = &sortition_out.0.blobs {
+        insert_expected_rel(out_dir, b, &mut expected);
+    }
 
     // Bitcoin auxiliary files.
     expected.insert("burnchain/burnchain.sqlite".to_string());

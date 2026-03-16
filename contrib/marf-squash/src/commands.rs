@@ -13,9 +13,9 @@ use crate::ops::{
     validate_one, SideTableMode,
 };
 use crate::util::{
-    chainstate_paths, default_open_opts, ensure_blobs_match, ensure_targets_selected,
+    chainstate_paths, ensure_blobs_match, ensure_flag_requires, ensure_targets_selected,
     index_pox_constants, resolve_burn_height_for_sortition, selected_targets, sortition_open_opts,
-    target_out_paths, target_out_paths_sortition,
+    squash_marf_open_opts, target_out_paths, target_out_paths_sortition,
 };
 use crate::verify::verify_gss;
 
@@ -60,7 +60,7 @@ pub fn run_squash(args: SquashArgs) {
             &out,
             args.height,
             SideTableMode::Clarity,
-            default_open_opts(),
+            squash_marf_open_opts(),
         );
         clarity_out = Some(out);
     }
@@ -83,7 +83,7 @@ pub fn run_squash(args: SquashArgs) {
                 first_burn_height,
                 reward_cycle_len,
             },
-            default_open_opts(),
+            squash_marf_open_opts(),
         );
         index_out = Some(out);
     }
@@ -104,10 +104,7 @@ pub fn run_squash(args: SquashArgs) {
 
     // Block preservation: requires --index.
     let do_blocks = args.blocks || args.all;
-    if do_blocks && !do_index {
-        eprintln!("--blocks requires --index (or --all)");
-        std::process::exit(1);
-    }
+    ensure_flag_requires("blocks", do_blocks, "index", do_index);
 
     let mut blocks_stats: Option<BlocksSection> = None;
     let mut copied_block_rel_paths: Vec<String> = Vec::new();
@@ -219,10 +216,7 @@ pub fn run_squash(args: SquashArgs) {
     // Bitcoin auxiliary files: burnchain.sqlite + headers.sqlite.
     // Requires --sortition (or --all) for the squashed sortition DB and burn heights.
     let do_bitcoin_aux = args.bitcoin || args.all;
-    if do_bitcoin_aux && !do_sortition {
-        eprintln!("--bitcoin requires --sortition (or --all)");
-        std::process::exit(1);
-    }
+    ensure_flag_requires("bitcoin", do_bitcoin_aux, "sortition", do_sortition);
     // These variables are needed by both the copy and validation phases for bitcoin aux.
     let src_bc_db = args.chainstate.join("burnchain/burnchain.sqlite");
     let dst_bc_db = args.out_dir.join("burnchain/burnchain.sqlite");
@@ -258,7 +252,7 @@ pub fn run_squash(args: SquashArgs) {
                 args.height,
                 args.full,
                 SideTableMode::Clarity,
-                default_open_opts(),
+                squash_marf_open_opts(),
             )
         {
             all_valid = false;
@@ -275,7 +269,7 @@ pub fn run_squash(args: SquashArgs) {
                     first_burn_height,
                     reward_cycle_len,
                 },
-                default_open_opts(),
+                squash_marf_open_opts(),
             )
         {
             all_valid = false;
@@ -373,7 +367,7 @@ pub fn run_validate(args: ValidateArgs) {
             args.height,
             args.full,
             SideTableMode::Clarity,
-            default_open_opts(),
+            squash_marf_open_opts(),
         )
     {
         all_valid = false;
@@ -391,7 +385,7 @@ pub fn run_validate(args: ValidateArgs) {
                 first_burn_height,
                 reward_cycle_len,
             },
-            default_open_opts(),
+            squash_marf_open_opts(),
         ) {
             all_valid = false;
         }
@@ -418,10 +412,7 @@ pub fn run_validate(args: ValidateArgs) {
 
     // Block validation.
     let do_blocks = args.blocks || args.all;
-    if do_blocks && !do_index {
-        eprintln!("--blocks requires --index (or --all)");
-        std::process::exit(1);
-    }
+    ensure_flag_requires("blocks", do_blocks, "index", do_index);
     if do_blocks {
         let src_nakamoto = args
             .source_chainstate
@@ -445,10 +436,7 @@ pub fn run_validate(args: ValidateArgs) {
 
     // Bitcoin auxiliary validation.
     let do_bitcoin_aux = args.bitcoin || args.all;
-    if do_bitcoin_aux && !do_sortition {
-        eprintln!("--bitcoin requires --sortition (or --all)");
-        std::process::exit(1);
-    }
+    ensure_flag_requires("bitcoin", do_bitcoin_aux, "sortition", do_sortition);
     if do_bitcoin_aux {
         let (_, bitcoin_height) = resolve_burn_height_for_sortition(
             source_paths.sortition.db.to_str().unwrap(),
@@ -551,7 +539,7 @@ pub fn run_latest_height(args: LatestHeightArgs) {
         ensure_blobs_match(target.db.to_str().unwrap(), blobs.to_str().unwrap());
     }
 
-    let open_opts = default_open_opts();
+    let open_opts = squash_marf_open_opts();
     let src_storage = TrieFileStorage::open_readonly(target.db.to_str().unwrap(), open_opts)
         .unwrap_or_else(|e| {
             eprintln!("Failed to open MARF: {e:?}");

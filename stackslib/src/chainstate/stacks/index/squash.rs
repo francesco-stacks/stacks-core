@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read as _, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, DatabaseName, OptionalExtension};
@@ -597,58 +598,125 @@ fn recompute_content_hashes(store: &mut NodeStore) -> Result<(), Error> {
     Ok(())
 }
 
+/// Replace array-index child pointers in `node` with the corresponding
+/// blob byte offsets from `blob_offsets`.  Only forward (non-back, non-empty)
+/// pointers are remapped.
+pub(crate) fn remap_ptrs_to_blob_offsets(
+    node: &mut TrieNodeType,
+    blob_offsets: &[u64],
+) -> Result<(), Error> {
+    if node.is_leaf() {
+        return Ok(());
+    }
+    for ptr in node.ptrs_mut() {
+        if ptr.id() != TrieNodeID::Empty as u8 && !is_backptr(ptr.id()) {
+            let child_idx = ptr.ptr() as usize;
+            ptr.ptr = *blob_offsets.get(child_idx).ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "blob offset remap: child index {child_idx} out of bounds"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Compute per-node byte offsets within the serialized blob.
 ///
 /// Returns `(blob_offsets, total_size)` where `blob_offsets[i]` is the byte
 /// position where node `i` starts in the blob (after the header).
 pub(crate) fn compute_blob_offsets(store: &mut NodeStore) -> Result<(Vec<u64>, u64), Error> {
+    compute_blob_offsets_inner(store, u32::MAX as u64)
+}
+
+/// Inner implementation with a configurable early-exit threshold.
+/// When `current_offset <= early_exit_threshold` after pass 1, the fixpoint
+/// loop is skipped because no pointer will switch to u64 encoding.
+pub(crate) fn compute_blob_offsets_inner(
+    store: &mut NodeStore,
+    early_exit_threshold: u64,
+) -> Result<(Vec<u64>, u64), Error> {
     let n = store.len();
     let mut reader = store.open_reader()?;
     let header_size = BLOCK_HEADER_HASH_ENCODED_SIZE as u64 + 4;
     let mut blob_offsets: Vec<u64> = Vec::with_capacity(n);
     let mut current_offset = header_size;
+    let mut forward_ptr_count: usize = 0;
+
+    // Per-node byte lengths cached during Pass 1.  For nodes without
+    // forward pointers the length is constant across fixpoint passes,
+    // so we can skip re-reading them from disk entirely.
+    let mut byte_lens: Vec<u64> = Vec::with_capacity(n);
+    // True when a node has forward pointers (must be re-read in fixpoint).
+    let mut has_forward_ptrs: Vec<bool> = Vec::with_capacity(n);
 
     // Pass 1: compute offsets using original (array-index) pointer values.
     for idx in 0..n {
         blob_offsets.push(current_offset);
         let node = store.read_node_with(&mut reader, idx)?;
+        let mut has_fwd = false;
+        if !node.is_leaf() {
+            for ptr in node.ptrs() {
+                if ptr.id() != TrieNodeID::Empty as u8 && !is_backptr(ptr.id()) {
+                    forward_ptr_count = forward_ptr_count
+                        .checked_add(1)
+                        .ok_or(Error::OverflowError)?;
+                    has_fwd = true;
+                }
+            }
+        }
+        has_forward_ptrs.push(has_fwd);
         let byte_len = get_node_byte_len(&node) as u64;
+        byte_lens.push(byte_len);
         current_offset += byte_len;
     }
 
     // If the blob fits in 4 GiB, no pointer will switch to u64 encoding.
-    if current_offset <= u32::MAX as u64 {
+    if current_offset <= early_exit_threshold {
         return Ok((blob_offsets, current_offset));
     }
 
     // Pass 2+: recompute with blob-offset pointer values until stable.
-    loop {
+    // Each forward pointer widens from u32 to u64 at most once, so
+    // `forward_ptr_count + 2` bounds convergence (same as dump_consume).
+    let max_passes = forward_ptr_count.saturating_add(2);
+    let mut converged = false;
+    for _ in 0..max_passes {
         let prev_total = current_offset;
         current_offset = header_size;
 
         for idx in 0..n {
-            blob_offsets[idx] = current_offset;
-            let mut node = store.read_node_with(&mut reader, idx)?;
+            // Temporary mutable borrow — released at the semicolon so
+            // `remap_ptrs_to_blob_offsets` can borrow `blob_offsets` immutably.
+            *blob_offsets.get_mut(idx).ok_or_else(|| {
+                Error::CorruptionError("blob offset index out of bounds".into())
+            })? = current_offset;
 
-            // Simulate the pointer replacement that stream_squash_blob will do.
-            if !node.is_leaf() {
-                for ptr in node.ptrs_mut() {
-                    if ptr.id() != TrieNodeID::Empty as u8 && !is_backptr(ptr.id()) {
-                        let child_idx = ptr.ptr() as usize;
-                        if let Some(&offset) = blob_offsets.get(child_idx) {
-                            ptr.ptr = offset;
-                        }
-                    }
-                }
+            let has_fwd = *has_forward_ptrs.get(idx).ok_or_else(|| {
+                Error::CorruptionError("has_forward_ptrs index out of bounds".into())
+            })?;
+            if has_fwd {
+                let mut node = store.read_node_with(&mut reader, idx)?;
+                remap_ptrs_to_blob_offsets(&mut node, &blob_offsets)?;
+                *byte_lens.get_mut(idx).ok_or_else(|| {
+                    Error::CorruptionError("byte_lens index out of bounds".into())
+                })? = get_node_byte_len(&node) as u64;
             }
 
-            let byte_len = get_node_byte_len(&node) as u64;
-            current_offset += byte_len;
+            current_offset += *byte_lens
+                .get(idx)
+                .ok_or_else(|| Error::CorruptionError("byte_lens index out of bounds".into()))?;
         }
 
         if current_offset == prev_total {
+            converged = true;
             break;
         }
+    }
+    if !converged {
+        return Err(Error::CorruptionError(format!(
+            "compute_blob_offsets layout did not converge after {max_passes} passes"
+        )));
     }
 
     Ok((blob_offsets, current_offset))
@@ -693,18 +761,7 @@ pub(crate) fn stream_squash_blob<T: MarfTrieId, F: Write + Seek>(
         let hash = store.hash(idx);
 
         // Convert array-index pointers to byte offsets (relative to blob start)
-        if !node.is_leaf() {
-            for ptr in node.ptrs_mut() {
-                if ptr.id() != TrieNodeID::Empty as u8 && !is_backptr(ptr.id()) {
-                    let child_idx = ptr.ptr() as usize;
-                    ptr.ptr = *blob_offsets.get(child_idx).ok_or_else(|| {
-                        Error::CorruptionError(format!(
-                            "blob write: child index {child_idx} out of bounds"
-                        ))
-                    })?;
-                }
-            }
-        }
+        remap_ptrs_to_blob_offsets(&mut node, blob_offsets)?;
 
         write_nodetype_bytes(sink, &node, hash)?;
     }
@@ -1171,8 +1228,11 @@ impl<T: MarfTrieId> MARF<T> {
         );
         log_memory_snapshot("after trie DFS");
 
+        let mut dst_open_opts = open_opts.clone();
+        dst_open_opts.external_blobs = true;
+
         // Open destination MARF and begin transaction
-        let mut dst = MARF::from_path(dst_path, open_opts.clone())?;
+        let mut dst = MARF::from_path(dst_path, dst_open_opts.clone())?;
         let mut tx = dst.begin_tx()?;
         tx.begin(&T::sentinel(), &block_at_height)?;
 
@@ -1231,7 +1291,7 @@ impl<T: MarfTrieId> MARF<T> {
         let parent_hash = T::sentinel();
 
         let (blob_offsets, total_blob_size) = compute_blob_offsets(&mut node_store)?;
-        let block_id = if open_opts.external_blobs {
+        let block_id = if dst_open_opts.external_blobs {
             // Stream directly into the external .blobs file (no Vec<u8> copy)
             tx.storage.with_trie_blobs(|db, blobs| match blobs {
                 Some(trie_file) => {
@@ -1523,33 +1583,31 @@ impl<T: MarfTrieId> MARF<T> {
     ///
     /// ## Full leaf scan (`full_leaf_scan = true`)
     ///
-    /// In addition to the fast path, walks every leaf in both MARFs and
-    /// cross-checks them.  This is O(leaf_count) and much slower, but
-    /// useful for debugging squash implementation correctness.
-    pub fn validate_squashed_at_height(
-        src_path: &str,
-        squashed_path: &str,
-        open_opts: MARFOpenOpts,
-        height: u32,
-    ) -> Result<SquashValidationStats, Error> {
-        Self::validate_squashed_at_height_ex(src_path, squashed_path, open_opts, height, false)
-    }
-
-    /// Extended validation with optional full leaf scan.
+    /// Validate a squashed MARF against its source with optional full leaf scan.
     ///
-    /// See [`Self::validate_squashed_at_height`] for details on fast vs full mode.
-    pub fn validate_squashed_at_height_ex(
+    /// In addition to the fast path, `full_leaf_scan = true` walks every leaf
+    /// in both MARFs and cross-checks them. This is O(leaf_count) and much
+    /// slower, but useful for debugging squash implementation correctness.
+    ///
+    /// If `full_leaf_scan` is `false`, this performs the fast validation path.
+    pub fn validate_squashed_at_height(
         src_path: &str,
         squashed_path: &str,
         open_opts: MARFOpenOpts,
         height: u32,
         full_leaf_scan: bool,
     ) -> Result<SquashValidationStats, Error> {
-        let external_blobs = open_opts.external_blobs;
-        let src_storage = TrieFileStorage::open_readonly(src_path, open_opts.clone())?;
+        let mut src_open_opts = open_opts.clone();
+        src_open_opts.external_blobs = Path::new(&format!("{src_path}.blobs")).exists();
+
+        let mut squashed_open_opts = open_opts;
+        squashed_open_opts.external_blobs = true;
+
+        let source_external_blobs = src_open_opts.external_blobs;
+        let src_storage = TrieFileStorage::open_readonly(src_path, src_open_opts)?;
         let mut src = MARF::from_storage(src_storage);
 
-        let squashed_storage = TrieFileStorage::open_readonly(squashed_path, open_opts)?;
+        let squashed_storage = TrieFileStorage::open_readonly(squashed_path, squashed_open_opts)?;
         let mut squashed = MARF::from_storage(squashed_storage);
 
         let squashed_block_at_height =
@@ -1585,7 +1643,7 @@ impl<T: MarfTrieId> MARF<T> {
             .into_iter()
             .map(|(id, bh, offset)| (bh, (id, offset)))
             .collect();
-        let mut blob_reader = BlobReader::new(src_path, external_blobs)?;
+        let mut blob_reader = BlobReader::new(src_path, source_external_blobs)?;
 
         info!("Validate: per-height walks for source root hashes ...");
         let source_tip = trie_sql::get_latest_confirmed_block_hash::<T>(src.sqlite_conn())?;

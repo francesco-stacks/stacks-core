@@ -18,7 +18,8 @@ use std::time::Instant;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::common::{
-    clone_schemas_from_source, execute_copy_specs, full_row_except_match, TableCopySpec,
+    clone_schemas_from_source, copy_canonical_fork_storage, execute_copy_specs,
+    full_row_except_match, table_exists, TableCopySpec,
 };
 use crate::burnchains::PoxConstants;
 use crate::chainstate::stacks::index::Error;
@@ -60,6 +61,7 @@ pub struct IndexSideTableStats {
     pub burnchain_txids_rows: u64,
     pub epoch_transitions_rows: u64,
     pub staging_blocks_rows: u64,
+    pub fork_storage_rows: u64,
 }
 
 /// Validation result for index side tables in a squashed DB.
@@ -67,6 +69,7 @@ pub struct IndexSideTableStats {
 pub struct IndexSideTableValidation {
     pub tables_present: bool,
     pub db_config_matches: bool,
+    pub fork_storage_match: bool,
     pub block_headers_count_match: bool,
     pub nakamoto_headers_count_match: bool,
     pub payments_count_match: bool,
@@ -87,6 +90,7 @@ impl IndexSideTableValidation {
     pub fn is_valid(&self) -> bool {
         self.tables_present
             && self.db_config_matches
+            && self.fork_storage_match
             && self.block_headers_count_match
             && self.nakamoto_headers_count_match
             && self.payments_count_match
@@ -234,7 +238,7 @@ pub fn copy_index_side_tables(
         return Err(e);
     }
 
-    let result = copy_tables_inner(&conn, first_burn_height, reward_cycle_len);
+    let result = copy_tables_inner(&conn, dst_path, first_burn_height, reward_cycle_len);
 
     match result {
         Ok(stats) => {
@@ -253,6 +257,7 @@ pub fn copy_index_side_tables(
 
 fn copy_tables_inner(
     conn: &Connection,
+    dst_path: &str,
     first_burn_height: u64,
     reward_cycle_len: u64,
 ) -> Result<IndexSideTableStats, Error> {
@@ -266,6 +271,11 @@ fn copy_tables_inner(
     )
     .map_err(Error::SQLError)?;
     info!("  copy_side_tables: db_config done in {:?}", t.elapsed());
+
+    // Copy only canonical __fork_storage rows — the squashed MARF trie
+    // leaves reference these by value_hash. Non-canonical fork entries
+    // are excluded.
+    let fork_storage_rows = copy_canonical_fork_storage(conn, dst_path)?;
 
     // Build canonical block set from squash metadata.
     let t = Instant::now();
@@ -348,6 +358,7 @@ fn copy_tables_inner(
         burnchain_txids_rows: get("burnchain_txids"),
         epoch_transitions_rows: get("epoch_transitions"),
         staging_blocks_rows,
+        fork_storage_rows,
     })
 }
 
@@ -399,6 +410,26 @@ pub fn validate_index_side_tables(
             )
             .unwrap_or(1)
             == 0;
+
+    // __fork_storage: canonical-only copy. Destination is a subset of source.
+    let fork_storage_match = {
+        let dst_has = table_exists(&conn, "", "__fork_storage");
+        let src_has = table_exists(&conn, "src", "__fork_storage");
+        match (dst_has, src_has) {
+            (false, false) => true, // neither has it (test fixtures)
+            (true, true) => {
+                // No destination rows should be absent from source.
+                conn.query_row(
+                    "SELECT COUNT(*) FROM (SELECT * FROM __fork_storage EXCEPT SELECT * FROM src.__fork_storage)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(1)
+                    == 0
+            }
+            _ => false, // mismatch: one has it, other doesn't
+        }
+    };
 
     // Build canonical block set.
     let _ = conn.execute_batch(
@@ -586,6 +617,7 @@ pub fn validate_index_side_tables(
     Ok(IndexSideTableValidation {
         tables_present,
         db_config_matches,
+        fork_storage_match,
         block_headers_count_match,
         nakamoto_headers_count_match,
         payments_count_match,

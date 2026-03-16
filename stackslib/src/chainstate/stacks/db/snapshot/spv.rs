@@ -86,6 +86,11 @@ pub fn copy_spv_headers(
 
     let conn = Connection::open(dst_path).map_err(Error::SQLError)?;
 
+    // Match the journal mode used by stacks-node (WAL) so the database can be
+    // opened later without needing write access to switch modes.
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(Error::SQLError)?;
+
     conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
         .map_err(Error::SQLError)?;
 

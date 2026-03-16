@@ -132,6 +132,11 @@ pub fn copy_burnchain_db(
 
     let conn = Connection::open(dst_burnchain_db_path).map_err(Error::SQLError)?;
 
+    // Match the journal mode used by stacks-node (WAL) so the database can be
+    // opened later without needing write access to switch modes.
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(Error::SQLError)?;
+
     // Disable FK enforcement during bulk copy.
     conn.execute_batch("PRAGMA foreign_keys = OFF")
         .map_err(Error::SQLError)?;

@@ -7,7 +7,9 @@ use blockstack_lib::chainstate::stacks::index::{trie_sql, MarfTrieId};
 use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 
 use crate::cli::{CheckpointFile, SquashManifest, GSS_MANIFEST};
-use crate::util::{collect_files_recursive, default_open_opts, sha256_file, sortition_open_opts};
+use crate::util::{
+    collect_files_recursive, sha256_file, sortition_open_opts_for_path, squash_marf_open_opts,
+};
 
 /// Validate a `0x`-prefixed 64-hex-char hash string.  Returns `Ok(())` or an
 /// error message describing what is wrong.
@@ -130,7 +132,7 @@ pub fn verify_gss(gss_dir: &Path, checkpoint_file: Option<&Path>) -> Result<(), 
         gss_dir,
         "chainstate/vm/clarity/marf.sqlite",
         "clarity",
-        default_open_opts(),
+        squash_marf_open_opts(),
         manifest
             .squash_roots
             .clarity_squash_root_node_hash
@@ -142,7 +144,7 @@ pub fn verify_gss(gss_dir: &Path, checkpoint_file: Option<&Path>) -> Result<(), 
         gss_dir,
         "chainstate/vm/index.sqlite",
         "index",
-        default_open_opts(),
+        squash_marf_open_opts(),
         manifest.squash_roots.index_squash_root_node_hash.as_deref(),
         &mut errors,
     );
@@ -151,7 +153,7 @@ pub fn verify_gss(gss_dir: &Path, checkpoint_file: Option<&Path>) -> Result<(), 
         gss_dir,
         "burnchain/sortition/marf.sqlite",
         "sortition",
-        sortition_open_opts(),
+        sortition_open_opts_for_path(&gss_dir.join("burnchain/sortition/marf.sqlite")),
         manifest
             .squash_roots
             .sortition_squash_root_node_hash

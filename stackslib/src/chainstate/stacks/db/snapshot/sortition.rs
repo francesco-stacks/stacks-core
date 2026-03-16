@@ -17,7 +17,8 @@ use rusqlite::{params, Connection};
 
 use super::common::{
     check_optional_table_match, clone_optional_schemas_from_source, clone_schemas_from_source,
-    execute_copy_specs, full_row_except_match, TableCopySpec,
+    copy_canonical_fork_storage, execute_copy_specs, full_row_except_match, table_exists,
+    TableCopySpec,
 };
 use crate::chainstate::stacks::index::Error;
 
@@ -62,6 +63,7 @@ pub struct SortitionSideTableStats {
     pub vote_for_aggregate_key_rows: u64,
     pub epochs_rows: u64,
     pub db_config_rows: u64,
+    pub fork_storage_rows: u64,
 }
 
 /// Validation result for sortition side tables in a squashed DB.
@@ -90,6 +92,7 @@ pub struct SortitionSideTableValidation {
     pub vote_for_aggregate_key_match: bool,
     pub epochs_match: bool,
     pub db_config_match: bool,
+    pub fork_storage_match: bool,
     pub ast_rule_heights_match: Option<bool>,
     pub snapshot_burn_distributions_match: Option<bool>,
 }
@@ -112,6 +115,7 @@ impl SortitionSideTableValidation {
             && self.vote_for_aggregate_key_match
             && self.epochs_match
             && self.db_config_match
+            && self.fork_storage_match
             && self.ast_rule_heights_match.unwrap_or(true)
             && self.snapshot_burn_distributions_match.unwrap_or(true)
     }
@@ -250,7 +254,7 @@ pub fn copy_sortition_side_tables(
         return Err(e);
     }
 
-    let result = copy_sortition_tables_inner(&conn);
+    let result = copy_sortition_tables_inner(&conn, dst_path);
 
     match result {
         Ok(stats) => {
@@ -267,7 +271,10 @@ pub fn copy_sortition_side_tables(
     }
 }
 
-fn copy_sortition_tables_inner(conn: &Connection) -> Result<SortitionSideTableStats, Error> {
+fn copy_sortition_tables_inner(
+    conn: &Connection,
+    dst_path: &str,
+) -> Result<SortitionSideTableStats, Error> {
     // Copy db_config verbatim.
     let db_config_rows = conn
         .execute(
@@ -275,6 +282,11 @@ fn copy_sortition_tables_inner(conn: &Connection) -> Result<SortitionSideTableSt
             [],
         )
         .map_err(Error::SQLError)? as u64;
+
+    // Copy only canonical __fork_storage rows — the squashed MARF trie
+    // leaves reference these by value_hash. Non-canonical fork entries
+    // are excluded.
+    let fork_storage_rows = copy_canonical_fork_storage(conn, dst_path)?;
 
     // Build canonical sortition set from squash metadata.
     populate_canonical_sortitions(conn)?;
@@ -336,6 +348,7 @@ fn copy_sortition_tables_inner(conn: &Connection) -> Result<SortitionSideTableSt
         vote_for_aggregate_key_rows: get("vote_for_aggregate_key"),
         epochs_rows: get("epochs"),
         db_config_rows,
+        fork_storage_rows,
     })
 }
 
@@ -482,6 +495,26 @@ pub fn validate_sortition_side_tables(
         "SELECT * FROM src.db_config",
     );
 
+    // __fork_storage: canonical-only copy. Destination is a subset of source.
+    let fork_storage_match = {
+        let dst_has = table_exists(&conn, "", "__fork_storage");
+        let src_has = table_exists(&conn, "src", "__fork_storage");
+        match (dst_has, src_has) {
+            (false, false) => true, // neither has it (test fixtures)
+            (true, true) => {
+                // No destination rows should be absent from source.
+                conn.query_row(
+                    "SELECT COUNT(*) FROM (SELECT * FROM __fork_storage EXCEPT SELECT * FROM src.__fork_storage)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(1)
+                    == 0
+            }
+            _ => false, // mismatch: one has it, other doesn't
+        }
+    };
+
     // Optional tables
     let ast_rule_heights_match = check_optional_table_match(&conn, "ast_rule_heights", None);
     let snapshot_burn_distributions_match = check_optional_table_match(
@@ -512,6 +545,7 @@ pub fn validate_sortition_side_tables(
         vote_for_aggregate_key_match,
         epochs_match,
         db_config_match,
+        fork_storage_match,
         ast_rule_heights_match,
         snapshot_burn_distributions_match,
     })

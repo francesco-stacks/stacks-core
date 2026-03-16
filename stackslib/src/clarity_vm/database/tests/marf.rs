@@ -228,7 +228,7 @@ fn test_squashed_clarity_marf_metadata_reads_work() {
 
     // Verify sqlite_get_metadata path works. Metadata was inserted at
     // height 0 with blockhash = blocks[0]. The lookup resolves the
-    // deployment block via get_contract_hash → get_block_at_height.
+    // deployment block via get_contract_hash -> get_block_at_height.
     {
         let mut store = kv.begin_read_only(Some(&blocks[3]));
         let contract_id =

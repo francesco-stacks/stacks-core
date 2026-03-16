@@ -237,7 +237,7 @@ pub fn read_squash_block_height<T: MarfTrieId>(
 }
 
 /// Read the block hash for a given height from the squash block-heights table.
-/// This is the reverse lookup: height → block_hash.
+/// This is the reverse lookup: height -> block_hash.
 /// Returns `None` if the height is not in the squashed range.
 #[cfg(test)]
 pub fn read_squash_block_height_reverse<T: MarfTrieId>(

@@ -682,7 +682,7 @@ fn test_sortition_burn_header_hash_filtering() {
     insert_epoch(&conn, 0, 1);
     drop(conn);
 
-    // Only sort_0 is canonical → bhh_canon is the only canonical burn hash.
+    // Only sort_0 is canonical -> bhh_canon is the only canonical burn hash.
     let dst_path = dir.path().join("dst_sort.sqlite");
     create_sortition_dest_db(&dst_path, &["sort_0"]);
 
@@ -940,7 +940,8 @@ fn test_epoch2_block_file_copy_and_validate() {
     drop(conn);
 
     // Create source block file for height 1.
-    let rel = format!("aa/bb/{hash_hex}");
+    // index_block_hash_to_rel_path uses 2-byte (4 hex char) directory segments.
+    let rel = format!("aabb/ccdd/{hash_hex}");
     let src_file = src_blocks_dir.join(&rel);
     std::fs::create_dir_all(src_file.parent().unwrap()).unwrap();
     std::fs::write(&src_file, b"block data here").unwrap();
@@ -1702,7 +1703,8 @@ fn test_epoch2_file_validation_ignores_nakamoto_sqlite() {
     drop(conn);
 
     // Create source + dest block files.
-    let rel = format!("aa/bb/{hash_hex}");
+    // index_block_hash_to_rel_path uses 2-byte (4 hex char) directory segments.
+    let rel = format!("aabb/ccdd/{hash_hex}");
     let src_file = src_blocks_dir.join(&rel);
     std::fs::create_dir_all(src_file.parent().unwrap()).unwrap();
     std::fs::write(&src_file, b"block data").unwrap();
@@ -1798,7 +1800,7 @@ fn create_squashed_sortition(
 }
 
 /// Create a source headers.sqlite (SPV v3 schema with chain_work).
-/// Replays the real SPV migration pipeline: INITIAL → SCHEMA_2 → SCHEMA_3.
+/// Replays the real SPV migration pipeline: INITIAL -> SCHEMA_2 -> SCHEMA_3.
 fn create_spv_headers_db(path: &std::path::Path) -> Connection {
     let conn = Connection::open(path).unwrap();
     for cmd in SPV_INITIAL_SCHEMA {
@@ -2355,7 +2357,7 @@ fn test_spv_headers_chain_work_boundary_0() {
             .unwrap();
 
     assert_eq!(stats.headers_rows, 1);
-    // (0+1)*2016-1 = 2015 > 0 → no intervals included.
+    // (0+1)*2016-1 = 2015 > 0 -> no intervals included.
     assert_eq!(stats.chain_work_rows, 0);
 }
 
@@ -2385,7 +2387,7 @@ fn test_spv_headers_chain_work_boundary_2015() {
             .unwrap();
 
     assert_eq!(stats.headers_rows, 2016);
-    // (0+1)*2016-1 = 2015 <= 2015 ✓ → 1 interval.
+    // (0+1)*2016-1 = 2015 <= 2015 ✓ -> 1 interval.
     assert_eq!(stats.chain_work_rows, 1);
 }
 
@@ -2482,7 +2484,7 @@ fn test_spv_headers_chain_work_boundary_4032() {
             .unwrap();
 
     assert_eq!(stats.headers_rows, 4033);
-    // (2+1)*2016-1 = 6047 <= 4032 ✗ → still only 2 intervals.
+    // (2+1)*2016-1 = 6047 <= 4032 ✗ -> still only 2 intervals.
     assert_eq!(stats.chain_work_rows, 2);
 }
 

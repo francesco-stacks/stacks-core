@@ -114,12 +114,12 @@ pub fn squash_and_copy_one(
             ) {
                 Ok(st) => {
                     println!(
-                        "Index side-table copy complete: block_headers={}, nakamoto_headers={}, payments={}, transactions={}, tenure_events={}, reward_sets={}, signer_stats={}, matured_rewards={}, burnchain_txids={}, epoch_transitions={}, staging_blocks={}",
+                        "Index side-table copy complete: block_headers={}, nakamoto_headers={}, payments={}, transactions={}, tenure_events={}, reward_sets={}, signer_stats={}, matured_rewards={}, burnchain_txids={}, epoch_transitions={}, staging_blocks={}, fork_storage={}",
                         st.block_headers_rows, st.nakamoto_block_headers_rows, st.payments_rows,
                         st.transactions_rows, st.nakamoto_tenure_events_rows,
                         st.nakamoto_reward_sets_rows, st.signer_stats_rows,
                         st.matured_rewards_rows, st.burnchain_txids_rows, st.epoch_transitions_rows,
-                        st.staging_blocks_rows
+                        st.staging_blocks_rows, st.fork_storage_rows
                     );
                 }
                 Err(e) => {
@@ -139,8 +139,8 @@ pub fn squash_and_copy_one(
             {
                 Ok(st) => {
                     println!(
-                        "Sortition side-table copy complete: snapshots={}, leader_keys={}, block_commits={}, epochs={}",
-                        st.snapshots_rows, st.leader_keys_rows, st.block_commits_rows, st.epochs_rows
+                        "Sortition side-table copy complete: snapshots={}, leader_keys={}, block_commits={}, epochs={}, fork_storage={}",
+                        st.snapshots_rows, st.leader_keys_rows, st.block_commits_rows, st.epochs_rows, st.fork_storage_rows
                     );
                 }
                 Err(e) => {
@@ -320,7 +320,7 @@ fn validate_or_exit(
     }
 
     if is_sortition {
-        match MARF::<SortitionId>::validate_squashed_at_height_ex(
+        match MARF::<SortitionId>::validate_squashed_at_height(
             source_db,
             squashed_db,
             open_opts,
@@ -334,7 +334,7 @@ fn validate_or_exit(
             }
         }
     } else {
-        match MARF::<StacksBlockId>::validate_squashed_at_height_ex(
+        match MARF::<StacksBlockId>::validate_squashed_at_height(
             source_db,
             squashed_db,
             open_opts,
@@ -388,6 +388,7 @@ fn print_index_side_table_validation(
     println!("Index side-table validation:");
     println!("  tables_present: {}", v.tables_present);
     println!("  db_config_matches: {}", v.db_config_matches);
+    println!("  fork_storage_match: {}", v.fork_storage_match);
     println!(
         "  block_headers_count_match: {}",
         v.block_headers_count_match
@@ -432,6 +433,7 @@ fn print_sortition_side_table_validation(
     println!("Sortition side-table validation:");
     println!("  required_tables_present: {}", v.required_tables_present);
     println!("  canonical_set_in_source: {}", v.canonical_set_in_source);
+    println!("  fork_storage_match: {}", v.fork_storage_match);
     println!("  snapshots_match: {}", v.snapshots_match);
     println!("  leader_keys_match: {}", v.leader_keys_match);
     println!("  block_commits_match: {}", v.block_commits_match);

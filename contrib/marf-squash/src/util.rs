@@ -132,6 +132,7 @@ pub fn chainstate_paths(root: &Path) -> ChainstatePaths {
     let clarity_db = root.join("chainstate/vm/clarity/marf.sqlite");
     let index_db = root.join("chainstate/vm/index.sqlite");
     let sortition_db = root.join("burnchain/sortition/marf.sqlite");
+    let sortition_blobs = PathBuf::from(format!("{}.blobs", sortition_db.display()));
     ChainstatePaths {
         clarity: TargetPaths {
             blobs: Some(PathBuf::from(format!("{}.blobs", clarity_db.display()))),
@@ -142,7 +143,7 @@ pub fn chainstate_paths(root: &Path) -> ChainstatePaths {
             db: index_db,
         },
         sortition: TargetPaths {
-            blobs: None, // sortition uses internal blobs
+            blobs: sortition_blobs.exists().then_some(sortition_blobs),
             db: sortition_db,
         },
     }
@@ -174,6 +175,14 @@ pub fn ensure_targets_selected(
         eprintln!(
             "Must specify at least one target: --clarity, --index, --sortition, --blocks, --bitcoin, or --all"
         );
+        std::process::exit(1);
+    }
+}
+
+/// Verify that `--{flag}` is only used when `--{dep}` (or `--all`) is also set.
+pub fn ensure_flag_requires(flag: &str, flag_val: bool, dep: &str, dep_val: bool) {
+    if flag_val && !dep_val {
+        eprintln!("--{flag} requires --{dep} (or --all)");
         std::process::exit(1);
     }
 }
@@ -245,25 +254,30 @@ pub fn target_out_paths_sortition(out_dir: &Path, source_db: &Path) -> TargetPat
     let out_parent = out_dir.join(rel_path);
     let out_db = out_parent.join(file_name);
     TargetPaths {
-        blobs: None,
+        blobs: Some(PathBuf::from(format!("{}.blobs", out_db.display()))),
         db: out_db,
     }
 }
 
-pub fn default_open_opts() -> MARFOpenOpts {
+fn marf_open_opts(external_blobs: bool) -> MARFOpenOpts {
     let mut open_opts = MARFOpenOpts::default();
     open_opts.hash_calculation_mode = TrieHashCalculationMode::Deferred;
     open_opts.cache_strategy = "noop".to_string();
-    open_opts.external_blobs = true;
+    open_opts.external_blobs = external_blobs;
     open_opts
 }
 
+pub fn squash_marf_open_opts() -> MARFOpenOpts {
+    marf_open_opts(true)
+}
+
 pub fn sortition_open_opts() -> MARFOpenOpts {
-    let mut open_opts = MARFOpenOpts::default();
-    open_opts.hash_calculation_mode = TrieHashCalculationMode::Deferred;
-    open_opts.cache_strategy = "noop".to_string();
-    open_opts.external_blobs = false;
-    open_opts
+    marf_open_opts(false)
+}
+
+pub fn sortition_open_opts_for_path(db_path: &Path) -> MARFOpenOpts {
+    let blobs_path = PathBuf::from(format!("{}.blobs", db_path.display()));
+    marf_open_opts(blobs_path.exists())
 }
 
 /// Read `mainnet` from the index DB's `db_config` table and derive PoX constants.
@@ -313,7 +327,7 @@ pub fn resolve_burn_height_for_sortition(
     // 1. Open the index MARF and resolve the canonical block hash at this height.
     let canonical_block_hash = {
         let storage =
-            TrieFileStorage::<StacksBlockId>::open_readonly(index_db_path, default_open_opts())
+            TrieFileStorage::<StacksBlockId>::open_readonly(index_db_path, squash_marf_open_opts())
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to open index MARF: {e:?}");
                     std::process::exit(1);
