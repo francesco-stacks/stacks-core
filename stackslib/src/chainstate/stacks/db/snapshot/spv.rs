@@ -22,6 +22,7 @@ use super::common::{
     clone_optional_schemas_from_source, clone_schemas_from_source, full_row_except_match,
     table_exists,
 };
+use crate::chainstate::stacks::db::snapshot::common::checkpoint_destination_wal;
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all headers.sqlite versions.
@@ -149,15 +150,6 @@ fn copy_spv_headers_inner(
         headers_rows,
         chain_work_rows,
     })
-}
-
-fn checkpoint_destination_wal(conn: &Connection) -> Result<(), Error> {
-    let _: (i64, i64, i64) = conn
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .map_err(Error::SQLError)?;
-    Ok(())
 }
 
 /// Validate a copied headers.sqlite against its source.

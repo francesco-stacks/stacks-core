@@ -309,3 +309,12 @@ pub fn copy_canonical_fork_storage<T: MarfTrieId>(
 
     Ok(rows)
 }
+
+pub fn checkpoint_destination_wal(conn: &Connection) -> Result<(), Error> {
+    let _: (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(Error::SQLError)?;
+    Ok(())
+}

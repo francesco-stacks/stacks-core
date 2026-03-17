@@ -22,6 +22,7 @@ use super::common::{
     clone_optional_schemas_from_source, clone_schemas_from_source, full_row_except_match,
     table_exists,
 };
+use crate::chainstate::stacks::db::snapshot::common::checkpoint_destination_wal;
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all burnchain.sqlite versions (v2 and v3).
@@ -161,6 +162,7 @@ pub fn copy_burnchain_db(
                 .map_err(Error::SQLError)?;
             conn.execute_batch("DETACH DATABASE src")
                 .map_err(Error::SQLError)?;
+            checkpoint_destination_wal(&conn)?;
             Ok(stats)
         }
         Err(e) => {
