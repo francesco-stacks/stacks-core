@@ -3,23 +3,22 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
-use blockstack_lib::chainstate::stacks::index::storage::{
-    TrieFileStorage, TrieHashCalculationMode,
-};
-use blockstack_lib::chainstate::stacks::index::trie_sql;
+use blockstack_lib::burnchains::PoxConstants;
+use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
+use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
+use blockstack_lib::chainstate::stacks::db::StacksChainState;
+use blockstack_lib::chainstate::stacks::index::marf::MARFOpenOpts;
+use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use blockstack_lib::core::{
     BITCOIN_MAINNET_FIRST_BLOCK_HEIGHT, BITCOIN_TESTNET_FIRST_BLOCK_HEIGHT,
     POX_REWARD_CYCLE_LENGTH, POX_TESTNET_CYCLE_LENGTH,
 };
-use rusqlite::params;
 use sha2::{Digest, Sha256};
-use stacks_common::types::chainstate::StacksBlockId;
 
 use crate::cli::{ChainstatePaths, TargetPaths, GSS_MANIFEST, SQLITE_SIDECAR_EXTENSIONS};
 
 /// Compute SHA-256 checksums for all files in `out_dir`, enforcing directory
-/// cleanliness.  Fails on SQLite sidecars, symlinks, and non-regular files.
+/// cleanliness. Skips transient SQLite sidecars, fails on symlink and non-regular files.
 ///
 /// When `expected_files` is `Some`, any regular file on disk that is NOT in the
 /// expected set (and not a manifest) is a hard error.  This prevents stale files
@@ -62,8 +61,8 @@ pub fn compute_checksums(
     Ok(checksums)
 }
 
-/// Recursively collect regular files, rejecting symlinks, non-regular files,
-/// and SQLite sidecars.
+/// Recursively collect regular files, rejecting symlinks and non-regular
+/// files. SQLite sidecars are ignored.
 pub fn collect_files_recursive(
     base: &Path,
     dir: &Path,
@@ -96,13 +95,11 @@ pub fn collect_files_recursive(
             ));
         }
 
-        // Reject SQLite sidecars.
+        // Ignore transient SQLite sidecars. These can legitimately appear
+        // around WAL-mode databases and should not be hashed or manifested.
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             if SQLITE_SIDECAR_EXTENSIONS.contains(&ext) {
-                return Err(format!(
-                    "SQLite sidecar in GSS directory: {}",
-                    path.strip_prefix(base).unwrap_or(&path).display()
-                ));
+                continue;
             }
         }
 
@@ -310,101 +307,178 @@ pub fn index_pox_constants(index_db_path: &Path) -> (u64, u64) {
     }
 }
 
-/// Resolve Stacks block height to both the sortition MARF height and the actual
-/// Bitcoin block height for the tenure that produced that Stacks block.
-///
-/// Returns `(marf_height, bitcoin_height)` where:
-/// - `marf_height` = bitcoin_height - first_burn_height (for MARF squash/validate)
-/// - `bitcoin_height` = the actual Bitcoin block height (for Bitcoin auxiliary DBs and SPV)
-///
-/// Uses the index MARF to find the canonical block hash at `stacks_height`, then
-/// looks up `burn_header_height` from `nakamoto_block_headers` for that exact block.
-pub fn resolve_burn_height_for_sortition(
-    sortition_db_path: &str,
-    index_db_path: &str,
-    stacks_height: u32,
-) -> (u32, u32) {
-    // 1. Open the index MARF and resolve the canonical block hash at this height.
-    let canonical_block_hash = {
-        let storage =
-            TrieFileStorage::<StacksBlockId>::open_readonly(index_db_path, squash_marf_open_opts())
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to open index MARF: {e:?}");
-                    std::process::exit(1);
-                });
-        let mut marf = MARF::from_storage(storage);
-        let tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to get index MARF tip: {e:?}");
-                std::process::exit(1);
-            });
-        marf.get_bhh_at_height(&tip, stacks_height)
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to resolve block at Stacks height {stacks_height}: {e:?}");
-                std::process::exit(1);
-            })
-            .unwrap_or_else(|| {
-                eprintln!("No canonical block found at Stacks height {stacks_height}");
-                std::process::exit(1);
-            })
-    };
-
-    // 2. Look up burn_header_height for this exact canonical block.
-    let bitcoin_height: u64 = {
-        let conn = rusqlite::Connection::open_with_flags(
-            index_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to open index DB: {e}");
-            std::process::exit(1);
-        });
-        conn.query_row(
-            "SELECT burn_header_height FROM nakamoto_block_headers \
-             WHERE index_block_hash = ?1",
-            params![canonical_block_hash.to_string()],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "No nakamoto block found for canonical hash {canonical_block_hash} \
-                 at Stacks height {stacks_height}: {e}"
-            );
-            std::process::exit(1);
-        }) as u64
-    };
-
-    // 3. Compute sortition MARF height = bitcoin_height - first_burn_height.
-    let first_burn_height: u64 = {
-        let conn = rusqlite::Connection::open_with_flags(
-            sortition_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to open sortition DB: {e}");
-            std::process::exit(1);
-        });
-        conn.query_row(
-            "SELECT MIN(block_height) FROM snapshots WHERE pox_valid = 1",
+/// Read (mainnet, chain_id) from the index DB's db_config table.
+pub fn read_db_config(index_db_path: &Path) -> (bool, u32) {
+    let conn = rusqlite::Connection::open(index_db_path).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to open index DB '{}' for db_config: {e}",
+            index_db_path.display()
+        );
+        std::process::exit(1);
+    });
+    let (mainnet_i, chain_id): (i64, i64) = conn
+        .query_row(
+            "SELECT mainnet, chain_id FROM db_config LIMIT 1",
             [],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap_or_else(|e| {
-            eprintln!("Failed to read first burn height from sortition DB: {e}");
+            eprintln!("Failed to read db_config: {e}");
             std::process::exit(1);
-        }) as u64
-    };
+        });
+    (mainnet_i != 0, chain_id as u32)
+}
 
+/// Build PoxConstants from mainnet/testnet defaults.
+pub fn build_pox_constants(mainnet: bool) -> PoxConstants {
+    if mainnet {
+        PoxConstants::mainnet_default()
+    } else {
+        PoxConstants::testnet_default()
+    }
+}
+
+/// Read first_burn_height from the sortition DB.
+pub fn read_first_burn_height(sortition_db_path: &str) -> u64 {
+    let conn = rusqlite::Connection::open_with_flags(
+        sortition_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to open sortition DB: {e}");
+        std::process::exit(1);
+    });
+    conn.query_row(
+        "SELECT MIN(block_height) FROM snapshots WHERE pox_valid = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to read first burn height from sortition DB: {e}");
+        std::process::exit(1);
+    }) as u64
+}
+
+/// Convert a Bitcoin block height to the sortition MARF height.
+/// sortition_marf_height = bitcoin_height - first_burn_height
+pub fn bitcoin_height_to_sortition_marf_height(
+    sortition_db_path: &str,
+    bitcoin_height: u64,
+) -> u32 {
+    let first_burn_height = read_first_burn_height(sortition_db_path);
     if bitcoin_height < first_burn_height {
         eprintln!("Bitcoin height {bitcoin_height} is below first burn height {first_burn_height}");
         std::process::exit(1);
     }
+    (bitcoin_height - first_burn_height) as u32
+}
 
-    let marf_height = (bitcoin_height - first_burn_height) as u32;
+/// Find the highest canonical Stacks block in the tenure that started at
+/// `bitcoin_height`.
+///
+/// Validates that the Bitcoin height is a canonical tenure start (sortition=true)
+/// by walking the canonical burn chain from the tip. Uses the existing
+/// `NakamotoChainState::find_highest_known_block_header_in_tenure_by_block_height`
+/// helper for burn_view-aware canonical selection.
+///
+/// Returns the Stacks block height at the end of the tenure.
+pub fn find_tenure_end_stacks_height(
+    chainstate_root: &str,
+    sortition_db_dir: &str,
+    bitcoin_height: u64,
+    mainnet: bool,
+    chain_id: u32,
+    pox_constants: PoxConstants,
+) -> Result<u32, String> {
+    // Open the DBs with the correct APIs.
+    let (chainstate, _) = StacksChainState::open(mainnet, chain_id, chainstate_root, None)
+        .map_err(|e| format!("Failed to open chainstate at '{chainstate_root}': {e}"))?;
 
-    eprintln!(
-        "Resolved Stacks height {stacks_height} (canonical block {canonical_block_hash}) \
-         to Bitcoin height {bitcoin_height} (sortition MARF height {marf_height})"
-    );
-    (marf_height, bitcoin_height as u32)
+    let sortition_db = SortitionDB::open(sortition_db_dir, false, pox_constants, None)
+        .map_err(|e| format!("Failed to open sortition DB at '{sortition_db_dir}': {e}"))?;
+
+    // Walk the canonical burn chain to find the snapshot at this height.
+    let canonical_tip = SortitionDB::get_canonical_burn_chain_tip(sortition_db.conn())
+        .map_err(|e| format!("Failed to get canonical burn tip: {e}"))?;
+
+    let ic = sortition_db.index_handle_at_tip();
+    let snapshot =
+        SortitionDB::get_ancestor_snapshot(&ic, bitcoin_height, &canonical_tip.sortition_id)
+            .map_err(|e| {
+                format!("Failed to get ancestor snapshot at burn height {bitcoin_height}: {e}")
+            })?
+            .ok_or_else(|| format!("No canonical sortition at Bitcoin height {bitcoin_height}"))?;
+
+    if !snapshot.sortition {
+        // Find nearby tenure starts for a helpful error message.
+        let mut nearby = Vec::new();
+        let search_radius = 10u64;
+        let search_start = bitcoin_height.saturating_sub(search_radius);
+        let search_end = bitcoin_height.saturating_add(search_radius);
+        for h in search_start..=search_end {
+            if h == bitcoin_height {
+                continue;
+            }
+            if let Ok(Some(s)) =
+                SortitionDB::get_ancestor_snapshot(&ic, h, &canonical_tip.sortition_id)
+            {
+                if s.sortition {
+                    nearby.push(h);
+                }
+            }
+        }
+        let nearby_str = if nearby.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n  Nearby tenure starts: {}",
+                nearby
+                    .iter()
+                    .map(|h| h.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        return Err(format!(
+            "Bitcoin height {bitcoin_height} did not start a Nakamoto tenure \
+             (sortition=false).{nearby_str}"
+        ));
+    }
+
+    // Use the existing NakamotoChainState helper for burn_view-aware selection.
+    let header = NakamotoChainState::find_highest_known_block_header_in_tenure_by_block_height(
+        &chainstate,
+        &sortition_db,
+        bitcoin_height,
+    )
+    .map_err(|e| format!("Failed to find tenure end at burn height {bitcoin_height}: {e}"))?
+    .ok_or_else(|| {
+        format!("No Nakamoto blocks found at Bitcoin height {bitcoin_height}. This may predate Nakamoto activation.")
+    })?;
+
+    Ok(header.stacks_block_height as u32)
+}
+
+/// Warn if the tenure-start Bitcoin height is inside the Nakamoto prepare
+/// phase. Uses `is_in_naka_prepare_phase()` which excludes the `mod 0`
+/// block (unlike the broader `is_in_prepare_phase()`).
+///
+/// The cycle number is derived from the burn height directly using Nakamoto
+/// prepare-phase semantics: if inside the prepare phase, the corresponding
+/// cycle is the one being prepared for (i.e., the next cycle).
+pub fn warn_if_in_prepare_phase(bitcoin_height: u64, pox: &PoxConstants, first_burn_height: u64) {
+    if pox.is_in_naka_prepare_phase(first_burn_height, bitcoin_height) {
+        // Derive the cycle being prepared for using the same Nakamoto-specific
+        // semantics. In Nakamoto prepare phase (which excludes the mod-0 block),
+        // the corresponding cycle is always current_cycle + 1.
+        let current_cycle = pox.block_height_to_reward_cycle(first_burn_height, bitcoin_height);
+        if let Some(cycle) = current_cycle {
+            let preparing_for = cycle + 1;
+            eprintln!(
+                "Warning: Bitcoin height {bitcoin_height} is inside the Nakamoto prepare \
+                 phase for reward cycle {preparing_for}. The node may stall on startup \
+                 for missing the anchor block for cycle {preparing_for}."
+            );
+        }
+    }
 }

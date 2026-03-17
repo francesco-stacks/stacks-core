@@ -104,6 +104,7 @@ pub fn copy_spv_headers(
             conn.execute_batch("COMMIT").map_err(Error::SQLError)?;
             conn.execute_batch("DETACH DATABASE src")
                 .map_err(Error::SQLError)?;
+            checkpoint_destination_wal(&conn)?;
             Ok(Some(stats))
         }
         Err(e) => {
@@ -148,6 +149,15 @@ fn copy_spv_headers_inner(
         headers_rows,
         chain_work_rows,
     })
+}
+
+fn checkpoint_destination_wal(conn: &Connection) -> Result<(), Error> {
+    let _: (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(Error::SQLError)?;
+    Ok(())
 }
 
 /// Validate a copied headers.sqlite against its source.

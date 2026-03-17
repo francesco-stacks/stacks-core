@@ -16,6 +16,7 @@
 use std::time::Instant;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use stacks_common::types::chainstate::StacksBlockId;
 
 use super::common::{
     clone_schemas_from_source, copy_canonical_fork_storage, execute_copy_specs,
@@ -272,10 +273,10 @@ fn copy_tables_inner(
     .map_err(Error::SQLError)?;
     info!("  copy_side_tables: db_config done in {:?}", t.elapsed());
 
-    // Copy only canonical __fork_storage rows — the squashed MARF trie
+    // Copy only canonical __fork_storage rows - the squashed MARF trie
     // leaves reference these by value_hash. Non-canonical fork entries
     // are excluded.
-    let fork_storage_rows = copy_canonical_fork_storage(conn, dst_path)?;
+    let fork_storage_rows = copy_canonical_fork_storage::<StacksBlockId>(conn, dst_path)?;
 
     // Build canonical block set from squash metadata.
     let t = Instant::now();

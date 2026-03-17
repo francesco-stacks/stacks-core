@@ -686,7 +686,7 @@ pub(crate) fn compute_blob_offsets_inner(
         current_offset = header_size;
 
         for idx in 0..n {
-            // Temporary mutable borrow — released at the semicolon so
+            // Temporary mutable borrow - released at the semicolon so
             // `remap_ptrs_to_blob_offsets` can borrow `blob_offsets` immutably.
             *blob_offsets.get_mut(idx).ok_or_else(|| {
                 Error::CorruptionError("blob offset index out of bounds".into())

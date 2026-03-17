@@ -94,10 +94,7 @@ pub fn verify_gss(gss_dir: &Path, checkpoint_file: Option<&Path>) -> Result<(), 
             }
         }
         if errors.is_empty() {
-            println!(
-                "  PASS: {} files, no extras, no sidecars, no symlinks",
-                disk_files.len()
-            );
+            println!("  PASS: {} files, no extras, no symlinks", disk_files.len());
         }
     }
 
@@ -186,11 +183,17 @@ pub fn verify_gss(gss_dir: &Path, checkpoint_file: Option<&Path>) -> Result<(), 
         )
         .map_err(|e| vec![e])?;
 
-        // Height must match.
-        if cp.height != manifest.snapshot.height {
+        // Heights must match.
+        if cp.stacks_height != manifest.snapshot.stacks_height {
             errors.push(format!(
-                "Level 3: checkpoint height {} != manifest height {}",
-                cp.height, manifest.snapshot.height
+                "Level 3: checkpoint stacks_height {} != manifest stacks_height {}",
+                cp.stacks_height, manifest.snapshot.stacks_height
+            ));
+        }
+        if cp.bitcoin_height != manifest.snapshot.bitcoin_height {
+            errors.push(format!(
+                "Level 3: checkpoint bitcoin_height {} != manifest bitcoin_height {}",
+                cp.bitcoin_height, manifest.snapshot.bitcoin_height
             ));
         }
 

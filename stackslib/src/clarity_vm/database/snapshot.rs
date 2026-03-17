@@ -20,6 +20,7 @@ use clarity::vm::database::SqliteConnection;
 use rusqlite::Connection;
 use stacks_common::types::chainstate::StacksBlockId;
 
+use crate::chainstate::stacks::db::snapshot::common::collect_leaf_value_hashes;
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{trie_sql, Error};
@@ -48,12 +49,7 @@ pub fn copy_clarity_side_tables(
     conn.execute("ATTACH DATABASE ?1 AS src", [src_db_path])
         .map_err(Error::SQLError)?;
 
-    let squashed_tip = {
-        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-        let marf = MARF::<StacksBlockId>::from_path(dst_db_path, open_opts)?;
-        trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())?
-    };
-    let needed_keys = collect_trie_value_hashes_for_block(src_db_path, &squashed_tip)?;
+    let (squashed_tip, needed_keys) = collect_leaf_value_hashes::<StacksBlockId>(dst_db_path)?;
 
     let src_data_count: u64 = conn
         .query_row("SELECT COUNT(*) FROM src.data_table", [], |row| row.get(0))
@@ -199,40 +195,6 @@ pub struct ClaritySideTableStats {
     pub metadata_table_rows: u64,
 }
 
-fn collect_trie_value_hashes(db_path: &str) -> Result<(StacksBlockId, HashSet<String>), Error> {
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut marf = MARF::<StacksBlockId>::from_path(db_path, open_opts)?;
-    let tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())?;
-
-    let mut keys = HashSet::new();
-    marf.with_conn(|conn| {
-        MARF::for_each_leaf(conn, &tip, |_path, value| {
-            keys.insert(value.to_hex());
-            Ok(())
-        })
-    })?;
-
-    Ok((tip, keys))
-}
-
-fn collect_trie_value_hashes_for_block(
-    db_path: &str,
-    block: &StacksBlockId,
-) -> Result<HashSet<String>, Error> {
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut marf = MARF::<StacksBlockId>::from_path(db_path, open_opts)?;
-
-    let mut keys = HashSet::new();
-    marf.with_conn(|conn| {
-        MARF::for_each_leaf(conn, block, |_path, value| {
-            keys.insert(value.to_hex());
-            Ok(())
-        })
-    })?;
-
-    Ok(keys)
-}
-
 /// Validate that a squashed Clarity MARF's side tables match the source.
 ///
 /// Checks:
@@ -332,7 +294,7 @@ pub fn validate_clarity_side_tables(
         }
     }
 
-    let (_tip, needed_keys) = collect_trie_value_hashes(dst_db_path)?;
+    let (_tip, needed_keys) = collect_leaf_value_hashes::<StacksBlockId>(dst_db_path)?;
     dst_conn
         .execute("ATTACH DATABASE ?1 AS src", [src_db_path])
         .map_err(Error::SQLError)?;

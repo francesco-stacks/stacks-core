@@ -14,6 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use rusqlite::{params, Connection};
+use stacks_common::types::chainstate::SortitionId;
 
 use super::common::{
     check_optional_table_match, clone_optional_schemas_from_source, clone_schemas_from_source,
@@ -40,10 +41,11 @@ const REQUIRED_TABLES: &[&str] = &[
     "epochs",
 ];
 
-/// Optional sortition tables (may not exist in production).
+/// Optional sortition tables (may not exist in all source DBs).
 const OPTIONAL_TABLES: &[&str] = &[
-    "ast_rule_heights",            // dropped by SORTITION_DB_SCHEMA_10
-    "snapshot_burn_distributions", // test-only (#[cfg(test)])
+    "stacks_chain_tips_by_burn_view", // added in SORTITION_DB_SCHEMA_11
+    "ast_rule_heights",               // dropped by SORTITION_DB_SCHEMA_10
+    "snapshot_burn_distributions",    // test-only (#[cfg(test)])
 ];
 
 /// Row-count statistics returned by [`copy_sortition_side_tables`].
@@ -55,6 +57,7 @@ pub struct SortitionSideTableStats {
     pub block_commit_parents_rows: u64,
     pub snapshot_transition_ops_rows: u64,
     pub stacks_chain_tips_rows: u64,
+    pub stacks_chain_tips_by_burn_view_rows: u64,
     pub preprocessed_reward_sets_rows: u64,
     pub missed_commits_rows: u64,
     pub stack_stx_rows: u64,
@@ -84,6 +87,7 @@ pub struct SortitionSideTableValidation {
     pub block_commit_parents_match: bool,
     pub snapshot_transition_ops_match: bool,
     pub stacks_chain_tips_match: bool,
+    pub stacks_chain_tips_by_burn_view_match: Option<bool>,
     pub preprocessed_reward_sets_match: bool,
     pub missed_commits_match: bool,
     pub stack_stx_match: bool,
@@ -107,6 +111,7 @@ impl SortitionSideTableValidation {
             && self.block_commit_parents_match
             && self.snapshot_transition_ops_match
             && self.stacks_chain_tips_match
+            && self.stacks_chain_tips_by_burn_view_match.unwrap_or(true)
             && self.preprocessed_reward_sets_match
             && self.missed_commits_match
             && self.stack_stx_match
@@ -283,10 +288,10 @@ fn copy_sortition_tables_inner(
         )
         .map_err(Error::SQLError)? as u64;
 
-    // Copy only canonical __fork_storage rows — the squashed MARF trie
+    // Copy only canonical __fork_storage rows - the squashed MARF trie
     // leaves reference these by value_hash. Non-canonical fork entries
     // are excluded.
-    let fork_storage_rows = copy_canonical_fork_storage(conn, dst_path)?;
+    let fork_storage_rows = copy_canonical_fork_storage::<SortitionId>(conn, dst_path)?;
 
     // Build canonical sortition set from squash metadata.
     populate_canonical_sortitions(conn)?;
@@ -297,6 +302,10 @@ fn copy_sortition_tables_inner(
 
     // Optional tables: copy if present in source.
     for (table, filter) in [
+        (
+            "stacks_chain_tips_by_burn_view",
+            " WHERE sortition_id IN (SELECT sortition_id FROM canonical_sortitions)",
+        ),
         ("ast_rule_heights", ""),
         (
             "snapshot_burn_distributions",
@@ -340,6 +349,7 @@ fn copy_sortition_tables_inner(
         block_commit_parents_rows: get("block_commit_parents"),
         snapshot_transition_ops_rows: get("snapshot_transition_ops"),
         stacks_chain_tips_rows: get("stacks_chain_tips"),
+        stacks_chain_tips_by_burn_view_rows: get("stacks_chain_tips_by_burn_view"),
         preprocessed_reward_sets_rows: get("preprocessed_reward_sets"),
         missed_commits_rows: get("missed_commits"),
         stack_stx_rows: get("stack_stx"),
@@ -453,6 +463,11 @@ pub fn validate_sortition_side_tables(
         "SELECT * FROM stacks_chain_tips",
         &format!("SELECT * FROM src.stacks_chain_tips WHERE sortition_id IN ({sid})"),
     );
+    let stacks_chain_tips_by_burn_view_match = check_optional_table_match(
+        &conn,
+        "stacks_chain_tips_by_burn_view",
+        Some(&format!("WHERE sortition_id IN ({sid})")),
+    );
     let preprocessed_reward_sets_match = full_row_except_match(
         &conn,
         "SELECT * FROM preprocessed_reward_sets",
@@ -537,6 +552,7 @@ pub fn validate_sortition_side_tables(
         block_commit_parents_match,
         snapshot_transition_ops_match,
         stacks_chain_tips_match,
+        stacks_chain_tips_by_burn_view_match,
         preprocessed_reward_sets_match,
         missed_commits_match,
         stack_stx_match,

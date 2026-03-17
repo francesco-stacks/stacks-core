@@ -13,15 +13,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::io::{Cursor, Read as _, Seek, SeekFrom};
+use std::collections::HashSet;
 use std::time::Instant;
 
 use rusqlite::{params, Connection};
 use stacks_common::util::hash::to_hex;
 
-use crate::chainstate::stacks::index::node::TrieNodeType;
-use crate::chainstate::stacks::index::squash::deserialize_node;
-use crate::chainstate::stacks::index::Error;
+use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
+use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
+use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
 
 /// A spec for copying a single table from the ATTACHed `src` database.
 ///
@@ -186,51 +186,47 @@ pub fn check_optional_table_match(
     }
 }
 
-/// Read the squashed trie blob from `marf_data` and return its raw bytes.
+/// Collect the hex-encoded `MARFValue` of every leaf in the squashed trie.
 ///
-/// Handles both inline blobs (sortition MARF) and external .blobs files
-/// (index/clarity MARFs). `dst_path` is the path to the squashed DB file
-/// (used to derive the `.blobs` companion path).
-fn read_squash_blob(conn: &Connection, dst_path: &str) -> Result<Vec<u8>, Error> {
-    // The squash block is the only non-sentinel entry in marf_data.
-    let row: (Option<Vec<u8>>, Option<i64>, Option<i64>) = conn
-        .query_row(
-            "SELECT data, external_offset, external_length \
-             FROM marf_data WHERE block_hash != ?1 LIMIT 1",
-            params!["sentinel"],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(Error::SQLError)?;
+/// Opens the MARF at `db_path` read-only, resolves the tip, and walks the
+/// trie via `for_each_leaf`.  Auto-detects external blobs.
+///
+/// Returns `(tip_block_hash, leaf_value_hashes)`.
+pub fn collect_leaf_value_hashes<T: MarfTrieId>(
+    db_path: &str,
+) -> Result<(T, HashSet<String>), Error> {
+    let external_blobs = std::path::Path::new(&format!("{db_path}.blobs")).exists();
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", external_blobs);
+    let storage = TrieFileStorage::open_readonly(db_path, open_opts)?;
+    let mut marf = MARF::<T>::from_storage(storage);
+    let tip = trie_sql::get_latest_confirmed_block_hash::<T>(marf.sqlite_conn())?;
 
-    match row {
-        (_, Some(offset), Some(length)) if length > 0 => {
-            let blobs_path = format!("{dst_path}.blobs");
-            let mut file = std::fs::File::open(&blobs_path).map_err(Error::IOError)?;
-            file.seek(SeekFrom::Start(offset as u64))
-                .map_err(Error::IOError)?;
-            let mut buf = vec![0u8; length as usize];
-            file.read_exact(&mut buf).map_err(Error::IOError)?;
-            Ok(buf)
-        }
-        (Some(data), _, _) if !data.is_empty() => Ok(data),
-        _ => Err(Error::CorruptionError(
-            "No squash blob found in marf_data".to_string(),
-        )),
-    }
+    let mut hashes = HashSet::new();
+    marf.with_conn(|conn| {
+        MARF::for_each_leaf(conn, &tip, |_hash, value| {
+            hashes.insert(to_hex(&value.to_vec()));
+            Ok(())
+        })
+    })?;
+
+    Ok((tip, hashes))
 }
 
 /// Copy only the `__fork_storage` rows that are referenced by leaf nodes
 /// in the squashed MARF trie. Non-canonical entries from forks are excluded.
 ///
-/// The squashed trie blob contains only canonical leaf nodes; each leaf
-/// carries a 40-byte `MARFValue` whose hex encoding matches the
-/// `value_hash` column in `__fork_storage`.
+/// Opens the squashed MARF read-only and walks the trie via `for_each_leaf`
+/// to collect canonical leaf value hashes, then copies only the matching
+/// `__fork_storage` rows from the source.
 ///
 /// Falls back to a full copy if `marf_data` is absent (e.g. in test
 /// fixtures that don't go through `squash_to_path`).
 ///
 /// Returns the number of rows copied.
-pub fn copy_canonical_fork_storage(conn: &Connection, dst_path: &str) -> Result<u64, Error> {
+pub fn copy_canonical_fork_storage<T: MarfTrieId>(
+    conn: &Connection,
+    dst_path: &str,
+) -> Result<u64, Error> {
     // Check if the source even has __fork_storage (test fixtures may not).
     let src_has_table: bool = conn
         .query_row(
@@ -269,30 +265,23 @@ pub fn copy_canonical_fork_storage(conn: &Connection, dst_path: &str) -> Result<
     }
 
     let t = Instant::now();
-    let blob = read_squash_blob(conn, dst_path)?;
+
+    let (_tip, leaf_hashes) = collect_leaf_value_hashes::<T>(dst_path)?;
+    let insert_count = leaf_hashes.len() as u64;
 
     // Build a temp table of canonical leaf value hashes.
     conn.execute_batch("CREATE TEMP TABLE __squash_leaf_values (value_hash TEXT PRIMARY KEY)")
         .map_err(Error::SQLError)?;
 
-    let mut cursor = Cursor::new(&blob);
-    let blob_len = blob.len() as u64;
-    let mut insert_count: u64 = 0;
-
     {
         let mut stmt = conn
             .prepare("INSERT OR IGNORE INTO __squash_leaf_values (value_hash) VALUES (?1)")
             .map_err(Error::SQLError)?;
-
-        while cursor.position() < blob_len {
-            let node = deserialize_node(&mut cursor)?;
-            if let TrieNodeType::Leaf(ref leaf) = node {
-                stmt.execute(params![to_hex(&leaf.data.to_vec())])
-                    .map_err(Error::SQLError)?;
-                insert_count += 1;
-            }
+        for hash in &leaf_hashes {
+            stmt.execute(params![hash]).map_err(Error::SQLError)?;
         }
     }
+    drop(leaf_hashes);
 
     info!(
         "  copy_canonical_fork_storage: extracted {insert_count} leaf hashes in {:?}",

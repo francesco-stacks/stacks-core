@@ -137,7 +137,8 @@ pub fn generate_manifest(
     clarity_out: &TargetPaths,
     index_out: &TargetPaths,
     sortition_out: (&TargetPaths, u32),
-    height: u32,
+    stacks_height: u32,
+    bitcoin_height: u64,
     blocks_section: BlocksSection,
     copied_block_rel_paths: &[String],
 ) {
@@ -146,8 +147,8 @@ pub fn generate_manifest(
         squash_marf_open_opts(),
     );
 
-    if i_height != height {
-        eprintln!("Manifest error: Index squash height {i_height} != requested {height}");
+    if i_height != stacks_height {
+        eprintln!("Manifest error: Index squash height {i_height} != requested {stacks_height}");
         std::process::exit(1);
     }
 
@@ -155,8 +156,8 @@ pub fn generate_manifest(
         clarity_out.db.to_str().unwrap(),
         squash_marf_open_opts(),
     );
-    if c_h != height {
-        eprintln!("Manifest error: Clarity squash height {c_h} != requested {height}");
+    if c_h != stacks_height {
+        eprintln!("Manifest error: Clarity squash height {c_h} != requested {stacks_height}");
         std::process::exit(1);
     }
     if c_tip != i_tip {
@@ -190,13 +191,10 @@ pub fn generate_manifest(
     };
 
     // Read timestamp from sortition snapshots, falling back to index headers.
-    let timestamp = read_snapshot_timestamp(Some(sortition_out), index_out, height);
+    let timestamp = read_snapshot_timestamp(Some(sortition_out), index_out, stacks_height);
 
-    // Read bitcoin height + block hash from sortition DB.
-    // Note: `bh` is the MARF-internal sortition height (0-indexed from
-    // genesis sortition), NOT the actual Bitcoin block height.  We read the
-    // real Bitcoin height from the `burn_header_height` column in snapshots.
-    let (bitcoin_height, bitcoin_block_hash) = {
+    // Read bitcoin block hash from sortition DB.
+    let bitcoin_block_hash = {
         let (s_out, bh) = &sortition_out;
         let conn = rusqlite::Connection::open(s_out.db.to_str().unwrap()).unwrap_or_else(|e| {
             eprintln!("Failed to open squashed sortition DB for bitcoin metadata: {e}");
@@ -214,17 +212,17 @@ pub fn generate_manifest(
                 );
                 std::process::exit(1);
             });
-        let (real_btc_height, btc_hash): (u32, String) = conn
+        let btc_hash: String = conn
             .query_row(
-                "SELECT block_height, burn_header_hash FROM snapshots WHERE sortition_id = ?1",
+                "SELECT burn_header_hash FROM snapshots WHERE sortition_id = ?1",
                 [&sort_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .unwrap_or_else(|e| {
-                eprintln!("Failed to read burn_header_height/hash for sortition_id {sort_id}: {e}");
+                eprintln!("Failed to read burn_header_hash for sortition_id {sort_id}: {e}");
                 std::process::exit(1);
             });
-        (real_btc_height, format!("0x{btc_hash}"))
+        format!("0x{btc_hash}")
     };
 
     // Build the set of expected files so that stale files in a reused
@@ -263,9 +261,9 @@ pub fn generate_manifest(
     let manifest = SquashManifest {
         snapshot: SnapshotSection {
             version: 1,
-            height,
+            stacks_height,
+            bitcoin_height,
             block_hash: format!("0x{i_tip}"),
-            bitcoin_height: Some(bitcoin_height),
             bitcoin_block_hash: Some(bitcoin_block_hash),
             timestamp,
             chain_id,

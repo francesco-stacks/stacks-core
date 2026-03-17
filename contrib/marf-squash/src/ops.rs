@@ -446,6 +446,9 @@ fn print_sortition_side_table_validation(
         v.snapshot_transition_ops_match
     );
     println!("  stacks_chain_tips_match: {}", v.stacks_chain_tips_match);
+    if let Some(m) = v.stacks_chain_tips_by_burn_view_match {
+        println!("  stacks_chain_tips_by_burn_view_match: {m}");
+    }
     println!(
         "  preprocessed_reward_sets_match: {}",
         v.preprocessed_reward_sets_match

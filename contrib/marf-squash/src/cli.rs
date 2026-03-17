@@ -36,9 +36,11 @@ pub struct SquashArgs {
     /// Output directory for the squashed MARF files.
     #[arg(long = "out-dir", value_name = "DIR")]
     pub out_dir: PathBuf,
-    /// Stacks block height to squash to.
+    /// Bitcoin block height where a Nakamoto tenure started (sortition=true).
+    /// The snapshot includes the complete tenure: all Stacks blocks produced
+    /// by the miner who won this sortition. Epoch 3.x (Nakamoto) only.
     #[arg(long, value_name = "HEIGHT")]
-    pub height: u32,
+    pub tenure_start_bitcoin_height: u64,
     /// Squash the Clarity MARF (chainstate/vm/clarity/marf.sqlite).
     #[arg(long)]
     pub clarity: bool,
@@ -77,9 +79,9 @@ pub struct ValidateArgs {
     /// Path to the squashed chainstate folder.
     #[arg(long = "squashed-chainstate", value_name = "DIR")]
     pub squashed_chainstate: PathBuf,
-    /// Stacks block height to validate at.
+    /// Bitcoin block height where the Nakamoto tenure started.
     #[arg(long, value_name = "HEIGHT")]
-    pub height: u32,
+    pub tenure_start_bitcoin_height: u64,
     /// Validate the Clarity MARF.
     #[arg(long)]
     pub clarity: bool,
@@ -135,7 +137,8 @@ pub struct VerifyArgs {
 /// Trusted WSCP checkpoint file format.
 #[derive(Deserialize)]
 pub struct CheckpointFile {
-    pub height: u32,
+    pub stacks_height: u32,
+    pub bitcoin_height: u64,
     pub clarity_squash_root_node_hash: String,
     pub index_squash_root_node_hash: String,
     pub sortition_squash_root_node_hash: String,
@@ -168,10 +171,9 @@ pub struct SquashManifest {
 #[derive(Serialize, Deserialize)]
 pub struct SnapshotSection {
     pub version: u32,
-    pub height: u32,
+    pub stacks_height: u32,
+    pub bitcoin_height: u64,
     pub block_hash: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bitcoin_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitcoin_block_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

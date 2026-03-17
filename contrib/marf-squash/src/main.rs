@@ -61,9 +61,9 @@ mod tests {
         let manifest = SquashManifest {
             snapshot: SnapshotSection {
                 version: 1,
-                height: 100,
+                stacks_height: 100,
+                bitcoin_height: 869704,
                 block_hash: "0xdeadbeef".to_string(),
-                bitcoin_height: None,
                 bitcoin_block_hash: None,
                 timestamp: None,
                 chain_id: 1,
@@ -91,8 +91,8 @@ mod tests {
             "squash",
             "--chainstate",
             "/tmp/chainstate",
-            "--height",
-            "123",
+            "--tenure-start-bitcoin-height",
+            "869704",
             "--out-dir",
             "/tmp/out",
             "--index",
@@ -104,7 +104,7 @@ mod tests {
         match cli.command {
             Command::Squash(args) => {
                 assert_eq!(args.chainstate, PathBuf::from("/tmp/chainstate"));
-                assert_eq!(args.height, 123);
+                assert_eq!(args.tenure_start_bitcoin_height, 869704);
                 assert!(args.index);
             }
             _ => panic!("expected squash command"),
@@ -118,8 +118,8 @@ mod tests {
             "squash",
             "--chainstate",
             "/tmp/chainstate",
-            "--height",
-            "123",
+            "--tenure-start-bitcoin-height",
+            "869704",
             "--out-dir",
             "/tmp/out",
             "--sortition",
@@ -147,8 +147,8 @@ mod tests {
             "/tmp/source",
             "--squashed-chainstate",
             "/tmp/squashed",
-            "--height",
-            "456",
+            "--tenure-start-bitcoin-height",
+            "869704",
             "--clarity",
         ]
         .into_iter()
@@ -159,13 +159,13 @@ mod tests {
             Command::Validate(ValidateArgs {
                 source_chainstate,
                 squashed_chainstate,
-                height,
+                tenure_start_bitcoin_height,
                 clarity,
                 ..
             }) => {
                 assert_eq!(source_chainstate, PathBuf::from("/tmp/source"));
                 assert_eq!(squashed_chainstate, PathBuf::from("/tmp/squashed"));
-                assert_eq!(height, 456);
+                assert_eq!(tenure_start_bitcoin_height, 869704);
                 assert!(clarity);
             }
             _ => panic!("expected validate command"),
@@ -256,14 +256,14 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_rejects_sqlite_sidecars() {
+    fn test_compute_checksums_ignores_sqlite_sidecars() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         create_test_gss_dir(dir, &["a.sqlite", "a.sqlite-wal"]);
 
-        let result = compute_checksums(dir, None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("SQLite sidecar"));
+        let checksums = compute_checksums(dir, None).unwrap();
+        assert_eq!(checksums.len(), 1);
+        assert!(checksums.contains_key("a.sqlite"));
     }
 
     #[test]
@@ -466,7 +466,8 @@ mod tests {
         write_manifest_toml(dir, Some(ChecksumsSection { files }), no_squash_roots());
 
         let cp_toml = r#"
-height = 100
+stacks_height = 100
+bitcoin_height = 869704
 clarity_squash_root_node_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 index_squash_root_node_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 sortition_squash_root_node_hash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
