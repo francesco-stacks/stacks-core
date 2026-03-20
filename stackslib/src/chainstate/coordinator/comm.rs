@@ -131,6 +131,22 @@ impl CoordinatorReceivers {
         }
         signal_bools.receive_signal()
     }
+
+    /// Like `wait_on`, but with a timeout. Returns `TIMEOUT` if the timeout
+    /// expires without any signal. Used when the coordinator is waiting for
+    /// a PoX anchor block - it needs to periodically wake up and process
+    /// any Stacks blocks that the p2p downloader has staged.
+    pub fn wait_on_timeout(&self, duration: std::time::Duration) -> u8 {
+        let mut signal_bools = self.signal_bools.lock().unwrap();
+        if !signal_bools.activated_signal() {
+            let (guard, _timeout_result) = self
+                .signal_wakeup
+                .wait_timeout(signal_bools, duration)
+                .unwrap();
+            signal_bools = guard;
+        }
+        signal_bools.receive_signal()
+    }
 }
 
 impl CoordinatorChannels {

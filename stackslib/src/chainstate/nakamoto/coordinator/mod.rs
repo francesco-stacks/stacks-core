@@ -52,6 +52,15 @@ use crate::util_lib::db::Error as DBError;
 #[cfg(any(test, feature = "testing"))]
 pub static TEST_COORDINATOR_STALL: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 
+/// Result of draining available Nakamoto Stacks blocks from staging.
+pub struct NakamotoBlockProgress {
+    /// True if at least one valid Stacks block was processed (received a
+    /// receipt). Invalid/deserialization-error blocks that are drained from
+    /// staging do NOT set this flag, since they don't advance the canonical
+    /// chain or improve anchor block availability.
+    pub made_progress: bool,
+}
+
 #[cfg(test)]
 pub mod tests;
 
@@ -672,9 +681,21 @@ impl<
         miner_status: Arc<Mutex<MinerStatus>>,
     ) -> bool {
         // timeout so that we handle Ctrl-C a little gracefully
-        if (bits & (CoordinatorEvents::NEW_STACKS_BLOCK as u8)) != 0 {
+        //
+        // When waiting for a PoX anchor block, also process stacks blocks on
+        // TIMEOUT events. The p2p downloader stages blocks asynchronously, but
+        // once burn processing is caught up, no NEW_STACKS_BLOCK signals may
+        // arrive. The timed wait in the main loop ensures we wake up periodically
+        // to drain any staged blocks.
+        let process_stacks = (bits & (CoordinatorEvents::NEW_STACKS_BLOCK as u8)) != 0
+            || (self.waiting_for_pox_anchor && (bits & (CoordinatorEvents::TIMEOUT as u8)) != 0);
+
+        if process_stacks {
             signal_mining_blocked(miner_status.clone());
-            debug!("Received new Nakamoto stacks block notice");
+            info!(
+                "Coordinator: processing stacks blocks (waiting_for_pox_anchor={}, bits={:#04x})",
+                self.waiting_for_pox_anchor, bits
+            );
 
             // we may still be processing epoch 2 blocks after the Nakamoto transition, so be sure
             // to process them so we can get to the Nakamoto blocks!
@@ -711,12 +732,9 @@ impl<
 
             // now we can process the nakamoto block
             match self.handle_new_nakamoto_stacks_block() {
-                Ok(new_anchor_block_opt) => {
-                    if let Some(bhh) = new_anchor_block_opt {
-                        debug!(
-                            "Found next PoX anchor block, waiting for reward cycle processing";
-                            "pox_anchor_block_hash" => %bhh
-                        );
+                Ok(progress) => {
+                    if progress.made_progress && self.waiting_for_pox_anchor {
+                        self.stacks_progress_since_anchor_wait = true;
                     }
                 }
                 Err(e) => {
@@ -729,16 +747,39 @@ impl<
         if (bits & (CoordinatorEvents::NEW_BURN_BLOCK as u8)) != 0 {
             signal_mining_blocked(miner_status.clone());
             debug!("Received new burn block notice");
-            match self.handle_new_nakamoto_burnchain_block() {
-                Ok(can_proceed) => {
-                    if !can_proceed {
-                        error!("Missing canonical anchor block");
+
+            // Only retry burn processing if we're not blocked, or if Stacks
+            // processing made real progress since we blocked.
+            let should_process =
+                !self.waiting_for_pox_anchor || self.stacks_progress_since_anchor_wait;
+
+            if should_process {
+                match self.handle_new_nakamoto_burnchain_block() {
+                    Ok(can_proceed) => {
+                        // Clear progress flag on Ok - we successfully attempted
+                        // the retry, so the progress is consumed.
+                        self.stacks_progress_since_anchor_wait = false;
+                        if can_proceed {
+                            self.waiting_for_pox_anchor = false;
+                        } else {
+                            if !self.waiting_for_pox_anchor {
+                                info!(
+                                    "Burn block processing waiting for PoX anchor block. \
+                                     Will retry after new Stacks blocks are processed."
+                                );
+                            }
+                            self.waiting_for_pox_anchor = true;
+                        }
+                    }
+                    Err(e) => {
+                        // Do NOT clear stacks_progress_since_burn_blocked here.
+                        // The retry errored, so progress is preserved for the
+                        // next wake-up to retry again.
+                        warn!("Error processing new burn block: {:?}", e);
                     }
                 }
-                Err(e) => {
-                    warn!("Error processing new burn block: {:?}", e);
-                }
             }
+
             signal_mining_ready(miner_status.clone());
         }
         if (bits & (CoordinatorEvents::STOP as u8)) != 0 {
@@ -766,17 +807,18 @@ impl<
     fn fault_injection_pause_nakamoto_block_processing() {}
 
     /// Handle one or more new Nakamoto Stacks blocks.
-    /// If we process a PoX anchor block, then return its block hash.  This unblocks processing the
-    /// next reward cycle's burnchain blocks.  Subsequent calls to this function will terminate
-    /// with Some(pox-anchor-block-hash) until the reward cycle info is processed in the sortition
-    /// DB.
-    pub fn handle_new_nakamoto_stacks_block(&mut self) -> Result<Option<BlockHeaderHash>, Error> {
+    /// Returns progress information: whether any valid blocks were processed.
+    /// If a block in the prepare phase triggers successful burn block processing
+    /// (via the internal line-957 call), `self.waiting_for_pox_anchor` is cleared directly.
+    pub fn handle_new_nakamoto_stacks_block(&mut self) -> Result<NakamotoBlockProgress, Error> {
         debug!("Handle new Nakamoto block");
         let canonical_sortition_tip = self.canonical_sortition_tip.clone().ok_or_else(|| {
             ChainstateError::Expects(
                 "processing a new Stacks block, but don't have a canonical sortition tip".into(),
             )
         })?;
+
+        let mut made_progress = false;
 
         loop {
             Self::fault_injection_pause_nakamoto_block_processing();
@@ -818,6 +860,8 @@ impl<
                 debug!("No more blocks to process (no receipts)");
                 break;
             };
+
+            made_progress = true;
 
             if block_receipt.signers_updated {
                 // notify p2p thread via globals
@@ -954,12 +998,17 @@ impl<
             // as determined by the history tipped at `canonical_stacks_block_id`.
             // Pause here and process the next sortitions
             debug!("Process next reward cycle's sortitions");
-            self.handle_new_nakamoto_burnchain_block()?;
-            debug!("Processed next reward cycle's sortitions");
+            let burn_ok = self.handle_new_nakamoto_burnchain_block()?;
+            if burn_ok {
+                // Anchor block found - clear the blocked state so the outer
+                // gate in handle_comms_nakamoto knows burn processing can proceed.
+                self.waiting_for_pox_anchor = false;
+                self.stacks_progress_since_anchor_wait = false;
+            }
+            debug!("Processed next reward cycle's sortitions (success={burn_ok})");
         }
 
-        // no PoX anchor block found
-        Ok(None)
+        Ok(NakamotoBlockProgress { made_progress })
     }
 
     /// Given a burnchain header, find the PoX reward cycle info

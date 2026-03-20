@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod diagnose;
 mod manifest;
 mod ops;
 mod util;
@@ -8,6 +9,7 @@ mod verify;
 use clap::Parser;
 use cli::{Cli, Command};
 use commands::{run_latest_height, run_squash, run_validate, run_verify};
+use diagnose::run_diagnose;
 
 fn main() {
     let cli = Cli::parse();
@@ -16,6 +18,7 @@ fn main() {
         Command::Validate(args) => run_validate(args),
         Command::Verify(args) => run_verify(args),
         Command::LatestHeight(args) => run_latest_height(args),
+        Command::Diagnose(args) => run_diagnose(args),
     }
 }
 

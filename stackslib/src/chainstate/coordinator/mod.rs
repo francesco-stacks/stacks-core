@@ -228,6 +228,17 @@ pub struct ChainsCoordinator<
     pub refresh_stacker_db: Arc<AtomicBool>,
     /// whether or not the canonical tip is now a Nakamoto header
     pub in_nakamoto_epoch: bool,
+    /// Set when burn block processing is blocked at a reward cycle boundary
+    /// because the PoX anchor block has not been downloaded/processed yet.
+    /// While set, the outer event loop suppresses burn block retries unless
+    /// `stacks_progress_since_anchor_wait` indicates that new Stacks blocks
+    /// have been processed (which may unblock the anchor).
+    pub waiting_for_pox_anchor: bool,
+    /// Set when `handle_new_nakamoto_stacks_block` processes at least one valid
+    /// block while `waiting_for_pox_anchor` is true. Cleared (on `Ok`) when burn
+    /// block processing is retried - regardless of whether the retry succeeds.
+    /// Preserved on `Err` so the next wake-up retries again.
+    pub stacks_progress_since_anchor_wait: bool,
 }
 
 #[derive(Debug)]
@@ -531,10 +542,24 @@ impl<
             burnchain_indexer,
             refresh_stacker_db: comms.refresh_stacker_db.clone(),
             in_nakamoto_epoch: false,
+            waiting_for_pox_anchor: false,
+            stacks_progress_since_anchor_wait: false,
         };
 
         loop {
-            let bits = comms.wait_on();
+            // When waiting for a PoX anchor block, use a timed wait so we
+            // periodically wake up and process any Stacks blocks that the
+            // p2p downloader has staged. Without this, the coordinator would
+            // sleep indefinitely once all burn signals stop.
+            let bits = if inst.waiting_for_pox_anchor {
+                let bits = comms.wait_on_timeout(std::time::Duration::from_secs(1));
+                if (bits & (CoordinatorEvents::TIMEOUT as u8)) != 0 {
+                    info!("Coordinator: timed wake-up while waiting for PoX anchor block");
+                }
+                bits
+            } else {
+                comms.wait_on()
+            };
             if inst.in_subsequent_nakamoto_reward_cycle() {
                 debug!("Coordinator: in subsequent Nakamoto reward cycle");
                 if !inst.handle_comms_nakamoto(bits, miner_status.clone()) {
@@ -696,6 +721,8 @@ impl<T: BlockEventDispatcher, U: RewardSetProvider, B: BurnchainHeaderReader>
             burnchain_indexer,
             refresh_stacker_db: Arc::new(AtomicBool::new(false)),
             in_nakamoto_epoch: false,
+            waiting_for_pox_anchor: false,
+            stacks_progress_since_anchor_wait: false,
         }
     }
 }

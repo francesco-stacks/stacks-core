@@ -818,11 +818,29 @@ impl Trie {
                 storage.read_node_hash_bytes(&root_ptr)?
             };
 
-            trace!(
-                "Include root hash {} from block {} in ancestor #{}",
-                ancestor_hash,
-                prev_block_header,
-                1u32 << log_depth
+            // Cross-verify: for post-squash ancestors, also check if the stored
+            // root hash matches the blob root hash. For squash-range ancestors
+            // on a squashed MARF, verify the blob root hash (which is the
+            // squash blob's content hash, NOT the archival MARF root hash).
+            if storage.squash_info().is_some() && !use_stored_root {
+                // Post-squash ancestor: also look up the archival root hash
+                // (should be None for post-squash blocks, but log it for debugging)
+                if let Ok(Some(stored)) = trie_sql::read_squash_archival_marf_root_hash(
+                    storage.sqlite_conn(),
+                    ancestor_height,
+                ) {
+                    if stored != ancestor_hash {
+                        eprintln!(
+                            "SQUASH-DIAG: MISMATCH at height {}: blob_root={} stored_root={}",
+                            ancestor_height, ancestor_hash, stored
+                        );
+                    }
+                }
+            }
+
+            eprintln!(
+                "SQUASH-TRACE: ancestor_hash at height {} (block {}) = {} (stored_root={})",
+                ancestor_height, prev_block_header, ancestor_hash, use_stored_root
             );
 
             hash_buf.push(ancestor_hash);

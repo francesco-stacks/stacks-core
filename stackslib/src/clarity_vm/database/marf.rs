@@ -1003,13 +1003,33 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
     }
 
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
+        use sha2::Digest;
         let mut keys = Vec::with_capacity(items.len());
         let mut values = Vec::with_capacity(items.len());
+        let mut key_hasher = sha2::Sha256::new();
         for (key, value) in items.into_iter() {
             let marf_value = MARFValue::from_value(&value);
             SqliteConnection::put(self.marf.sqlite_tx(), &marf_value.to_hex(), &value)?;
+            key_hasher.update(key.as_bytes());
+            key_hasher.update(marf_value.as_ref());
             keys.push(key);
             values.push(marf_value);
+        }
+        let digest = key_hasher.finalize();
+        eprintln!(
+            "SQUASH-WRITE: put_all_data: {} keys, content_hash={}",
+            keys.len(),
+            stacks_common::util::hash::to_hex(&digest[..16])
+        );
+        // Log individual keys for single-key writes (likely finish_block)
+        if keys.len() <= 2 {
+            for (k, v) in keys.iter().zip(values.iter()) {
+                eprintln!(
+                    "SQUASH-WRITE:   key={} value={}",
+                    k,
+                    stacks_common::util::hash::to_hex(&v.0[..8])
+                );
+            }
         }
         self.marf
             .insert_batch(&keys, values)

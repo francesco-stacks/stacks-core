@@ -4600,13 +4600,16 @@ impl StacksChainState {
         clarity_tx.connection().as_transaction(|tx_connection| {
             let epoch = tx_connection.get_epoch();
             let result = tx_connection.with_clarity_db(|db| {
-                let block_height = Value::UInt(db.get_current_block_height().into());
+                let h = db.get_current_block_height();
+                let block_height = Value::UInt(h.into());
+                eprintln!("SQUASH-UNLOCK: process_stx_unlocks clarity_height={h}");
                 let res = db.fetch_entry_unknown_descriptor(
                     &lockup_contract_id,
                     "lockups",
                     &block_height,
                     &epoch,
                 )?;
+                eprintln!("SQUASH-UNLOCK: lockups[{h}] = {:?}", &res);
                 Ok(res)
             })?;
 

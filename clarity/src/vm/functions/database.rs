@@ -569,12 +569,17 @@ pub fn special_at_block(
             .into());
         }
     };
-
+    let bhh_str = format!("{bhh}");
     exec_state.add_memory(cost_constants::AT_BLOCK_MEMORY)?;
     let result = exec_state
         .evaluate_at_block(bhh, &args[1], invoke_ctx, context)
         .and_then(|v| v.clone_with_cost(exec_state));
     exec_state.drop_memory(cost_constants::AT_BLOCK_MEMORY)?;
+
+    match &result {
+        Ok(val) => eprintln!("SQUASH-TRACE: at-block({bhh_str}) => Ok({val})"),
+        Err(e) => eprintln!("SQUASH-TRACE: at-block({bhh_str}) => Err({e:?})"),
+    }
 
     result
 }

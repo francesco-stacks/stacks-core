@@ -25,6 +25,23 @@ pub enum Command {
     Verify(VerifyArgs),
     /// Print the latest confirmed block height in a MARF.
     LatestHeight(LatestHeightArgs),
+    /// Diagnose state root divergence by comparing ancestor hashes between
+    /// squashed and archival clarity MARFs.
+    Diagnose(DiagnoseArgs),
+}
+
+/// Arguments for diagnosing state root divergence.
+#[derive(Parser, Debug)]
+pub struct DiagnoseArgs {
+    /// Path to the archival chainstate folder.
+    #[arg(long, value_name = "DIR")]
+    pub archival_chainstate: PathBuf,
+    /// Path to the squashed chainstate folder.
+    #[arg(long, value_name = "DIR")]
+    pub squashed_chainstate: PathBuf,
+    /// Stacks block height to diagnose (the failing block).
+    #[arg(long, value_name = "HEIGHT")]
+    pub stacks_height: u32,
 }
 
 /// Arguments for generating squashed MARFs.

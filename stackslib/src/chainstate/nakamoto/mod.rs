@@ -4842,6 +4842,17 @@ impl NakamotoChainState {
                 Ok((block_fees, _block_burns, txs_receipts)) => (block_fees, txs_receipts),
             };
 
+        info!("Block {block_hash} at height {next_block_height}: processed {} txs, fees = {block_fees}", tx_receipts.len() + txs_receipts.len());
+        for (i, receipt) in txs_receipts.iter().enumerate() {
+            let tx_hash = receipt.transaction.txid();
+            let result_repr = format!("{:?}", &receipt.result);
+            let result_short = if result_repr.len() > 120 {
+                &result_repr[..120]
+            } else {
+                &result_repr
+            };
+            info!("  tx[{i}] {tx_hash}: {result_short}");
+        }
         tx_receipts.extend(txs_receipts);
 
         let total_tenure_cost = clarity_tx.cost_so_far();
@@ -4871,7 +4882,10 @@ impl NakamotoChainState {
                 return Err(ChainstateError::InvalidStacksBlock(e));
             }
             Err(e) => return Err(e),
-            Ok(finish_events) => finish_events,
+            Ok(finish_events) => {
+                info!("Block {block_hash} at height {next_block_height}: finish_block complete, lockup_events={}, has_sip31={}", finish_events.lockup_events.len(), finish_events.sip31_event.is_some());
+                finish_events
+            }
         };
 
         // If any, append lockups events to the coinbase receipt
@@ -4917,6 +4931,7 @@ impl NakamotoChainState {
 
         // verify that the resulting chainstate matches the block's state root
         let root_hash = clarity_tx.seal();
+        info!("Block {block_hash} at height {next_block_height}: sealed state root = {root_hash}, expected = {}", block.header.state_index_root);
         if root_hash != block.header.state_index_root {
             let msg = format!(
                 "Block {} state root mismatch: expected {}, got {}",

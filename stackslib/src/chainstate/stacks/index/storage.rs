@@ -753,6 +753,10 @@ impl<T: MarfTrieId> TrieRAM<T> {
         // find trie root hash
         debug!("Calculate trie root hash");
         let root_trie_hash = self.calculate_node_hashes(storage_tx, 0)?;
+        eprintln!(
+            "SQUASH-TRACE: seal for block {}: trie_root_hash = {}",
+            &self.block_header, &root_trie_hash
+        );
 
         // find marf root hash -- the hash of the trie root node hash, and the hashes of the
         // geometric series of ancestor tries.  Because the trie is already in the process of
@@ -762,6 +766,10 @@ impl<T: MarfTrieId> TrieRAM<T> {
             debug!("Calculate marf root hash");
             moved_trieram.calculate_marf_root_hash(storage, &root_trie_hash)
         });
+        eprintln!(
+            "SQUASH-TRACE: seal for block {}: marf_root_hash = {}",
+            &self.block_header, &marf_root_hash
+        );
 
         if TrieHashCalculationMode::All == storage_tx.deref().hash_calculation_mode {
             // If we are doing both eager and deferred hashing (i.e. via a test), then verify
@@ -938,6 +946,36 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 buf.copy_from_slice(hasher.finalize().as_slice());
                 TrieHash(buf)
             };
+
+            // Log per-child hash contributions for the root node
+            if node_ptr == 0 {
+                for ptr in node.ptrs().iter() {
+                    if ptr.is_empty() {
+                        continue;
+                    }
+                    if !is_backptr(ptr.id()) {
+                        // Same-block child: its hash was computed recursively
+                        let child_hash =
+                            self.read_node_hash(&TriePtr::new(ptr.id(), ptr.chr(), ptr.ptr()))?;
+                        eprintln!(
+                            "SQUASH-ROOT-CHILD: chr=0x{:02x} type=inline ptr={} hash={}",
+                            ptr.chr(),
+                            ptr.ptr(),
+                            child_hash
+                        );
+                    } else {
+                        // Backpointer child: hash is the block hash
+                        if let Ok(bh) = storage_tx.get_block_hash_caching(ptr.back_block()) {
+                            eprintln!(
+                                "SQUASH-ROOT-CHILD: chr=0x{:02x} type=backptr bb={} block={}",
+                                ptr.chr(),
+                                ptr.back_block(),
+                                bh
+                            );
+                        }
+                    }
+                }
+            }
 
             Ok(node_hash)
         }
