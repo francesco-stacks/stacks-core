@@ -64,6 +64,10 @@ pub struct SquashArgs {
     /// Skip validation to speed up size measurements.
     #[arg(long = "skip-validate")]
     pub skip_validate: bool,
+    /// Path to the node config TOML file. Used to extract PoX constants
+    /// Required for testnet.
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
     /// Run full leaf-by-leaf comparison (slow, O(leaf_count)).
     /// By default, validation uses the fast hash-based check.
     #[arg(long)]
@@ -100,6 +104,10 @@ pub struct ValidateArgs {
     /// Validate Bitcoin auxiliary files (burnchain.sqlite + headers.sqlite).
     #[arg(long)]
     pub bitcoin: bool,
+    /// Path to the node config TOML file. Used to extract PoX constants
+    /// Required for testnet.
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
     /// Run full leaf-by-leaf comparison (slow, O(leaf_count)).
     /// By default, validation uses the fast hash-based check.
     #[arg(long)]

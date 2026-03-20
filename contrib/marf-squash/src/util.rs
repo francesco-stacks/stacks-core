@@ -9,10 +9,7 @@ use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
 use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use blockstack_lib::chainstate::stacks::index::marf::MARFOpenOpts;
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
-use blockstack_lib::core::{
-    BITCOIN_MAINNET_FIRST_BLOCK_HEIGHT, BITCOIN_TESTNET_FIRST_BLOCK_HEIGHT,
-    POX_REWARD_CYCLE_LENGTH, POX_TESTNET_CYCLE_LENGTH,
-};
+use blockstack_lib::config::ConfigFile;
 use sha2::{Digest, Sha256};
 
 use crate::cli::{ChainstatePaths, TargetPaths, GSS_MANIFEST, SQLITE_SIDECAR_EXTENSIONS};
@@ -278,35 +275,6 @@ pub fn sortition_open_opts_for_path(db_path: &Path) -> MARFOpenOpts {
 }
 
 /// Read `mainnet` from the index DB's `db_config` table and derive PoX constants.
-pub fn index_pox_constants(index_db_path: &Path) -> (u64, u64) {
-    let conn = rusqlite::Connection::open(index_db_path).unwrap_or_else(|e| {
-        eprintln!(
-            "Failed to open index DB '{}' for db_config: {e}",
-            index_db_path.display()
-        );
-        std::process::exit(1);
-    });
-    let mainnet: bool = conn
-        .query_row("SELECT mainnet FROM db_config LIMIT 1", [], |row| {
-            row.get::<_, i64>(0).map(|v| v != 0)
-        })
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to read db_config.mainnet: {e}");
-            std::process::exit(1);
-        });
-    if mainnet {
-        (
-            BITCOIN_MAINNET_FIRST_BLOCK_HEIGHT,
-            POX_REWARD_CYCLE_LENGTH as u64,
-        )
-    } else {
-        (
-            BITCOIN_TESTNET_FIRST_BLOCK_HEIGHT,
-            POX_TESTNET_CYCLE_LENGTH as u64,
-        )
-    }
-}
-
 /// Read (mainnet, chain_id) from the index DB's db_config table.
 pub fn read_db_config(index_db_path: &Path) -> (bool, u32) {
     let conn = rusqlite::Connection::open(index_db_path).unwrap_or_else(|e| {
@@ -329,12 +297,31 @@ pub fn read_db_config(index_db_path: &Path) -> (bool, u32) {
     (mainnet_i != 0, chain_id as u32)
 }
 
-/// Build PoxConstants from mainnet/testnet defaults.
-pub fn build_pox_constants(mainnet: bool) -> PoxConstants {
+/// Build PoxConstants. For mainnet the built-in constants are canonical.
+/// For any other network, the node config TOML is required because each
+/// testnet has its own PoX parameters.
+pub fn build_pox_constants(mainnet: bool, config_path: Option<&Path>) -> PoxConstants {
     if mainnet {
-        PoxConstants::mainnet_default()
+        let mut pox = PoxConstants::mainnet_default();
+        if let Some(p) = config_path {
+            apply_config_overrides(p, &mut pox);
+        }
+        pox
     } else {
-        PoxConstants::testnet_default()
+        let config_path = config_path.unwrap_or_else(|| {
+            eprintln!(
+                "Error: --config is required for non-mainnet networks.\n\
+                 Each testnet has its own PoX parameters (reward cycle length, \
+                 prepare phase length, etc.) that cannot be inferred from the \
+                 database. Pass the node config TOML with --config."
+            );
+            std::process::exit(1);
+        });
+        // Start from nakamoto_testnet_default as a baseline, then apply
+        // overrides from the config file.
+        let mut pox = PoxConstants::nakamoto_testnet_default();
+        apply_config_overrides(config_path, &mut pox);
+        pox
     }
 }
 
@@ -457,6 +444,40 @@ pub fn find_tenure_end_stacks_height(
     })?;
 
     Ok(header.stacks_block_height as u32)
+}
+
+/// Apply PoX overrides from a node config TOML file to the given PoxConstants.
+/// Reads the [burnchain] section and applies any pox_reward_length,
+/// pox_prepare_length, sunset_start, and sunset_end overrides.
+pub fn apply_config_overrides(config_path: &Path, pox: &mut PoxConstants) {
+    let config = ConfigFile::from_path(config_path.to_str().unwrap()).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to parse config file '{}': {e}",
+            config_path.display()
+        );
+        std::process::exit(1);
+    });
+    let bc = match config.burnchain {
+        Some(bc) => bc,
+        None => return,
+    };
+    if let Some(v) = bc.pox_reward_length {
+        eprintln!("Config override: pox_reward_length = {v}");
+        pox.reward_cycle_length = v;
+    }
+    if let Some(v) = bc.pox_prepare_length {
+        eprintln!("Config override: pox_prepare_length = {v}");
+        pox.prepare_length = v;
+    }
+    if let Some(v) = bc.sunset_start {
+        pox.sunset_start = v as u64;
+    }
+    if let Some(v) = bc.sunset_end {
+        pox.sunset_end = v as u64;
+    }
+    if let Some(v) = bc.pox_2_activation {
+        pox.v1_unlock_height = v;
+    }
 }
 
 /// Warn if the tenure-start Bitcoin height is inside the Nakamoto prepare

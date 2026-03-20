@@ -15,9 +15,9 @@ use crate::ops::{
 use crate::util::{
     bitcoin_height_to_sortition_marf_height, build_pox_constants, chainstate_paths,
     ensure_blobs_match, ensure_flag_requires, ensure_targets_selected,
-    find_tenure_end_stacks_height, index_pox_constants, read_db_config, read_first_burn_height,
-    selected_targets, sortition_open_opts, squash_marf_open_opts, target_out_paths,
-    target_out_paths_sortition, warn_if_in_prepare_phase,
+    find_tenure_end_stacks_height, read_db_config, read_first_burn_height, selected_targets,
+    sortition_open_opts, squash_marf_open_opts, target_out_paths, target_out_paths_sortition,
+    warn_if_in_prepare_phase,
 };
 use crate::verify::verify_gss;
 
@@ -39,7 +39,7 @@ pub fn run_squash(args: SquashArgs) {
 
     // Read network config.
     let (mainnet, chain_id) = read_db_config(&paths.index.db);
-    let pox = build_pox_constants(mainnet);
+    let pox = build_pox_constants(mainnet, args.config.as_deref());
 
     // Derive chainstate root: paths.index.db = ".../chainstate/vm/index.sqlite"
     let chainstate_root = paths
@@ -104,13 +104,6 @@ pub fn run_squash(args: SquashArgs) {
         clarity_out = Some(out);
     }
 
-    // Derive PoX constants from the source index DB (needed for index side-table filtering).
-    let (pox_first_burn_height, reward_cycle_len) = if do_index {
-        index_pox_constants(&paths.index.db)
-    } else {
-        (0, 1)
-    };
-
     if do_index {
         let out = target_out_paths(&args.out_dir, &paths.index.db);
         squash_and_copy_one(
@@ -119,8 +112,8 @@ pub fn run_squash(args: SquashArgs) {
             &out,
             stacks_height,
             SideTableMode::Index {
-                first_burn_height: pox_first_burn_height,
-                reward_cycle_len,
+                first_burn_height,
+                reward_cycle_len: pox.reward_cycle_length as u64,
             },
             squash_marf_open_opts(),
         );
@@ -302,8 +295,8 @@ pub fn run_squash(args: SquashArgs) {
                 stacks_height,
                 args.full,
                 SideTableMode::Index {
-                    first_burn_height: pox_first_burn_height,
-                    reward_cycle_len,
+                    first_burn_height,
+                    reward_cycle_len: pox.reward_cycle_length as u64,
                 },
                 squash_marf_open_opts(),
             )
@@ -396,7 +389,7 @@ pub fn run_validate(args: ValidateArgs) {
 
     // Resolve the same way as run_squash.
     let (mainnet, chain_id) = read_db_config(&source_paths.index.db);
-    let pox = build_pox_constants(mainnet);
+    let pox = build_pox_constants(mainnet, args.config.as_deref());
     let chainstate_root = source_paths
         .index
         .db
@@ -415,7 +408,7 @@ pub fn run_validate(args: ValidateArgs) {
         bitcoin_height,
         mainnet,
         chain_id,
-        pox,
+        pox.clone(),
     )
     .unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -426,6 +419,8 @@ pub fn run_validate(args: ValidateArgs) {
         source_paths.sortition.db.to_str().unwrap(),
         bitcoin_height,
     );
+
+    let first_burn_height = read_first_burn_height(source_paths.sortition.db.to_str().unwrap());
 
     let mut all_valid = true;
 
@@ -443,9 +438,8 @@ pub fn run_validate(args: ValidateArgs) {
         all_valid = false;
     }
 
-    if do_index {
-        let (first_burn_height, reward_cycle_len) = index_pox_constants(&source_paths.index.db);
-        if !validate_one(
+    if do_index
+        && !validate_one(
             "index",
             &source_paths.index,
             &squashed_paths.index,
@@ -453,12 +447,12 @@ pub fn run_validate(args: ValidateArgs) {
             args.full,
             SideTableMode::Index {
                 first_burn_height,
-                reward_cycle_len,
+                reward_cycle_len: pox.reward_cycle_length as u64,
             },
             squash_marf_open_opts(),
-        ) {
-            all_valid = false;
-        }
+        )
+    {
+        all_valid = false;
     }
 
     if do_sortition
