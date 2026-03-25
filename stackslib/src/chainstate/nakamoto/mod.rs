@@ -1965,7 +1965,7 @@ impl NakamotoChainState {
             );
             ChainstateError::NoSuchBlockError
         })?;
-        let (mut chainstate_tx, clarity_instance) = stacks_chain_state.chainstate_tx_begin()?;
+        let (mut chainstate_tx, clarity_instance) = stacks_chain_state.chainstate_tx_begin();
 
         // find parent header
         let Some(parent_header_info) =
@@ -2146,6 +2146,7 @@ impl NakamotoChainState {
         let mut sort_tx = sort_db.tx_handle_begin(canonical_sortition_tip)?;
         sort_tx.set_stacks_block_accepted(
             &next_ready_block.header.consensus_hash,
+            &burnchain_view,
             &next_ready_block.header.block_hash(),
             next_ready_block.header.chain_length,
         )?;
@@ -2823,11 +2824,13 @@ impl NakamotoChainState {
     ) -> Result<Option<StacksHeaderInfo>, ChainstateError> {
         let canonical_sortition_handle = sort_db.index_handle_at_tip();
         for candidate in candidates.into_iter() {
-            let Some(ref candidate_ch) = candidate.burn_view else {
-                // this is an epoch 2.x header, no burn view to check
-                return Ok(Some(candidate));
-            };
-            let in_canonical_fork = canonical_sortition_handle.processed_block(&candidate_ch)?;
+            // if burn_view is None, then this is an epoch 2.x header, and since epoch 2.x tenure's correspond
+            // to a single stacks block, we can use the miner's tenure sortition as a proxy for canonicity.
+            let candidate_ch = candidate
+                .burn_view
+                .as_ref()
+                .unwrap_or(&candidate.consensus_hash);
+            let in_canonical_fork = canonical_sortition_handle.processed_block(candidate_ch)?;
             if in_canonical_fork {
                 return Ok(Some(candidate));
             }
@@ -2913,8 +2916,7 @@ impl NakamotoChainState {
     /// tenure.
     ///
     /// Get the highest block in a given tenure (identified by burnchain block height) with a canonical
-    ///  burn_view (i.e., burn_view on the canonical sortition fork). This covers only Nakamoto blocks.
-    /// Epoch2 blocks will not be checked.
+    ///  burn_view (i.e., burn_view on the canonical sortition fork).
     pub fn find_highest_known_block_header_in_tenure_by_block_height(
         chainstate: &StacksChainState,
         sort_db: &SortitionDB,
@@ -2935,8 +2937,7 @@ impl NakamotoChainState {
     /// tenure.
     ///
     /// Get the highest block in a given tenure (identified by burnchain block hash) with a canonical
-    ///  burn_view (i.e., burn_view on the canonical sortition fork). This covers only Nakamoto blocks.
-    /// Epoch2 blocks will not be checked.
+    ///  burn_view (i.e., burn_view on the canonical sortition fork).
     pub fn find_highest_known_block_header_in_tenure_by_block_hash(
         chainstate: &StacksChainState,
         sort_db: &SortitionDB,
@@ -2982,8 +2983,7 @@ impl NakamotoChainState {
         if !out.is_empty() {
             return Ok(out);
         }
-
-        Err(ChainstateError::NoSuchBlockError)
+        StacksChainState::get_stacks_block_header_info_by_burn_header_height(db, tenure_height)
     }
 
     /// DO NOT USE IN CONSENSUS CODE.  Different nodes can have different blocks for the same
@@ -3015,8 +3015,7 @@ impl NakamotoChainState {
         if !out.is_empty() {
             return Ok(out);
         }
-
-        Err(ChainstateError::NoSuchBlockError)
+        StacksChainState::get_stacks_block_header_info_by_burn_header_hash(db, tenure_block_hash)
     }
 
     /// Get the VRF proof for a Stacks block.
