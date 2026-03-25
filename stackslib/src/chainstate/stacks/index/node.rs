@@ -53,16 +53,11 @@ impl error::Error for CursorError {
 }
 
 // All numeric values of a Trie node when encoded.
-// They are all 4-bit numbers
-// * the 8th bit is used to indicate whether or not the value
-// identifies a back-pointer to be followed.
-// * the 7th bit is used to indicate whether or not the ptrs
-// are compressed. This bit is cleared on read.
-// * the 6th bit is used to indicate whether or not the pointer
-// stores a u64 offset.
-// * the 5th bit is used to indicate that a compressed non-backptr
-// pointer carries an annotation payload (`back_block`).
-// This bit is wire-format metadata and is cleared on read.
+// They are all 4-bit numbers (values 0-5)
+// * the 8th bit (0x80) indicates a back-pointer to be followed
+// * the 7th bit (0x40) indicates the ptrs are compressed. Cleared on read.
+// * the 6th bit (0x20) indicates the ptr offset is encoded as u64, instead of u32. Cleared on read.
+// * the 5th bit (0x10) indicates the squashed node contains a back_block payload.
 define_u8_enum!(TrieNodeID {
     Empty = 0,
     Leaf = 1,
@@ -504,6 +499,20 @@ impl TriePtr {
         self.ptr
     }
 
+    /// Convert `self.ptr()` to a `u32` in-memory index, or return an error
+    /// if the value exceeds `u32::MAX`.
+    #[inline]
+    pub fn ptr_as_u32(&self) -> Result<u32, Error> {
+        u32::try_from(self.ptr).map_err(|_| Error::OverflowError)
+    }
+
+    /// Convert `self.ptr()` to a `usize` in-memory index, or return an error
+    /// if the value exceeds `usize::MAX`.
+    #[inline]
+    pub fn ptr_as_usize(&self) -> Result<usize, Error> {
+        usize::try_from(self.ptr).map_err(|_| Error::OverflowError)
+    }
+
     #[inline]
     pub fn back_block(&self) -> u32 {
         self.back_block
@@ -525,7 +534,7 @@ impl TriePtr {
     /// control bit to match the encoded pointer width.
     #[inline]
     pub fn encoded_id(&self) -> u8 {
-        if self.ptr() > u32::MAX as u64 {
+        if self.ptr() > u64::from(u32::MAX) {
             set_u64_ptr(self.id())
         } else {
             clear_u64_ptr(self.id())
@@ -565,7 +574,8 @@ impl TriePtr {
         if is_u64_ptr(encoded_id) {
             w.write_all(&self.ptr().to_be_bytes())?;
         } else {
-            w.write_all(&(self.ptr() as u32).to_be_bytes())?;
+            let ptr32 = u32::try_from(self.ptr()).map_err(|_| Error::OverflowError)?;
+            w.write_all(&ptr32.to_be_bytes())?;
         }
         w.write_all(&self.back_block().to_be_bytes())?;
         Ok(())
@@ -583,7 +593,8 @@ impl TriePtr {
         if is_u64_ptr(encoded_id) {
             w.write_all(&self.ptr().to_be_bytes())?;
         } else {
-            w.write_all(&(self.ptr() as u32).to_be_bytes())?;
+            let ptr32 = u32::try_from(self.ptr()).map_err(|_| Error::OverflowError)?;
+            w.write_all(&ptr32.to_be_bytes())?;
         }
         if is_backptr(self.id()) || self.back_block() != 0 {
             w.write_all(&self.back_block().to_be_bytes())?;
@@ -629,7 +640,7 @@ impl TriePtr {
             let back_block = u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
             (ptr, back_block)
         } else {
-            let ptr = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as u64;
+            let ptr = u64::from(u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]));
             let back_block = u32::from_be_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
             (ptr, back_block)
         };
@@ -664,7 +675,7 @@ impl TriePtr {
                 bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
             ])
         } else {
-            u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as u64
+            u64::from(u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]))
         };
 
         let back_block = if is_backptr(id) || has_annotation {
@@ -704,7 +715,7 @@ impl TriePtr {
             u64::from_be_bytes([hi[0], hi[1], hi[2], hi[3], lo[0], lo[1], lo[2], lo[3]])
         } else {
             let ptr_be_bytes: [u8; 4] = read_next(fd)?;
-            u32::from_be_bytes(ptr_be_bytes) as u64
+            u64::from(u32::from_be_bytes(ptr_be_bytes))
         };
         let back_block = if is_backptr(id) || has_annotation {
             let bytes: [u8; 4] = read_next(fd)?;

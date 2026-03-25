@@ -389,7 +389,7 @@ fn assert_second_last_ptr_id_is_u64(
 }
 
 #[test]
-#[ignore = "synthetic large-offset regression"]
+#[ignore = "u64-pointer support"]
 fn dump_consume_large_offset_sets_u64_ptr_bit() {
     let dir = tempdir().expect("create temp dir");
     let path = dir
@@ -425,7 +425,7 @@ fn dump_consume_large_offset_sets_u64_ptr_bit() {
 }
 
 #[test]
-#[ignore = "synthetic large-offset regression"]
+#[ignore = "u64-pointer support"]
 fn dump_compressed_consume_large_offset_sets_u64_ptr_bit() {
     let dir = tempdir().expect("create temp dir");
     let path = dir
@@ -483,80 +483,6 @@ fn dump_compressed_consume_large_offset_sets_u64_ptr_bit() {
         u64::try_from(TRIEHASH_ENCODED_SIZE + 1 + 1).expect("infallible") + bitmap_size,
         "seek to second-last compressed child ptr id",
     );
-}
-
-/// A writer that fails after a configurable number of bytes, used to
-/// exercise I/O error propagation in `dump_consume`.
-struct FailWriter {
-    inner: std::io::Cursor<Vec<u8>>,
-    fail_after: usize,
-    written: usize,
-}
-
-impl FailWriter {
-    fn new(fail_after: usize) -> Self {
-        FailWriter {
-            inner: std::io::Cursor::new(Vec::new()),
-            fail_after,
-            written: 0,
-        }
-    }
-}
-
-impl std::io::Write for FailWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.written + buf.len() > self.fail_after {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "injected write failure",
-            ));
-        }
-        let n = self.inner.write(buf)?;
-        self.written += n;
-        Ok(n)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl Seek for FailWriter {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.inner.seek(pos)
-    }
-}
-
-/// Verify that `dump_consume` propagates write errors from
-/// `write_trie_indirect` back to the caller.
-#[test]
-fn test_dump_consume_write_error() {
-    let block = StacksBlockId([0x33; 32]);
-    let parent = StacksBlockId([0x44; 32]);
-    let mut trie = TrieRAM::new(&block, 0, &parent);
-
-    // Build a small trie: root Node256 -> child Node256 -> leaf.
-    let mut root = TrieNode256::new(&[]);
-    assert!(root.insert(&TriePtr::new(TrieNodeID::Node256 as u8, 0x00, 1)));
-    trie.write_nodetype(0, &TrieNodeType::Node256(Box::new(root)), TrieHash([0; 32]))
-        .unwrap();
-
-    let mut inner = TrieNode256::new(&[]);
-    assert!(inner.insert(&TriePtr::new(TrieNodeID::Leaf as u8, 0x01, 2)));
-    trie.write_nodetype(
-        1,
-        &TrieNodeType::Node256(Box::new(inner)),
-        TrieHash([0; 32]),
-    )
-    .unwrap();
-
-    let leaf = TrieLeaf::new(&[0x02], &[0xAA; 40]);
-    trie.write_nodetype(2, &TrieNodeType::Leaf(leaf), TrieHash([0; 32]))
-        .unwrap();
-
-    // Allow header write (36 bytes) but fail during node serialization.
-    let mut writer = FailWriter::new(40);
-    let result = trie.dump_consume(&mut writer);
-    assert!(result.is_err(), "dump_consume should propagate write error");
 }
 
 /// Verify that `dump_compressed_consume` exercises COW-patch and

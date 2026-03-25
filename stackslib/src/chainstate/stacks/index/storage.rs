@@ -272,7 +272,7 @@ impl<T: MarfTrieId> UncommittedState<T> {
 
     /// Write a node hash to a particular slot in the TrieRAM.
     /// Panics of the UncommittedState is sealed already.
-    pub fn write_node_hash(&mut self, node_array_ptr: u64, hash: TrieHash) -> Result<(), Error> {
+    pub fn write_node_hash(&mut self, node_array_ptr: u32, hash: TrieHash) -> Result<(), Error> {
         match self {
             UncommittedState::RW(ref mut trie_ram) => {
                 trie_ram.write_node_hash(node_array_ptr, hash)
@@ -824,14 +824,11 @@ impl<T: MarfTrieId> TrieRAM<T> {
     fn calculate_node_hashes(
         &mut self,
         storage_tx: &mut TrieStorageTransaction<T>,
-        node_ptr: u64,
+        node_ptr: u32, // in-memory index is always a u32
     ) -> Result<TrieHash, Error> {
         let start_time = storage_tx.bench.write_children_hashes_start();
         let mut start_node_time = Some(storage_tx.bench.write_children_hashes_same_block_start());
-        let node_ptr_u32 = u32::try_from(node_ptr).map_err(|_| {
-            Error::CorruptionError(format!("In-memory node index {node_ptr} exceeds u32::MAX"))
-        })?;
-        let (node, node_hash) = self.get_nodetype(node_ptr_u32)?.to_owned();
+        let (node, node_hash) = self.get_nodetype(node_ptr)?.to_owned();
         if node.is_leaf() {
             // base case: we already have the hash of the leaf, so return it.
             Ok(node_hash)
@@ -872,7 +869,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                         .write_children_hashes_empty_finish(start_time);
                 } else if !is_backptr(ptr.id()) {
                     // hash is the hash of this node's children
-                    let node_hash = self.calculate_node_hashes(storage_tx, ptr.ptr())?;
+                    let node_hash = self.calculate_node_hashes(storage_tx, ptr.ptr_as_u32()?)?;
 
                     // count the time taken to store the hash towards the
                     // write_children_hashes_same_benchmark
@@ -890,14 +887,8 @@ impl<T: MarfTrieId> TrieRAM<T> {
                     if TrieHashCalculationMode::Deferred == storage_tx.deref().hash_calculation_mode
                         && ptr.id() != TrieNodeID::Leaf as u8
                     {
-                        if ptr.ptr() > u32::MAX as u64 {
-                            return Err(Error::CorruptionError(format!(
-                                "In-memory child index {} exceeds u32::MAX",
-                                ptr.ptr()
-                            )));
-                        }
                         // need to store this hash too, since we deferred calculation
-                        self.write_node_hash(ptr.ptr(), node_hash)?;
+                        self.write_node_hash(ptr.ptr_as_u32()?, node_hash)?;
                     }
 
                     storage_tx
@@ -959,8 +950,6 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 .map_err(|_| Error::CorruptionError("Root pointer exceeds u32::MAX".into()))?,
         );
 
-        // first 32 bytes is reserved for the parent block hash
-        //    next 4 bytes is the local block identifier
         while let Some(pointer) = frontier.pop_front() {
             let (node, _node_hash) = self.get_nodetype(pointer)?;
 
@@ -969,12 +958,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
             if !node.is_leaf() {
                 for ptr in node.ptrs().iter() {
                     if !ptr.is_empty() && !is_backptr(ptr.id) {
-                        let idx = u32::try_from(ptr.ptr()).map_err(|_| {
-                            Error::CorruptionError(format!(
-                                "In-memory node index {} exceeds u32::MAX",
-                                ptr.ptr()
-                            ))
-                        })?;
+                        let idx = ptr.ptr_as_u32()?;
                         frontier.push_back(idx);
                         forward_ptr_count = forward_ptr_count
                             .checked_add(1)
@@ -989,17 +973,19 @@ impl<T: MarfTrieId> TrieRAM<T> {
         }
 
         // step 2: repeatedly lay out nodes until serialized offsets stabilize
+        // The first 32 bytes are reserved for the parent block hash,
+        // and the next 4 bytes for the local block identifier.
         let mut end_offset = BLOCK_HEADER_HASH_ENCODED_SIZE as u64 + 4;
         let mut offsets = Vec::with_capacity(node_data.len());
         // Cached byte lengths: nodes without forward pointers have constant
         // sizes across passes, so we only recompute nodes with forward ptrs.
-        let mut byte_lens: Vec<u64> = node_data
+        let mut byte_lens = node_data
             .iter()
             .map(|p| {
-                let (node, _) = self.get_nodetype(*p).expect("BFS index valid");
-                get_node_byte_len(node) as u64
+                let (node, _) = self.get_nodetype(*p)?;
+                u64::try_from(get_node_byte_len(node)).map_err(|_| Error::OverflowError)
             })
-            .collect();
+            .collect::<Result<Vec<u64>, Error>>()?;
         // The first pass replaces in-memory indices with serialized offsets.
         // Afterwards, each mutable child pointer can widen from u32 to u64 at most once.
         // A pass that changes offsets without introducing any new wide pointers is the final
@@ -1016,7 +1002,8 @@ impl<T: MarfTrieId> TrieRAM<T> {
             {
                 if has_fwd {
                     let (node, _) = self.get_nodetype(pointer)?;
-                    *blen = get_node_byte_len(node) as u64;
+                    *blen =
+                        u64::try_from(get_node_byte_len(node)).map_err(|_| Error::OverflowError)?;
                 }
                 ptr += *blen;
                 offsets.push(ptr);
@@ -1031,7 +1018,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 }
                 let next_node = &mut self
                     .data
-                    .get_mut(node_data_ptr as usize)
+                    .get_mut(usize::try_from(node_data_ptr).map_err(|_| Error::OverflowError)?)
                     .ok_or_else(|| {
                         Error::CorruptionError("Miscalculated dump_consume pointer".into())
                     })?
@@ -1171,8 +1158,6 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 .map_err(|_| Error::CorruptionError("Root pointer exceeds u32::MAX".into()))?,
         );
 
-        // first 32 bytes is reserved for the parent block hash
-        //    next 4 bytes is the local block identifier
         while let Some(pointer) = frontier.pop_front() {
             let (node, node_hash) = self.get_nodetype(pointer)?;
 
@@ -1224,27 +1209,21 @@ impl<T: MarfTrieId> TrieRAM<T> {
             };
 
             if let Some((_, patch_node)) = patch_node_opt.as_ref() {
-                let mut num_new_nodes = 0;
-                if !node.is_leaf() {
-                    for ptr in node.ptrs().iter() {
-                        if !ptr.is_empty() && !is_backptr(ptr.id) {
-                            num_new_nodes += 1;
-                        }
-                    }
-                }
-                if num_new_nodes != patch_node.ptr_diff.len() {
-                    // Extending a squashed MARF can rewrite many formerly-inline
-                    // children as backpointers. In that case the patch diff still
-                    // describes semantic pointer changes correctly, but it no
-                    // longer matches the count of forward children that need layout
-                    // space in the compressed dump. Fall back to full-node
-                    // serialization for this node instead of panicking.
-                    trace!(
-                        "Patch ptr_diff mismatch ({num_new_nodes} vs {}), falling back to full node",
-                        patch_node.ptr_diff.len()
-                    );
-                    patch_node_opt = None;
-                }
+                // The BFS frontier and the convergence loop must visit the
+                // exact same forward children in the same order. Compare the
+                // chr() sequence of forward pointers in the full node against
+                // the patch diff to guarantee this.
+                let node_forward = node
+                    .ptrs()
+                    .iter()
+                    .filter(|p| !p.is_empty() && !is_backptr(p.id))
+                    .map(|p| p.chr());
+                let diff_forward = patch_node
+                    .ptr_diff
+                    .iter()
+                    .filter(|p| !p.is_empty() && !is_backptr(p.id))
+                    .map(|p| p.chr());
+                assert!(node_forward.eq(diff_forward));
             }
 
             // queue each child
@@ -1279,21 +1258,24 @@ impl<T: MarfTrieId> TrieRAM<T> {
         }
 
         // step 2: repeatedly lay out nodes until serialized offsets stabilize
+        // The first 32 bytes are reserved for the parent block hash,
+        // and the next 4 bytes for the local block identifier.
         let mut end_offset = BLOCK_HEADER_HASH_ENCODED_SIZE as u64 + 4;
         let mut offsets = vec![];
         // Cached byte lengths: leaf / pointer-free / patch node sizes are
         // constant across passes, so we only recompute non-leaf nodes.
-        let mut byte_lens: Vec<u64> = node_data
+        let mut byte_lens = node_data
             .iter()
             .map(|dp| {
-                if let Some(patch) = dp.patch() {
-                    (TRIEHASH_ENCODED_SIZE + patch.size()) as u64
+                let byte_len = if let Some(patch) = dp.patch() {
+                    TRIEHASH_ENCODED_SIZE + patch.size()
                 } else {
-                    let (node, _) = self.get_nodetype(dp.ptr()).expect("BFS index valid");
-                    get_node_byte_len_compressed(node) as u64
-                }
+                    let (node, _) = self.get_nodetype(dp.ptr())?;
+                    get_node_byte_len_compressed(node)
+                };
+                u64::try_from(byte_len).map_err(|_| Error::OverflowError)
             })
-            .collect();
+            .collect::<Result<Vec<u64>, Error>>()?;
         // The first pass replaces in-memory indices with serialized offsets.
         // Afterwards, each mutable child pointer can widen from u32 to u64 at most once.
         // A pass that changes offsets without introducing any new wide pointers is the final
@@ -1309,7 +1291,8 @@ impl<T: MarfTrieId> TrieRAM<T> {
             {
                 if has_fwd {
                     let (node, _) = self.get_nodetype(node_data_ptr.ptr())?;
-                    *blen = get_node_byte_len_compressed(node) as u64;
+                    *blen = u64::try_from(get_node_byte_len_compressed(node))
+                        .map_err(|_| Error::OverflowError)?;
                 }
                 ptr += *blen;
                 offsets.push(ptr);
@@ -1337,7 +1320,10 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 } else if has_fwd {
                     let next_node = &mut self
                         .data
-                        .get_mut(node_data_ptr.ptr() as usize)
+                        .get_mut(
+                            usize::try_from(node_data_ptr.ptr())
+                                .map_err(|_| Error::OverflowError)?,
+                        )
                         .ok_or_else(|| {
                             Error::CorruptionError(
                                 "Miscalculated dump_compressed_consume pointer".into(),
@@ -1479,12 +1465,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
 
     /// Read a node's hash from the TrieRAM.  ptr.ptr() is an array index.
     pub fn read_node_hash(&self, ptr: &TriePtr) -> Result<TrieHash, Error> {
-        let idx = usize::try_from(ptr.ptr()).map_err(|_| {
-            Error::CorruptionError(format!(
-                "In-memory node index {} exceeds usize::MAX",
-                ptr.ptr()
-            ))
-        })?;
+        let idx = ptr.ptr_as_usize()?;
         let (_, node_trie_hash) = self.data.get(idx).ok_or_else(|| {
             error!(
                 "TrieRAM: Failed to read node bytes: {} >= {}",
@@ -1530,12 +1511,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
             self.read_node_count += 1;
         }
 
-        let idx = usize::try_from(ptr.ptr()).map_err(|_| {
-            Error::CorruptionError(format!(
-                "In-memory node index {} exceeds usize::MAX",
-                ptr.ptr()
-            ))
-        })?;
+        let idx = ptr.ptr_as_usize()?;
         if let Some(node) = self.data.get(idx) {
             Ok(node.clone())
         } else {
@@ -1584,7 +1560,9 @@ impl<T: MarfTrieId> TrieRAM<T> {
         if let Some(existing_node) = self.data.get_mut(node_index) {
             *existing_node = (node.clone(), hash);
             Ok(())
-        } else if node_array_ptr == (self.data.len() as u64) {
+        } else if node_array_ptr
+            == u64::try_from(self.data.len()).map_err(|_| Error::OverflowError)?
+        {
             self.data.push((node.clone(), hash));
             self.total_bytes += get_node_byte_len(node);
             Ok(())
@@ -1595,7 +1573,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
     }
 
     /// Store a node hash into the TrieRAM at a given node slot.
-    pub fn write_node_hash(&mut self, node_array_ptr: u64, hash: TrieHash) -> Result<(), Error> {
+    pub fn write_node_hash(&mut self, node_array_ptr: u32, hash: TrieHash) -> Result<(), Error> {
         if self.readonly {
             trace!("Read-only!");
             return Err(Error::ReadOnlyError);
@@ -1621,7 +1599,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
 
     /// Get the next ptr value for a node to store.
     pub fn last_ptr(&mut self) -> Result<u64, Error> {
-        Ok(self.data.len() as u64)
+        u64::try_from(self.data.len()).map_err(|_| Error::OverflowError)
     }
 
     #[cfg(test)]
@@ -1639,12 +1617,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
 
 impl<T: MarfTrieId> NodeHashReader for TrieRAM<T> {
     fn read_node_hash_bytes<W: Write>(&mut self, ptr: &TriePtr, w: &mut W) -> Result<(), Error> {
-        let idx = usize::try_from(ptr.ptr()).map_err(|_| {
-            Error::CorruptionError(format!(
-                "In-memory node index {} exceeds usize::MAX",
-                ptr.ptr()
-            ))
-        })?;
+        let idx = ptr.ptr_as_usize()?;
         let (_, node_trie_hash) = self.data.get(idx).ok_or_else(|| {
             error!(
                 "TrieRAM: Failed to read node bytes: {} >= {}",
