@@ -13,7 +13,7 @@ use blockstack_lib::chainstate::stacks::miner::{
 use blockstack_lib::config::DEFAULT_MAX_TENURE_BYTES;
 use clarity::types::chainstate::ConsensusHash;
 use clarity::vm::costs::ExecutionCost;
-use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 
 use crate::context::BenchContext;
 use crate::metrics::{BlockMetrics, BlockProcessingBaseline, TransactionMetrics};
@@ -318,6 +318,7 @@ where
     let mut cur_parent_info = parent_info.clone();
 
     let mut out: Vec<BlockMetrics> = Vec::new();
+    let mut last_state_index_root = None;
 
     for (seg_ix, seg) in segments.iter().enumerate() {
         if seg.range.is_empty() && !seg.sampled {
@@ -398,6 +399,8 @@ where
 
         drop(_segment_root);
 
+        last_state_index_root = Some(exec_result.state_index_root);
+
         // Grab all profiler roots for this segment.
         let segment_profiler_roots = if seg.sampled {
             stacks_profiler::Profiler::take_results()
@@ -456,6 +459,20 @@ where
         }
     }
 
+    // Validate state root for full-block replay (single segment covering all txs). Multi-segment
+    // replays commit intermediate state under synthetic block IDs, which alters the MARF trie
+    // structure and invalidates root comparison.
+    if segments.len() == 1 && segments[0].range == (0..block.txs.len()) {
+        if let Some(replayed_root) = last_state_index_root {
+            if replayed_root != block.header.state_index_root {
+                bail!(
+                    "State root mismatch for block {origin_id}: expected {}, got {replayed_root}",
+                    block.header.state_index_root,
+                );
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -466,6 +483,7 @@ struct SegmentExecResult {
     execution_duration: Duration,
     segment_total_clarity_cost: ExecutionCost,
     segment_tx_metrics: Vec<(Txid, Duration, ExecutionCost)>,
+    state_index_root: TrieHash,
 }
 
 fn execute_segment(
@@ -620,6 +638,7 @@ fn execute_segment(
 
     let mined_block = builder.mine_nakamoto_block(&mut clarity_tx, burn_chain_height);
     let mined_block_hash = mined_block.header.block_hash();
+    let mined_state_index_root = mined_block.header.state_index_root;
     let mined_consensus_hash = mined_block.header.consensus_hash.clone();
 
     drop(_finalize_guard);
@@ -693,6 +712,7 @@ fn execute_segment(
         execution_duration,
         segment_total_clarity_cost,
         segment_tx_metrics,
+        state_index_root: mined_state_index_root,
     })
 }
 

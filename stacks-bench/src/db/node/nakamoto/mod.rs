@@ -63,14 +63,12 @@ impl<Mode> NakamotoDb<Mode> {
     }
 
     pub async fn get_min_block_height(&self) -> Result<Option<u64>> {
-        use diesel::dsl::min;
-
         use self::schema::nakamoto_staging_blocks::dsl::*;
 
         let mut conn = self.handle.get_conn().await?;
 
         nakamoto_staging_blocks
-            .select(min(height))
+            .select(diesel::dsl::min(height))
             .first::<Option<i32>>(&mut conn)
             .await
             .map(|opt| opt.map(|h| h as u64))
