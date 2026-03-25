@@ -63,6 +63,24 @@ impl StacksEpoch {
     }
 }
 
+impl From<&StacksEpoch> for stacks_common::types::StacksEpoch<clarity::vm::costs::ExecutionCost> {
+    fn from(e: &StacksEpoch) -> Self {
+        Self {
+            epoch_id: e.epoch_id,
+            start_height: e.start_block_height,
+            end_height: e.end_block_height,
+            block_limit: clarity::vm::costs::ExecutionCost {
+                write_length: e.write_length_budget,
+                write_count: e.write_count_budget,
+                read_length: e.read_length_budget,
+                read_count: e.read_count_budget,
+                runtime: e.runtime_budget,
+            },
+            network_epoch: StacksEpochId::network_epoch(e.epoch_id),
+        }
+    }
+}
+
 pub trait ResolveEpochFromHeight {
     fn resolve_stacks_epoch(&self, height: u64) -> Option<StacksEpochId>;
 }

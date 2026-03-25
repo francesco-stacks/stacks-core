@@ -3,11 +3,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bollard::Docker;
+use bollard::models::{ContainerCreateBody, HealthConfig, HostConfig, PortBinding};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
     StartContainerOptionsBuilder, StopContainerOptions, WaitContainerOptions,
 };
-use bollard::secret::{ContainerCreateBody, HostConfig, PortBinding};
 use futures::StreamExt as _;
 use stacks_bench::paths::AppDataDir;
 
@@ -162,7 +162,7 @@ async fn run_metabase_container(app_data: &AppDataDir, port: u16, image_tag: Str
             "POSTGRES_PASSWORD=metabase".to_string(),
         ]),
         host_config: Some(pg_host_config),
-        healthcheck: Some(bollard::secret::HealthConfig {
+        healthcheck: Some(HealthConfig {
             test: Some(vec![
                 "CMD-SHELL".to_string(),
                 "pg_isready -U metabase".to_string(),

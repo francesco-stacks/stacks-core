@@ -465,8 +465,18 @@ where
     if segments.len() == 1 && segments[0].range == (0..block.txs.len()) {
         if let Some(replayed_root) = last_state_index_root {
             if replayed_root != block.header.state_index_root {
+                let tenure_tx = block.get_tenure_tx_payload();
+                let tenure_cause = tenure_tx.as_ref().map(|t| format!("{:?}", t.cause));
                 bail!(
-                    "State root mismatch for block {origin_id}: expected {}, got {replayed_root}",
+                    "State root mismatch for block {origin_id} \
+                     (height={}, consensus_hash={}, parent={}, \
+                     tenure={}, txs={}): \
+                     expected {}, got {replayed_root}",
+                    block.header.chain_length,
+                    block.header.consensus_hash,
+                    block.header.parent_block_id,
+                    tenure_cause.as_deref().unwrap_or("none"),
+                    block.txs.len(),
                     block.header.state_index_root,
                 );
             }
@@ -540,6 +550,8 @@ fn execute_segment(
         builder.load_tenure_info(chainstate, &burn_dbconn, segment_cause)?;
 
     let burn_chain_height = miner_tenure_info.burn_tip_height;
+    let coinbase_height = miner_tenure_info.coinbase_height;
+    let is_new_tenure = segment_cause.is_new_tenure();
     let mut clarity_tx = builder.tenure_begin(&burn_dbconn, &mut miner_tenure_info)?;
 
     let setup_duration = setup_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
@@ -640,6 +652,7 @@ fn execute_segment(
     let mined_block_hash = mined_block.header.block_hash();
     let mined_state_index_root = mined_block.header.state_index_root;
     let mined_consensus_hash = mined_block.header.consensus_hash.clone();
+    let evaluated_epoch = clarity_tx.get_epoch();
 
     drop(_finalize_guard);
 
@@ -653,16 +666,58 @@ fn execute_segment(
 
     drop(_clarity_commit_guard);
 
+    let burn_view = NakamotoChainState::get_block_burn_view(sortdb, &mined_block, cur_parent_info)?;
+
+    let sn = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), &mined_consensus_hash)?
+        .ok_or_else(|| anyhow!("Snapshot not found for {}", mined_consensus_hash))?;
+
+    // Compute the block fees from the segment's transactions.
+    let block_fees: u128 = seg
+        .range
+        .clone()
+        .map(|i| block.txs[i].get_tx_fee() as u128)
+        .sum();
+
+    // Compute the scheduled miner reward for tenure-start blocks so that future
+    // matured-reward lookups find the correct payment entries.
+    let scheduled_miner_reward = if is_new_tenure {
+        let parent_coinbase_height = coinbase_height
+            .checked_sub(1)
+            .expect("coinbase_height underflow on tenure-start block");
+        let (commit_burn, sortition_burn) = {
+            let block_commit = SortitionDB::get_block_commit(
+                sortdb.conn(),
+                &sn.winning_block_txid,
+                &sn.sortition_id,
+            )?
+            .ok_or_else(|| {
+                anyhow!(
+                    "No block-commit for tenure-start snapshot {}",
+                    sn.sortition_id,
+                )
+            })?;
+            let sort_burn = SortitionDB::get_block_burn_amount(sortdb.conn(), &sn)?;
+            (block_commit.burn_fee, sort_burn)
+        };
+        Some(NakamotoChainState::calculate_scheduled_tenure_reward(
+            &mut miner_tenure_info.chainstate_tx,
+            &burn_dbconn,
+            &mined_block,
+            evaluated_epoch,
+            parent_coinbase_height,
+            burn_chain_height.into(),
+            commit_burn,
+            sortition_burn,
+        )?)
+    } else {
+        None
+    };
+
     let _advance_chain_tip_guard = if seg.sampled {
         stacks_profiler::span!("Segment: Advance Chain Tip", seg_ix)
     } else {
         None
     };
-
-    let burn_view = NakamotoChainState::get_block_burn_view(sortdb, &mined_block, cur_parent_info)?;
-
-    let sn = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), &mined_consensus_hash)?
-        .ok_or_else(|| anyhow!("Snapshot not found for {}", mined_consensus_hash))?;
 
     let new_tip_info = NakamotoChainState::advance_tip(
         &mut miner_tenure_info.chainstate_tx.tx,
@@ -673,7 +728,7 @@ fn execute_segment(
         &sn.burn_header_hash,
         sn.block_height as u32,
         sn.burn_header_timestamp,
-        None,
+        scheduled_miner_reward.as_ref(),
         None,
         &block_execution_cost,
         &total_tenure_cost,
@@ -683,9 +738,9 @@ fn execute_segment(
         vec![],
         vec![],
         vec![],
-        false,
-        0,
-        0,
+        is_new_tenure,
+        coinbase_height,
+        block_fees,
         &burn_view,
     )?;
 

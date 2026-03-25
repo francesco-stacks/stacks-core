@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use blockstack_lib::burnchains::Burnchain;
+use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
 use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use blockstack_lib::chainstate::stacks::index::marf::MARFOpenOpts;
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
@@ -189,7 +190,27 @@ impl<'a> BenchContext<'a> {
             self.env.burnchain_dir.as_str()?,
             BURNCHAIN_NAME,
             &network_name,
+            None,
         )?;
+
+        // Open the sortition DB using SortitionDB::connect() which applies
+        // schema migrations if needed. This is safe because we operate on a
+        // CoW copy of the chainstate.
+        let sortdb_epochs: Vec<
+            stacks_common::types::StacksEpoch<clarity::vm::costs::ExecutionCost>,
+        > = self.env.epochs.iter().map(Into::into).collect();
+        let sort_db_path = burnchain.get_db_path();
+        drop(SortitionDB::connect(
+            &sort_db_path,
+            burnchain.first_block_height,
+            &burnchain.first_block_hash,
+            burnchain.first_block_timestamp.into(),
+            &sortdb_epochs,
+            burnchain.pox_constants.clone(),
+            None,
+            true,
+            burnchain.marf_opts.clone(),
+        )?);
 
         let marf_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
 
