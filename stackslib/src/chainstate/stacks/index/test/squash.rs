@@ -14,10 +14,10 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashSet;
-use std::io::Seek;
+use std::io::{Cursor, Seek};
 use std::path::PathBuf;
 
-use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
+use stacks_common::types::chainstate::{StacksBlockId, TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE};
 use tempfile::tempdir;
 
 use super::marf::setup_marf;
@@ -25,9 +25,17 @@ use crate::chainstate::stacks::index::bits::get_node_byte_len;
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashStats, MARF, OWN_BLOCK_HEIGHT_KEY,
 };
+use crate::chainstate::stacks::index::node::{
+    is_u64_ptr, set_backptr, TrieNode as _, TrieNode16, TrieNode256, TrieNode4, TrieNode48,
+    TrieNodeID, TrieNodeType, TriePtr,
+};
+use crate::chainstate::stacks::index::squash::{
+    compute_blob_offsets, compute_blob_offsets_inner, deserialize_node, remap_ptrs_to_blob_offsets,
+    serialize_node, stream_squash_blob, NodeStore,
+};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{
-    trie_sql, ClarityMarfTrieId, Error, MARFValue, TrieMerkleProof,
+    trie_sql, ClarityMarfTrieId, Error, MARFValue, TrieLeaf, TrieMerkleProof,
 };
 
 // ---------------------------------------------------------------------------
@@ -608,7 +616,7 @@ fn test_squash_historical_read_intermittent_key() {
 
     // common_some_0 is written at heights where (height + 0) % 3 == 0,
     // i.e. heights 0, 3, 6, 9, 12, ... with value "common_some_0_at_{h}".
-    // Read at block 10 — last write was at height 9.
+    // Read at block 10 - last write was at height 9.
     let early_block = &blocks[10];
 
     let arch_val = archival.get(early_block, "common_some_0").unwrap();
@@ -1476,18 +1484,6 @@ fn test_squash_internal_blobs_extend_with_compression() {
 // Targeted unit tests for the disk-backed squash mechanisms
 // ---------------------------------------------------------------------------
 
-use std::io::Cursor;
-
-use crate::chainstate::stacks::index::node::{
-    is_u64_ptr, TrieNode as _, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID,
-    TrieNodeType, TriePtr,
-};
-use crate::chainstate::stacks::index::squash::{
-    compute_blob_offsets, compute_blob_offsets_inner, deserialize_node, remap_ptrs_to_blob_offsets,
-    serialize_node, stream_squash_blob, NodeStore,
-};
-use crate::chainstate::stacks::index::TrieLeaf;
-
 /// Helper: build a leaf node for tests.
 fn make_test_leaf(path: &[u8], value_byte: u8) -> TrieNodeType {
     let mut data = [0u8; 40];
@@ -1693,8 +1689,6 @@ fn test_serialize_deserialize_node_roundtrip() {
 ///   6: Leaf
 #[test]
 fn test_blob_offsets_with_mixed_node_types() {
-    use stacks_common::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
-
     let dir = tempdir().unwrap();
     let dir_str = dir.path().to_str().unwrap();
     let mut store = NodeStore::new(dir_str).unwrap();
@@ -1842,8 +1836,6 @@ fn test_stream_squash_blob_at_nonzero_offset() {
 /// untouched, and returns CorruptionError for out-of-bounds indices.
 #[test]
 fn test_remap_ptrs_to_blob_offsets() {
-    use crate::chainstate::stacks::index::node::set_backptr;
-
     // Build a Node4 with a mix of pointer types:
     //   slot 0: forward ptr to child index 1
     //   slot 1: back ptr (should be left untouched)
@@ -2072,4 +2064,171 @@ fn compute_blob_offsets_large_offset_sets_u64_ptr_bit() {
     std::io::Read::read_exact(&mut file, &mut encoded_id)
         .expect("read encoded second-last child ptr id");
     assert!(is_u64_ptr(encoded_id[0]));
+}
+
+/// Extending a squashed MARF must correctly serialize patch nodes even when
+/// the squash tip has many inline (forward-ptr) children that become
+/// backpointers in the new block.
+///
+/// This test uses `insert_raw` with controlled `TrieHash` paths to build a
+/// deterministic wide Node256 root (64 children in distinct chr() slots).
+/// After squashing and extending with a single-key modification, the root is
+/// COW'd as a patch: 1 forward child + 63 inherited backpointers.
+///
+/// The test verifies:
+/// 1. The `assert!(node_forward.eq(diff_forward))` in `dump_compressed_consume`
+///    does not panic - the forward-ptr sequence filtering is correct.
+/// 2. The root of b3's blob is actually stored as a `TrieNodeID::Patch`,
+///    proving the patch path was exercised (not silently skipped).
+/// 3. Both archival and squashed MARFs produce identical data when extended
+///    with the same operations.
+///
+/// Regression test for the `assert_eq!(num_new_nodes, patch_node.ptr_diff.len())`
+/// panic that occurred when extending squashed mainnet MARFs.
+#[test]
+fn test_squash_extend_many_keys_patch_backptr_regression() {
+    let dir = tempdir().unwrap();
+    let src_db_path = dir.path().join("src.sqlite");
+
+    // Compression MUST be enabled for the patch path in dump_compressed_consume.
+    let open_opts =
+        MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", false).with_compression(true);
+
+    // Build a controlled trie path for each first-byte value.
+    // 64 distinct first bytes guarantees a Node256 root (>48 children).
+    let make_path = |first_byte: u8| -> TrieHash {
+        let mut bytes = [0u8; 32];
+        bytes[0] = first_byte;
+        TrieHash(bytes)
+    };
+    let make_leaf = |val: u8| -> TrieLeaf {
+        let mut data = [0u8; 40];
+        data[0] = val;
+        TrieLeaf {
+            path: vec![],
+            data: MARFValue(data),
+        }
+    };
+    let num_keys: u8 = 64;
+
+    let b1 = StacksBlockId::from_bytes(&[1u8; 32]).unwrap();
+    let b2 = StacksBlockId::from_bytes(&[2u8; 32]).unwrap();
+    let b3 = StacksBlockId::from_bytes(&[3u8; 32]).unwrap();
+
+    // --- Build archival source MARF ---
+    let mut src =
+        MARF::<StacksBlockId>::from_path(src_db_path.to_str().unwrap(), open_opts.clone()).unwrap();
+
+    src.begin(&StacksBlockId::sentinel(), &b1).unwrap();
+    for i in 0..num_keys {
+        src.insert_raw(make_path(i), make_leaf(i)).unwrap();
+    }
+    src.commit().unwrap();
+
+    src.begin(&b1, &b2).unwrap();
+    for i in 0..num_keys {
+        src.insert_raw(make_path(i), make_leaf(i.wrapping_add(100)))
+            .unwrap();
+    }
+    src.commit().unwrap();
+
+    // Extend archival to b3: modify ONE key so the root is COW'd with
+    // 1 changed child + (num_keys - 1) inherited backpointers.
+    src.begin(&b2, &b3).unwrap();
+    src.insert_raw(make_path(0), make_leaf(255)).unwrap();
+    src.commit().unwrap();
+
+    // Collect archival values at b3 for later comparison.
+    let archival_val_0 = src
+        .with_conn(|c| MARF::get_by_hash(c, &b3, &make_path(0)))
+        .unwrap();
+    let archival_val_1 = src
+        .with_conn(|c| MARF::get_by_hash(c, &b3, &make_path(1)))
+        .unwrap();
+    let archival_val_63 = src
+        .with_conn(|c| MARF::get_by_hash(c, &b3, &make_path(num_keys - 1)))
+        .unwrap();
+    drop(src);
+
+    // --- Squash at height 1 (= b2) ---
+    let dst_dir = dir.path().join("squashed");
+    std::fs::create_dir_all(&dst_dir).unwrap();
+    let dst_db_path = dst_dir.join("dst.sqlite");
+
+    // squash_to_path requires compress=false; compression is for the extend step.
+    let squash_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", false);
+    MARF::<StacksBlockId>::squash_to_path(
+        src_db_path.to_str().unwrap(),
+        dst_db_path.to_str().unwrap(),
+        squash_opts,
+        1,
+        "test",
+    )
+    .unwrap();
+
+    // --- Extend squashed MARF to b3 with compression enabled ---
+    // Compression enables the patch-node path in dump_compressed_consume.
+    let squashed_opts =
+        MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true).with_compression(true);
+    let mut squashed =
+        MARF::<StacksBlockId>::from_path(dst_db_path.to_str().unwrap(), squashed_opts.clone())
+            .unwrap();
+
+    squashed.begin(&b2, &b3).unwrap();
+    squashed.insert_raw(make_path(0), make_leaf(255)).unwrap();
+    // The commit exercises dump_compressed_consume with a COW'd Node256
+    // root where most children are backpointers. The forward-ptr sequence
+    // assertion must pass for this to succeed.
+    squashed.commit().unwrap();
+
+    // --- Verify patch node was actually emitted ---
+    // b3's blob is in the .blobs file. The root node starts at
+    // blob_offset + HEADER (36 bytes). Its type ID byte is at +68.
+    // TrieNodeID::Patch = 6 proves patch encoding was used, not Normal.
+    let b3_block_id = trie_sql::get_block_identifier(squashed.sqlite_conn(), &b3).unwrap();
+    let (b3_blob_offset, b3_blob_length) =
+        trie_sql::get_external_trie_offset_length(squashed.sqlite_conn(), b3_block_id).unwrap();
+    assert!(b3_blob_length > 0, "b3 blob should have non-zero length");
+
+    let blobs_path = format!("{}.blobs", dst_db_path.display());
+    let mut blobs_file = std::fs::File::open(&blobs_path).unwrap();
+    // Root node type ID is at: blob_offset + 32 (parent hash) + 4 (identifier) + 32 (node hash)
+    let root_type_offset = b3_blob_offset + (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4 + 32;
+    blobs_file
+        .seek(std::io::SeekFrom::Start(root_type_offset))
+        .unwrap();
+    let mut type_byte = [0u8; 1];
+    std::io::Read::read_exact(&mut blobs_file, &mut type_byte).unwrap();
+    assert_eq!(
+        type_byte[0],
+        TrieNodeID::Patch as u8,
+        "Root of b3 should be stored as a Patch node (type {}), got type {}. \
+         This means dump_compressed_consume fell back to Normal serialization.",
+        TrieNodeID::Patch as u8,
+        type_byte[0]
+    );
+
+    // --- Verify data matches archival MARF ---
+    let squashed_val_0 = squashed
+        .with_conn(|c| MARF::get_by_hash(c, &b3, &make_path(0)))
+        .unwrap();
+    let squashed_val_1 = squashed
+        .with_conn(|c| MARF::get_by_hash(c, &b3, &make_path(1)))
+        .unwrap();
+    let squashed_val_63 = squashed
+        .with_conn(|c| MARF::get_by_hash(c, &b3, &make_path(num_keys - 1)))
+        .unwrap();
+
+    assert_eq!(archival_val_0, squashed_val_0, "modified key mismatch");
+    assert_eq!(archival_val_1, squashed_val_1, "inherited key mismatch");
+    assert_eq!(
+        archival_val_63, squashed_val_63,
+        "last inherited key mismatch"
+    );
+
+    // Pre-squash data still readable through the squash tip.
+    let val_at_b2 = squashed
+        .with_conn(|c| MARF::get_by_hash(c, &b2, &make_path(1)))
+        .unwrap();
+    assert!(val_at_b2.is_some(), "data at b2 should still be readable");
 }
