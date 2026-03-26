@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -202,9 +204,20 @@ impl RunArgs {
     }
 
     pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
+        // Install a ctrl-c handler so we can break out of the replay loop
+        // gracefully and still run cleanup (shadow dir removal, DB vacuum).
+        let interrupted = Arc::new(AtomicBool::new(false));
+        {
+            let interrupted = interrupted.clone();
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                interrupted.store(true, Ordering::Relaxed);
+            });
+        }
+
         // Dispatch to the txid-specific path if --txid is provided.
         if self.txid.is_some() {
-            return self.exec_txid(ctx).await;
+            return self.exec_txid(ctx, &interrupted).await;
         }
 
         // Disable capturing `record!()` entries during setup/warmup.
@@ -299,7 +312,18 @@ impl RunArgs {
         let (mut chainstate, burnchain) = bench_context.open_stacks_chainstate()?;
 
         let (block_processing_baselines1, block_processing_baselines2) = self
-            .run_overhead_baselines(&mut chainstate, &burnchain, &bench_context.end_block().id)?;
+            .run_overhead_baselines(
+                &mut chainstate,
+                &burnchain,
+                &bench_context.end_block().id,
+                &interrupted,
+            )?;
+
+        if interrupted.load(Ordering::Relaxed) {
+            cliclack::log::info("Interrupted before replay, skipping benchmark.")?;
+            run_cleanup(app_db, shadow_dir).await?;
+            return Ok(());
+        }
 
         cliclack::note(
             "Block Processing Overhead Baselines",
@@ -364,6 +388,11 @@ impl RunArgs {
 
         let start = Instant::now();
         for (i, block_id) in block_ids.iter().enumerate() {
+            if interrupted.load(Ordering::Relaxed) {
+                cliclack::log::info("Interrupted by Ctrl-C, cleaning up...")?;
+                break;
+            }
+
             is_warmup = i < self.warmup;
             Profiler::clear();
 
@@ -488,12 +517,17 @@ impl RunArgs {
         }
 
         // Finalize progress bars
-        replay_pb.stop(fmt_success!(
-            "Replayed {} blocks in {:.2}s",
-            selected_block_count - self.warmup,
-            start.elapsed().as_secs_f32()
-        ));
-        replay_multi_pb.stop();
+        if interrupted.load(Ordering::Relaxed) {
+            replay_pb.cancel("Interrupted");
+            replay_multi_pb.cancel();
+        } else {
+            replay_pb.stop(fmt_success!(
+                "Replayed {} blocks in {:.2}s",
+                selected_block_count - self.warmup,
+                start.elapsed().as_secs_f32()
+            ));
+            replay_multi_pb.stop();
+        }
 
         // Flush any remaining metrics in the calibration buffer
         if !metrics_buffer.is_empty() {
@@ -523,19 +557,40 @@ impl RunArgs {
             .await?;
 
         {
+            let total_replay_duration = accumulator.summary().duration;
+            let overhead = duration
+                .saturating_sub(total_replay_duration)
+                .saturating_sub(total_clarity_db_checkpoint_duration);
             let mut table = Table::new()
                 .col("Metric", Align::Left)
                 .col("Value", Align::Right);
-            table.row(vec!["Blocks".into(), selected_block_count.to_string()]);
+            table.row(vec![
+                "Blocks".into(),
+                format!(
+                    "{selected_block_count} ({} warmup + {actual_block_count} measured)",
+                    self.warmup,
+                ),
+            ]);
             table.row(vec!["Total Duration".into(), format!("{duration:.2?}")]);
+            table.row(vec![
+                "Block Replay".into(),
+                format!("{total_replay_duration:.2?}"),
+            ]);
             table.row(vec![
                 "Clarity DB Checkpointing".into(),
                 format!("{total_clarity_db_checkpoint_duration:.2?}"),
             ]);
             table.row(vec![
                 "Benchmarking Overhead".into(),
-                format!("{:.2?}", duration - total_clarity_db_checkpoint_duration),
+                format!("{overhead:.2?}"),
             ]);
+            if interrupted.load(Ordering::Relaxed) {
+                let completed = accumulator.summary().count;
+                table.row(vec![
+                    "Status".into(),
+                    format!("INTERRUPTED ({completed}/{selected_block_count} blocks)"),
+                ]);
+            }
             cliclack::note("Replay Summary", table.to_string())?;
         }
 
@@ -559,7 +614,7 @@ impl RunArgs {
     /// 2. Create a shadow dir copy
     /// 3. Index only the narrow range around the target block
     /// 4. Replay the block N times (--repetitions), each fork from the same parent
-    async fn exec_txid(&self, ctx: &CliContext) -> Result<()> {
+    async fn exec_txid(&self, ctx: &CliContext, interrupted: &Arc<AtomicBool>) -> Result<()> {
         stacks_profiler::Profiler::disable_record();
 
         let txid_arg = self.txid.as_ref().expect("--txid required for exec_txid");
@@ -801,6 +856,11 @@ impl RunArgs {
 
         let start = Instant::now();
         for rep in 0..total_reps {
+            if interrupted.load(Ordering::Relaxed) {
+                cliclack::log::info("Interrupted by Ctrl-C, cleaning up...")?;
+                break;
+            }
+
             let is_warmup = rep < warmup_reps;
             Profiler::clear();
 
@@ -865,11 +925,16 @@ impl RunArgs {
         }
 
         // Finalize progress bars
-        replay_pb.stop(fmt_success!(
-            "Replayed {measured_reps} measured repetitions in {:.2}s",
-            start.elapsed().as_secs_f32()
-        ));
-        replay_multi_pb.stop();
+        if interrupted.load(Ordering::Relaxed) {
+            replay_pb.cancel("Interrupted");
+            replay_multi_pb.cancel();
+        } else {
+            replay_pb.stop(fmt_success!(
+                "Replayed {measured_reps} measured repetitions in {:.2}s",
+                start.elapsed().as_secs_f32()
+            ));
+            replay_multi_pb.stop();
+        }
 
         // Flush metrics
         if !metrics_buffer.is_empty() {
@@ -890,14 +955,21 @@ impl RunArgs {
                 .col("Value", Align::Right);
             table.row(vec!["Transaction".into(), txid_arg.to_string()]);
             table.row(vec![
-                "Measured Repetitions".into(),
-                measured_reps.to_string(),
+                "Repetitions".into(),
+                format!("{total_reps} ({warmup_reps} warmup + {measured_reps} measured)",),
             ]);
             table.row(vec!["Total Duration".into(), format!("{duration:.2?}")]);
             table.row(vec![
                 "Clarity DB Checkpointing".into(),
                 format!("{total_clarity_db_checkpoint_duration:.2?}"),
             ]);
+            if interrupted.load(Ordering::Relaxed) {
+                let completed = accumulator.summary().count;
+                table.row(vec![
+                    "Status".into(),
+                    format!("INTERRUPTED ({completed}/{measured_reps} repetitions)"),
+                ]);
+            }
             cliclack::note("Replay Summary", table.to_string())?;
         }
 
@@ -916,6 +988,7 @@ impl RunArgs {
         chainstate: &mut blockstack_lib::chainstate::stacks::db::StacksChainState,
         burnchain: &blockstack_lib::burnchains::Burnchain,
         start_parent: &stacks_common::types::chainstate::StacksBlockId,
+        interrupted: &Arc<AtomicBool>,
     ) -> anyhow::Result<(
         stacks_bench::metrics::BlockProcessingBaseline,
         stacks_bench::metrics::BlockProcessingBaseline,
@@ -944,6 +1017,8 @@ impl RunArgs {
                 .with_template(BLOCK_PROGRESS_BAR_TEMPLATE),
         );
 
+        let is_interrupted = || interrupted.load(Ordering::Relaxed);
+
         if let Some(warmup_pb) = maybe_warmup_pb {
             warmup_pb.start("Warming up");
             timer = Instant::now();
@@ -952,8 +1027,16 @@ impl RunArgs {
                 burnchain,
                 start_parent,
                 self.warmup as u32,
-                |completed, _| warmup_pb.set_position(completed as u64),
+                |completed, _| {
+                    warmup_pb.set_position(completed as u64);
+                    !is_interrupted()
+                },
             )?;
+            if is_interrupted() {
+                warmup_pb.cancel("Warmup interrupted");
+                baseline_multipb.cancel();
+                return Ok(Default::default());
+            }
             warmup_pb.stop(fmt_success!(
                 "Warmed up for {} blocks ({:.2}s)",
                 self.warmup,
@@ -968,8 +1051,16 @@ impl RunArgs {
             burnchain,
             start_parent,
             BASELINE_MEASURED_BLOCKS,
-            |completed, _| baseline_pb1.set_position(completed as u64),
+            |completed, _| {
+                baseline_pb1.set_position(completed as u64);
+                !is_interrupted()
+            },
         )?;
+        if is_interrupted() {
+            baseline_pb1.cancel("Baseline round 1 interrupted");
+            baseline_multipb.cancel();
+            return Ok(Default::default());
+        }
         baseline_pb1.stop(fmt_success!(
             "Baseline round 1 finished ({:.2}s)",
             timer.elapsed().as_secs_f32()
@@ -982,8 +1073,16 @@ impl RunArgs {
             burnchain,
             start_parent,
             BASELINE_MEASURED_BLOCKS,
-            |completed, _| baseline_pb2.set_position(completed as u64),
+            |completed, _| {
+                baseline_pb2.set_position(completed as u64);
+                !is_interrupted()
+            },
         )?;
+        if is_interrupted() {
+            baseline_pb2.cancel("Baseline round 2 interrupted");
+            baseline_multipb.cancel();
+            return Ok(Default::default());
+        }
         baseline_pb2.stop(fmt_success!(
             "Baseline round 2 finished ({:.2}s)",
             timer.elapsed().as_secs_f32()

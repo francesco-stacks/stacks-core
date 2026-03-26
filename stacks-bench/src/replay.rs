@@ -779,7 +779,7 @@ pub fn replay_nakamoto_empty_chain_baseline<F>(
     mut on_progress: F,
 ) -> anyhow::Result<BlockProcessingBaseline>
 where
-    F: FnMut(u32, u32),
+    F: FnMut(u32, u32) -> bool,
 {
     if n_blocks == 0 {
         return Ok(BlockProcessingBaseline::default());
@@ -916,7 +916,9 @@ where
 
         cur_parent_info = new_tip_info;
 
-        on_progress(i + 1, n_blocks);
+        if !on_progress(i + 1, n_blocks) {
+            break;
+        }
     }
 
     Ok(BlockProcessingBaseline {
