@@ -191,8 +191,8 @@ pub fn run_squash(args: SquashArgs) {
         ) {
             Ok(st) => {
                 println!(
-                    "Epoch 2.x block files copied: files={}, bytes={}, genesis_skipped={}, missing_pruned={}",
-                    st.files_copied, st.total_bytes, st.genesis_skipped, st.files_missing
+                    "Epoch 2.x block files copied: files={}, bytes={}, genesis_skipped={}",
+                    st.files_copied, st.total_bytes, st.genesis_skipped
                 );
                 st
             }

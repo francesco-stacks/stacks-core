@@ -40,7 +40,6 @@ pub struct Epoch2BlockFileCopyStats {
     pub files_copied: u64,
     pub total_bytes: u64,
     pub genesis_skipped: u64,
-    pub files_missing: u64,
     pub copied_paths: Vec<String>,
 }
 
@@ -335,14 +334,11 @@ pub fn copy_epoch2_block_files(
         let dst_path = Path::new(dst_blocks_dir).join(&rel_path);
 
         if !src_path.exists() {
-            warn!(
-                "Source block file missing (pruned?) for height {} hash {}: {}",
-                block_height,
-                index_block_hash,
+            return Err(Error::CorruptionError(format!(
+                "Missing source epoch-2 block file for height {block_height} hash {index_block_hash}: {}. \
+                 A complete source archive is required to preserve block serving.",
                 src_path.display()
-            );
-            stats.files_missing += 1;
-            continue;
+            )));
         }
 
         if let Some(parent) = dst_path.parent() {
@@ -630,7 +626,11 @@ pub fn validate_epoch2_block_files(
         let dst_path = Path::new(dst_blocks_dir).join(&rel_path);
 
         if !src_path.exists() {
-            continue;
+            return Err(Error::CorruptionError(format!(
+                "Missing source epoch-2 block file for height {block_height} hash {index_block_hash}: {}. \
+                 Validation requires a complete source archive.",
+                src_path.display()
+            )));
         }
 
         expected_files.insert(rel_path);
