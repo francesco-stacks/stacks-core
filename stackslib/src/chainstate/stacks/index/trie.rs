@@ -760,9 +760,13 @@ impl Trie {
         // Instead, look up the actual height from the SQL side-table that
         // was populated during squashing.
         let cur_block_height = if let Some(h) = storage.squash_info().and_then(|_| {
-            trie_sql::read_squash_block_height(storage.sqlite_conn(), &cur_block_header)
-                .ok()
-                .flatten()
+            match trie_sql::read_squash_block_height(storage.sqlite_conn(), &cur_block_header) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    warn!("Failed to read squash block height for {cur_block_header}: {e:?}; falling back to trie lookup");
+                    None
+                }
+            }
         }) {
             h
         } else {
