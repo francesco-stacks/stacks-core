@@ -3550,18 +3550,25 @@ fn non_blocking_minority_configured_to_favour_test(variant: NonBlockingMinorityV
         "------------------------- Wait for Signers to Mark Incoming Miner as Invalid -------------------------"
     );
 
+    // Clear retained observer history so we only match the post-timeout
+    // state-machine transition, not the earlier "miner 2 won Tenure B" updates.
+    test_observer::clear();
+
     // Sleep to let the short-timeout signers mark the incoming miner as invalid
     std::thread::sleep(tenure_extend_wait_timeout.add(Duration::from_secs(1)));
 
     // Verify the short-timeout signers have updated their state machine.
-    // In the latest protocol, the minority reports miner 1 as the active miner (extending).
-    // In v1 / FavourIncoming, signers still report miner 2 as the winning miner.
-    let (expected_pkh, stacks_tip_height) =
-        if matches!(variant, NonBlockingMinorityVariant::FavourPrevMiner) {
-            (miner_pkh_1.clone(), stacks_height_before - 1)
-        } else {
+    // In the latest protocol they switch back to miner 1 / the prior tenure.
+    // In the v1 variant they still report miner 2 as the winning miner.
+    let (expected_pkh, stacks_tip_height) = match variant {
+        NonBlockingMinorityVariant::FavourPrevMinerV1 => {
             (miner_pkh_2.clone(), stacks_height_before)
-        };
+        }
+        NonBlockingMinorityVariant::FavourIncomingMiner
+        | NonBlockingMinorityVariant::FavourPrevMiner => {
+            (miner_pkh_1.clone(), stacks_height_before - 1)
+        }
+    };
     wait_for_state_machine_update(
         30,
         &get_chain_info(&conf_1).pox_consensus,
