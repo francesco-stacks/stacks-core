@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use stackslib::burnchains::PoxConstants;
 use stackslib::chainstate::burn::db::sortdb::SortitionDB;
 use stackslib::chainstate::nakamoto::NakamotoChainState;
@@ -10,9 +11,8 @@ use stackslib::chainstate::stacks::db::StacksChainState;
 use stackslib::chainstate::stacks::index::marf::MARFOpenOpts;
 use stackslib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use stackslib::config::ConfigFile;
-use sha2::{Digest, Sha256};
 
-use crate::cli::{ChainstatePaths, TargetPaths, GSS_MANIFEST, SQLITE_SIDECAR_EXTENSIONS};
+use crate::cli::{ChainstatePaths, GSS_MANIFEST, SQLITE_SIDECAR_EXTENSIONS, TargetPaths};
 
 /// Compute SHA-256 checksums for all files in `out_dir`, enforcing directory
 /// cleanliness. Skips transient SQLite sidecars, fails on symlink and non-regular files.
@@ -42,13 +42,13 @@ pub fn compute_checksums(
         }
 
         // When an expected set is provided, reject unexpected files.
-        if let Some(expected) = expected_files {
-            if !expected.contains(&rel_str) {
-                return Err(format!(
-                    "unexpected file in output directory: {rel_str} \
+        if let Some(expected) = expected_files
+            && !expected.contains(&rel_str)
+        {
+            return Err(format!(
+                "unexpected file in output directory: {rel_str} \
                      (reuse a clean --out-dir or remove stale files)"
-                ));
-            }
+            ));
         }
 
         let hash = sha256_file(path)?;
@@ -94,10 +94,10 @@ pub fn collect_files_recursive(
 
         // Ignore transient SQLite sidecars. These can legitimately appear
         // around WAL-mode databases and should not be hashed or manifested.
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if SQLITE_SIDECAR_EXTENSIONS.contains(&ext) {
-                continue;
-            }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && SQLITE_SIDECAR_EXTENSIONS.contains(&ext)
+        {
+            continue;
         }
 
         out.push(path);
@@ -408,10 +408,9 @@ pub fn find_tenure_end_stacks_height(
             }
             if let Ok(Some(s)) =
                 SortitionDB::get_ancestor_snapshot(&ic, h, &canonical_tip.sortition_id)
+                && s.sortition
             {
-                if s.sortition {
-                    nearby.push(h);
-                }
+                nearby.push(h);
             }
         }
         let nearby_str = if nearby.is_empty() {

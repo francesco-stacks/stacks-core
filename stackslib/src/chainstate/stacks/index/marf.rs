@@ -13,6 +13,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+use std::collections::HashSet;
 use std::ops::DerefMut;
 #[cfg(any(test, feature = "testing"))]
 use std::sync::LazyLock;
@@ -1721,8 +1722,8 @@ impl<T: MarfTrieId> MARF<T> {
     /// MARF's squash metadata.  Returns an empty set for archival
     /// (non-squashed) MARFs.
     #[cfg(test)]
-    pub fn trusted_squash_node_hashes(&self) -> std::collections::HashSet<TrieHash> {
-        let mut set = std::collections::HashSet::new();
+    pub fn trusted_squash_node_hashes(&self) -> HashSet<TrieHash> {
+        let mut set = HashSet::new();
         if let Some(info) = self.storage.squash_info() {
             let h = info.squash_root_node_hash;
             if h != TrieHash::from_data(&[]) {

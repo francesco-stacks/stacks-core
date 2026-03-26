@@ -1,12 +1,12 @@
 use std::fs;
 use std::path::Path;
 
-use stackslib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
-use stackslib::chainstate::stacks::index::storage::TrieFileStorage;
-use stackslib::chainstate::stacks::index::{trie_sql, MarfTrieId};
 use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
+use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, MarfConnection};
+use stackslib::chainstate::stacks::index::storage::TrieFileStorage;
+use stackslib::chainstate::stacks::index::{MarfTrieId, trie_sql};
 
-use crate::cli::{CheckpointFile, SquashManifest, GSS_MANIFEST};
+use crate::cli::{CheckpointFile, GSS_MANIFEST, SquashManifest};
 use crate::util::{
     collect_files_recursive, sha256_file, sortition_open_opts_for_path, squash_marf_open_opts,
 };

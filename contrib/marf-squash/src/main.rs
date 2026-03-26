@@ -27,8 +27,8 @@ mod tests {
     use clap::Parser;
 
     use crate::cli::{
-        ChecksumsSection, Cli, Command, LatestHeightArgs, RootsSection, SnapshotSection,
-        SquashManifest, SquashRootsSection, ValidateArgs, GSS_MANIFEST,
+        ChecksumsSection, Cli, Command, GSS_MANIFEST, LatestHeightArgs, RootsSection,
+        SnapshotSection, SquashManifest, SquashRootsSection, ValidateArgs,
     };
     use crate::util::{compute_checksums, sha256_file};
     use crate::verify::{validate_checkpoint_hash, verify_gss};

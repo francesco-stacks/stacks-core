@@ -39,14 +39,14 @@ pub fn squash_and_copy_one(
         ensure_blobs_match(source.db.to_str().unwrap(), blobs.to_str().unwrap());
     }
 
-    if let Some(parent) = out.db.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            eprintln!(
-                "Failed to create output directory '{}': {e}",
-                parent.display()
-            );
-            std::process::exit(1);
-        }
+    if let Some(parent) = out.db.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "Failed to create output directory '{}': {e}",
+            parent.display()
+        );
+        std::process::exit(1);
     }
 
     let is_sortition = matches!(side_table_mode, SideTableMode::Sortition);
