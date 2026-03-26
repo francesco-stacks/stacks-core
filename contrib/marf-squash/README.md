@@ -30,7 +30,7 @@ cargo build -p marf-squash --release
 marf-squash squash \
   --chainstate /data/mainnet \
   --out-dir /tmp/gss \
-  --height 150000 \
+  --tenure-start-bitcoin-height 880000 \
   --all --blocks
 ```
 
@@ -57,7 +57,7 @@ chainstate:
 marf-squash validate \
   --source-chainstate /data/mainnet \
   --squashed-chainstate /tmp/gss \
-  --height 150000 \
+  --tenure-start-bitcoin-height 880000 \
   --all --blocks
 ```
 
