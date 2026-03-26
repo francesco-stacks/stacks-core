@@ -177,8 +177,7 @@ fn derive_confirmed_microblock_set(
 
         if hashes.is_empty() {
             warn!(
-                "No confirmed microblocks found for parent {}/{} (tip {}, seq {}), skipping stream",
-                parent_ch, parent_bh, parent_mblock_hash, parent_mblock_seq
+                "No confirmed microblocks found for parent {parent_ch}/{parent_bh} (tip {parent_mblock_hash}, seq {parent_mblock_seq}), skipping stream"
             );
             stats.streams_skipped += 1;
             continue;
@@ -241,7 +240,7 @@ pub fn copy_confirmed_epoch2_microblocks(
     )
     .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{}' AS src", src_index_path))
+    conn.execute_batch(&format!("ATTACH DATABASE '{src_index_path}' AS src"))
         .map_err(Error::SQLError)?;
 
     let (selected_hashes, selected_parents, mut stats) = derive_confirmed_microblock_set(&conn)?;
@@ -344,19 +343,17 @@ pub fn copy_epoch2_block_files(
         if let Some(parent) = dst_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 Error::CorruptionError(format!(
-                    "Failed to create directory {}: {:?}",
+                    "Failed to create directory {}: {e:?}",
                     parent.display(),
-                    e
                 ))
             })?;
         }
 
         let bytes_copied = fs::copy(&src_path, &dst_path).map_err(|e| {
             Error::CorruptionError(format!(
-                "Failed to copy block file {} -> {}: {:?}",
+                "Failed to copy block file {} -> {}: {e:?}",
                 src_path.display(),
                 dst_path.display(),
-                e
             ))
         })?;
 
@@ -391,7 +388,7 @@ pub fn copy_nakamoto_staging_blocks(
     )
     .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{}' AS src", src_nakamoto_path))
+    conn.execute_batch(&format!("ATTACH DATABASE '{src_nakamoto_path}' AS src"))
         .map_err(Error::SQLError)?;
 
     clone_schemas_from_source(&conn, &["nakamoto_staging_blocks", "db_version"])?;
@@ -399,7 +396,7 @@ pub fn copy_nakamoto_staging_blocks(
     conn.execute("INSERT INTO db_version SELECT * FROM src.db_version", [])
         .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{}' AS idx", squashed_index_path))
+    conn.execute_batch(&format!("ATTACH DATABASE '{squashed_index_path}' AS idx"))
         .map_err(Error::SQLError)?;
 
     conn.execute(
@@ -441,7 +438,7 @@ pub fn validate_microblock_streams(
     )
     .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{}' AS src", src_index_path))
+    conn.execute_batch(&format!("ATTACH DATABASE '{src_index_path}' AS src"))
         .map_err(Error::SQLError)?;
 
     let (selected_hashes, selected_parents, _stats) = derive_confirmed_microblock_set(&conn)?;
@@ -517,10 +514,10 @@ pub fn validate_nakamoto_staging_blocks(
     )
     .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{}' AS src", src_nakamoto_path))
+    conn.execute_batch(&format!("ATTACH DATABASE '{src_nakamoto_path}' AS src"))
         .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{}' AS idx", squashed_index_path))
+    conn.execute_batch(&format!("ATTACH DATABASE '{squashed_index_path}' AS idx"))
         .map_err(Error::SQLError)?;
 
     let metadata_columns = "block_hash, consensus_hash, parent_block_id, is_tenure_start, \
@@ -641,10 +638,10 @@ pub fn validate_epoch2_block_files(
         }
 
         let src_bytes = fs::read(&src_path).map_err(|e| {
-            Error::CorruptionError(format!("Failed to read {}: {:?}", src_path.display(), e))
+            Error::CorruptionError(format!("Failed to read {}: {e:?}", src_path.display()))
         })?;
         let dst_bytes = fs::read(&dst_path).map_err(|e| {
-            Error::CorruptionError(format!("Failed to read {}: {:?}", dst_path.display(), e))
+            Error::CorruptionError(format!("Failed to read {}: {e:?}", dst_path.display()))
         })?;
         if src_bytes != dst_bytes {
             all_bytes_match = false;
@@ -658,14 +655,14 @@ pub fn validate_epoch2_block_files(
         let mut dirs_to_visit = vec![dst_root.to_path_buf()];
         while let Some(dir) = dirs_to_visit.pop() {
             let entries = fs::read_dir(&dir).map_err(|e| {
-                Error::CorruptionError(format!("Failed to read dir {}: {:?}", dir.display(), e))
+                Error::CorruptionError(format!("Failed to read dir {}: {e:?}", dir.display()))
             })?;
             for entry in entries {
                 let entry = entry.map_err(|e| {
-                    Error::CorruptionError(format!("Failed to read dir entry: {:?}", e))
+                    Error::CorruptionError(format!("Failed to read dir entry: {e:?}"))
                 })?;
                 let ft = entry.file_type().map_err(|e| {
-                    Error::CorruptionError(format!("Failed to get file type: {:?}", e))
+                    Error::CorruptionError(format!("Failed to get file type: {e:?}"))
                 })?;
                 if ft.is_dir() {
                     dirs_to_visit.push(entry.path());
