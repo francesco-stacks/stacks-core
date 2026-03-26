@@ -54,7 +54,11 @@ pub fn clone_schemas_from_source(conn: &Connection, tables: &[&str]) -> Result<(
             .ok();
 
         if let Some(create_sql) = sql {
-            let safe_sql = create_sql.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1);
+            let safe_sql = if create_sql.contains("IF NOT EXISTS") {
+                create_sql
+            } else {
+                create_sql.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
+            };
             stmts.push(safe_sql);
         }
 
@@ -66,7 +70,11 @@ pub fn clone_schemas_from_source(conn: &Connection, tables: &[&str]) -> Result<(
             .map_err(Error::SQLError)?;
         for idx_sql in idx_rows {
             let idx_sql = idx_sql.map_err(Error::SQLError)?;
-            let safe_sql = idx_sql.replacen("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1);
+            let safe_sql = if idx_sql.contains("IF NOT EXISTS") {
+                idx_sql
+            } else {
+                idx_sql.replacen("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
+            };
             stmts.push(safe_sql);
         }
     }
