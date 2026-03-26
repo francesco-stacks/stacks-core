@@ -1034,7 +1034,101 @@ impl MultipleMinerTest {
         self.get_peer_info().stacks_tip_consensus_hash
     }
 
-    /// Ensures that miner 2 submits a commit pointing to the current view reported by the stacks node as expected
+    /// Snapshot miner counters that indicate activity. If any of these
+    /// change between polls, the miner is still making progress toward
+    /// submitting a commit and we should keep waiting.
+    fn snapshot_miner_activity(counters: &Counters) -> [u64; 5] {
+        [
+            counters.blocks_processed.load(Ordering::SeqCst),
+            counters.sortitions_processed.load(Ordering::SeqCst),
+            counters.naka_submitted_vrfs.load(Ordering::SeqCst),
+            counters.naka_mined_blocks.load(Ordering::SeqCst),
+            counters.naka_miner_directives.load(Ordering::SeqCst),
+        ]
+    }
+
+    /// Wait for a miner to submit a commit. As long as the miner's
+    /// show activity (blocks processed, sortitions processed, VRFs
+    /// submitted, etc.), we keep waiting up to `max_wait`.
+    fn wait_for_miner_commit(
+        counters: &Counters,
+        burn_height: u64,
+        stacks_height: u64,
+        commits_before: Option<u64>,
+        stall_timeout: Duration,
+        max_wait: Duration,
+        miner_label: &str,
+    ) {
+        let started = Instant::now();
+        let mut last_activity = Instant::now();
+        let mut last_snapshot = Self::snapshot_miner_activity(counters);
+
+        loop {
+            let height_ok = counters
+                .naka_submitted_commit_last_burn_height
+                .load(Ordering::SeqCst)
+                >= burn_height
+                && counters
+                    .naka_submitted_commit_last_stacks_tip
+                    .load(Ordering::SeqCst)
+                    >= stacks_height;
+            let commit_ok = commits_before
+                .map(|before| counters.naka_submitted_commits.load(Ordering::SeqCst) > before)
+                .unwrap_or(true);
+
+            if height_ok && commit_ok {
+                return;
+            }
+
+            // If any miner counter changed, it is still making progress
+            let current_snapshot = Self::snapshot_miner_activity(counters);
+            if current_snapshot != last_snapshot {
+                last_activity = Instant::now();
+                last_snapshot = current_snapshot;
+            }
+
+            let elapsed = started.elapsed();
+            let stalled = last_activity.elapsed();
+
+            if stalled > stall_timeout {
+                panic!(
+                    "Miner {miner_label} stalled for {}s without submitting a commit op \
+                     (total wait: {}s). \
+                     Expected burn_height >= {burn_height}, stacks_tip >= {stacks_height}. \
+                     Current: burn_height={}, stacks_tip={}, total_commits={}",
+                    stalled.as_secs(),
+                    elapsed.as_secs(),
+                    counters
+                        .naka_submitted_commit_last_burn_height
+                        .load(Ordering::SeqCst),
+                    counters
+                        .naka_submitted_commit_last_stacks_tip
+                        .load(Ordering::SeqCst),
+                    counters.naka_submitted_commits.load(Ordering::SeqCst),
+                );
+            }
+
+            if elapsed > max_wait {
+                panic!(
+                    "Miner {miner_label} did not submit commit within {}s \
+                     (miner was still active). \
+                     Expected burn_height >= {burn_height}, stacks_tip >= {stacks_height}. \
+                     Current: burn_height={}, stacks_tip={}, total_commits={}",
+                    max_wait.as_secs(),
+                    counters
+                        .naka_submitted_commit_last_burn_height
+                        .load(Ordering::SeqCst),
+                    counters
+                        .naka_submitted_commit_last_stacks_tip
+                        .load(Ordering::SeqCst),
+                    counters.naka_submitted_commits.load(Ordering::SeqCst),
+                );
+            }
+
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     /// Ensures that miner 2 has submitted a commit pointing to the current
     /// view reported by the stacks node. Temporarily unpauses commits if
     /// needed, waits until the commit counters reflect the current burn
@@ -1058,28 +1152,15 @@ impl MultipleMinerTest {
         self.unpause_commits_miner_2();
 
         info!("Waiting for RL2 commit at burn_height={burn_height}, stacks_height={stacks_height_before}");
-        wait_for(30, || {
-            let height_ok = self
-                .rl2_counters
-                .naka_submitted_commit_last_burn_height
-                .load(Ordering::SeqCst)
-                >= burn_height
-                && self
-                    .rl2_counters
-                    .naka_submitted_commit_last_stacks_tip
-                    .load(Ordering::SeqCst)
-                    >= stacks_height_before;
-            let commit_incremented = commits_before
-                .map(|before| {
-                    self.rl2_counters
-                        .naka_submitted_commits
-                        .load(Ordering::SeqCst)
-                        > before
-                })
-                .unwrap_or(true);
-            Ok(height_ok && commit_incremented)
-        })
-        .expect("Timed out waiting for miner 2 to submit a commit op");
+        Self::wait_for_miner_commit(
+            &self.rl2_counters,
+            burn_height,
+            stacks_height_before,
+            commits_before,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            "RL2",
+        );
 
         if was_paused {
             info!("Restoring paused state for RL2");
@@ -1140,34 +1221,15 @@ impl MultipleMinerTest {
         self.unpause_commits_miner_1();
 
         info!("Waiting for RL1 commit at burn_height={burn_height}, stacks_height={stacks_height_before}");
-        wait_for(30, || {
-            let height_ok = self
-                .signer_test
-                .running_nodes
-                .counters
-                .naka_submitted_commit_last_burn_height
-                .load(Ordering::SeqCst)
-                >= burn_height
-                && self
-                    .signer_test
-                    .running_nodes
-                    .counters
-                    .naka_submitted_commit_last_stacks_tip
-                    .load(Ordering::SeqCst)
-                    >= stacks_height_before;
-            let commit_incremented = commits_before
-                .map(|before| {
-                    self.signer_test
-                        .running_nodes
-                        .counters
-                        .naka_submitted_commits
-                        .load(Ordering::SeqCst)
-                        > before
-                })
-                .unwrap_or(true);
-            Ok(height_ok && commit_incremented)
-        })
-        .expect("Timed out waiting for miner 1 to submit a commit op");
+        Self::wait_for_miner_commit(
+            &self.signer_test.running_nodes.counters,
+            burn_height,
+            stacks_height_before,
+            commits_before,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            "RL1",
+        );
 
         if was_paused {
             info!("Restoring paused state for RL1");
