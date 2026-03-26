@@ -1,16 +1,16 @@
-use blockstack_lib::chainstate::stacks::db::snapshot::{
+use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
+use stackslib::chainstate::stacks::db::snapshot::{
     copy_confirmed_epoch2_microblocks, copy_epoch2_block_files, copy_nakamoto_staging_blocks,
 };
-use blockstack_lib::chainstate::stacks::index::marf::{MarfConnection, MARF};
-use blockstack_lib::chainstate::stacks::index::storage::TrieFileStorage;
-use blockstack_lib::chainstate::stacks::index::trie_sql;
-use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
+use stackslib::chainstate::stacks::index::marf::{MARF, MarfConnection};
+use stackslib::chainstate::stacks::index::storage::TrieFileStorage;
+use stackslib::chainstate::stacks::index::trie_sql;
 
 use crate::cli::{BlocksSection, LatestHeightArgs, SquashArgs, ValidateArgs, VerifyArgs};
 use crate::manifest::generate_manifest;
 use crate::ops::{
-    copy_bitcoin_aux_files, squash_and_copy_one, validate_bitcoin_aux_files, validate_block_data,
-    validate_one, SideTableMode,
+    SideTableMode, copy_bitcoin_aux_files, squash_and_copy_one, validate_bitcoin_aux_files,
+    validate_block_data, validate_one,
 };
 use crate::util::{
     bitcoin_height_to_sortition_marf_height, build_pox_constants, chainstate_paths,
@@ -169,7 +169,10 @@ pub fn run_squash(args: SquashArgs) {
             Ok(st) => {
                 println!(
                     "Microblock copy complete: streams_copied={}, streams_skipped={}, rows={}, bytes={}",
-                    st.streams_copied, st.streams_skipped, st.microblock_rows_copied, st.microblock_bytes_copied
+                    st.streams_copied,
+                    st.streams_skipped,
+                    st.microblock_rows_copied,
+                    st.microblock_bytes_copied
                 );
                 st
             }

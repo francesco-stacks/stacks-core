@@ -1,17 +1,17 @@
 use std::fs;
 use std::path::Path;
 
-use blockstack_lib::chainstate::stacks::db::snapshot::{
-    copy_burnchain_db, copy_index_side_tables, copy_sortition_side_tables, copy_spv_headers,
-    validate_burnchain_db, validate_epoch2_block_files, validate_index_side_tables,
-    validate_microblock_streams, validate_nakamoto_staging_blocks, validate_sortition_side_tables,
-    validate_spv_headers,
+use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
+use stackslib::chainstate::stacks::db::snapshot::{
+    IndexSideTableValidation, SortitionSideTableValidation, copy_burnchain_db,
+    copy_index_side_tables, copy_sortition_side_tables, copy_spv_headers, validate_burnchain_db,
+    validate_epoch2_block_files, validate_index_side_tables, validate_microblock_streams,
+    validate_nakamoto_staging_blocks, validate_sortition_side_tables, validate_spv_headers,
 };
-use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, SquashValidationStats, MARF};
-use blockstack_lib::clarity_vm::database::snapshot::{
+use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, SquashValidationStats};
+use stackslib::clarity_vm::database::snapshot::{
     copy_clarity_side_tables, validate_clarity_side_tables,
 };
-use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 
 use crate::cli::TargetPaths;
 use crate::util::ensure_blobs_match;
@@ -115,11 +115,18 @@ pub fn squash_and_copy_one(
                 Ok(st) => {
                     println!(
                         "Index side-table copy complete: block_headers={}, nakamoto_headers={}, payments={}, transactions={}, tenure_events={}, reward_sets={}, signer_stats={}, matured_rewards={}, burnchain_txids={}, epoch_transitions={}, staging_blocks={}, fork_storage={}",
-                        st.block_headers_rows, st.nakamoto_block_headers_rows, st.payments_rows,
-                        st.transactions_rows, st.nakamoto_tenure_events_rows,
-                        st.nakamoto_reward_sets_rows, st.signer_stats_rows,
-                        st.matured_rewards_rows, st.burnchain_txids_rows, st.epoch_transitions_rows,
-                        st.staging_blocks_rows, st.fork_storage_rows
+                        st.block_headers_rows,
+                        st.nakamoto_block_headers_rows,
+                        st.payments_rows,
+                        st.transactions_rows,
+                        st.nakamoto_tenure_events_rows,
+                        st.nakamoto_reward_sets_rows,
+                        st.signer_stats_rows,
+                        st.matured_rewards_rows,
+                        st.burnchain_txids_rows,
+                        st.epoch_transitions_rows,
+                        st.staging_blocks_rows,
+                        st.fork_storage_rows
                     );
                 }
                 Err(e) => {
@@ -140,7 +147,11 @@ pub fn squash_and_copy_one(
                 Ok(st) => {
                     println!(
                         "Sortition side-table copy complete: snapshots={}, leader_keys={}, block_commits={}, epochs={}, fork_storage={}",
-                        st.snapshots_rows, st.leader_keys_rows, st.block_commits_rows, st.epochs_rows, st.fork_storage_rows
+                        st.snapshots_rows,
+                        st.leader_keys_rows,
+                        st.block_commits_rows,
+                        st.epochs_rows,
+                        st.fork_storage_rows
                     );
                 }
                 Err(e) => {
@@ -382,9 +393,7 @@ fn print_validation(stats: &SquashValidationStats) {
     println!("Valid: {}", stats.is_valid());
 }
 
-fn print_index_side_table_validation(
-    v: &blockstack_lib::chainstate::stacks::db::snapshot::IndexSideTableValidation,
-) {
+fn print_index_side_table_validation(v: &IndexSideTableValidation) {
     println!("Index side-table validation:");
     println!("  tables_present: {}", v.tables_present);
     println!("  db_config_matches: {}", v.db_config_matches);
@@ -427,9 +436,7 @@ fn print_index_side_table_validation(
     println!("  Index side-table valid: {}", v.is_valid());
 }
 
-fn print_sortition_side_table_validation(
-    v: &blockstack_lib::chainstate::stacks::db::snapshot::SortitionSideTableValidation,
-) {
+fn print_sortition_side_table_validation(v: &SortitionSideTableValidation) {
     println!("Sortition side-table validation:");
     println!("  required_tables_present: {}", v.required_tables_present);
     println!("  canonical_set_in_source: {}", v.canonical_set_in_source);
@@ -649,9 +656,12 @@ pub fn copy_bitcoin_aux_files(
         Ok(bc_stats) => {
             println!(
                 "  block_headers={}, block_ops={}, commit_metadata={}, anchor_blocks={}, overrides={}, affirmation_maps={}",
-                bc_stats.block_headers_rows, bc_stats.block_ops_rows,
-                bc_stats.block_commit_metadata_rows, bc_stats.anchor_blocks_rows,
-                bc_stats.overrides_rows, bc_stats.affirmation_maps_rows
+                bc_stats.block_headers_rows,
+                bc_stats.block_ops_rows,
+                bc_stats.block_commit_metadata_rows,
+                bc_stats.anchor_blocks_rows,
+                bc_stats.overrides_rows,
+                bc_stats.affirmation_maps_rows
             );
         }
         Err(e) => {

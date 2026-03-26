@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
-use blockstack_lib::chainstate::stacks::index::storage::TrieFileStorage;
-use blockstack_lib::chainstate::stacks::index::{trie_sql, MarfTrieId};
+use stackslib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
+use stackslib::chainstate::stacks::index::storage::TrieFileStorage;
+use stackslib::chainstate::stacks::index::{trie_sql, MarfTrieId};
 use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 
 use crate::cli::{CheckpointFile, SquashManifest, GSS_MANIFEST};

@@ -3,13 +3,13 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use blockstack_lib::burnchains::PoxConstants;
-use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
-use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
-use blockstack_lib::chainstate::stacks::db::StacksChainState;
-use blockstack_lib::chainstate::stacks::index::marf::MARFOpenOpts;
-use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
-use blockstack_lib::config::ConfigFile;
+use stackslib::burnchains::PoxConstants;
+use stackslib::chainstate::burn::db::sortdb::SortitionDB;
+use stackslib::chainstate::nakamoto::NakamotoChainState;
+use stackslib::chainstate::stacks::db::StacksChainState;
+use stackslib::chainstate::stacks::index::marf::MARFOpenOpts;
+use stackslib::chainstate::stacks::index::storage::TrieHashCalculationMode;
+use stackslib::config::ConfigFile;
 use sha2::{Digest, Sha256};
 
 use crate::cli::{ChainstatePaths, TargetPaths, GSS_MANIFEST, SQLITE_SIDECAR_EXTENSIONS};

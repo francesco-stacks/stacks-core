@@ -2,13 +2,13 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
-use blockstack_lib::chainstate::stacks::index::{trie_sql, MarfTrieId};
 use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
+use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, MarfConnection};
+use stackslib::chainstate::stacks::index::{MarfTrieId, trie_sql};
 
 use crate::cli::{
-    BlocksSection, ChecksumsSection, RootsSection, SnapshotSection, SquashManifest,
-    SquashRootsSection, TargetPaths, GSS_MANIFEST,
+    BlocksSection, ChecksumsSection, GSS_MANIFEST, RootsSection, SnapshotSection, SquashManifest,
+    SquashRootsSection, TargetPaths,
 };
 use crate::util::{
     compute_checksums, format_timestamp, sortition_open_opts_for_path, squash_marf_open_opts,
