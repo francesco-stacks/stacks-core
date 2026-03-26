@@ -3437,7 +3437,7 @@ impl SortitionDB {
     fn check_schema_version_or_error(&mut self) -> Result<(), db_error> {
         match SortitionDB::get_schema_version(self.conn()) {
             Ok(Some(version)) => {
-                eprintln!("SortitionDB schema version: {version}");
+                debug!("SortitionDB schema version: {version}");
                 if version == SORTITION_DB_VERSION {
                     Ok(())
                 } else {

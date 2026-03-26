@@ -833,8 +833,6 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                         return None;
                     }
                     if !trusted_squash_node_hashes.contains(node_root_hash) {
-                        eprintln!(
-                            "DEBUG Squash shunt rejected: node_root_hash {node_root_hash:?} not in trusted set {trusted_squash_node_hashes:?}"                        );
                         trace!(
                             "Squash shunt rejected: node_root_hash {node_root_hash:?} not in trusted set"
                         );
