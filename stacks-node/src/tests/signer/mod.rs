@@ -217,30 +217,6 @@ impl<Z: SpawnedSignerTrait> SignerTest<Z> {
     >(
         num_signers: usize,
         initial_balances: Vec<(StacksAddress, u64)>,
-        signer_config_modifier: F,
-        node_config_modifier: G,
-        btc_miner_pubkeys: Option<Vec<Secp256k1PublicKey>>,
-        signer_stacks_private_keys: Option<Vec<StacksPrivateKey>>,
-        snapshot_name: Option<&str>,
-    ) -> Self {
-        let mut test = Self::new_without_signers(
-            num_signers,
-            initial_balances,
-            signer_config_modifier,
-            node_config_modifier,
-            btc_miner_pubkeys,
-            signer_stacks_private_keys,
-            snapshot_name,
-        );
-        test.spawn_all_signers();
-        test
-    }
-
-    /// Build the test harness (node + configs) without spawning signers.
-    /// Call [`Self::spawn_all_signers`] when ready.
-    pub(crate) fn new_without_signers<F: FnMut(&mut SignerConfig), G: FnMut(&mut NeonConfig)>(
-        num_signers: usize,
-        initial_balances: Vec<(StacksAddress, u64)>,
         mut signer_config_modifier: F,
         mut node_config_modifier: G,
         btc_miner_pubkeys: Option<Vec<Secp256k1PublicKey>>,
@@ -309,6 +285,8 @@ impl<Z: SpawnedSignerTrait> SignerTest<Z> {
         .collect();
         assert_eq!(signer_configs.len(), num_signers);
 
+        let spawned_signers = signer_configs.iter().cloned().map(Z::new).collect();
+
         // Setup the nodes and deploy the contract to it
         let btc_miner_pubkeys = btc_miner_pubkeys
             .filter(|keys| !keys.is_empty())
@@ -339,13 +317,12 @@ impl<Z: SpawnedSignerTrait> SignerTest<Z> {
             node_config_modifier,
             snapshot_exists,
         );
-
         let config = signer_configs.first().unwrap();
         let stacks_client = StacksClient::from(config);
 
         Self {
             running_nodes: node,
-            spawned_signers: vec![],
+            spawned_signers,
             signer_stacks_private_keys,
             stacks_client,
             num_stacking_cycles: 12_u64,
@@ -355,11 +332,6 @@ impl<Z: SpawnedSignerTrait> SignerTest<Z> {
                 SetupSnapshotResult::NoSnapshot => None,
             },
         }
-    }
-
-    /// Spawn all signers from their stored configs.
-    pub fn spawn_all_signers(&mut self) {
-        self.spawned_signers = self.signer_configs.iter().cloned().map(Z::new).collect();
     }
 
     /// Whether the snapshot needs to be created.

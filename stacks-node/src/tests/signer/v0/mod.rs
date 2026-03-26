@@ -649,7 +649,7 @@ impl MultipleMinerTest {
 
         // partition the signer set so that ~half are listening and using node 1 for RPC and events,
         //  and the rest are using node 2
-        let mut signer_test = SignerTest::new_without_signers(
+        let signer_test: SignerTest<SpawnedSigner> = SignerTest::new_with_config_modifications(
             num_signers,
             vec![(sender_addr, (send_amt + send_fee) * num_transfer_txs)],
             |signer_config| {
@@ -698,7 +698,6 @@ impl MultipleMinerTest {
             },
             Some(vec![btc_miner_1_pk.clone(), btc_miner_2_pk.clone()]),
             None,
-            None,
         );
         let conf = signer_test.running_nodes.conf.clone();
         let mut conf_node_2 = conf.clone();
@@ -737,10 +736,7 @@ impl MultipleMinerTest {
             .spawn(move || run_loop_2.start(None, 0))
             .unwrap();
 
-        info!("Waiting for run_loop_2...");
         wait_for_runloop(&rl2_blocks_processed);
-
-        signer_test.spawn_all_signers();
 
         MultipleMinerTest {
             signer_test,
