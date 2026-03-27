@@ -19,6 +19,7 @@ use crate::chainstate::stacks::db::{
     CHAINSTATE_INDEXES, CHAINSTATE_INITIAL_SCHEMA, CHAINSTATE_SCHEMA_2, CHAINSTATE_SCHEMA_3,
     CHAINSTATE_SCHEMA_4, CHAINSTATE_SCHEMA_5,
 };
+use crate::chainstate::stacks::index::Error;
 use crate::chainstate::stacks::{
     StacksMicroblock, StacksMicroblockHeader, StacksTransaction, TokenTransferMemo,
     TransactionAuth, TransactionPayload, TransactionSpendingCondition, TransactionVersion,
@@ -996,15 +997,22 @@ fn test_epoch2_block_file_missing_source_is_error() {
 
     std::fs::create_dir_all(&src_blocks_dir).unwrap();
 
-    let stats = super::blocks::copy_epoch2_block_files(
+    let err = super::blocks::copy_epoch2_block_files(
         idx_path.to_str().unwrap(),
         src_blocks_dir.to_str().unwrap(),
         dst_blocks_dir.to_str().unwrap(),
     )
-    .expect("copy should succeed even with missing source files (pruned blocks)");
+    .expect_err("copy should fail when a required source epoch-2 block file is missing");
 
-    assert_eq!(stats.files_missing, 1, "should track the missing file");
-    assert_eq!(stats.files_copied, 0, "no files should be copied");
+    match err {
+        Error::CorruptionError(msg) => {
+            assert!(
+                msg.contains("Missing source epoch-2 block file"),
+                "unexpected error message: {msg}"
+            );
+        }
+        other => panic!("unexpected error type: {other:?}"),
+    }
 }
 
 #[test]
