@@ -1768,7 +1768,7 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     unconfirmed: bool,
 
     /// Snapshot metadata if this MARF is squashed.
-    squash_info: Option<SquashInfo<T>>,
+    squash_info: Option<SquashInfo>,
 }
 
 /// Snapshot metadata cached at open time for squashed MARFs.
@@ -1778,7 +1778,7 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
 /// when the MARF is opened and used by the ancestor-hash computation to
 /// avoid opening pruned historical blocks.
 #[derive(Clone, Debug)]
-pub struct SquashInfo<T: MarfTrieId> {
+pub struct SquashInfo {
     /// Archival MARF root hash committed to the chain at the squash height.
     pub archival_marf_root_hash: TrieHash,
     /// Root node hash of the squash trie. i.e. `hash(consensus_bytes(root) || children_content_hashes)`
@@ -1786,8 +1786,6 @@ pub struct SquashInfo<T: MarfTrieId> {
     pub squash_root_node_hash: TrieHash,
     /// Height at which the MARF was squashed.
     pub height: u32,
-    /// Block hash at the snapshot height.
-    pub block_hash: T,
 }
 
 // disk-backed Trie.
@@ -1838,7 +1836,7 @@ impl<T: MarfTrieId> TrieStorageTransientData<T> {
         self.cur_block = bhh;
     }
 
-    fn set_squash_info(&mut self, squash_info: Option<SquashInfo<T>>) {
+    fn set_squash_info(&mut self, squash_info: Option<SquashInfo>) {
         self.squash_info = squash_info;
     }
 }
@@ -1891,27 +1889,21 @@ impl<'a, T: MarfTrieId> ReopenedTrieStorageConnection<'a, T> {
 
 impl<T: MarfTrieId> TrieFileStorage<T> {
     /// Detect whether this MARF was produced by a squash operation and, if
-    /// so, cache the squash metadata ([`SquashInfo`]) in transient data.
+    /// so, cache the squash metadata [`SquashInfo`].
     ///
-    /// The metadata is read from the out-of-trie `marf_squash_info` SQL
-    /// table (not from trie keys), so it never affects per-block root
-    /// hashes.
+    /// The metadata is read from the `marf_squash_info` SQL table
     fn init_squash_info(&mut self) -> Result<(), Error> {
-        // Gracefully handle databases that don't have the squash tables
-        // (e.g. in-memory test databases created via `new_memory()`).
-        let squash_info = match trie_sql::read_squash_info(&self.db) {
-            Ok(Some((archival_marf_root_hash, squash_root_node_hash_opt, height))) => {
-                let tip = trie_sql::get_latest_confirmed_block_hash::<T>(&self.db)?;
+        let squash_info = match trie_sql::read_squash_info(&self.db)? {
+            Some((archival_marf_root_hash, squash_root_node_hash_opt, height)) => {
                 Some(SquashInfo {
                     archival_marf_root_hash,
+                    // While creating a squash, this may still be empty.
                     squash_root_node_hash: squash_root_node_hash_opt
                         .unwrap_or_else(|| TrieHash::from_data(&[])),
                     height,
-                    block_hash: tip,
                 })
             }
-            Ok(None) => None,
-            Err(_) => None, // table may not exist yet
+            None => None,
         };
 
         self.data.set_squash_info(squash_info);
@@ -1919,7 +1911,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
     }
 
     /// Returns cached squashing metadata, if present.
-    pub fn squash_info(&self) -> Option<&SquashInfo<T>> {
+    pub fn squash_info(&self) -> Option<&SquashInfo> {
         self.data.squash_info.as_ref()
     }
 
@@ -2649,7 +2641,7 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     }
 
     /// Returns cached squashing metadata, if present.
-    pub fn squash_info(&self) -> Option<&SquashInfo<T>> {
+    pub fn squash_info(&self) -> Option<&SquashInfo> {
         self.data.squash_info.as_ref()
     }
 
@@ -2657,7 +2649,7 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     ///
     /// Restricted to crate-internal use to prevent accidental mutation by
     /// external consumers.
-    pub(crate) fn set_squash_info(&mut self, squash_info: Option<SquashInfo<T>>) {
+    pub(crate) fn set_squash_info(&mut self, squash_info: Option<SquashInfo>) {
         self.data.set_squash_info(squash_info);
     }
 

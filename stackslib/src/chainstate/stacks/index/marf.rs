@@ -434,7 +434,7 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
     ///
     /// Called during `squash_to_path` so the ancestor-hash computation can
     /// use stored root hashes instead of opening pruned historical blocks.
-    pub(crate) fn set_squash_info(&mut self, info: Option<SquashInfo<T>>) {
+    pub(crate) fn set_squash_info(&mut self, info: Option<SquashInfo>) {
         self.storage.set_squash_info(info);
     }
 

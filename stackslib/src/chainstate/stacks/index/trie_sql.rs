@@ -30,7 +30,7 @@ use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
 use crate::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use crate::types::sqlite::NO_PARAMS;
-use crate::util_lib::db::{query_count, query_row, tx_begin_immediate, u64_to_sql};
+use crate::util_lib::db::{query_count, query_row, table_exists, tx_begin_immediate, u64_to_sql};
 
 static SQL_MARF_DATA_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS marf_data (
@@ -127,6 +127,10 @@ pub fn write_squash_info(
 pub fn read_squash_info(
     conn: &Connection,
 ) -> Result<Option<(TrieHash, Option<TrieHash>, u32)>, Error> {
+    if !table_exists(conn, "marf_squash_info")? {
+        return Ok(None);
+    }
+
     let result: Option<(Vec<u8>, Option<Vec<u8>>, i64)> = conn
         .query_row(
             "SELECT archival_marf_root_hash, squash_root_node_hash, squash_height FROM marf_squash_info WHERE id = 1",
@@ -142,34 +146,37 @@ pub fn read_squash_info(
 
     match result {
         Some((archival_bytes, squash_bytes, height)) => {
-            if archival_bytes.len() < TRIEHASH_ENCODED_SIZE {
+            if archival_bytes.len() != TRIEHASH_ENCODED_SIZE {
                 return Err(Error::CorruptionError(
                     "Invalid archival root hash length".to_string(),
                 ));
             }
-            let hash_bytes = archival_bytes.get(..TRIEHASH_ENCODED_SIZE).ok_or_else(|| {
-                Error::CorruptionError("Archival root hash bytes too short".to_string())
-            })?;
-            let archival_marf_root_hash = TrieHash::from_bytes(hash_bytes).ok_or_else(|| {
-                Error::CorruptionError("Invalid archival root hash bytes".to_string())
-            })?;
+            let archival_marf_root_hash =
+                TrieHash::from_bytes(&archival_bytes).ok_or_else(|| {
+                    Error::CorruptionError("Invalid archival root hash bytes".to_string())
+                })?;
 
             let squash_root_node_hash = match squash_bytes {
-                Some(bytes) if bytes.len() >= TRIEHASH_ENCODED_SIZE => {
-                    let h = bytes.get(..TRIEHASH_ENCODED_SIZE).ok_or_else(|| {
-                        Error::CorruptionError("Squash root hash bytes too short".to_string())
-                    })?;
-                    Some(TrieHash::from_bytes(h).ok_or_else(|| {
+                Some(bytes) => {
+                    if bytes.len() != TRIEHASH_ENCODED_SIZE {
+                        return Err(Error::CorruptionError(
+                            "Invalid squash root hash length".to_string(),
+                        ));
+                    }
+                    Some(TrieHash::from_bytes(&bytes).ok_or_else(|| {
                         Error::CorruptionError("Invalid squash root hash bytes".to_string())
                     })?)
                 }
-                _ => None,
+                None => None,
             };
+
+            let squash_height = u32::try_from(height)
+                .map_err(|_| Error::CorruptionError("Invalid squash height".to_string()))?;
 
             Ok(Some((
                 archival_marf_root_hash,
                 squash_root_node_hash,
-                height as u32,
+                squash_height,
             )))
         }
         None => Ok(None),
@@ -202,15 +209,12 @@ pub fn read_squash_archival_marf_root_hash(
 
     match result {
         Some(bytes) => {
-            if bytes.len() < TRIEHASH_ENCODED_SIZE {
+            if bytes.len() != TRIEHASH_ENCODED_SIZE {
                 return Err(Error::CorruptionError(
                     "Invalid squash root hash length".to_string(),
                 ));
             }
-            let hash_bytes = bytes.get(..TRIEHASH_ENCODED_SIZE).ok_or_else(|| {
-                Error::CorruptionError("Squash root hash bytes too short".to_string())
-            })?;
-            Ok(Some(TrieHash::from_bytes(hash_bytes).ok_or_else(|| {
+            Ok(Some(TrieHash::from_bytes(&bytes).ok_or_else(|| {
                 Error::CorruptionError("Invalid squash root hash bytes".to_string())
             })?))
         }
@@ -233,7 +237,12 @@ pub fn read_squash_block_height<T: MarfTrieId>(
         )
         .optional()?;
 
-    Ok(result.map(|h| h as u32))
+    result
+        .map(|h| {
+            u32::try_from(h)
+                .map_err(|_| Error::CorruptionError("Invalid squash block height".to_string()))
+        })
+        .transpose()
 }
 
 /// Read the block hash for a given height from the squash block-heights table.
@@ -293,17 +302,19 @@ pub fn bulk_read_squash_archival_marf_root_hashes(
     let rows = stmt.query_map(NO_PARAMS, |row| {
         let height: i64 = row.get(0)?;
         let marf_root_hash_bytes: Vec<u8> = row.get(1)?;
-        Ok((height as u32, marf_root_hash_bytes))
+        Ok((height, marf_root_hash_bytes))
     })?;
     let mut result = Vec::new();
     for row in rows {
-        let (h, marf_root_hash_bytes) = row?;
-        let hash_bytes = marf_root_hash_bytes
-            .get(..TRIEHASH_ENCODED_SIZE)
-            .ok_or_else(|| {
-                Error::CorruptionError("Squash root hash bytes too short".to_string())
-            })?;
-        let root = TrieHash::from_bytes(hash_bytes)
+        let (height, marf_root_hash_bytes) = row?;
+        let h = u32::try_from(height)
+            .map_err(|_| Error::CorruptionError("Invalid squash root hash height".to_string()))?;
+        if marf_root_hash_bytes.len() != TRIEHASH_ENCODED_SIZE {
+            return Err(Error::CorruptionError(
+                "Invalid squash root hash length".to_string(),
+            ));
+        }
+        let root = TrieHash::from_bytes(&marf_root_hash_bytes)
             .ok_or_else(|| Error::CorruptionError("Invalid squash root hash bytes".to_string()))?;
         result.push((h, root));
     }

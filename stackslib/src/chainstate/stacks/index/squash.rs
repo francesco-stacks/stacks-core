@@ -1333,7 +1333,6 @@ impl<T: MarfTrieId> MARF<T> {
             archival_marf_root_hash: source_root_hash,
             squash_root_node_hash,
             height,
-            block_hash: block_at_height.clone(),
         }));
 
         // Commit the SQL transaction without flushing TrieRAM (we already wrote the blob directly)

@@ -109,18 +109,15 @@ fn test_squash_info_detected_on_open() {
         trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(squashed.sqlite_conn()).unwrap();
 
     // Verify squash metadata was detected from the SQL table on open.
-    let (is_squashed, info_root, info_height, info_block) = squashed
-        .with_conn(
-            |conn| -> Result<(bool, TrieHash, u32, StacksBlockId), Error> {
-                let info = conn.squash_info().expect("missing squash info");
-                Ok((
-                    conn.is_squashed(),
-                    info.archival_marf_root_hash,
-                    info.height,
-                    info.block_hash.clone(),
-                ))
-            },
-        )
+    let (is_squashed, info_root, info_height) = squashed
+        .with_conn(|conn| -> Result<(bool, TrieHash, u32), Error> {
+            let info = conn.squash_info().expect("missing squash info");
+            Ok((
+                conn.is_squashed(),
+                info.archival_marf_root_hash,
+                info.height,
+            ))
+        })
         .unwrap();
 
     // Cross-check with the SQL table directly.
@@ -133,7 +130,6 @@ fn test_squash_info_detected_on_open() {
     assert_eq!(info_root, sql_root);
     assert_eq!(info_height, sql_height);
     assert_eq!(info_height, 1);
-    assert_eq!(info_block, tip);
 }
 
 #[test]
