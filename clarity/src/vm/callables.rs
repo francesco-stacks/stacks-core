@@ -443,7 +443,7 @@ impl CallableType {
         match self {
             CallableType::NativeFunction(rust_name, function, cost_function, clarity_name) => {
                 let _span = crate::profiler::begin_builtin_span(clarity_name, rust_name);
-                runtime_cost(cost_function.clone(), env, evaluated_args.len())
+                runtime_cost(*cost_function, env, evaluated_args.len())
                     .map_err(VmExecutionError::from)?;
                 function.apply(evaluated_args, env)
             }
@@ -460,8 +460,7 @@ impl CallableType {
                 } else {
                     evaluated_args.len() as u64
                 };
-                runtime_cost(cost_function.clone(), env, cost_input)
-                    .map_err(VmExecutionError::from)?;
+                runtime_cost(*cost_function, env, cost_input).map_err(VmExecutionError::from)?;
                 function.apply(evaluated_args, env)
             }
             CallableType::UserFunction(function) => {

@@ -17,6 +17,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 use crate::db::ReadOnly;
 use crate::db::node::NakamotoDb;
 
+pub mod bench_events;
 pub mod blocks;
 pub mod context;
 pub mod db;
@@ -24,6 +25,7 @@ pub mod filter;
 pub mod indexer;
 pub mod metrics;
 pub mod paths;
+pub mod provenance;
 pub mod replay;
 pub mod shadow;
 

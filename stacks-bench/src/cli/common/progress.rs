@@ -53,7 +53,8 @@ pub async fn run_indexer_progress_ui(
             }
 
             // Shouldn't arrive before PipelineStarted, but handle gracefully.
-            IndexerEvent::CheckpointStarted
+            IndexerEvent::Interrupted
+            | IndexerEvent::CheckpointStarted
             | IndexerEvent::CheckpointComplete
             | IndexerEvent::VacuumStarted
             | IndexerEvent::VacuumComplete
@@ -284,6 +285,7 @@ async fn run_pipeline_progress(
 
                     // These shouldn't arrive during pipeline, ignore.
                     Some(IndexerEvent::AlreadyCached)
+                    | Some(IndexerEvent::Interrupted)
                     | Some(IndexerEvent::IndexIncomplete { .. })
                     | Some(IndexerEvent::PipelineStarted { .. }) => {}
                 }

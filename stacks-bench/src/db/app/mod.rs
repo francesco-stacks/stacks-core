@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use blockstack_lib::chainstate::stacks::{StacksTransaction, TransactionPayload};
 use chrono::NaiveDateTime;
-use diesel::sql_types::{BigInt, Binary};
+use diesel::sql_types::{BigInt, Binary, Nullable, Text};
 use diesel::upsert::excluded;
 use diesel::{
     ExpressionMethods as _, JoinOnDsl as _, NullableExpressionMethods as _, OptionalExtension as _,
@@ -78,6 +78,19 @@ struct CheckpointResult {
     checkpointed: i64,
 }
 
+/// A row from `sqlite_master` used for schema introspection.
+#[derive(Debug, QueryableByName)]
+pub struct SchemaRow {
+    #[diesel(sql_type = Text)]
+    pub object_type: String,
+    #[diesel(sql_type = Text)]
+    pub name: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub tbl_name: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub sql: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AppDb {
     pool: SqlitePool,
@@ -101,47 +114,38 @@ impl AppDb {
         sql_query("PRAGMA page_size = 8192;")
             .execute(conn)
             .await
-            .inspect_err(|e| eprintln!("Failed to set PRAGMA page_size=8192: {}", e))
             .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         sql_query("PRAGMA wal_autocheckpoint = 0;")
             .execute(conn)
             .await
-            .inspect_err(|e| eprintln!("Failed to set PRAGMA wal_autocheckpoint=0: {}", e))
             .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         sql_query("PRAGMA journal_mode=WAL")
             .execute(conn)
             .await
-            .inspect_err(|e| eprintln!("Failed to set PRAGMA journal_mode=WAL: {}", e))
             .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         sql_query("PRAGMA locking_mode = NORMAL;")
             .execute(conn)
             .await
-            .inspect_err(|e| eprintln!("Failed to set PRAGMA locking_mode=NORMAL: {}", e))
             .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         sql_query("PRAGMA synchronous = NORMAL;")
             .execute(conn)
             .await
-            .inspect_err(|e| eprintln!("Failed to set PRAGMA synchronous=NORMAL: {}", e))
             .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         sql_query("PRAGMA temp_store = MEMORY;")
             .execute(conn)
             .await
-            .inspect_err(|e| eprintln!("Failed to set PRAGMA temp_store=MEMORY: {}", e))
             .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         sql_query("PRAGMA cache_size = -262144;")
             .execute(conn)
             .await
-            .inspect_err(|e| eprintln!("Failed to set PRAGMA cache_size=-262144: {}", e))
             .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         sql_query("PRAGMA mmap_size = 30000000000;")
             .execute(conn)
             .await
-            .inspect_err(|e| eprintln!("Failed to set PRAGMA mmap_size=30000000000: {}", e))
             .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         sql_query("PRAGMA foreign_keys = ON")
             .execute(conn)
             .await
-            .inspect_err(|e| eprintln!("Failed to set PRAGMA foreign_keys=ON: {}", e))
             .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         Ok(())
     }
@@ -298,6 +302,24 @@ impl AppDb {
         Ok(())
     }
 
+    /// Returns DDL rows from `sqlite_master` for tables and indexes, excluding
+    /// internal/staging objects. Each row carries the object type, name, parent
+    /// table name, and the `CREATE` SQL.
+    pub async fn get_schema_ddl(&self) -> Result<Vec<SchemaRow>> {
+        sql_query(
+            "SELECT type AS object_type, name, tbl_name, sql \
+             FROM sqlite_master \
+             WHERE type IN ('table', 'index') \
+               AND name NOT LIKE '\\_%' ESCAPE '\\' \
+               AND name NOT LIKE 'sqlite_%' \
+               AND sql IS NOT NULL \
+             ORDER BY type DESC, name ASC",
+        )
+        .load::<SchemaRow>(&mut self.get_conn().await?)
+        .await
+        .context("Failed to query sqlite_master for schema DDL")
+    }
+
     /// Maps the Network enum to the static IDs defined in the initial migration.
     /// 1=mainnet, 2=testnet, 3=regtest
     fn resolve_network_id(network: crate::Network) -> i32 {
@@ -424,6 +446,7 @@ impl AppDb {
         git_commit_hash: Vec<u8>,
         run_name: Option<String>,
         args_json: String,
+        prov: crate::provenance::BenchmarkProvenance,
     ) -> Result<BenchmarkRun> {
         diesel::insert_into(benchmark_run::table)
             .values((
@@ -432,6 +455,14 @@ impl AppDb {
                 benchmark_run::git_commit_hash.eq(git_commit_hash),
                 benchmark_run::run_name.eq(run_name),
                 benchmark_run::args_json.eq(args_json),
+                benchmark_run::build_profile.eq(prov.build.profile),
+                benchmark_run::build_opt_level.eq(prov.build.opt_level),
+                benchmark_run::build_debug_assertions.eq(prov.build.debug_assertions),
+                benchmark_run::build_overflow_checks.eq(prov.build.overflow_checks),
+                benchmark_run::build_target_triple.eq(prov.build.target_triple),
+                benchmark_run::build_rustc_version.eq(prov.build.rustc_version),
+                benchmark_run::git_branch.eq(prov.git.branch),
+                benchmark_run::git_dirty.eq(prov.git.dirty),
             ))
             .get_result(&mut self.get_conn().await?)
             .await
@@ -474,6 +505,193 @@ impl AppDb {
             .context("Failed to list benchmark runs")
     }
 
+    /// Returns lightweight summary stats for a benchmark run.
+    pub async fn get_run_summary(&self, run_id: i32) -> Result<Option<RunSummary>> {
+        #[derive(Debug, QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            block_count: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_duration_us: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_execution_us: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_commit_us: i64,
+        }
+
+        let row: Option<Row> = sql_query(
+            "SELECT \
+                COUNT(*) AS block_count, \
+                COALESCE(SUM(total_duration_us), 0) AS total_duration_us, \
+                COALESCE(SUM(execution_duration_us), 0) AS total_execution_us, \
+                COALESCE(SUM(commit_duration_us), 0) AS total_commit_us \
+             FROM stacks_block_stats \
+             WHERE benchmark_run_id = ?1",
+        )
+        .bind::<diesel::sql_types::Integer, _>(run_id)
+        .get_result(&mut self.get_conn().await?)
+        .await
+        .optional()
+        .context("Failed to get run summary")?;
+
+        Ok(row.map(|r| RunSummary {
+            block_count: r.block_count as u64,
+            total_duration_us: r.total_duration_us as u64,
+            total_execution_us: r.total_execution_us as u64,
+            total_commit_us: r.total_commit_us as u64,
+        }))
+    }
+
+    /// Returns detailed summary stats for `bench show --summary`.
+    pub async fn get_run_detailed_summary(
+        &self,
+        run_id: i32,
+    ) -> Result<Option<RunDetailedSummary>> {
+        #[derive(Debug, QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            block_count: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_duration_us: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            avg_duration_us: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_setup_us: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_execution_us: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_commit_us: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_clarity_runtime: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_clarity_read_length: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_clarity_read_count: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_clarity_write_length: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_clarity_write_count: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_storage_delta: i64,
+        }
+
+        let row: Option<Row> = sql_query(
+            "SELECT \
+                COUNT(*) AS block_count, \
+                COALESCE(SUM(total_duration_us), 0) AS total_duration_us, \
+                COALESCE(AVG(total_duration_us), 0) AS avg_duration_us, \
+                COALESCE(SUM(setup_duration_us), 0) AS total_setup_us, \
+                COALESCE(SUM(execution_duration_us), 0) AS total_execution_us, \
+                COALESCE(SUM(commit_duration_us), 0) AS total_commit_us, \
+                COALESCE(SUM(clarity_runtime), 0) AS total_clarity_runtime, \
+                COALESCE(SUM(clarity_read_length), 0) AS total_clarity_read_length, \
+                COALESCE(SUM(clarity_read_count), 0) AS total_clarity_read_count, \
+                COALESCE(SUM(clarity_write_length), 0) AS total_clarity_write_length, \
+                COALESCE(SUM(clarity_write_count), 0) AS total_clarity_write_count, \
+                COALESCE(SUM(total_storage_delta), 0) AS total_storage_delta \
+             FROM stacks_block_stats \
+             WHERE benchmark_run_id = ?1",
+        )
+        .bind::<diesel::sql_types::Integer, _>(run_id)
+        .get_result(&mut self.get_conn().await?)
+        .await
+        .optional()
+        .context("Failed to get detailed run summary")?;
+
+        Ok(row.and_then(|r| {
+            if r.block_count == 0 {
+                return None;
+            }
+            Some(RunDetailedSummary {
+                block_count: r.block_count as u64,
+                total_duration_us: r.total_duration_us as u64,
+                avg_duration_us: r.avg_duration_us as u64,
+                total_setup_us: r.total_setup_us as u64,
+                total_execution_us: r.total_execution_us as u64,
+                total_commit_us: r.total_commit_us as u64,
+                total_clarity_runtime: r.total_clarity_runtime as u64,
+                total_clarity_read_length: r.total_clarity_read_length as u64,
+                total_clarity_read_count: r.total_clarity_read_count as u64,
+                total_clarity_write_length: r.total_clarity_write_length as u64,
+                total_clarity_write_count: r.total_clarity_write_count as u64,
+                total_storage_delta: r.total_storage_delta,
+            })
+        }))
+    }
+
+    /// Returns the top-N hottest profiler spans for a run, sorted by
+    /// estimated self wall time descending.
+    pub async fn get_profiler_hot_spans(
+        &self,
+        run_id: i32,
+        limit: usize,
+    ) -> Result<Vec<ProfilerHotSpan>> {
+        #[derive(Debug, QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            span_name: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            span_context: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Double)]
+            est_self_wall_us: f64,
+            #[diesel(sql_type = diesel::sql_types::Double)]
+            est_wall_us: f64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            call_count: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            sample_count: i64,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            file: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+            line: Option<i32>,
+        }
+
+        // Get top-N spans from the pre-computed summary, then join one
+        // representative location from profiler_record for file:line.
+        let rows: Vec<Row> = sql_query(
+            "SELECT \
+                ps.name AS span_name, \
+                ps.context AS span_context, \
+                COALESCE(pss.est_self_wall_us, pss.self_wall_time_us) AS est_self_wall_us, \
+                COALESCE(pss.est_wall_us, pss.wall_time_us) AS est_wall_us, \
+                pss.call_count, \
+                pss.sample_count, \
+                pl.file, \
+                pl.line \
+             FROM profiler_span_summary pss \
+             JOIN profiler_span ps ON ps.id = pss.profiler_span_id \
+             LEFT JOIN ( \
+                SELECT profiler_span_id, profiler_location_id, \
+                       ROW_NUMBER() OVER (PARTITION BY profiler_span_id ORDER BY id) AS rn \
+                FROM profiler_record \
+                WHERE benchmark_run_id = ?1 \
+             ) pr ON pr.profiler_span_id = pss.profiler_span_id AND pr.rn = 1 \
+             LEFT JOIN profiler_location pl ON pl.id = pr.profiler_location_id \
+             WHERE pss.benchmark_run_id = ?1 \
+             ORDER BY est_self_wall_us DESC \
+             LIMIT ?2",
+        )
+        .bind::<diesel::sql_types::Integer, _>(run_id)
+        .bind::<diesel::sql_types::BigInt, _>(limit as i64)
+        .load(&mut self.get_conn().await?)
+        .await
+        .context("Failed to get profiler hot spans")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ProfilerHotSpan {
+                span_name: r.span_name,
+                span_context: r.span_context,
+                est_self_wall_us: r.est_self_wall_us,
+                est_wall_us: r.est_wall_us,
+                call_count: r.call_count,
+                sample_count: r.sample_count,
+                file: r.file,
+                line: r.line,
+            })
+            .collect())
+    }
+
     /// Gets a chainstate by ID, returning `None` if it doesn't exist.
     pub async fn get_chainstate(&self, chainstate_id: i32) -> Result<Option<Chainstate>> {
         chainstate::table
@@ -511,6 +729,291 @@ impl AppDb {
             .get_result::<i64>(&mut self.get_conn().await?)
             .await
             .context("Failed to count benchmark runs for chainstate")
+    }
+
+    /// Returns all epochs for a chainstate, ordered by start height.
+    pub async fn get_epochs_for_chainstate(
+        &self,
+        chainstate_id: i32,
+    ) -> Result<Vec<models::Epoch>> {
+        epoch::table
+            .filter(epoch::chainstate_id.eq(chainstate_id))
+            .order(epoch::start_height.asc())
+            .load::<models::Epoch>(&mut self.get_conn().await?)
+            .await
+            .context("Failed to list epochs for chainstate")
+    }
+
+    /// Returns paginated per-block stats for a benchmark run, joined with
+    /// block height and index hash.
+    pub async fn get_block_stats(
+        &self,
+        run_id: i32,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<BlockStatsRow>> {
+        #[derive(Debug, QueryableByName)]
+        pub struct Row {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            height: i64,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            block_id: String,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            total_duration_us: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            setup_duration_us: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            execution_duration_us: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            commit_duration_us: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            commit_overhead_baseline_us: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            clarity_runtime: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            clarity_read_length: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            clarity_read_count: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            clarity_write_length: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            clarity_write_count: i32,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            total_storage_delta: i64,
+        }
+
+        let rows: Vec<Row> = sql_query(
+            "SELECT \
+                sb.height, \
+                LOWER(HEX(sb.index_hash)) AS block_id, \
+                sbs.total_duration_us, sbs.setup_duration_us, \
+                sbs.execution_duration_us, sbs.commit_duration_us, \
+                sbs.commit_overhead_baseline_us, \
+                sbs.clarity_runtime, sbs.clarity_read_length, sbs.clarity_read_count, \
+                sbs.clarity_write_length, sbs.clarity_write_count, \
+                sbs.total_storage_delta \
+             FROM stacks_block_stats sbs \
+             JOIN synthetic_block syn ON syn.id = sbs.synthetic_block_id \
+             JOIN stacks_block sb ON sb.id = syn.stacks_block_id \
+             WHERE sbs.benchmark_run_id = ?1 \
+             ORDER BY sb.height ASC \
+             LIMIT ?2 OFFSET ?3",
+        )
+        .bind::<diesel::sql_types::Integer, _>(run_id)
+        .bind::<diesel::sql_types::BigInt, _>(limit)
+        .bind::<diesel::sql_types::BigInt, _>(offset)
+        .load(&mut self.get_conn().await?)
+        .await
+        .context("Failed to get block stats")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| BlockStatsRow {
+                height: r.height,
+                block_id: r.block_id,
+                total_duration_us: r.total_duration_us,
+                setup_duration_us: r.setup_duration_us,
+                execution_duration_us: r.execution_duration_us,
+                commit_duration_us: r.commit_duration_us,
+                commit_overhead_baseline_us: r.commit_overhead_baseline_us,
+                clarity_runtime: r.clarity_runtime,
+                clarity_read_length: r.clarity_read_length,
+                clarity_read_count: r.clarity_read_count,
+                clarity_write_length: r.clarity_write_length,
+                clarity_write_count: r.clarity_write_count,
+                total_storage_delta: r.total_storage_delta,
+            })
+            .collect())
+    }
+
+    /// Returns paginated per-tx stats for a benchmark run, optionally filtered
+    /// to a single block by its index hash.
+    pub async fn get_tx_stats(
+        &self,
+        run_id: i32,
+        block_id_hex: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<TxStatsRow>> {
+        #[derive(Debug, QueryableByName)]
+        pub struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            tx_hash: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            tx_type: String,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            block_height: i64,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            duration_us: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            clarity_runtime: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            clarity_read_length: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            clarity_read_count: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            clarity_write_length: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            clarity_write_count: i32,
+        }
+
+        let rows: Vec<Row> = if let Some(block_hex) = block_id_hex {
+            sql_query(
+                "SELECT \
+                    st.tx_hash_hex AS tx_hash, stt.name AS tx_type, \
+                    sb.height AS block_height, \
+                    sts.duration_us, sts.clarity_runtime, \
+                    sts.clarity_read_length, sts.clarity_read_count, \
+                    sts.clarity_write_length, sts.clarity_write_count \
+                 FROM stacks_tx_stats sts \
+                 JOIN stacks_tx st ON st.id = sts.stacks_tx_id \
+                 JOIN stacks_tx_type stt ON stt.id = st.stacks_tx_type_id \
+                 JOIN synthetic_block syn ON syn.id = sts.synthetic_block_id \
+                 JOIN stacks_block sb ON sb.id = syn.stacks_block_id \
+                 WHERE sts.benchmark_run_id = ?1 \
+                   AND LOWER(HEX(sb.index_hash)) = ?2 \
+                 ORDER BY sts.duration_us DESC \
+                 LIMIT ?3 OFFSET ?4",
+            )
+            .bind::<diesel::sql_types::Integer, _>(run_id)
+            .bind::<diesel::sql_types::Text, _>(block_hex.to_lowercase())
+            .bind::<diesel::sql_types::BigInt, _>(limit)
+            .bind::<diesel::sql_types::BigInt, _>(offset)
+            .load(&mut self.get_conn().await?)
+            .await
+            .context("Failed to get tx stats (filtered)")?
+        } else {
+            sql_query(
+                "SELECT \
+                    st.tx_hash_hex AS tx_hash, stt.name AS tx_type, \
+                    sb.height AS block_height, \
+                    sts.duration_us, sts.clarity_runtime, \
+                    sts.clarity_read_length, sts.clarity_read_count, \
+                    sts.clarity_write_length, sts.clarity_write_count \
+                 FROM stacks_tx_stats sts \
+                 JOIN stacks_tx st ON st.id = sts.stacks_tx_id \
+                 JOIN stacks_tx_type stt ON stt.id = st.stacks_tx_type_id \
+                 JOIN synthetic_block syn ON syn.id = sts.synthetic_block_id \
+                 JOIN stacks_block sb ON sb.id = syn.stacks_block_id \
+                 WHERE sts.benchmark_run_id = ?1 \
+                 ORDER BY sts.duration_us DESC \
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .bind::<diesel::sql_types::Integer, _>(run_id)
+            .bind::<diesel::sql_types::BigInt, _>(limit)
+            .bind::<diesel::sql_types::BigInt, _>(offset)
+            .load(&mut self.get_conn().await?)
+            .await
+            .context("Failed to get tx stats")?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|r| TxStatsRow {
+                tx_hash: r.tx_hash,
+                tx_type: r.tx_type,
+                block_height: r.block_height,
+                duration_us: r.duration_us,
+                clarity_runtime: r.clarity_runtime,
+                clarity_read_length: r.clarity_read_length,
+                clarity_read_count: r.clarity_read_count,
+                clarity_write_length: r.clarity_write_length,
+                clarity_write_count: r.clarity_write_count,
+            })
+            .collect())
+    }
+
+    /// Compares profiler spans between two benchmark runs. Returns per-span
+    /// deltas ordered by absolute delta descending.
+    pub async fn compare_run_spans(
+        &self,
+        baseline_id: i32,
+        candidate_id: i32,
+        limit: i64,
+    ) -> Result<Vec<SpanComparisonRow>> {
+        #[derive(Debug, QueryableByName)]
+        pub struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            span_name: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            span_context: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+            baseline_self_wall_us: Option<f64>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+            candidate_self_wall_us: Option<f64>,
+            #[diesel(sql_type = diesel::sql_types::Double)]
+            delta_us: f64,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+            delta_pct: Option<f64>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+            baseline_calls: Option<i64>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+            candidate_calls: Option<i64>,
+        }
+
+        let rows: Vec<Row> = sql_query(
+            "SELECT * FROM ( \
+                SELECT \
+                    ps.name AS span_name, \
+                    ps.context AS span_context, \
+                    COALESCE(b.est_self_wall_us, b.self_wall_time_us) AS baseline_self_wall_us, \
+                    COALESCE(c.est_self_wall_us, c.self_wall_time_us) AS candidate_self_wall_us, \
+                    (COALESCE(COALESCE(c.est_self_wall_us, c.self_wall_time_us), 0) \
+                     - COALESCE(b.est_self_wall_us, b.self_wall_time_us)) AS delta_us, \
+                    CASE WHEN COALESCE(b.est_self_wall_us, b.self_wall_time_us) > 0 \
+                         THEN ((COALESCE(COALESCE(c.est_self_wall_us, c.self_wall_time_us), 0) \
+                                - COALESCE(b.est_self_wall_us, b.self_wall_time_us)) \
+                               / COALESCE(b.est_self_wall_us, b.self_wall_time_us) * 100) \
+                         ELSE NULL END AS delta_pct, \
+                    b.call_count AS baseline_calls, \
+                    c.call_count AS candidate_calls \
+                FROM profiler_span_summary b \
+                JOIN profiler_span ps ON ps.id = b.profiler_span_id \
+                LEFT JOIN profiler_span_summary c \
+                    ON c.profiler_span_id = b.profiler_span_id \
+                    AND c.benchmark_run_id = ?2 \
+                WHERE b.benchmark_run_id = ?1 \
+                UNION ALL \
+                SELECT \
+                    ps.name AS span_name, \
+                    ps.context AS span_context, \
+                    NULL AS baseline_self_wall_us, \
+                    COALESCE(c.est_self_wall_us, c.self_wall_time_us) AS candidate_self_wall_us, \
+                    COALESCE(c.est_self_wall_us, c.self_wall_time_us) AS delta_us, \
+                    NULL AS delta_pct, \
+                    NULL AS baseline_calls, \
+                    c.call_count AS candidate_calls \
+                FROM profiler_span_summary c \
+                JOIN profiler_span ps ON ps.id = c.profiler_span_id \
+                WHERE c.benchmark_run_id = ?2 \
+                  AND c.profiler_span_id NOT IN ( \
+                      SELECT profiler_span_id \
+                      FROM profiler_span_summary \
+                      WHERE benchmark_run_id = ?1 \
+                  ) \
+            ) ORDER BY ABS(delta_us) DESC \
+            LIMIT ?3",
+        )
+        .bind::<diesel::sql_types::Integer, _>(baseline_id)
+        .bind::<diesel::sql_types::Integer, _>(candidate_id)
+        .bind::<diesel::sql_types::BigInt, _>(limit)
+        .load(&mut self.get_conn().await?)
+        .await
+        .context("Failed to compare run spans")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| SpanComparisonRow {
+                span_name: r.span_name,
+                span_context: r.span_context,
+                baseline_self_wall_us: r.baseline_self_wall_us,
+                candidate_self_wall_us: r.candidate_self_wall_us,
+                delta_us: r.delta_us,
+                delta_pct: r.delta_pct,
+                baseline_calls: r.baseline_calls,
+                candidate_calls: r.candidate_calls,
+            })
+            .collect())
     }
 
     /// Deletes a chainstate and all associated data (benchmark runs, epochs).

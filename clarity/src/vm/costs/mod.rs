@@ -877,7 +877,7 @@ impl LimitedCostTracker {
                     contract_id: boot_costs_id.clone(),
                     function_name: each.get_name(),
                 },
-                each.clone(),
+                *each,
                 version,
             );
             cost_functions.insert(each, evaluator);
@@ -970,7 +970,7 @@ impl TrackerData {
             if cost_function_ref.contract_id == boot_costs_id {
                 m.insert(
                     f,
-                    ClarityCostFunctionEvaluator::Default(cost_function_ref, f.clone(), v),
+                    ClarityCostFunctionEvaluator::Default(cost_function_ref, *f, v),
                 );
             } else {
                 m.insert(f, ClarityCostFunctionEvaluator::Clarity(cost_function_ref));

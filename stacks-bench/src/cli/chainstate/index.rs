@@ -1,14 +1,16 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use stacks_bench::indexer::ChainstateIndexer;
 use stacks_bench::{Network, StacksBlockRef};
-use tokio::sync::mpsc;
 
-use crate::cli::common::{
-    CliContext, IndexerArgs, run_indexer_progress_ui, setup_bench_env_and_plan,
-};
+use crate::cli::common::{CliContext, ExecCommand, run_indexer_progress_ui};
+use crate::commands::chainstate::index::ChainstateIndexParams;
+// Re-export for use by other CLI consumers
+pub use crate::commands::chainstate::index::IndexResult;
+use crate::commands::common::{IndexerArgs, IndexerUiSpawner};
 
 #[derive(clap::Args, Debug, Serialize, Deserialize)]
 pub struct IndexArgs {
@@ -61,34 +63,63 @@ impl IndexerArgs for IndexArgs {
     }
 }
 
-impl IndexArgs {
-    pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
+impl From<&IndexArgs> for ChainstateIndexParams {
+    fn from(args: &IndexArgs) -> Self {
+        Self {
+            source_dir: args.source_dir.clone(),
+            start_at: args.start_at.clone(),
+            end_at: args.end_at.clone(),
+            block_count: args.block_count,
+            tip: args.tip.clone(),
+            network: args.network,
+        }
+    }
+}
+
+impl ExecCommand for IndexArgs {
+    type Output = IndexResult;
+
+    async fn exec(&self, ctx: &CliContext) -> Result<Self::Output> {
         let mut app_db = ctx.app_db();
+        let params = ChainstateIndexParams::from(self);
 
-        let (env, plan) = setup_bench_env_and_plan(&self.source_dir, self).await?;
+        let indexer_ui: IndexerUiSpawner = if ctx.interactive() {
+            Box::new(|rx, start, end, tip| {
+                tokio::spawn(run_indexer_progress_ui(rx, start, end, tip))
+            })
+        } else {
+            crate::commands::common::silent_indexer_ui()
+        };
 
-        let tip_height = plan.anchor_tip.height;
-        let start_height = plan.start_height;
-        let end_height = plan.end_height;
+        // Install ctrl-c handler for graceful cancellation.
+        let interrupted = Arc::new(AtomicBool::new(false));
+        {
+            let interrupted = interrupted.clone();
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                interrupted.store(true, Ordering::Relaxed);
+            });
+        }
 
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let mut indexer = ChainstateIndexer::new(&mut app_db, &env).with_events(event_tx);
+        let result = crate::commands::chainstate::index::index_chainstate(
+            &mut app_db,
+            &params,
+            indexer_ui,
+            interrupted,
+        )
+        .await?;
 
-        let ui_fut = run_indexer_progress_ui(event_rx, start_height, end_height, tip_height);
-        let index_fut =
-            indexer.index_chainstate_range(env.network, env.chain_id, &env.epochs, plan);
+        if ctx.interactive() {
+            cliclack::note(
+                "Indexing Complete",
+                format!(
+                    "Start: {} (height {})\n\
+                     End:   {} (height {})",
+                    result.start_block, result.start_height, result.end_block, result.end_height,
+                ),
+            )?;
+        }
 
-        let ((resolved, _block_ids), _) = tokio::try_join!(index_fut, ui_fut)?;
-
-        cliclack::note(
-            "Indexing Complete",
-            format!(
-                "Start: {} (height {})\n\
-                 End:   {} (height {})",
-                resolved.start.id, resolved.start.height, resolved.end.id, resolved.end.height,
-            ),
-        )?;
-
-        Ok(())
+        Ok(result)
     }
 }

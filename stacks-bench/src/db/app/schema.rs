@@ -147,6 +147,14 @@ table! {
         start_time -> Timestamp,
         end_time -> Nullable<Timestamp>,
         args_json -> Text,
+        build_profile -> Text,
+        build_opt_level -> Text,
+        build_debug_assertions -> Bool,
+        build_overflow_checks -> Bool,
+        build_target_triple -> Text,
+        build_rustc_version -> Text,
+        git_branch -> Nullable<Text>,
+        git_dirty -> Nullable<Bool>,
     }
 }
 

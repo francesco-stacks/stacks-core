@@ -119,12 +119,6 @@ async fn build_pool<U: Into<String>>(url: U, size: u32) -> Result<Pool<AsyncSqli
             diesel::sql_query("PRAGMA busy_timeout = 10000")
                 .execute(&mut conn)
                 .await
-                .inspect_err(|e| {
-                    eprintln!(
-                        "Failed to set PRAGMA busy_timeout=10000 on SqliteDbHandle<ReadWrite>: {}",
-                        e
-                    )
-                })
                 .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
             Ok(conn)
         })

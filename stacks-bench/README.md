@@ -1,6 +1,85 @@
 <!-- markdownlint-disable MD060 -->
 # `stacks-bench`: Stacks-Core Benchmarking Tool
 
+## Features
+
+`stacks-bench` supports the following features
+
+| Feature | Description | CLI Command | MCP Tool | MCP Resource |
+| ---- | ---- | ---- | ---- | ---- |
+| Run benchmark | Replay a block range recording per-block timing, clarity costs, and profiler data | `bench run` | `run_benchmark` | — |
+| Re-run benchmark | Re-run a previous benchmark using its stored parameters | `bench rerun` | `rerun_benchmark` | — |
+| List runs | List benchmark runs with optional filters and sorting | `bench list` | `list_runs` | — |
+| Show run details | Display detailed stats and profiler hotspots for a run | `bench show` | `get_run_details` | — |
+| Delete runs | Delete benchmark runs and all dependent data | `bench remove` | `delete_run` | — |
+| Profiler hotspots | View top-N slowest profiler spans for a run | `bench show --profiler-hot N` | `get_hotspots` | — |
+| Per-block stats | Paginated per-block timing breakdown and clarity costs | — | `get_block_stats` | — |
+| Per-tx stats | Paginated per-transaction timing and clarity costs | — | `get_tx_stats` | — |
+| Compare runs | Diff two runs at summary and per-span level | — | `compare_runs` | — |
+| Index chainstate | Index blocks from the node database into the app DB | `chainstate index` | `index_chainstate` | — |
+| List chainstates | List indexed chainstates | `chainstate list` | `list_chainstates` | — |
+| Chainstate details | View chainstate info including epochs and cost budgets | — | `get_chainstate` | — |
+| Delete chainstates | Delete chainstates and all associated data | `chainstate remove` | `delete_chainstate` | — |
+| Metabase analytics | Launch a pre-configured Metabase instance for BI dashboards | `metabase` | — | — |
+| Profiler explorer | Interactive web UI for hierarchical profiler call trees | `explorer start/stop/status` | — | — |
+| Schema discovery | Expose the database DDL as MCP resources | — | — | `stacks-bench://schema` |
+
+## MCP Server
+
+`stacks-bench` includes an MCP (Model Context Protocol) server that exposes all benchmark data
+and operations as tools and resources. This allows AI agents to run benchmarks, query results,
+compare runs, and explore the database schema programmatically.
+
+The server uses stdio transport and supports progress notifications for long-running operations
+(indexing, benchmarking).
+
+### Configuration
+
+Configure `stacks-bench` as a `STDIO`-style MCP server. Example:
+
+```json
+{
+  "mcpServers": {
+    "stacks-bench": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "-p", "stacks-bench",
+        "--release",
+        "--",
+        "--db", "/path/to/stacks-bench-data",
+        "mcp"
+      ]
+    }
+  }
+}
+```
+
+### Tools
+
+| Tool | Description | Destructive |
+| ---- | ---- | ---- |
+| `list_runs` | List benchmark runs with optional filters (name, incomplete) | No |
+| `get_run_details` | Detailed run info with summary stats and top-N profiler hotspots | No |
+| `get_hotspots` | Profiler hotspots sorted by estimated self wall time | No |
+| `get_block_stats` | Paginated per-block timing, clarity costs, and storage delta | No |
+| `get_tx_stats` | Paginated per-tx timing and clarity costs, filterable by block | No |
+| `compare_runs` | Summary-level and per-span diff between two runs | No |
+| `list_chainstates` | List indexed chainstates with run counts | No |
+| `get_chainstate` | Chainstate detail including epochs and cost budgets | No |
+| `run_benchmark` | Run a benchmark (block range or single tx) with progress notifications | Yes |
+| `rerun_benchmark` | Re-run a previous benchmark by ID | Yes |
+| `index_chainstate` | Index chainstate blocks into the app DB | Yes |
+| `delete_run` | Delete a benchmark run and all dependent data | Yes |
+| `delete_chainstate` | Delete a chainstate and all associated runs | Yes |
+
+### Resources
+
+| URI | Description |
+| ---- | ---- |
+| `stacks-bench://schema` | SQL DDL for the stacks-bench database (excludes internal/staging tables) |
+| `stacks-bench://schema/{table}` | DDL for a single table and its indexes |
+
 ## Hardware Disk Qualification Test
 
 `stacks-bench` is sensitive to disk speed. If your storage cannot deliver fast random reads/writes, benchmark results will reflect storage bottlenecks atypical of a production node.
@@ -62,12 +141,19 @@ WRITE: bw=179MiB/s
 
 - This test is the **official storage sanity-check** for `stacks-bench`
 - Ensures reliable and comparable benchmark results
-- Recommended environment: internal NVMe _or_ high-quality USB4/TB3 NVMe
+- Recommended environment: internal NVMe _or_ high-quality USB4/Thunderbolt NVMe enclosure
 
 ## Benchmark Data Storage
 
-`stacks-bench` stores its benchmarking data in an SQLite database, which by default is written
-to `./.stacks-bench/appdata/stacks-bench.db`, relative to the `stacks-bench` binary's working directory (e.g. the workspace `target/release/` directory if executed using `cargo run` or the `cargo stacks-bench` alias).
+`stacks-bench` stores its benchmarking data in an SQLite database at `~/.stacks-bench/appdata/stacks-bench.db`.
+
+The data directory can be overridden in three ways (highest priority first):
+
+1. **`--db <path>`** CLI flag
+2. **`STACKS_BENCH_DATA_DIR`** environment variable
+3. **Default:** `~/.stacks-bench`
+
+Using a fixed home-relative path means benchmark data is shared across worktrees, making cross-branch comparisons straightforward.
 
 ## Analyzing Benchmark Data
 

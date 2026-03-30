@@ -11,7 +11,7 @@ use bollard::query_parameters::{
 use futures::StreamExt as _;
 use stacks_bench::paths::AppDataDir;
 
-use crate::cli::common::CliContext;
+use crate::cli::common::{CliContext, ExecCommand};
 
 const METABASE_IMAGE_TAG: &str = "v0.58.1.3";
 
@@ -26,12 +26,24 @@ pub struct MetabaseArgs {
     pub image_tag: String,
 }
 
+impl ExecCommand for MetabaseArgs {
+    type Output = serde_json::Value;
+
+    async fn exec(&self, ctx: &CliContext) -> anyhow::Result<Self::Output> {
+        self.run(ctx).await?;
+        Ok(serde_json::json!({
+            "message": "Metabase stopped",
+            "port": self.port,
+        }))
+    }
+}
+
 impl MetabaseArgs {
-    pub async fn exec(&self, ctx: &CliContext) -> anyhow::Result<()> {
+    async fn run(&self, ctx: &CliContext) -> anyhow::Result<()> {
+        let interactive = ctx.interactive();
         let app_data = ctx.app_data_dir();
         let db_path = app_data.app_db_path();
 
-        // db_path is the full path to the database file.
         if !db_path.exists() {
             anyhow::bail!(
                 "Database not found at {:?}. Run a benchmark first.",
@@ -39,41 +51,36 @@ impl MetabaseArgs {
             );
         }
 
-        // We store postgres data in a subdirectory
         let pg_data_dir = app_data.postgres_data_dir();
 
-        if pg_data_dir.exists()
-            && pg_data_dir
-                .read_dir()
-                .map(|mut i| i.next().is_some())
-                .unwrap_or(false)
-        {
-            println!("  - Status:      Loading existing dashboards/users (Postgres)");
-        } else {
-            println!("  - Status:      Initializing new configuration (Postgres)");
+        if interactive {
+            let status = if pg_data_dir.exists()
+                && pg_data_dir
+                    .read_dir()
+                    .map(|mut i| i.next().is_some())
+                    .unwrap_or(false)
+            {
+                "Loading existing dashboards/users (Postgres)"
+            } else {
+                "Initializing new configuration (Postgres)"
+            };
+
+            eprintln!("Starting Metabase on http://localhost:{}", self.port);
+            eprintln!("  - App DB:      {:?}", db_path);
+            eprintln!("  - Postgres DB: {:?}", pg_data_dir);
+            eprintln!("  - Status:      {status}");
         }
 
-        println!("Starting Metabase on http://localhost:{}", self.port);
-        println!("  - App DB:      {:?}", db_path);
-        println!("  - Postgres DB: {:?}", pg_data_dir);
-
-        if pg_data_dir.exists()
-            && pg_data_dir
-                .read_dir()
-                .map(|mut i| i.next().is_some())
-                .unwrap_or(false)
-        {
-            println!("  - Status:      Loading existing dashboards/users (Postgres)");
-        } else {
-            println!("  - Status:      Initializing new configuration (Postgres)");
-        }
-
-        // Setup and run Metabase container
-        run_metabase_container(app_data, self.port, self.image_tag.clone()).await
+        run_metabase_container(app_data, self.port, self.image_tag.clone(), interactive).await
     }
 }
 
-async fn run_metabase_container(app_data: &AppDataDir, port: u16, image_tag: String) -> Result<()> {
+async fn run_metabase_container(
+    app_data: &AppDataDir,
+    port: u16,
+    image_tag: String,
+    interactive: bool,
+) -> Result<()> {
     let pg_data_dir = app_data.postgres_data_dir();
     let app_db_dir = app_data.app_db_dir();
 
@@ -90,7 +97,9 @@ async fn run_metabase_container(app_data: &AppDataDir, port: u16, image_tag: Str
     // 1. Check/Pull images
     for image in [&mb_image, pg_image] {
         if docker.inspect_image(image).await.is_err() {
-            println!("Image {} not found locally. Pulling...", image);
+            if interactive {
+                eprintln!("Image {} not found locally. Pulling...", image);
+            }
             let mut pull_stream = docker.create_image(
                 Some(
                     CreateImageOptionsBuilder::default()
@@ -112,7 +121,9 @@ async fn run_metabase_container(app_data: &AppDataDir, port: u16, image_tag: Str
                 }
             }
         } else {
-            println!("Image {} found locally. Skipping pull.", image);
+            if interactive {
+                eprintln!("Image {} found locally. Skipping pull.", image);
+            }
         }
     }
 
@@ -196,7 +207,9 @@ async fn run_metabase_container(app_data: &AppDataDir, port: u16, image_tag: Str
         .await
         .context("Failed to start Postgres container")?;
 
-    println!("Postgres started. Waiting for readiness...");
+    if interactive {
+        eprintln!("Postgres started. Waiting for readiness...");
+    }
 
     // Wait loop for Postgres Health
     let start_wait = Instant::now();
@@ -230,7 +243,9 @@ async fn run_metabase_container(app_data: &AppDataDir, port: u16, image_tag: Str
 
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    println!("Postgres is ready.");
+    if interactive {
+        eprintln!("Postgres is ready.");
+    }
 
     // 5. Start Metabase
     let mb_host_config = HostConfig {
@@ -281,24 +296,26 @@ async fn run_metabase_container(app_data: &AppDataDir, port: u16, image_tag: Str
         .await
         .context("Failed to start Metabase container")?;
 
-    println!("\nMetabase is running (backed by Postgres).");
-    println!("Open http://localhost:{} in your browser.", port);
-    println!("Press Ctrl-C to stop.");
+    if interactive {
+        eprintln!("\nMetabase is running (backed by Postgres).");
+        eprintln!("Open http://localhost:{} in your browser.", port);
+        eprintln!("Press Ctrl-C to stop.");
+    }
 
     // 6. Wait for Ctrl-C or Container Exit
     let wait_stream = docker.wait_container(mb_container_name, None::<WaitContainerOptions>);
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            println!("\nStopping containers...");
+            if interactive { eprintln!("\nStopping containers..."); }
             let _ = docker.stop_container(mb_container_name, None::<StopContainerOptions>).await;
             let _ = docker.stop_container(pg_container_name, None::<StopContainerOptions>).await;
-            println!("Stopped.");
+            if interactive { eprintln!("Stopped."); }
         }
         _ = async {
             wait_stream.collect::<Vec<_>>().await
         } => {
-            println!("\nMetabase container exited unexpectedly.");
+            if interactive { eprintln!("\nMetabase container exited unexpectedly."); }
             // Ensure postgres is stopped too
             let _ = docker.stop_container(pg_container_name, None::<StopContainerOptions>).await;
         }

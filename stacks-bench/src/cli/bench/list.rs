@@ -1,8 +1,13 @@
 use anyhow::Result;
-use chrono::Utc;
 use console::style;
+use stacks_bench::db::app::models::BenchmarkRun;
 
-use crate::cli::common::{Align, CliContext, Table, fmt_duration, fmt_relative_time, parse_since};
+use crate::cli::common::{
+    Align, CliContext, ExecCommand, Table, fmt_duration, fmt_relative_time, parse_since,
+};
+use crate::commands::bench::list::{
+    BenchListFilters, RunJson, RunSummaryJson, SortField, query_benchmark_runs, to_run_json,
+};
 
 #[derive(clap::Args, Debug)]
 pub struct ListArgs {
@@ -32,95 +37,62 @@ pub struct ListArgs {
     #[arg(long, default_value_t = 50)]
     pub limit: usize,
 
-    /// Output as JSON instead of a table.
+    /// Sort runs by the given field. Default: `date` (most recent first).
+    #[arg(long, default_value = "date", value_name = "FIELD")]
+    pub sort_by: CliSortField,
+
+    /// Include the original run arguments in JSON output.
     #[arg(long)]
-    pub json: bool,
+    pub with_args: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, Default)]
+pub enum CliSortField {
+    /// Sort by start time (most recent first).
+    #[default]
+    Date,
+    /// Sort by total duration (longest first).
+    Duration,
+    /// Sort by block count (most first). Requires summary lookup.
+    Blocks,
 }
 
 impl ListArgs {
-    pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
-        let app_db = ctx.app_db();
-        let mut runs = app_db.list_benchmark_runs().await?;
+    fn to_filters(&self) -> Result<BenchListFilters> {
+        let since = self.since.as_deref().map(parse_since).transpose()?;
 
-        // --- Completion status filter (default: completed only) ---
-        if self.incomplete {
-            runs.retain(|r| r.end_time.is_none());
-        } else if !self.all {
-            runs.retain(|r| r.end_time.is_some());
-        }
+        Ok(BenchListFilters {
+            incomplete: self.incomplete,
+            all: self.all,
+            since,
+            today: self.today,
+            name: self.name.clone(),
+            sort_by: match self.sort_by {
+                CliSortField::Date => SortField::Date,
+                CliSortField::Duration => SortField::Duration,
+                CliSortField::Blocks => SortField::Blocks,
+            },
+            limit: self.limit,
+        })
+    }
 
-        // --- Time-based filters ---
-        if self.today {
-            let today_start = Utc::now()
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .expect("valid midnight");
-            runs.retain(|r| r.start_time >= today_start);
-        } else if let Some(since_str) = &self.since {
-            let duration = parse_since(since_str)?;
-            let cutoff = Utc::now().naive_utc() - duration;
-            runs.retain(|r| r.start_time >= cutoff);
-        }
-
-        // --- Name filter ---
-        if let Some(pattern) = &self.name {
-            let pat = pattern.to_lowercase();
-            runs.retain(|r| {
-                r.run_name
-                    .as_deref()
-                    .map(|n| n.to_lowercase().contains(&pat))
-                    .unwrap_or(false)
-            });
-        }
-
-        // --- Limit ---
-        runs.truncate(self.limit);
-
-        if runs.is_empty() {
+    fn print_table(&self, results: &[(BenchmarkRun, Option<RunSummaryJson>)]) -> Result<()> {
+        if results.is_empty() {
             cliclack::log::info("No matching benchmark runs found.")?;
             return Ok(());
         }
 
-        // --- JSON output ---
-        if self.json {
-            #[derive(serde::Serialize)]
-            struct RunJson {
-                id: i32,
-                name: Option<String>,
-                start_time: String,
-                end_time: Option<String>,
-                duration: Option<String>,
-                git_hash: String,
-            }
-
-            let items: Vec<RunJson> = runs
-                .iter()
-                .map(|r| RunJson {
-                    id: r.id,
-                    name: r.run_name.clone(),
-                    start_time: r.start_time.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                    end_time: r
-                        .end_time
-                        .map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string()),
-                    duration: r.end_time.map(|end| fmt_duration(r.start_time, end)),
-                    git_hash: hex::encode(&r.git_commit_hash),
-                })
-                .collect();
-
-            println!("{}", serde_json::to_string_pretty(&items)?);
-            return Ok(());
-        }
-
-        // --- Table output ---
         let mut table = Table::new()
             .col("ID", Align::Right)
-            .col("", Align::Left) // status icon
-            .col_with("Name", Align::Left, 4, Some(40))
+            .col("", Align::Left)
+            .col_with("Name", Align::Left, 4, Some(30))
             .col("Started", Align::Left)
             .col("Duration", Align::Left)
+            .col("Blocks", Align::Right)
+            .col("Avg/Block", Align::Right)
             .col("Git Hash", Align::Left);
 
-        for r in &runs {
+        for (r, summary) in results {
             let status_icon = if r.end_time.is_some() {
                 style("✔").green().to_string()
             } else {
@@ -134,6 +106,14 @@ impl ListArgs {
                 .map(|end| fmt_duration(r.start_time, end))
                 .unwrap_or_else(|| style("running").yellow().to_string());
 
+            let (blocks, avg_block) = match summary {
+                Some(s) => {
+                    let avg_ms = s.avg_block_duration_us as f64 / 1000.0;
+                    (s.blocks.to_string(), format!("{avg_ms:.1}ms"))
+                }
+                None => ("—".into(), "—".into()),
+            };
+
             let hash = hex::encode(&r.git_commit_hash);
             let short_hash = hash[..hash.len().min(8)].to_string();
 
@@ -143,11 +123,31 @@ impl ListArgs {
                 name,
                 started,
                 duration,
+                blocks,
+                avg_block,
                 short_hash,
             ]);
         }
 
         table.print_with_footer("run", self.limit)?;
         Ok(())
+    }
+}
+
+impl ExecCommand for ListArgs {
+    type Output = Vec<RunJson>;
+
+    async fn exec(&self, ctx: &CliContext) -> Result<Self::Output> {
+        let filters = self.to_filters()?;
+        let results = query_benchmark_runs(&ctx.app_db(), &filters).await?;
+
+        if !ctx.json() {
+            self.print_table(&results)?;
+        }
+
+        Ok(results
+            .iter()
+            .map(|(run, summary)| to_run_json(run, summary, self.with_args))
+            .collect())
     }
 }

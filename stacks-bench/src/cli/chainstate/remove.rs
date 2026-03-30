@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
 use console::style;
 
-use crate::cli::common::{CliContext, run_db_cleanup};
+use crate::cli::common::{CliContext, ExecCommand, run_db_cleanup};
+use crate::commands::chainstate::remove::{self, RemoveResult};
 
 #[derive(clap::Args, Debug)]
 pub struct RemoveArgs {
@@ -15,11 +16,13 @@ pub struct RemoveArgs {
     pub yes: bool,
 }
 
-impl RemoveArgs {
-    pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
+impl ExecCommand for RemoveArgs {
+    type Output = RemoveResult;
+
+    async fn exec(&self, ctx: &CliContext) -> Result<Self::Output> {
+        let interactive = ctx.interactive();
         let mut app_db = ctx.app_db();
 
-        // Resolve the set of chainstate IDs to delete
         let chainstate_ids: Vec<i32> = if let Some(ids) = &self.chainstate_id {
             let mut converted: Vec<i32> = ids
                 .iter()
@@ -32,22 +35,24 @@ impl RemoveArgs {
             converted.sort_unstable();
             converted.dedup();
             converted
+        } else if !interactive {
+            bail!("--chainstate-id is required in non-interactive mode");
         } else {
-            // Interactive mode: list chainstates and let the user pick
             let chainstates = app_db.list_chainstates().await?;
             if chainstates.is_empty() {
                 cliclack::log::info("No chainstates found.")?;
-                return Ok(());
+                return Ok(RemoveResult {
+                    deleted_chainstate_ids: vec![],
+                    message: "No chainstates found.".into(),
+                });
             }
 
-            let mut select = cliclack::multiselect(format!(
-                "Select chainstates to delete ({} available)",
-                chainstates.len()
-            ));
+            // Collect labels before creating the multiselect (MultiSelect is !Send)
+            let mut items = Vec::with_capacity(chainstates.len());
             for cs in &chainstates {
                 let network_name = app_db.get_network_name(cs.network_id).await?;
                 let run_count = app_db.count_benchmark_runs_for_chainstate(cs.id).await?;
-                select = select.item(
+                items.push((
                     cs.id,
                     format!("Chainstate {}", cs.id),
                     format!(
@@ -56,17 +61,28 @@ impl RemoveArgs {
                         cs.tip_height,
                         if run_count == 1 { "" } else { "s" }
                     ),
-                );
+                ));
+            }
+
+            let mut select = cliclack::multiselect(format!(
+                "Select chainstates to delete ({} available)",
+                chainstates.len()
+            ));
+            for (id, label, hint) in items {
+                select = select.item(id, label, hint);
             }
             let chosen: Vec<i32> = select.filter_mode().interact()?;
             if chosen.is_empty() {
                 cliclack::log::info("No chainstates selected.")?;
-                return Ok(());
+                return Ok(RemoveResult {
+                    deleted_chainstate_ids: vec![],
+                    message: "No chainstates selected.".into(),
+                });
             }
             chosen
         };
 
-        // Look up each chainstate to validate and display context
+        // Validate chainstates exist
         let mut chainstates = Vec::with_capacity(chainstate_ids.len());
         for &id in &chainstate_ids {
             match app_db.get_chainstate(id).await? {
@@ -75,37 +91,47 @@ impl RemoveArgs {
             }
         }
 
-        for cs in &chainstates {
-            let network_name = app_db.get_network_name(cs.network_id).await?;
-            let run_count = app_db.count_benchmark_runs_for_chainstate(cs.id).await?;
-            cliclack::log::step(format!(
-                "Chainstate {} — {} | tip_height={} | {run_count} associated run{}",
-                style(cs.id).bold(),
-                network_name,
-                cs.tip_height,
-                if run_count == 1 { "" } else { "s" },
-            ))?;
-        }
+        // Interactive confirmation
+        if interactive {
+            for cs in &chainstates {
+                let network_name = app_db.get_network_name(cs.network_id).await?;
+                let run_count = app_db.count_benchmark_runs_for_chainstate(cs.id).await?;
+                cliclack::log::step(format!(
+                    "Chainstate {} — {} | tip_height={} | {run_count} associated run{}",
+                    style(cs.id).bold(),
+                    network_name,
+                    cs.tip_height,
+                    if run_count == 1 { "" } else { "s" },
+                ))?;
+            }
 
-        if !self.yes {
-            let label = if chainstates.len() == 1 {
-                format!(
-                    "Delete chainstate {} and all associated data (including benchmark runs)?",
-                    chainstates[0].id
-                )
-            } else {
-                format!(
-                    "Delete {} chainstates and all associated data (including benchmark runs)?",
-                    chainstates.len()
-                )
-            };
-            if !cliclack::confirm(label).interact()? {
-                cliclack::log::info("Aborted.")?;
-                return Ok(());
+            if !self.yes {
+                let label = if chainstates.len() == 1 {
+                    format!(
+                        "Delete chainstate {} and all associated data (including benchmark runs)?",
+                        chainstates[0].id
+                    )
+                } else {
+                    format!(
+                        "Delete {} chainstates and all associated data (including benchmark runs)?",
+                        chainstates.len()
+                    )
+                };
+                if !cliclack::confirm(label).interact()? {
+                    cliclack::log::info("Aborted.")?;
+                    return Ok(RemoveResult {
+                        deleted_chainstate_ids: vec![],
+                        message: "Aborted.".into(),
+                    });
+                }
             }
         }
 
-        // Delete each chainstate with its own spinner inside a multi_progress
+        // Delete — non-interactive delegates entirely; interactive shows spinners
+        if !interactive {
+            return remove::delete_chainstates(&mut app_db, &chainstate_ids, true).await;
+        }
+
         let multi = cliclack::multi_progress(format!(
             "Deleting {} chainstate{}",
             chainstates.len(),
@@ -121,8 +147,11 @@ impl RemoveArgs {
 
         multi.stop();
 
-        run_db_cleanup(app_db).await?;
+        run_db_cleanup(app_db, false).await?;
 
-        Ok(())
+        Ok(RemoveResult {
+            message: format!("{} chainstate(s) deleted", chainstate_ids.len()),
+            deleted_chainstate_ids: chainstate_ids,
+        })
     }
 }

@@ -3,12 +3,20 @@ use std::time::Instant;
 use anyhow::Result;
 use stacks_bench::db::app::{AppDb, CheckpointMode};
 
-/// Run checkpoint + vacuum inside a "Cleaning up" multi-progress group.
+/// Run checkpoint + vacuum on the app database.
 ///
-/// Both operations are spawned onto a tokio task so the UI thread stays
-/// responsive.  Errors are rendered on the spinner rather than propagated,
-/// since cleanup failures are not fatal.
-pub async fn run_db_cleanup(mut app_db: AppDb) -> Result<()> {
+/// When `silent` is false, renders a cliclack multi-progress with a spinner.
+/// When `silent` is true, runs the operations quietly.
+///
+/// Errors are non-fatal: they are rendered on the spinner (interactive) or
+/// silently ignored (non-interactive).
+pub async fn run_db_cleanup(mut app_db: AppDb, silent: bool) -> Result<()> {
+    if silent {
+        let _ = app_db.checkpoint(CheckpointMode::Truncate).await;
+        let _ = app_db.vacuum().await;
+        return Ok(());
+    }
+
     let cleanup = cliclack::multi_progress("Cleaning up");
 
     let db_spinner = cleanup.add(cliclack::spinner());

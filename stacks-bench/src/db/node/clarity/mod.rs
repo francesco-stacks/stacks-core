@@ -4,7 +4,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use diesel_async::RunQueryDsl;
-use models::*;
 
 use crate::db::{DbOpen, ReadWrite, SqliteDbHandle};
 
@@ -45,19 +44,11 @@ where
 
 impl ClarityDb<ReadWrite> {
     pub async fn checkpoint(&mut self) -> Result<()> {
-        let results: Vec<CheckpointResult> = diesel::sql_query("PRAGMA wal_checkpoint(FULL)")
-            .load(&mut self.handle.get_conn().await?)
+        diesel::sql_query("PRAGMA wal_checkpoint(FULL)")
+            .execute(&mut self.handle.get_conn().await?)
             .await
             .context("Failed to perform WAL checkpoint")?;
 
-        #[allow(clippy::get_first)]
-        if let Some(res) = results.get(0) {
-            // Print status regardless of busy state to debug
-            eprintln!(
-                "Checkpoint Status: busy={}, log={}, checkpointed={}",
-                res.busy, res.log, res.checkpointed
-            );
-        }
         Ok(())
     }
 

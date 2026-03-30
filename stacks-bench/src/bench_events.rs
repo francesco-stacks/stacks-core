@@ -1,0 +1,157 @@
+//! Typed events emitted by benchmark execution for UI/progress rendering.
+//!
+//! The core benchmark logic emits these events through a channel. Consumers
+//! (interactive cliclack UI, silent JSON mode, future MCP progress) subscribe
+//! to the channel and render as appropriate. The execution code has zero
+//! knowledge of UI.
+//!
+//! ## Channel design
+//!
+//! The event sender is an unbounded `tokio::sync::mpsc` channel. This matches
+//! the pattern used by [`IndexerEvent`](crate::indexer::IndexerEvent). Per-block
+//! progress events are small (~48 bytes each) and the consumer runs on a
+//! separate tokio task, so in practice the queue stays shallow. A bounded
+//! channel would risk stalling the benchmark execution if the consumer (e.g.
+//! a cliclack progress bar poll) temporarily blocks, which would corrupt
+//! timing measurements. The tradeoff is: unbounded memory growth is
+//! theoretically possible if the consumer stops processing, but the events
+//! are lightweight and the consumer is always co-scheduled.
+
+use std::time::Duration;
+
+use crate::metrics::{BlockProcessingBaseline, MetricsSummary};
+use crate::shadow::ShadowDirDeltaReport;
+
+/// Events emitted during a `bench run` execution (block-range mode).
+#[derive(Debug)]
+pub enum BenchEvent {
+    // --- Txid scan phase (--txid mode only) ---
+    /// Txid chain scan started.
+    TxidScanStarted { txid: String },
+    /// Txid scan progress update.
+    TxidScanProgress { scanned: u64, current_height: u64 },
+    /// Txid found in the chain.
+    TxidScanComplete {
+        txid: String,
+        block_id: String,
+        block_height: u64,
+        duration: Duration,
+    },
+
+    // --- Setup phase ---
+    /// Shadow directory creation started.
+    ShadowDirStarted,
+    /// Shadow directory created successfully.
+    ShadowDirComplete { duration: Duration },
+
+    /// Environment resolved and ready.
+    EnvironmentReady {
+        chain_id: u32,
+        network: String,
+        epochs: Vec<String>,
+        source_dir: String,
+        shadow_dir: String,
+        /// Present in --txid mode only.
+        target_txid: Option<String>,
+        /// Present in --txid mode only.
+        target_block: Option<String>,
+        /// Present in --txid mode only.
+        target_block_height: Option<u64>,
+        /// Present in --txid mode only.
+        repetitions: Option<u32>,
+    },
+
+    // --- Baseline phase ---
+    /// Overhead baseline measurement started.
+    BaselineStarted {
+        warmup_blocks: usize,
+        measured_blocks: u32,
+    },
+    /// Baseline warmup progress.
+    BaselineWarmupProgress { completed: u32, total: u32 },
+    /// Baseline warmup complete.
+    BaselineWarmupComplete { duration: Duration },
+    /// Baseline round progress.
+    BaselineRoundProgress {
+        round: u8,
+        completed: u32,
+        total: u32,
+    },
+    /// Baseline round complete.
+    BaselineRoundComplete { round: u8, duration: Duration },
+    /// Checkpointing chainstate DBs during baseline.
+    BaselineCheckpointStarted,
+    /// Checkpointing complete.
+    BaselineCheckpointComplete { duration: Duration },
+    /// Full baseline measurement complete with results.
+    BaselineComplete {
+        round1: BlockProcessingBaseline,
+        round2: BlockProcessingBaseline,
+    },
+
+    // --- Replay phase ---
+    /// Replay phase started.
+    ReplayStarted {
+        total_blocks: usize,
+        warmup_blocks: usize,
+        mode: String,
+    },
+    /// Replay warmup progress (block-range mode).
+    ReplayWarmupProgress { completed: usize, total: usize },
+    /// Replay warmup complete.
+    ReplayWarmupComplete {
+        warmup_blocks: usize,
+        duration: Duration,
+    },
+    /// Replay measured block progress.
+    ReplayProgress { completed: usize, total: usize },
+    /// Replay interrupted by Ctrl-C.
+    ReplayInterrupted { completed: usize, total: usize },
+    /// Replay complete.
+    ReplayComplete {
+        measured_blocks: usize,
+        duration: Duration,
+    },
+
+    // --- Metrics flush ---
+    /// Flushing remaining metrics from calibration buffer.
+    MetricsFlush { count: usize },
+
+    // --- Summary phase ---
+    /// Replay summary computed.
+    ReplaySummary {
+        total_blocks: usize,
+        warmup_blocks: usize,
+        measured_blocks: usize,
+        total_duration: Duration,
+        replay_duration: Duration,
+        checkpoint_duration: Duration,
+        overhead: Duration,
+        interrupted: bool,
+    },
+    /// Benchmark metrics summary computed.
+    BenchmarkSummary(MetricsSummary),
+    /// Storage delta report computed.
+    StorageSummary(ShadowDirDeltaReport),
+
+    // --- Cleanup phase ---
+    /// Cleanup started (shadow dir removal + DB checkpoint/vacuum).
+    CleanupStarted,
+    /// Shadow directory removed.
+    CleanupShadowDirComplete { duration: Duration },
+    /// DB checkpoint + vacuum complete.
+    CleanupDbComplete { duration: Duration },
+    /// DB checkpoint + vacuum failed (non-fatal).
+    CleanupDbFailed { error: String, duration: Duration },
+    /// Cleanup finished.
+    CleanupComplete,
+}
+
+/// Convenience type for the event sender.
+pub type BenchEventSender = tokio::sync::mpsc::UnboundedSender<BenchEvent>;
+
+/// Send a bench event, ignoring errors (receiver may have been dropped).
+#[inline]
+pub fn emit(tx: &BenchEventSender, event: BenchEvent) {
+    let _ = tx.send(event);
+}

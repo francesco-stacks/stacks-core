@@ -6,12 +6,14 @@ use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use tempfile::TempDir;
 
+#[derive(Debug)]
 pub struct FileDeltaReport {
     pub path: PathBuf,
     pub size_delta_bytes: i64,
     pub was_modified: bool,
 }
 
+#[derive(Debug)]
 pub struct ShadowDirDeltaReport {
     pub net_growth_bytes: i64,
     pub estimated_bytes_written: u64,

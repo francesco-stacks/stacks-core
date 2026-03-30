@@ -1,6 +1,8 @@
 use clap::Parser as _;
 
 mod cli;
+mod commands;
+mod mcp;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

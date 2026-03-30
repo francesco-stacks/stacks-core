@@ -146,6 +146,148 @@ impl CostModel {
     }
 }
 
+/// Manages the calibration lifecycle during benchmark replay.
+///
+/// Absorbs [`BlockMetrics`] and returns flush-ready batches once a cost model
+/// has been fitted (or the sample budget is exhausted). The caller is
+/// responsible for persisting the returned batches — this type never touches
+/// the database.
+///
+/// Lifecycle:
+/// 1. **Pre-calibration** — metrics are buffered until enough samples exist to
+///    fit a [`CostModel`]. Once a model is accepted (or the hard cap is hit),
+///    the model is applied to *all* buffered metrics at once and the batch is
+///    returned.
+/// 2. **Post-calibration** — each incoming metric is immediately model-applied
+///    and added to an internal write buffer. A batch is returned whenever the
+///    buffer exceeds the flush threshold.
+/// 3. **Finish** — any remaining metrics are drained. If calibration never
+///    completed, a final fit attempt is made; otherwise a heuristic is applied.
+pub struct CalibrationState {
+    buffer: Vec<BlockMetrics>,
+    model: CostModel,
+    calibrated: bool,
+    min_samples: usize,
+    max_samples: usize,
+    flush_threshold: usize,
+}
+
+impl CalibrationState {
+    const DEFAULT_MAX_SAMPLES: usize = 500;
+    const DEFAULT_FLUSH_THRESHOLD: usize = 250;
+
+    pub fn new(needs_calibration: bool, min_samples: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            model: CostModel::default(),
+            calibrated: !needs_calibration,
+            min_samples,
+            max_samples: Self::DEFAULT_MAX_SAMPLES,
+            flush_threshold: Self::DEFAULT_FLUSH_THRESHOLD,
+        }
+    }
+
+    /// Ingest metrics from one block replay. Returns a flush-ready batch when
+    /// enough data has accumulated.
+    pub fn observe(&mut self, metrics: Vec<BlockMetrics>) -> Option<Vec<BlockMetrics>> {
+        if !self.calibrated {
+            self.observe_uncalibrated(metrics)
+        } else {
+            self.observe_calibrated(metrics)
+        }
+    }
+
+    /// Drain any remaining buffered metrics.
+    ///
+    /// When `completed_normally` is true and calibration never completed, a
+    /// final model fit is attempted from the buffered samples. When false
+    /// (e.g. interrupted runs), the fit is skipped and all remaining metrics
+    /// receive heuristic attribution — matching the pre-refactor behavior.
+    ///
+    /// Consumes `self` — no further observations are possible.
+    pub fn finish(mut self, completed_normally: bool) -> Vec<BlockMetrics> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+
+        if !self.calibrated && completed_normally {
+            // Last-chance model fit (only on clean completion).
+            if self.buffer.len() >= self.min_samples {
+                self.model = CostModel::compute(&self.buffer);
+            }
+            // If the model has no useful slope the per-metric
+            // apply_model_to_buffer falls through to `apply_heuristic`.
+        }
+
+        self.apply_model_to_buffer();
+        self.buffer
+    }
+
+    pub fn model(&self) -> &CostModel {
+        &self.model
+    }
+
+    pub fn is_calibrated(&self) -> bool {
+        self.calibrated
+    }
+
+    // -- private -----------------------------------------------------------
+
+    fn observe_uncalibrated(&mut self, metrics: Vec<BlockMetrics>) -> Option<Vec<BlockMetrics>> {
+        self.buffer.extend(metrics);
+
+        if self.buffer.len() < self.min_samples {
+            return None;
+        }
+
+        let candidate = CostModel::compute(&self.buffer);
+        let is_good =
+            candidate.source != ModelSource::SingleBlock && candidate.time_per_byte > f64::EPSILON;
+
+        if !is_good && self.buffer.len() < self.max_samples {
+            return None;
+        }
+
+        // Accept this model.
+        self.model = candidate;
+        self.calibrated = true;
+        self.apply_model_to_buffer();
+        Some(self.buffer.drain(..).collect())
+    }
+
+    fn observe_calibrated(&mut self, metrics: Vec<BlockMetrics>) -> Option<Vec<BlockMetrics>> {
+        for mut m in metrics {
+            self.apply_to_single(&mut m);
+            self.buffer.push(m);
+        }
+
+        if self.buffer.len() >= self.flush_threshold {
+            Some(self.buffer.drain(..).collect())
+        } else {
+            None
+        }
+    }
+
+    fn apply_model_to_buffer(&mut self) {
+        let model = &self.model;
+        for m in self.buffer.iter_mut() {
+            if model.time_per_byte > f64::EPSILON {
+                m.apply_cost_model(model);
+            } else {
+                m.apply_heuristic();
+            }
+        }
+    }
+
+    fn apply_to_single(&self, m: &mut BlockMetrics) {
+        if self.model.time_per_byte > f64::EPSILON {
+            m.apply_cost_model(&self.model);
+        } else {
+            m.apply_heuristic();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BlockProcessingBaseline {
     pub avg_setup_duration: Duration,
@@ -227,6 +369,7 @@ pub struct TransactionMetrics {
 }
 
 /// Read-only snapshot of accumulated benchmark metrics.
+#[derive(Debug)]
 pub struct MetricsSummary {
     pub count: u64,
     pub txs: u64,

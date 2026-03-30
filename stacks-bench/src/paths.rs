@@ -31,15 +31,14 @@ impl TryFrom<&Path> for AppDataDir {
 
 impl AppDataDir {
     pub const APP_DATA_DIR_NAME: &'static str = ".stacks-bench";
+    const ENV_VAR: &'static str = "STACKS_BENCH_DATA_DIR";
 
-    /// Resolves the app data directory from the CLI `db_path` option.
+    /// Resolves the app data directory.
     ///
-    /// Logic:
-    /// 1. If `custom_path` is provided:
-    ///    - If it's a directory, use it.
-    ///    - If it's a file, use its parent directory.
-    /// 2. If not provided:
-    ///    - Use `<exe_dir>/.stacks-bench` (creating it if missing).
+    /// Resolution order:
+    /// 1. If `custom_path` is provided (via `--db`), use it.
+    /// 2. If `STACKS_BENCH_DATA_DIR` is set, use that path.
+    /// 3. Otherwise, default to `~/.stacks-bench`.
     pub fn resolve_from_opt<P: AsRef<Path>>(custom_path: Option<P>) -> Result<Self> {
         if let Some(path) = custom_path {
             let path_ref = path.as_ref();
@@ -56,21 +55,54 @@ impl AppDataDir {
             return dir.try_into();
         }
 
-        // Default behavior: <exe_dir>/.stacks-bench
-        let base_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
+        // Environment variable override (useful for CI/Docker).
+        if let Ok(env_dir) = std::env::var(Self::ENV_VAR) {
+            let p = PathBuf::from(env_dir);
+            if !p.exists() {
+                std::fs::create_dir_all(&p).with_context(|| {
+                    format!("Failed to create ${} directory at {p:?}", Self::ENV_VAR)
+                })?;
+            }
+            return p.try_into();
+        }
 
-        let storage_dir = base_dir.join(Self::APP_DATA_DIR_NAME);
+        // Default: ~/.stacks-bench
+        let home = home::home_dir().ok_or_else(|| anyhow!("Unable to determine home directory"))?;
+        let storage_dir = home.join(Self::APP_DATA_DIR_NAME);
 
         if !storage_dir.exists() {
-            std::fs::create_dir_all(&storage_dir).with_context(|| {
-                format!("Failed to create storage directory at {:?}", storage_dir)
-            })?;
+            std::fs::create_dir_all(&storage_dir)
+                .with_context(|| format!("Failed to create data directory at {storage_dir:?}"))?;
+        }
+
+        // Hint once: only when the new location has no DB yet but the
+        // legacy <exe_dir>/.stacks-bench does.  After the first successful
+        // run (or manual mv) the new DB exists and the hint is silenced.
+        let new_db = storage_dir.join("appdata").join("stacks-bench.db");
+        if !new_db.exists() {
+            if let Some(legacy) = Self::detect_legacy_data_dir() {
+                eprintln!(
+                    "Note: stacks-bench data directory has moved to {}\n\
+                     Found existing data at {}\n\
+                     To migrate: mv {}/* {}/",
+                    storage_dir.display(),
+                    legacy.display(),
+                    legacy.display(),
+                    storage_dir.display(),
+                );
+            }
         }
 
         storage_dir.try_into()
+    }
+
+    /// Detect whether a legacy `<exe_dir>/.stacks-bench` directory exists.
+    fn detect_legacy_data_dir() -> Option<PathBuf> {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))?;
+        let legacy = exe_dir.join(Self::APP_DATA_DIR_NAME);
+        if legacy.is_dir() { Some(legacy) } else { None }
     }
 
     pub fn path(&self) -> &Path {

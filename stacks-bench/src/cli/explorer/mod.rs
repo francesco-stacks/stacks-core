@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
-use crate::cli::common::CliContext;
+use crate::cli::common::{CliContext, ExecCommand};
 
 const EXPLORER_REL_PATH: &str = "tools/profiler-explorer";
 const SERVER_FILE: &str = "server.ts";
@@ -57,17 +57,73 @@ pub struct ExplorerStopArgs {}
 #[derive(Args, Debug)]
 pub struct ExplorerStatusArgs {}
 
-impl ExplorerArgs {
-    pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
+impl ExecCommand for ExplorerArgs {
+    type Output = serde_json::Value;
+
+    async fn exec(&self, ctx: &CliContext) -> Result<Self::Output> {
+        let interactive = ctx.interactive();
         match &self.command {
-            ExplorerCommand::Start(args) => start_explorer(ctx, args).await,
-            ExplorerCommand::Stop(_) => stop_explorer(ctx).await,
-            ExplorerCommand::Status(_) => status_explorer(ctx).await,
+            ExplorerCommand::Start(args) => {
+                let (pid, db_path, log_path) = start_explorer(ctx, args, interactive).await?;
+                if interactive {
+                    cliclack::note(
+                        "Explorer started",
+                        format!(
+                            "URL:    http://{}:{}\n\
+                             PID:    {pid}\n\
+                             App DB: {}\n\
+                             Log:    {}",
+                            args.host,
+                            args.port,
+                            db_path.display(),
+                            log_path.display(),
+                        ),
+                    )?;
+                }
+                Ok(serde_json::json!({
+                    "message": "Explorer started",
+                    "host": args.host,
+                    "port": args.port,
+                    "url": format!("http://{}:{}", args.host, args.port),
+                    "pid": pid,
+                }))
+            }
+            ExplorerCommand::Stop(_) => {
+                let pid = stop_explorer(ctx, interactive).await?;
+                Ok(serde_json::json!({"message": "Explorer stopped", "pid": pid}))
+            }
+            ExplorerCommand::Status(_) => {
+                let app_data = ctx.app_data_dir();
+                let pid_path = app_data.path().join(PID_FILE_NAME);
+                if let Some(pid) = read_pid(&pid_path)? {
+                    if pid_is_running(pid) {
+                        if interactive {
+                            cliclack::log::info(format!("Explorer is running (pid {pid})"))?;
+                        }
+                        return Ok(serde_json::json!({"running": true, "pid": pid}));
+                    }
+                    if interactive {
+                        cliclack::log::warning(format!(
+                            "Explorer is not running (stale pid {pid})"
+                        ))?;
+                    }
+                    return Ok(serde_json::json!({"running": false, "stale_pid": pid}));
+                }
+                if interactive {
+                    cliclack::log::info("Explorer is not running")?;
+                }
+                Ok(serde_json::json!({"running": false}))
+            }
         }
     }
 }
 
-async fn start_explorer(ctx: &CliContext, args: &ExplorerStartArgs) -> Result<()> {
+/// Start the explorer process. Returns (pid, db_path, log_path) on success.
+async fn start_explorer(
+    ctx: &CliContext,
+    args: &ExplorerStartArgs,
+    interactive: bool,
+) -> Result<(u32, PathBuf, PathBuf)> {
     let app_data = ctx.app_data_dir();
     let db_path = app_data.app_db_path();
     if !db_path.exists() {
@@ -79,14 +135,14 @@ async fn start_explorer(ctx: &CliContext, args: &ExplorerStartArgs) -> Result<()
 
     let explorer_root = explorer_root()?;
     if args.restart {
-        let _ = stop_explorer(ctx).await;
+        let _ = stop_explorer(ctx, interactive).await;
     }
 
     if args.refresh {
-        build_ui(&explorer_root)?;
+        build_ui(&explorer_root, interactive)?;
     }
     ensure_ui_build(&explorer_root)?;
-    ensure_node_deps(&explorer_root)?;
+    ensure_node_deps(&explorer_root, interactive)?;
 
     let pid_path = app_data.path().join(PID_FILE_NAME);
     if let Some(pid) = read_pid(&pid_path)? {
@@ -123,23 +179,11 @@ async fn start_explorer(ctx: &CliContext, args: &ExplorerStartArgs) -> Result<()
     fs::write(&pid_path, pid.to_string())
         .with_context(|| format!("Failed to write pid file at {pid_path:?}"))?;
 
-    cliclack::note(
-        "Explorer started",
-        format!(
-            "URL:    http://{}:{}\n\
-             PID:    {pid}\n\
-             App DB: {}\n\
-             Log:    {}",
-            args.host,
-            args.port,
-            db_path.display(),
-            log_path.display(),
-        ),
-    )?;
-    Ok(())
+    Ok((pid, db_path, log_path))
 }
 
-async fn stop_explorer(ctx: &CliContext) -> Result<()> {
+/// Stop the explorer process. Returns the stopped PID.
+async fn stop_explorer(ctx: &CliContext, interactive: bool) -> Result<u32> {
     let app_data = ctx.app_data_dir();
     let pid_path = app_data.path().join(PID_FILE_NAME);
     let pid = read_pid(&pid_path)?.ok_or_else(|| anyhow::anyhow!("Explorer is not running"))?;
@@ -152,23 +196,10 @@ async fn stop_explorer(ctx: &CliContext) -> Result<()> {
     }
 
     let _ = fs::remove_file(&pid_path);
-    cliclack::log::info(format!("Explorer stopped (pid {pid})"))?;
-    Ok(())
-}
-
-async fn status_explorer(ctx: &CliContext) -> Result<()> {
-    let app_data = ctx.app_data_dir();
-    let pid_path = app_data.path().join(PID_FILE_NAME);
-    if let Some(pid) = read_pid(&pid_path)? {
-        if pid_is_running(pid) {
-            cliclack::log::info(format!("Explorer is running (pid {pid})"))?;
-            return Ok(());
-        }
-        cliclack::log::warning(format!("Explorer is not running (stale pid {pid})"))?;
-        return Ok(());
+    if interactive {
+        cliclack::log::info(format!("Explorer stopped (pid {pid})"))?;
     }
-    cliclack::log::info("Explorer is not running")?;
-    Ok(())
+    Ok(pid)
 }
 
 fn explorer_root() -> Result<PathBuf> {
@@ -179,20 +210,17 @@ fn explorer_root() -> Result<PathBuf> {
     Ok(root)
 }
 
-fn ensure_node_deps(explorer_root: &Path) -> Result<()> {
+fn ensure_node_deps(explorer_root: &Path, interactive: bool) -> Result<()> {
     let node_modules_dir = explorer_root.join(NODE_MODULES_DIR_NAME);
     let package_json = explorer_root.join("package.json");
     let sentinel = explorer_root.join(SENTINEL_FILE_NAME);
 
-    // Detect the current Node major version so we can rebuild native
-    // modules when Node is upgraded.
     let node_major = Command::new("node")
         .arg("--version")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|v| {
-            // v24.1.0 → "24"
             v.trim()
                 .strip_prefix('v')?
                 .split('.')
@@ -211,15 +239,18 @@ fn ensure_node_deps(explorer_root: &Path) -> Result<()> {
         (Err(_), _) => false,
     };
 
-    // The sentinel stores the Node major version from the last install.
-    // If it differs, native modules need to be rebuilt.
     let node_version_changed = fs::read_to_string(&sentinel)
         .map(|s| s.trim() != node_major)
         .unwrap_or(false);
 
     if package_json_changed || node_version_changed || !node_modules_dir.exists() {
-        let spinner = cliclack::spinner();
-        spinner.start("Installing Node dependencies...");
+        let spinner = if interactive {
+            let s = cliclack::spinner();
+            s.start("Installing Node dependencies...");
+            Some(s)
+        } else {
+            None
+        };
 
         let status = Command::new("npm")
             .arg("install")
@@ -230,14 +261,18 @@ fn ensure_node_deps(explorer_root: &Path) -> Result<()> {
             .context("Failed to install profiler explorer Node dependencies")?;
 
         if !status.success() {
-            spinner.error("npm install failed");
+            if let Some(s) = spinner {
+                s.error("npm install failed");
+            }
             bail!("npm install failed with status {:?}", status.code());
         }
 
         fs::write(&sentinel, &node_major)
             .with_context(|| format!("Failed to write sentinel file at {sentinel:?}"))?;
 
-        spinner.stop(fmt_success!("Node dependencies installed"));
+        if let Some(s) = spinner {
+            s.stop(fmt_success!("Node dependencies installed"));
+        }
     }
 
     Ok(())
@@ -257,14 +292,19 @@ fn ensure_ui_build(explorer_root: &Path) -> Result<()> {
     );
 }
 
-fn build_ui(explorer_root: &Path) -> Result<()> {
+fn build_ui(explorer_root: &Path, interactive: bool) -> Result<()> {
     let web_dir = explorer_root.join("web");
     if !web_dir.exists() {
         bail!("Explorer web directory not found at {:?}", web_dir);
     }
 
-    let spinner = cliclack::spinner();
-    spinner.start("Building explorer UI...");
+    let spinner = if interactive {
+        let s = cliclack::spinner();
+        s.start("Building explorer UI...");
+        Some(s)
+    } else {
+        None
+    };
 
     let status = Command::new("npm")
         .arg("run")
@@ -276,11 +316,15 @@ fn build_ui(explorer_root: &Path) -> Result<()> {
         .context("Failed to run npm build for profiler explorer")?;
 
     if !status.success() {
-        spinner.error("UI build failed");
+        if let Some(s) = spinner {
+            s.error("UI build failed");
+        }
         bail!("npm run build failed with status {:?}", status.code());
     }
 
-    spinner.stop(fmt_success!("Explorer UI built"));
+    if let Some(s) = spinner {
+        s.stop(fmt_success!("Explorer UI built"));
+    }
     Ok(())
 }
 

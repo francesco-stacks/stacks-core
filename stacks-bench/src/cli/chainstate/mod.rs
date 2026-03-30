@@ -2,38 +2,36 @@ pub mod index;
 pub mod list;
 pub mod remove;
 
-use anyhow::Result;
 use clap::Subcommand;
-use index::IndexArgs;
-use list::ListArgs;
-use remove::RemoveArgs;
 
-use crate::cli::common::CliContext;
+use crate::cli::common::{BoxedOutput, CliContext, ExecCommand, boxed};
 
 #[derive(Subcommand, Debug)]
-pub enum ChainstateCommands {
+pub enum ChainstateCommand {
     /// Index a range of blocks from the node database
-    Index(IndexArgs),
+    Index(index::IndexArgs),
     /// List indexed chainstates
     #[command(alias = "ls")]
-    List(ListArgs),
+    List(list::ListArgs),
     /// Delete one or more chainstates and all associated data
     #[command(alias = "rm")]
-    Remove(RemoveArgs),
+    Remove(remove::RemoveArgs),
 }
 
 #[derive(clap::Args, Debug)]
 pub struct ChainstateArgs {
     #[command(subcommand)]
-    command: ChainstateCommands,
+    pub command: ChainstateCommand,
 }
 
-impl ChainstateArgs {
-    pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
+impl ExecCommand for ChainstateArgs {
+    type Output = BoxedOutput;
+
+    async fn exec(&self, ctx: &CliContext) -> anyhow::Result<BoxedOutput> {
         match &self.command {
-            ChainstateCommands::Index(args) => args.exec(ctx).await,
-            ChainstateCommands::List(args) => args.exec(ctx).await,
-            ChainstateCommands::Remove(args) => args.exec(ctx).await,
+            ChainstateCommand::Index(args) => Ok(boxed(args.exec(ctx).await?)),
+            ChainstateCommand::List(args) => Ok(boxed(args.exec(ctx).await?)),
+            ChainstateCommand::Remove(args) => Ok(boxed(args.exec(ctx).await?)),
         }
     }
 }

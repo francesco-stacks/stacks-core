@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -56,6 +56,8 @@ pub enum IndexerEvent {
     VacuumStarted,
     /// Vacuum finished.
     VacuumComplete,
+    /// Indexing was interrupted by the caller (cancellation / ctrl-c).
+    Interrupted,
     /// Indexing is complete (terminal event). UI must exit on receiving this.
     Finished,
 }
@@ -90,6 +92,7 @@ pub struct ChainstateIndexer<'a> {
     merge_threshold: usize,
     channel_buffer_size: usize,
     event_tx: Option<mpsc::UnboundedSender<IndexerEvent>>,
+    interrupted: Option<Arc<AtomicBool>>,
 }
 
 impl<'a> ChainstateIndexer<'a> {
@@ -105,12 +108,24 @@ impl<'a> ChainstateIndexer<'a> {
             merge_threshold: Self::DEFAULT_MERGE_THRESHOLD,
             channel_buffer_size: Self::DEFAULT_CHANNEL_BUFFER_SIZE,
             event_tx: None,
+            interrupted: None,
         }
     }
 
     pub fn with_events(mut self, tx: mpsc::UnboundedSender<IndexerEvent>) -> Self {
         self.event_tx = Some(tx);
         self
+    }
+
+    pub fn with_interrupted(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.interrupted = Some(flag);
+        self
+    }
+
+    fn is_interrupted(&self) -> bool {
+        self.interrupted
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     pub fn set_batch_size(&mut self, batch_size: usize) {
@@ -323,6 +338,12 @@ impl<'a> ChainstateIndexer<'a> {
             .run_indexing_pipeline(plan.anchor_tip.clone(), index_start_height, plan.end_height)
             .await?;
 
+        if self.is_interrupted() {
+            self.send_event(IndexerEvent::Interrupted);
+            self.send_event(IndexerEvent::Finished);
+            return Err(anyhow!("Indexing interrupted"));
+        }
+
         self.send_event(IndexerEvent::CheckpointStarted);
         self.app_db.checkpoint(CheckpointMode::Truncate).await?;
         self.send_event(IndexerEvent::CheckpointComplete);
@@ -371,6 +392,7 @@ impl<'a> ChainstateIndexer<'a> {
             tx_sender,
             metrics.clone(),
             walk_progress,
+            self.interrupted.clone(),
         );
 
         let writer_task = Self::run_writer(
@@ -383,6 +405,7 @@ impl<'a> ChainstateIndexer<'a> {
             self.merge_threshold,
             metrics.clone(),
             self.event_tx.clone(),
+            self.interrupted.clone(),
         );
 
         let (resolved, _) = tokio::try_join!(loader_task, writer_task)?;
@@ -400,6 +423,7 @@ impl<'a> ChainstateIndexer<'a> {
         tx_sender: mpsc::Sender<Result<(StacksBlockHeader, Vec<StacksTransaction>)>>,
         metrics: Arc<IndexerMetrics>,
         walk_progress: Arc<AtomicU64>,
+        interrupted: Option<Arc<AtomicBool>>,
     ) -> Result<ResolvedRange> {
         let blocks_dir = env.chainstate_dir.blocks_dir();
         let nakamoto_db = env.open_nakamoto_db_for_read().await?;
@@ -477,6 +501,13 @@ impl<'a> ChainstateIndexer<'a> {
                 break;
             }
 
+            if interrupted
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                break;
+            }
+
             let header = block_res?;
 
             if header.height == end_height && resolved_end.is_none() {
@@ -527,6 +558,7 @@ impl<'a> ChainstateIndexer<'a> {
         merge_threshold: usize,
         metrics: Arc<IndexerMetrics>,
         event_tx: Option<mpsc::UnboundedSender<IndexerEvent>>,
+        interrupted: Option<Arc<AtomicBool>>,
     ) -> Result<()> {
         let send_event = |event: IndexerEvent| {
             if let Some(tx) = &event_tx {
@@ -584,6 +616,13 @@ impl<'a> ChainstateIndexer<'a> {
         }
 
         while let Some(res) = tx_receiver.recv().await {
+            if interrupted
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                break;
+            }
+
             let (header, transactions) = res?;
             batch.push((header, transactions));
 

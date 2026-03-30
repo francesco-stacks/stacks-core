@@ -1,0 +1,1004 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use blockstack_lib::burnchains::Txid;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use stacks_bench::bench_events::{self, BenchEvent, BenchEventSender};
+use stacks_bench::blocks::{BackwardsBlockStream, BlockRef};
+use stacks_bench::context::{BenchContext, BenchEnv};
+use stacks_bench::db::DbOpenForRead;
+use stacks_bench::db::app::AppDb;
+use stacks_bench::db::app::models::BenchmarkRun;
+use stacks_bench::db::node::{ChainStateDb, NakamotoDb};
+use stacks_bench::filter::TxFilter;
+use stacks_bench::indexer::{ChainIndexPlan, ChainstateIndexer, ResolvedRange};
+use stacks_bench::metrics::{BlockMetrics, CalibrationState, MetricsAccumulator, MetricsSummary};
+use stacks_bench::paths::ChainStateDir;
+use stacks_bench::provenance::BenchmarkProvenance;
+use stacks_bench::replay::{ReplayMode, SegmentReplayInfo};
+use stacks_bench::shadow::ShadowDir;
+use stacks_bench::{Network, StacksBlockHeader, StacksBlockLoader, StacksBlockRef};
+use stacks_common::types::chainstate::StacksBlockId;
+use stacks_profiler::Profiler;
+use tokio::sync::mpsc;
+
+use crate::commands::common::{
+    IndexerArgs, IndexerUiSpawner, TxIdArg, create_shadow_dir, get_git_hash,
+    run_cleanup_with_events, setup_bench_env, setup_bench_env_and_plan,
+};
+
+const BASELINE_MEASURED_BLOCKS: u32 = 1000;
+
+/// Non-clap parameter struct for benchmark runs. CLI converts from `RunArgs`
+/// via `From`; MCP constructs directly from tool parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchRunParams {
+    pub source_dir: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_at: Option<StacksBlockRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_at: Option<StacksBlockRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip: Option<StacksBlockRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<Network>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txid: Option<TxIdArg>,
+    pub repetitions: u32,
+    pub calibration: usize,
+    pub warmup: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterKind>,
+    pub no_profiler_kv: bool,
+    pub include_pre_nakamoto_blocks: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Transaction filter kind (presentation-agnostic; no clap derives).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FilterKind {
+    ContractCall,
+    Txid(TxIdArg),
+}
+
+impl IndexerArgs for BenchRunParams {
+    fn start_at(&self) -> Option<&StacksBlockRef> {
+        self.start_at.as_ref()
+    }
+    fn end_at(&self) -> Option<&StacksBlockRef> {
+        self.end_at.as_ref()
+    }
+    fn block_count(&self) -> Option<u32> {
+        self.block_count
+    }
+    fn tip(&self) -> Option<&StacksBlockRef> {
+        self.tip.as_ref()
+    }
+    fn network(&self) -> Option<Network> {
+        self.network
+    }
+}
+
+impl BenchRunParams {
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string(self).context("Failed to serialize BenchRunParams to JSON")
+    }
+
+    /// Returns the effective filter, mapping the legacy `txid` field to
+    /// [`FilterKind::Txid`] when present. This allows the unified
+    /// [`run_benchmark`] function to branch on a single discriminant.
+    pub fn resolved_filter(&self) -> Option<FilterKind> {
+        if let Some(ref txid) = self.txid {
+            Some(FilterKind::Txid(txid.clone()))
+        } else {
+            self.filter.clone()
+        }
+    }
+}
+
+/// Structured result returned by benchmark runs.
+#[derive(serde::Serialize)]
+pub struct RunResult {
+    pub run_id: i32,
+    pub blocks: usize,
+    pub warmup_blocks: usize,
+    pub measured_blocks: usize,
+    pub duration_secs: f64,
+    pub interrupted: bool,
+    pub summary: Option<RunSummaryJson>,
+}
+
+/// Aggregated benchmark metrics for JSON output.
+#[derive(serde::Serialize)]
+pub struct RunSummaryJson {
+    pub total_duration_us: u64,
+    pub setup_duration_us: u64,
+    pub execution_duration_us: u64,
+    pub commit_duration_us: u64,
+    pub transactions: u64,
+    pub clarity_runtime: u64,
+    pub write_length: u64,
+    pub read_length: u64,
+}
+
+/// Result of scanning the canonical chain for a specific transaction.
+struct TxidScanResult {
+    block_header: StacksBlockHeader,
+    #[allow(dead_code)]
+    tx_index: usize,
+}
+
+/// The resolved target for a benchmark run, produced after the indexer
+/// pipeline completes. Collapses the correlated `(effective_filter,
+/// target_txid, txid_scan, block_ids)` tuple into a single discriminant so
+/// impossible states are unrepresentable.
+enum ResolvedTarget {
+    /// Replay a range of indexed blocks (Follower or SegmentedFiltered).
+    BlockRange {
+        block_ids: Vec<StacksBlockId>,
+        filter: Option<FilterKind>,
+    },
+    /// Replay a single transaction's block repeatedly (SingleTx mode).
+    SingleTx { txid: Txid, scan: TxidScanResult },
+}
+
+/// A single entry in the replay schedule.
+struct ScheduledBlock {
+    block_id: StacksBlockId,
+    /// Repetition index for this block. Always 0 for range mode (each block
+    /// replayed once). In txid mode, increments 0..N across warmup + measured.
+    repetition: u32,
+}
+
+/// Fully resolved replay plan. Captures all mode-dependent decisions so the
+/// execution loop ([`execute_replay_plan`]) is mode-agnostic.
+///
+/// Built by [`build_replay_plan`] after the indexer pipeline completes.
+struct ReplayPlan {
+    /// Ordered replay schedule — each entry is one block replay iteration.
+    schedule: Vec<ScheduledBlock>,
+    /// Number of warmup iterations at the start of the schedule.
+    warmup_count: usize,
+    /// Number of measured iterations after warmup.
+    measured_count: usize,
+    /// How to replay each block (Follower, SegmentedFiltered, SingleTx).
+    replay_mode: ReplayMode,
+    /// Whether cost model calibration should run. False for txid mode (starts
+    /// pre-calibrated with heuristic attribution).
+    needs_calibration: bool,
+    /// Prefix for auto-generated run name ("txid-" or "").
+    name_prefix: &'static str,
+    /// Human-readable mode description for event emission.
+    mode_label: String,
+}
+
+impl ReplayPlan {
+    fn total_iterations(&self) -> usize {
+        self.schedule.len()
+    }
+}
+
+/// Walk the canonical chain backwards from `tip`, loading and deserializing
+/// each block, until the transaction with `target_txid` is found.
+async fn scan_for_txid(
+    app_db: &mut AppDb,
+    source_dir: &Path,
+    tip: &BlockRef,
+    target_txid: &Txid,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<TxidScanResult> {
+    let chainstate_dir = ChainStateDir::from_node_root(source_dir);
+    let chainstate_db = ChainStateDb::open_for_read(chainstate_dir.index_db_path()).await?;
+    let mut naka_db = NakamotoDb::open_for_read(chainstate_dir.nakamoto_db_path()).await?;
+    let min_naka_height = naka_db.get_min_block_height().await?.unwrap_or(u64::MAX);
+    let blocks_dir = chainstate_dir.blocks_dir();
+
+    let mut stream = BackwardsBlockStream::new(&chainstate_db, tip.id.clone()).with_cache(app_db);
+
+    let mut scanned: u64 = 0;
+
+    loop {
+        let header = stream.next_block().await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Reached genesis without finding txid {}",
+                target_txid.to_hex()
+            )
+        })?;
+
+        let mut loader = StacksBlockLoader::new(&blocks_dir, &mut naka_db, min_naka_height);
+        let block = loader.load_block(&header).await?;
+
+        for (i, tx) in block.transactions().iter().enumerate() {
+            if tx.txid() == *target_txid {
+                return Ok(TxidScanResult {
+                    block_header: header,
+                    tx_index: i,
+                });
+            }
+        }
+
+        scanned += 1;
+        on_progress(scanned, header.height);
+    }
+}
+
+fn avg_baseline(
+    a: &stacks_bench::metrics::BlockProcessingBaseline,
+    b: &stacks_bench::metrics::BlockProcessingBaseline,
+) -> stacks_bench::metrics::BlockProcessingBaseline {
+    stacks_bench::metrics::BlockProcessingBaseline {
+        avg_setup_duration: (a.avg_setup_duration + b.avg_setup_duration) / 2,
+        avg_finalize_duration: (a.avg_finalize_duration + b.avg_finalize_duration) / 2,
+        avg_clarity_state_commit_duration: (a.avg_clarity_state_commit_duration
+            + b.avg_clarity_state_commit_duration)
+            / 2,
+        avg_advance_tip_duration: (a.avg_advance_tip_duration + b.avg_advance_tip_duration) / 2,
+        avg_index_commit_duration: (a.avg_index_commit_duration + b.avg_index_commit_duration) / 2,
+    }
+}
+
+fn run_overhead_baselines(
+    warmup: usize,
+    chainstate: &mut blockstack_lib::chainstate::stacks::db::StacksChainState,
+    burnchain: &blockstack_lib::burnchains::Burnchain,
+    start_parent: &stacks_common::types::chainstate::StacksBlockId,
+    interrupted: &Arc<AtomicBool>,
+    ev: &BenchEventSender,
+) -> anyhow::Result<(
+    stacks_bench::metrics::BlockProcessingBaseline,
+    stacks_bench::metrics::BlockProcessingBaseline,
+)> {
+    let mut timer;
+    let is_interrupted = || interrupted.load(Ordering::Relaxed);
+
+    bench_events::emit(
+        ev,
+        BenchEvent::BaselineStarted {
+            warmup_blocks: warmup,
+            measured_blocks: BASELINE_MEASURED_BLOCKS,
+        },
+    );
+
+    if warmup > 0 {
+        timer = Instant::now();
+        let ev_ref = ev.clone();
+        let warmup_total = warmup as u32;
+        stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
+            chainstate,
+            burnchain,
+            start_parent,
+            warmup_total,
+            |completed, _| {
+                bench_events::emit(
+                    &ev_ref,
+                    BenchEvent::BaselineWarmupProgress {
+                        completed,
+                        total: warmup_total,
+                    },
+                );
+                !is_interrupted()
+            },
+        )?;
+        if is_interrupted() {
+            return Ok(Default::default());
+        }
+        bench_events::emit(
+            ev,
+            BenchEvent::BaselineWarmupComplete {
+                duration: timer.elapsed(),
+            },
+        );
+    }
+
+    timer = Instant::now();
+    let ev1 = ev.clone();
+    let round1 = stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
+        chainstate,
+        burnchain,
+        start_parent,
+        BASELINE_MEASURED_BLOCKS,
+        |completed, _| {
+            bench_events::emit(
+                &ev1,
+                BenchEvent::BaselineRoundProgress {
+                    round: 1,
+                    completed,
+                    total: BASELINE_MEASURED_BLOCKS,
+                },
+            );
+            !is_interrupted()
+        },
+    )?;
+    if is_interrupted() {
+        return Ok(Default::default());
+    }
+    bench_events::emit(
+        ev,
+        BenchEvent::BaselineRoundComplete {
+            round: 1,
+            duration: timer.elapsed(),
+        },
+    );
+
+    timer = Instant::now();
+    let ev2 = ev.clone();
+    let round2 = stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
+        chainstate,
+        burnchain,
+        start_parent,
+        BASELINE_MEASURED_BLOCKS,
+        |completed, _| {
+            bench_events::emit(
+                &ev2,
+                BenchEvent::BaselineRoundProgress {
+                    round: 2,
+                    completed,
+                    total: BASELINE_MEASURED_BLOCKS,
+                },
+            );
+            !is_interrupted()
+        },
+    )?;
+    if is_interrupted() {
+        return Ok(Default::default());
+    }
+    bench_events::emit(
+        ev,
+        BenchEvent::BaselineRoundComplete {
+            round: 2,
+            duration: timer.elapsed(),
+        },
+    );
+
+    // Checkpoint the chainstate/clarity dbs
+    bench_events::emit(ev, BenchEvent::BaselineCheckpointStarted);
+    timer = Instant::now();
+    chainstate.checkpoint_sqlite_dbs()?;
+    bench_events::emit(
+        ev,
+        BenchEvent::BaselineCheckpointComplete {
+            duration: timer.elapsed(),
+        },
+    );
+
+    Ok((round1, round2))
+}
+
+/// Create a shadow directory, emitting lifecycle events.
+fn create_shadow_dir_with_events(
+    source_dir: &Path,
+    include_pre_nakamoto: bool,
+    ev: &BenchEventSender,
+) -> Result<ShadowDir> {
+    bench_events::emit(ev, BenchEvent::ShadowDirStarted);
+    let timer = Instant::now();
+    let shadow_dir = create_shadow_dir(source_dir, include_pre_nakamoto)?;
+    bench_events::emit(
+        ev,
+        BenchEvent::ShadowDirComplete {
+            duration: timer.elapsed(),
+        },
+    );
+    Ok(shadow_dir)
+}
+
+/// Run the chainstate indexer pipeline with a UI consumer, returning the
+/// resolved range and the ordered list of block IDs in the range.
+async fn run_indexer_pipeline(
+    app_db: &mut AppDb,
+    env: &BenchEnv,
+    plan: ChainIndexPlan,
+    interrupted: &Arc<AtomicBool>,
+    indexer_ui: IndexerUiSpawner,
+) -> Result<(ResolvedRange, Vec<StacksBlockId>)> {
+    let tip_height = plan.anchor_tip.height;
+    let idx_start = plan.start_height;
+    let idx_end = plan.end_height;
+
+    let (idx_event_tx, idx_event_rx) = mpsc::unbounded_channel();
+    let mut indexer = ChainstateIndexer::new(app_db, env)
+        .with_events(idx_event_tx)
+        .with_interrupted(interrupted.clone());
+
+    let idx_ui_fut = indexer_ui(idx_event_rx, idx_start, idx_end, tip_height);
+
+    let index_result = indexer
+        .index_chainstate_range(env.network, env.chain_id, &env.epochs, plan)
+        .await;
+    drop(indexer); // Close event channel so UI task can exit on error
+    idx_ui_fut.await??;
+    index_result
+}
+
+/// Create the benchmark run DB model with auto-generated name and git hash.
+async fn create_bench_run_model(
+    app_db: &mut AppDb,
+    chainstate_id: i32,
+    params: &BenchRunParams,
+    name_prefix: &str,
+) -> Result<BenchmarkRun> {
+    let run_name = params
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("{}{}", name_prefix, Utc::now().format("%Y%m%d-%H%M%S")));
+    let args_json = params.to_json()?;
+    let git_commit_hash = get_git_hash().unwrap_or(vec![0u8; 20]);
+    let prov = BenchmarkProvenance::capture();
+
+    app_db
+        .create_benchmark_run(
+            chainstate_id,
+            Utc::now().naive_utc(),
+            git_commit_hash,
+            Some(run_name),
+            args_json,
+            prov,
+        )
+        .await
+}
+
+/// Build a [`RunSummaryJson`] from aggregated metrics, if any blocks were
+/// measured.
+fn build_run_summary(summary: &MetricsSummary) -> Option<RunSummaryJson> {
+    if summary.count > 0 {
+        Some(RunSummaryJson {
+            total_duration_us: summary.duration.as_micros() as u64,
+            setup_duration_us: summary.setup.as_micros() as u64,
+            execution_duration_us: summary.exec.as_micros() as u64,
+            commit_duration_us: summary.commit.as_micros() as u64,
+            transactions: summary.txs,
+            clarity_runtime: summary.runtime,
+            write_length: summary.write_len,
+            read_length: summary.read_len,
+        })
+    } else {
+        None
+    }
+}
+
+/// Accumulated state from a replay loop, consumed by [`finalize_run`].
+struct ReplayOutcome {
+    run_id: i32,
+    total_blocks: usize,
+    warmup_blocks: usize,
+    completed_measured: usize,
+    replay_start: Instant,
+    accumulator: MetricsAccumulator,
+    total_checkpoint_duration: Duration,
+    was_interrupted: bool,
+}
+
+/// Post-replay finalization: emit summary events, persist final state, run
+/// cleanup, and build the [`RunResult`].
+async fn finalize_run(
+    app_db: &mut AppDb,
+    outcome: ReplayOutcome,
+    shadow_dir: ShadowDir,
+    ev: &BenchEventSender,
+) -> Result<RunResult> {
+    if !outcome.was_interrupted {
+        bench_events::emit(
+            ev,
+            BenchEvent::ReplayComplete {
+                measured_blocks: outcome.completed_measured,
+                duration: outcome.replay_start.elapsed(),
+            },
+        );
+    }
+
+    let duration = outcome.replay_start.elapsed();
+
+    app_db
+        .finish_benchmark_run(outcome.run_id, Utc::now().naive_utc())
+        .await?;
+
+    let summary = outcome.accumulator.summary();
+
+    let overhead = duration
+        .saturating_sub(summary.duration)
+        .saturating_sub(outcome.total_checkpoint_duration);
+
+    bench_events::emit(
+        ev,
+        BenchEvent::ReplaySummary {
+            total_blocks: outcome.total_blocks,
+            warmup_blocks: outcome.warmup_blocks,
+            measured_blocks: outcome.completed_measured,
+            total_duration: duration,
+            replay_duration: summary.duration,
+            checkpoint_duration: outcome.total_checkpoint_duration,
+            overhead,
+            interrupted: outcome.was_interrupted,
+        },
+    );
+
+    bench_events::emit(
+        ev,
+        BenchEvent::BenchmarkSummary(outcome.accumulator.summary()),
+    );
+
+    // Give the OS a moment to sync metadata
+    std::thread::sleep(Duration::from_millis(100));
+
+    let storage_delta_report = shadow_dir.calculate_storage_delta()?;
+    bench_events::emit(ev, BenchEvent::StorageSummary(storage_delta_report));
+
+    run_cleanup_with_events(app_db.clone(), shadow_dir, ev).await?;
+
+    Ok(RunResult {
+        run_id: outcome.run_id,
+        blocks: outcome.total_blocks,
+        warmup_blocks: outcome.warmup_blocks,
+        measured_blocks: outcome.completed_measured,
+        duration_secs: duration.as_secs_f64(),
+        interrupted: outcome.was_interrupted,
+        summary: build_run_summary(&summary),
+    })
+}
+
+/// Build a [`ReplayPlan`] from a [`ResolvedTarget`].
+///
+/// All mode-dependent decisions — schedule shape, replay mode, calibration
+/// strategy, and naming — are encoded here so that [`execute_replay_plan`]
+/// never inspects the original filter or mode flags.
+fn build_replay_plan(params: &BenchRunParams, target: ResolvedTarget) -> Result<ReplayPlan> {
+    match target {
+        ResolvedTarget::SingleTx { txid, scan } => {
+            let block_id = scan.block_header.id.clone();
+            let warmup = params.warmup;
+            let measured = params.repetitions as usize;
+            let total = warmup + measured;
+
+            let schedule: Vec<ScheduledBlock> = (0..total)
+                .map(|i| ScheduledBlock {
+                    block_id: block_id.clone(),
+                    repetition: i as u32,
+                })
+                .collect();
+
+            let mode_label = format!("SingleTx({})", txid);
+            let replay_mode = ReplayMode::SingleTx(TxFilter::Txid(txid));
+
+            Ok(ReplayPlan {
+                schedule,
+                warmup_count: warmup,
+                measured_count: measured,
+                replay_mode,
+                needs_calibration: false,
+                name_prefix: "txid-",
+                mode_label,
+            })
+        }
+        ResolvedTarget::BlockRange { block_ids, filter } => {
+            let warmup = params.warmup;
+            if warmup > block_ids.len() {
+                bail!(
+                    "--warmup ({}) cannot exceed selected block count ({})",
+                    warmup,
+                    block_ids.len()
+                );
+            }
+            let measured = block_ids.len() - warmup;
+
+            let schedule: Vec<ScheduledBlock> = block_ids
+                .into_iter()
+                .map(|id| ScheduledBlock {
+                    block_id: id,
+                    repetition: 0,
+                })
+                .collect();
+
+            let replay_mode = match filter {
+                Some(FilterKind::ContractCall) => {
+                    ReplayMode::SegmentedFiltered(TxFilter::ContractCall)
+                }
+                _ => ReplayMode::Follower,
+            };
+            let mode_label = replay_mode.to_string();
+
+            Ok(ReplayPlan {
+                schedule,
+                warmup_count: warmup,
+                measured_count: measured,
+                replay_mode,
+                needs_calibration: true,
+                name_prefix: "",
+                mode_label,
+            })
+        }
+    }
+}
+
+/// Execute a resolved [`ReplayPlan`]. This function is mode-agnostic — all
+/// mode-dependent decisions are encoded in the plan.
+async fn execute_replay_plan(
+    app_db: &mut AppDb,
+    plan: &ReplayPlan,
+    params: &BenchRunParams,
+    shadow_dir: ShadowDir,
+    mut bench_context: BenchContext<'_>,
+    chainstate_model_id: i32,
+    interrupted: Arc<AtomicBool>,
+    ev: &BenchEventSender,
+) -> Result<RunResult> {
+    let run_model =
+        create_bench_run_model(app_db, chainstate_model_id, params, plan.name_prefix).await?;
+
+    let (mut chainstate, burnchain) = bench_context.open_stacks_chainstate()?;
+
+    // --- Overhead baselines ---
+    let (bl1, bl2) = run_overhead_baselines(
+        plan.warmup_count,
+        &mut chainstate,
+        &burnchain,
+        &bench_context.end_block().id,
+        &interrupted,
+        ev,
+    )?;
+
+    if interrupted.load(Ordering::Relaxed) {
+        bench_events::emit(
+            ev,
+            BenchEvent::ReplayInterrupted {
+                completed: 0,
+                total: plan.measured_count,
+            },
+        );
+        run_cleanup_with_events(app_db.clone(), shadow_dir, ev).await?;
+        return Ok(RunResult {
+            run_id: run_model.id,
+            blocks: plan.total_iterations(),
+            warmup_blocks: plan.warmup_count,
+            measured_blocks: 0,
+            duration_secs: 0.0,
+            interrupted: true,
+            summary: None,
+        });
+    }
+
+    bench_events::emit(
+        ev,
+        BenchEvent::BaselineComplete {
+            round1: bl1.clone(),
+            round2: bl2.clone(),
+        },
+    );
+
+    let averaged = avg_baseline(&bl1, &bl2);
+    app_db
+        .save_block_processing_baseline(
+            run_model.id,
+            &bench_context.end_block().id,
+            plan.warmup_count as u32,
+            BASELINE_MEASURED_BLOCKS,
+            &averaged,
+        )
+        .await?;
+
+    shadow_dir.calculate_storage_delta()?; // Reset storage delta baseline
+
+    let mut calibration = CalibrationState::new(plan.needs_calibration, params.calibration);
+    let mut completed_measured: usize = 0;
+    let mut total_clarity_db_checkpoint_duration = Duration::ZERO;
+    let mut last_storage_delta: i64 = 0;
+
+    let mut accumulator = MetricsAccumulator::default();
+
+    bench_events::emit(
+        ev,
+        BenchEvent::ReplayStarted {
+            total_blocks: plan.total_iterations(),
+            warmup_blocks: plan.warmup_count,
+            mode: plan.mode_label.clone(),
+        },
+    );
+
+    // --- Replay loop ---
+    let mut warmup_complete_emitted = false;
+    let start = Instant::now();
+    for (i, entry) in plan.schedule.iter().enumerate() {
+        if interrupted.load(Ordering::Relaxed) {
+            bench_events::emit(
+                ev,
+                BenchEvent::ReplayInterrupted {
+                    completed: completed_measured,
+                    total: plan.measured_count,
+                },
+            );
+            break;
+        }
+
+        let is_warmup = i < plan.warmup_count;
+        Profiler::clear();
+
+        if !is_warmup && !params.no_profiler_kv {
+            Profiler::enable_record();
+        }
+
+        let block = app_db.get_block(&entry.block_id).await?;
+
+        let mut on_segment = |_: &SegmentReplayInfo, m: Option<&mut BlockMetrics>| -> Result<()> {
+            let storage_report = shadow_dir.calculate_storage_delta()?;
+            let current_delta = storage_report.net_growth_bytes;
+            let delta_since_last = current_delta - last_storage_delta;
+            last_storage_delta = current_delta;
+
+            if !is_warmup && let Some(m) = m {
+                m.total_storage_delta = delta_since_last;
+                total_clarity_db_checkpoint_duration += m.clarity_db_checkpoint_duration;
+            }
+            Ok(())
+        };
+
+        let maybe_metrics_vec = stacks_bench::replay::replay_block(
+            &mut bench_context,
+            &mut chainstate,
+            &burnchain,
+            &plan.replay_mode,
+            &block,
+            entry.repetition,
+            Some(&mut on_segment),
+        )?;
+
+        if is_warmup {
+            bench_events::emit(
+                ev,
+                BenchEvent::ReplayWarmupProgress {
+                    completed: i + 1,
+                    total: plan.warmup_count,
+                },
+            );
+            continue;
+        }
+
+        completed_measured += 1;
+
+        if !warmup_complete_emitted && plan.warmup_count > 0 {
+            bench_events::emit(
+                ev,
+                BenchEvent::ReplayWarmupComplete {
+                    warmup_blocks: plan.warmup_count,
+                    duration: start.elapsed(),
+                },
+            );
+            warmup_complete_emitted = true;
+        }
+
+        bench_events::emit(
+            ev,
+            BenchEvent::ReplayProgress {
+                completed: completed_measured,
+                total: plan.measured_count,
+            },
+        );
+
+        let Some(metrics_vec) = maybe_metrics_vec else {
+            continue;
+        };
+
+        accumulator.add_many(&metrics_vec);
+
+        if let Some(batch) = calibration.observe(metrics_vec) {
+            app_db
+                .save_block_metrics(run_model.id, batch.into_iter())
+                .await?;
+        }
+    }
+
+    // Flush remaining metrics. On interruption, skip the last-chance model
+    // fit so un-calibrated metrics receive heuristic attribution.
+    let was_interrupted = interrupted.load(Ordering::Relaxed);
+    let remaining = calibration.finish(!was_interrupted);
+    if !remaining.is_empty() {
+        bench_events::emit(
+            ev,
+            BenchEvent::MetricsFlush {
+                count: remaining.len(),
+            },
+        );
+        app_db
+            .save_block_metrics(run_model.id, remaining.into_iter())
+            .await?;
+    }
+
+    finalize_run(
+        app_db,
+        ReplayOutcome {
+            run_id: run_model.id,
+            total_blocks: plan.total_iterations(),
+            warmup_blocks: plan.warmup_count,
+            completed_measured,
+            replay_start: start,
+            accumulator,
+            total_checkpoint_duration: total_clarity_db_checkpoint_duration,
+            was_interrupted: interrupted.load(Ordering::Relaxed),
+        },
+        shadow_dir,
+        ev,
+    )
+    .await
+}
+
+/// Run a benchmark. Handles block-range, filtered, and single-transaction
+/// modes via [`BenchRunParams::resolved_filter`].
+///
+/// The caller is responsible for:
+/// - Wiring the `interrupted` flag to their cancellation source (ctrl-c, MCP
+///   session disconnect, etc.)
+/// - Spawning a consumer for `ev` (cliclack UI, MCP progress, or silent drain)
+/// - Providing an `indexer_ui` spawner for indexer progress events
+pub async fn run_benchmark(
+    app_db: &mut AppDb,
+    params: &BenchRunParams,
+    ev: BenchEventSender,
+    interrupted: Arc<AtomicBool>,
+    indexer_ui: IndexerUiSpawner,
+) -> Result<RunResult> {
+    Profiler::disable_record();
+
+    let effective_filter = params.resolved_filter();
+
+    // Parse the target Txid once (used for scanning and replay mode).
+    let target_txid = match &effective_filter {
+        Some(FilterKind::Txid(txid_arg)) => Some(
+            Txid::from_bytes(txid_arg.as_bytes())
+                .ok_or_else(|| anyhow::anyhow!("Failed to convert txid bytes to Txid"))?,
+        ),
+        _ => None,
+    };
+
+    let shadow_dir =
+        create_shadow_dir_with_events(&params.source_dir, params.include_pre_nakamoto_blocks, &ev)?;
+
+    // --- Resolve environment, index plan, and (for txid mode) locate the target tx ---
+    let (env, index_plan, txid_scan) =
+        if let Some(FilterKind::Txid(ref txid_arg)) = effective_filter {
+            let target_txid = target_txid.as_ref().unwrap();
+            let (env, anchor_tip) =
+                setup_bench_env(&shadow_dir, params.network, params.tip.as_ref()).await?;
+
+            bench_events::emit(
+                &ev,
+                BenchEvent::EnvironmentReady {
+                    chain_id: env.chain_id,
+                    network: env.network.to_string(),
+                    epochs: env.epochs.iter().map(|e| e.to_string()).collect(),
+                    source_dir: shadow_dir.source().display().to_string(),
+                    shadow_dir: shadow_dir.path().display().to_string(),
+                    target_txid: Some(txid_arg.to_string()),
+                    target_block: None,
+                    target_block_height: None,
+                    repetitions: Some(params.repetitions),
+                },
+            );
+
+            // Scan for the target transaction
+            bench_events::emit(
+                &ev,
+                BenchEvent::TxidScanStarted {
+                    txid: txid_arg.to_string(),
+                },
+            );
+            let scan_start = Instant::now();
+
+            let scan_result = if let Some(block_header) = app_db
+                .find_block_for_tx_hash_on_chain_tip(txid_arg.as_bytes(), &anchor_tip.id)
+                .await?
+            {
+                TxidScanResult {
+                    block_header,
+                    tx_index: 0,
+                }
+            } else {
+                let ev_scan = ev.clone();
+                let txid_str = txid_arg.to_string();
+                scan_for_txid(
+                    app_db,
+                    shadow_dir.path(),
+                    &anchor_tip,
+                    target_txid,
+                    |scanned, height| {
+                        bench_events::emit(
+                            &ev_scan,
+                            BenchEvent::TxidScanProgress {
+                                scanned,
+                                current_height: height,
+                            },
+                        );
+                        let _ = &txid_str;
+                    },
+                )
+                .await?
+            };
+
+            bench_events::emit(
+                &ev,
+                BenchEvent::TxidScanComplete {
+                    txid: txid_arg.to_string(),
+                    block_id: scan_result.block_header.id.to_string(),
+                    block_height: scan_result.block_header.height,
+                    duration: scan_start.elapsed(),
+                },
+            );
+
+            let target_height = scan_result.block_header.height;
+            let index_start = target_height.saturating_sub(1).max(1);
+            let index_plan = ChainIndexPlan {
+                anchor_tip,
+                start_height: index_start,
+                end_height: target_height,
+            };
+
+            (env, index_plan, Some(scan_result))
+        } else {
+            let (env, index_plan) = setup_bench_env_and_plan(&shadow_dir, params).await?;
+
+            bench_events::emit(
+                &ev,
+                BenchEvent::EnvironmentReady {
+                    chain_id: env.chain_id,
+                    network: env.network.to_string(),
+                    epochs: env.epochs.iter().map(|e| e.to_string()).collect(),
+                    source_dir: shadow_dir.source().display().to_string(),
+                    shadow_dir: shadow_dir.path().display().to_string(),
+                    target_txid: None,
+                    target_block: None,
+                    target_block_height: None,
+                    repetitions: None,
+                },
+            );
+
+            (env, index_plan, None)
+        };
+
+    // --- Indexer pipeline ---
+    let (resolved, block_ids) =
+        run_indexer_pipeline(app_db, &env, index_plan, &interrupted, indexer_ui).await?;
+
+    let (chainstate_model, _) = app_db
+        .get_or_create_chainstate(env.network, env.chain_id, &resolved.anchor_tip, &env.epochs)
+        .await?;
+
+    let bench_context = BenchContext::from_env(
+        &env,
+        resolved.anchor_tip.clone(),
+        resolved.start.clone(),
+        resolved.end.clone(),
+    );
+
+    // --- Resolve target ---
+    let target = match (txid_scan, target_txid) {
+        (Some(scan), Some(txid)) => ResolvedTarget::SingleTx { txid, scan },
+        (None, None) => ResolvedTarget::BlockRange {
+            block_ids,
+            filter: effective_filter,
+        },
+        (Some(_), None) | (None, Some(_)) => {
+            bail!(
+                "inconsistent resolution state: txid_scan and target_txid must both be Some or both be None"
+            )
+        }
+    };
+
+    // --- Build replay plan and execute ---
+    let plan = build_replay_plan(params, target)?;
+
+    execute_replay_plan(
+        app_db,
+        &plan,
+        params,
+        shadow_dir,
+        bench_context,
+        chainstate_model.id,
+        interrupted,
+        &ev,
+    )
+    .await
+}

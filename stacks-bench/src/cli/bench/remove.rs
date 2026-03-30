@@ -1,7 +1,10 @@
 use anyhow::{Result, bail};
 use console::style;
 
-use crate::cli::common::{CliContext, fmt_run_label, fmt_run_name_suffix, run_db_cleanup};
+use crate::cli::common::{
+    CliContext, ExecCommand, fmt_run_label, fmt_run_name_suffix, run_db_cleanup,
+};
+use crate::commands::bench::remove::{self, RemoveResult};
 
 #[derive(clap::Args, Debug)]
 pub struct RemoveArgs {
@@ -15,19 +18,26 @@ pub struct RemoveArgs {
     pub yes: bool,
 }
 
-impl RemoveArgs {
-    pub async fn exec(&self, ctx: &CliContext) -> Result<()> {
+impl ExecCommand for RemoveArgs {
+    type Output = RemoveResult;
+
+    async fn exec(&self, ctx: &CliContext) -> Result<Self::Output> {
+        let interactive = ctx.interactive();
         let mut app_db = ctx.app_db();
 
         // Resolve the set of run IDs to delete
         let run_ids: Vec<i32> = if let Some(ids) = &self.run_id {
             ids.iter().map(|&id| id as i32).collect()
+        } else if !interactive {
+            bail!("--run-id is required in non-interactive mode");
         } else {
-            // Interactive mode: list runs and let the user pick
             let runs = app_db.list_benchmark_runs().await?;
             if runs.is_empty() {
                 cliclack::log::info("No benchmark runs found.")?;
-                return Ok(());
+                return Ok(RemoveResult {
+                    deleted_run_ids: vec![],
+                    message: "No benchmark runs found.".into(),
+                });
             }
 
             let mut select = cliclack::multiselect(format!(
@@ -40,12 +50,15 @@ impl RemoveArgs {
             let chosen: Vec<i32> = select.filter_mode().interact()?;
             if chosen.is_empty() {
                 cliclack::log::info("No runs selected.")?;
-                return Ok(());
+                return Ok(RemoveResult {
+                    deleted_run_ids: vec![],
+                    message: "No runs selected.".into(),
+                });
             }
             chosen
         };
 
-        // Look up each run to validate and display context
+        // Validate runs exist
         let mut runs = Vec::with_capacity(run_ids.len());
         for &id in &run_ids {
             match app_db.get_benchmark_run(id).await? {
@@ -54,34 +67,44 @@ impl RemoveArgs {
             }
         }
 
-        for run in &runs {
-            cliclack::log::step(format!(
-                "Run {}{} started at {}",
-                style(run.id).bold(),
-                fmt_run_name_suffix(run),
-                run.start_time.format("%Y-%m-%d %H:%M:%S"),
-            ))?;
-        }
+        // Interactive confirmation
+        if interactive {
+            for run in &runs {
+                cliclack::log::step(format!(
+                    "Run {}{} started at {}",
+                    style(run.id).bold(),
+                    fmt_run_name_suffix(run),
+                    run.start_time.format("%Y-%m-%d %H:%M:%S"),
+                ))?;
+            }
 
-        if !self.yes {
-            let label = if runs.len() == 1 {
-                format!(
-                    "Delete benchmark run {} and all associated data?",
-                    runs[0].id
-                )
-            } else {
-                format!(
-                    "Delete {} benchmark runs and all associated data?",
-                    runs.len()
-                )
-            };
-            if !cliclack::confirm(label).interact()? {
-                cliclack::log::info("Aborted.")?;
-                return Ok(());
+            if !self.yes {
+                let label = if runs.len() == 1 {
+                    format!(
+                        "Delete benchmark run {} and all associated data?",
+                        runs[0].id
+                    )
+                } else {
+                    format!(
+                        "Delete {} benchmark runs and all associated data?",
+                        runs.len()
+                    )
+                };
+                if !cliclack::confirm(label).interact()? {
+                    cliclack::log::info("Aborted.")?;
+                    return Ok(RemoveResult {
+                        deleted_run_ids: vec![],
+                        message: "Aborted.".into(),
+                    });
+                }
             }
         }
 
-        // Delete each run with its own spinner inside a multi_progress
+        // Delete — non-interactive delegates entirely; interactive shows spinners
+        if !interactive {
+            return remove::delete_benchmark_runs(&mut app_db, &run_ids, true).await;
+        }
+
         let multi = cliclack::multi_progress(format!(
             "Deleting {} benchmark run{}",
             runs.len(),
@@ -97,8 +120,11 @@ impl RemoveArgs {
 
         multi.stop();
 
-        run_db_cleanup(app_db).await?;
+        run_db_cleanup(app_db, false).await?;
 
-        Ok(())
+        Ok(RemoveResult {
+            message: format!("{} benchmark run(s) deleted", run_ids.len()),
+            deleted_run_ids: run_ids,
+        })
     }
 }

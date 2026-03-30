@@ -242,6 +242,14 @@ pub struct BenchmarkRun {
     pub start_time: NaiveDateTime,
     pub end_time: Option<NaiveDateTime>,
     pub args_json: String,
+    pub build_profile: String,
+    pub build_opt_level: String,
+    pub build_debug_assertions: bool,
+    pub build_overflow_checks: bool,
+    pub build_target_triple: String,
+    pub build_rustc_version: String,
+    pub git_branch: Option<String>,
+    pub git_dirty: Option<bool>,
 }
 
 #[derive(Insertable, Queryable, Selectable, Identifiable, Associations, Debug, Clone)]
@@ -393,4 +401,88 @@ pub struct ChainTipCache {
     pub tip_index_hash: Vec<u8>,
     pub height: i64,
     pub index_hash: Vec<u8>,
+}
+
+/// Lightweight summary statistics for a benchmark run.
+#[derive(Debug, Clone)]
+pub struct RunSummary {
+    pub block_count: u64,
+    pub total_duration_us: u64,
+    pub total_execution_us: u64,
+    pub total_commit_us: u64,
+}
+
+/// Full summary statistics for `bench show --summary`.
+#[derive(Debug, Clone)]
+pub struct RunDetailedSummary {
+    pub block_count: u64,
+    pub total_duration_us: u64,
+    pub avg_duration_us: u64,
+    pub total_setup_us: u64,
+    pub total_execution_us: u64,
+    pub total_commit_us: u64,
+    pub total_clarity_runtime: u64,
+    pub total_clarity_read_length: u64,
+    pub total_clarity_read_count: u64,
+    pub total_clarity_write_length: u64,
+    pub total_clarity_write_count: u64,
+    pub total_storage_delta: i64,
+}
+
+/// A hot profiler span for `bench show --profiler-hot`.
+#[derive(Debug, Clone)]
+pub struct ProfilerHotSpan {
+    pub span_name: String,
+    pub span_context: Option<String>,
+    pub est_self_wall_us: f64,
+    pub est_wall_us: f64,
+    pub call_count: i64,
+    pub sample_count: i64,
+    pub file: Option<String>,
+    pub line: Option<i32>,
+}
+
+/// Per-block stats row returned by [`AppDb::get_block_stats`].
+#[derive(Debug, Clone)]
+pub struct BlockStatsRow {
+    pub height: i64,
+    pub block_id: String,
+    pub total_duration_us: i32,
+    pub setup_duration_us: i32,
+    pub execution_duration_us: i32,
+    pub commit_duration_us: i32,
+    pub commit_overhead_baseline_us: i32,
+    pub clarity_runtime: i32,
+    pub clarity_read_length: i32,
+    pub clarity_read_count: i32,
+    pub clarity_write_length: i32,
+    pub clarity_write_count: i32,
+    pub total_storage_delta: i64,
+}
+
+/// Per-tx stats row returned by [`AppDb::get_tx_stats`].
+#[derive(Debug, Clone)]
+pub struct TxStatsRow {
+    pub tx_hash: String,
+    pub tx_type: String,
+    pub block_height: i64,
+    pub duration_us: i32,
+    pub clarity_runtime: i32,
+    pub clarity_read_length: i32,
+    pub clarity_read_count: i32,
+    pub clarity_write_length: i32,
+    pub clarity_write_count: i32,
+}
+
+/// Per-span comparison row returned by [`AppDb::compare_run_spans`].
+#[derive(Debug, Clone)]
+pub struct SpanComparisonRow {
+    pub span_name: String,
+    pub span_context: Option<String>,
+    pub baseline_self_wall_us: Option<f64>,
+    pub candidate_self_wall_us: Option<f64>,
+    pub delta_us: f64,
+    pub delta_pct: Option<f64>,
+    pub baseline_calls: Option<i64>,
+    pub candidate_calls: Option<i64>,
 }
