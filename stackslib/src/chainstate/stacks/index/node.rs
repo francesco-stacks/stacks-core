@@ -596,14 +596,15 @@ impl TriePtr {
             let ptr32 = u32::try_from(self.ptr()).map_err(|_| Error::OverflowError)?;
             w.write_all(&ptr32.to_be_bytes())?;
         }
-        if is_backptr(self.id()) || self.back_block() != 0 {
+        if has_back_block_payload_bytes(encoded_id) {
             w.write_all(&self.back_block().to_be_bytes())?;
         }
         Ok(())
     }
 
     /// The parts of a child pointer that are relevant for consensus are only its ID, path
-    /// character, and referred-to block hash.
+    /// character, and referred-to block hash.  The software doesn't care about the details of how/where
+    /// nodes are stored.
     pub fn write_consensus_bytes<W: Write, M: BlockMap>(
         &self,
         block_map: &mut M,
@@ -667,7 +668,6 @@ impl TriePtr {
     pub fn from_bytes_compressed(bytes: &[u8]) -> TriePtr {
         let encoded_id = clear_compressed(bytes[0]);
         assert!(bytes.len() >= TriePtr::compressed_size_for_id(encoded_id));
-        let has_annotation = has_inline_back_block(encoded_id);
         let id = clear_u64_ptr(clear_inline_back_block(encoded_id));
         let chr = bytes[1];
         let ptr = if is_u64_ptr(encoded_id) {
@@ -678,7 +678,8 @@ impl TriePtr {
             u64::from(u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]))
         };
 
-        let back_block = if is_backptr(id) || has_annotation {
+        let back_block = if has_back_block_payload_bytes(encoded_id) {
+            // Backpointers and squash annotations append a 4-byte `back_block` after the compressed ptr payload.
             let back_block_offset = TriePtr::encoded_size_compressed_for_id(encoded_id);
             assert!(bytes.len() >= back_block_offset + 4);
             u32::from_be_bytes([
@@ -706,7 +707,6 @@ impl TriePtr {
     pub fn read_bytes_compressed<R: Read>(fd: &mut R) -> Result<TriePtr, codec_error> {
         let id_bits: u8 = read_next(fd)?;
         let encoded_id = clear_compressed(id_bits);
-        let has_annotation = has_inline_back_block(encoded_id);
         let id = clear_u64_ptr(clear_inline_back_block(encoded_id));
         let chr: u8 = read_next(fd)?;
         let ptr = if is_u64_ptr(encoded_id) {
@@ -717,7 +717,7 @@ impl TriePtr {
             let ptr_be_bytes: [u8; 4] = read_next(fd)?;
             u64::from(u32::from_be_bytes(ptr_be_bytes))
         };
-        let back_block = if is_backptr(id) || has_annotation {
+        let back_block = if has_back_block_payload_bytes(encoded_id) {
             let bytes: [u8; 4] = read_next(fd)?;
             u32::from_be_bytes(bytes)
         } else {
@@ -1315,7 +1315,6 @@ impl StacksMessageCodec for TrieNodePatch {
     /// - `id` is [`TrieNodeID::Patch`]
     /// - `ptr` is a compressed [`TriePtr`]
     /// - `diff len` is the number of diffs, serialized as `len - 1`
-    /// - `ptr diffs` are compressed [`TriePtr`] entries
     /// - `ptr diffs` are the patch diffs written in compressed format
     ///
     /// # Invariants
@@ -1404,7 +1403,7 @@ impl StacksMessageCodec for TrieNodePatch {
 /// otherwise it is set to `child_block_id`.
 pub(crate) fn node_copy_update_ptrs(ptrs: &mut [TriePtr], child_block_id: u32) {
     for pointer in ptrs.iter_mut() {
-        // if the node is empty, do nothing, if it's a back pointer
+        // if the node is empty, do nothing, if it's a back pointer,
         if pointer.id() == TrieNodeID::Empty as u8 || is_backptr(pointer.id()) {
             continue;
         }

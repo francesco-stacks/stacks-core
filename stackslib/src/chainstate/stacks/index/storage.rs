@@ -1832,10 +1832,6 @@ impl<T: MarfTrieId> TrieStorageTransientData<T> {
         self.cur_block_id = None;
     }
 
-    fn retarget_block(&mut self, bhh: T) {
-        self.cur_block = bhh;
-    }
-
     fn set_squash_info(&mut self, squash_info: Option<SquashInfo>) {
         self.squash_info = squash_info;
     }
@@ -2646,18 +2642,11 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     }
 
     /// Set cached squashing metadata for this storage connection.
-    ///
-    /// Restricted to crate-internal use to prevent accidental mutation by
-    /// external consumers.
     pub(crate) fn set_squash_info(&mut self, squash_info: Option<SquashInfo>) {
         self.data.set_squash_info(squash_info);
     }
 
     /// Returns a reference to the underlying SQLite connection.
-    ///
-    /// Used by squashing code to read/write out-of-trie metadata
-    /// (e.g. root hashes stored in the SQL `marf_squash_archival_marf_roots` table)
-    /// without polluting the trie content.
     pub(crate) fn sqlite_conn(&self) -> &Connection {
         &self.db
     }

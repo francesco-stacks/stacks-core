@@ -1062,7 +1062,7 @@ fn finalize_shared_blob_offsets<T: MarfTrieId>(
     dst: &mut MARF<T>,
     block_at_height: &T,
     squash_root_node_hash: &TrieHash,
-) -> Result<u64, Error> {
+) -> Result<usize, Error> {
     // Persist squash_root_node_hash to SQL.
     {
         let conn = dst.sqlite_conn();

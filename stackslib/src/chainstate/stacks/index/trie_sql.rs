@@ -280,11 +280,13 @@ pub fn bulk_read_block_entries<T: MarfTrieId>(
         let block_id: u32 = row.get(0)?;
         let block_hash: T = row.get(1)?;
         let offset_i64: i64 = row.get(2)?;
-        Ok((block_id, block_hash, offset_i64 as u64))
+        Ok((block_id, block_hash, offset_i64))
     })?;
     let mut result = Vec::new();
     for row in rows {
-        result.push(row?);
+        let (block_id, block_hash, offset_i64) = row?;
+        let offset = u64::try_from(offset_i64).map_err(|_| Error::OverflowError)?;
+        result.push((block_id, block_hash, offset));
     }
     Ok(result)
 }
@@ -332,7 +334,7 @@ pub fn count_blob_offset_mismatches<T: MarfTrieId>(
     expected_length: u64,
     tip_block_hash: &T,
 ) -> Result<u64, Error> {
-    let count: i64 = conn.query_row(
+    let count: u64 = conn.query_row(
         "SELECT COUNT(*) FROM marf_data \
          WHERE (external_offset != ?1 OR external_length != ?2) \
          AND block_hash != ?3 \
@@ -344,7 +346,7 @@ pub fn count_blob_offset_mismatches<T: MarfTrieId>(
         ],
         |row| row.get(0),
     )?;
-    Ok(count as u64)
+    Ok(count)
 }
 
 /// Bulk-update all `marf_data` entries to share the same blob offset/length,
@@ -355,13 +357,13 @@ pub fn bulk_update_blob_offsets<T: MarfTrieId>(
     offset: u64,
     length: u64,
     tip_block_hash: &T,
-) -> Result<u64, Error> {
-    let affected = conn.execute(
+) -> Result<usize, Error> {
+    conn.execute(
         "UPDATE marf_data SET external_offset = ?1, external_length = ?2 \
          WHERE block_hash != ?3 AND unconfirmed = 0",
         params![u64_to_sql(offset)?, u64_to_sql(length)?, tip_block_hash],
-    )?;
-    Ok(affected as u64)
+    )
+    .map_err(|e| e.into())
 }
 
 fn get_schema_version(conn: &Connection) -> u64 {
