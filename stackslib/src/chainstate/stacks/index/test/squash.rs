@@ -77,7 +77,7 @@ fn test_squash_to_path_outputs_data() {
         1,
     );
 
-    assert!(stats.leaf_count > 0);
+    assert!(stats.node_count > 0);
     assert!(dst_db_path.exists());
     assert!(PathBuf::from(format!("{}.blobs", dst_db_path.display())).exists());
 
@@ -285,6 +285,101 @@ fn test_validate_detects_wrong_height() {
     assert!(
         !stats.archival_root_matches,
         "Expected squash root mismatch when validating at wrong height: {stats:?}"
+    );
+}
+
+/// Verify that `get_root_hash_at` and `get_block_height_of` return correct
+/// per-height values for blocks *inside* the squashed range.  Without the
+/// squash-aware overrides these would return the shared blob's root hash
+/// (wrong) and the squash height H (wrong) for every historical block.
+#[test]
+fn test_squashed_historical_root_hash_and_height() {
+    let dir = tempdir().unwrap();
+    let archival_path = dir.path().join("archival.sqlite");
+    let (mut archival, blocks, _) = setup_marf(archival_path.to_str().unwrap(), 5, 1);
+
+    // Collect archival root hashes and heights for blocks inside range.
+    let archival_roots: Vec<TrieHash> = (0..=4)
+        .map(|i| archival.get_root_hash_at(&blocks[i]).unwrap())
+        .collect();
+
+    // Squash at height 4 (blocks 0..=4 are in the squashed range).
+    let (squashed_path, _) = squash_helper(
+        archival_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        4,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let mut squashed =
+        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    // (a) get_root_hash_at must return the archival per-height root, not
+    //     the shared squash blob root.
+    for i in 0..=4 {
+        let sq_root = squashed.get_root_hash_at(&blocks[i]).unwrap();
+        assert_eq!(
+            archival_roots[i], sq_root,
+            "root hash mismatch at height {i} (inside squashed range)"
+        );
+    }
+
+    // (b) get_block_height_of must return the correct per-block height,
+    //     not the squash height (4) for all of them.
+    for i in 0..=4usize {
+        let h = squashed
+            .get_block_height_of(&blocks[i], &blocks[4])
+            .unwrap()
+            .expect("height should be Some");
+        assert_eq!(
+            h, i as u32,
+            "height mismatch for block at index {i}: expected {i}, got {h}"
+        );
+    }
+
+    // (c) The archival roots should not all be identical (sanity).
+    assert_ne!(archival_roots[0], archival_roots[4]);
+}
+
+/// Verify that `test_squash_info_detected_on_open` also asserts the
+/// squash_root_node_hash from the SQL table.
+#[test]
+fn test_squash_info_sql_squash_root_asserted() {
+    let dir = tempdir().unwrap();
+    let src_db_path = dir.path().join("index.sqlite");
+    let _ = setup_marf(src_db_path.to_str().unwrap(), 2, 1);
+
+    let (dst_db_path, _) = squash_helper(
+        src_db_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        1,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let mut squashed =
+        MARF::<StacksBlockId>::from_path(dst_db_path.to_str().unwrap(), open_opts).unwrap();
+
+    let (_, sql_squash_root, _) = trie_sql::read_squash_info(squashed.sqlite_conn())
+        .unwrap()
+        .expect("SQL squash info missing");
+
+    let cached_root = squashed
+        .with_conn(|conn| -> Result<TrieHash, Error> {
+            Ok(conn.squash_info().unwrap().squash_root_node_hash)
+        })
+        .unwrap();
+
+    // sql_squash_root may be None if not yet computed (squash_to_path sets
+    // it after blob commit).  If present, it must match the cached value.
+    if let Some(sql_root) = sql_squash_root {
+        assert_eq!(sql_root, cached_root, "cached vs SQL squash root mismatch");
+    }
+    // Either way, the cached root must not be the zero hash (squash_to_path
+    // computes and stores it).
+    assert_ne!(
+        cached_root,
+        TrieHash::from_data(&[]),
+        "squash root node hash should be populated after squash"
     );
 }
 
@@ -1378,7 +1473,7 @@ fn test_squash_internal_blobs_roundtrip() {
     )
     .unwrap();
 
-    assert!(stats.leaf_count > 0, "squash should copy leaves");
+    assert!(stats.node_count > 0, "squash should copy leaves");
     assert!(dst_db_path.exists(), "squashed DB should exist");
 
     // Squashed output is always externalized, even when the source MARF is inline.

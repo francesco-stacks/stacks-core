@@ -759,16 +759,39 @@ impl Trie {
         // Using that value would produce the wrong number of ancestors.
         // Instead, look up the actual height from the SQL side-table that
         // was populated during squashing.
-        let cur_block_height = if let Some(h) = storage.squash_info().and_then(|_| {
-            match trie_sql::read_squash_block_height(storage.sqlite_conn(), &cur_block_header) {
-                Ok(opt) => opt,
-                Err(e) => {
-                    warn!("Failed to read squash block height for {cur_block_header}: {e:?}; falling back to trie lookup");
-                    None
+        let cur_block_height = if storage.squash_info().is_some() {
+            // Try the squash side-table first.  Blocks within the squashed
+            // range (0..=H) MUST be resolved here because the trie would
+            // return H for all of them.  Blocks extended after squashing
+            // are not in the side-table and fall through to the trie path.
+            match trie_sql::read_squash_block_height(storage.sqlite_conn(), &cur_block_header)? {
+                Some(h) => h,
+                None => {
+                    // Not in the side-table — must be a post-squash block.
+                    let h = MARF::get_block_height_miner_tip(
+                        storage,
+                        &cur_block_header,
+                        &cur_block_header,
+                    )?
+                    .ok_or_else(|| {
+                        Error::CorruptionError(format!(
+                            "Could not obtain block height for block {}: got None",
+                            &cur_block_header
+                        ))
+                    })?;
+                    // Sanity: a post-squash block must be above the squash height.
+                    if let Some(info) = storage.squash_info() {
+                        if h <= info.height {
+                            return Err(Error::CorruptionError(format!(
+                                "Block {cur_block_header} at height {h} is within squashed \
+                                 range (0..={}) but missing from marf_squash_block_heights",
+                                info.height
+                            )));
+                        }
+                    }
+                    h
                 }
             }
-        }) {
-            h
         } else {
             MARF::get_block_height_miner_tip(storage, &cur_block_header, &cur_block_header)
                 .map_err(|e| match e {

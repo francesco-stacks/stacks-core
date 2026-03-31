@@ -41,7 +41,9 @@ use crate::chainstate::stacks::index::storage::{
     TrieStorageTransaction,
 };
 use crate::chainstate::stacks::index::trie::Trie;
-use crate::chainstate::stacks::index::{Error, MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof};
+use crate::chainstate::stacks::index::{
+    trie_sql, Error, MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof,
+};
 use crate::util_lib::db::Error as db_error;
 
 pub const BLOCK_HASH_TO_HEIGHT_MAPPING_KEY: &str = "__MARF_BLOCK_HASH_TO_HEIGHT";
@@ -1374,6 +1376,16 @@ impl<T: MarfTrieId> MARF<T> {
             //   when the trie struct is tested outside of marf.rs usage
             if storage.test_genesis_block.as_ref() == Some(current_block_hash) {
                 return Ok(Some(0));
+            }
+        }
+
+        // In a squashed MARF, OWN_BLOCK_HEIGHT_KEY returns the squash
+        // height H for every block in the squashed range.  Use the
+        // side-table when available.
+        if storage.squash_info().is_some() {
+            if let Some(h) = trie_sql::read_squash_block_height(storage.sqlite_conn(), block_hash)?
+            {
+                return Ok(Some(h));
             }
         }
 

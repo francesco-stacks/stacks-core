@@ -850,8 +850,8 @@ pub const MARF_SQUASHED_BLOCK_ROOT_HASH_KEY: &str = "__MARF_SQUASHED_BLOCK_ROOT_
 /// Summary statistics from a squashing run.
 #[derive(Debug, Clone)]
 pub struct SquashStats {
-    /// Total number of leaves copied into the squashed MARF.
-    pub leaf_count: u64,
+    /// Total number of nodes collected into the squashed MARF.
+    pub node_count: u64,
 }
 
 /// Summary statistics from a validation run.
@@ -1162,8 +1162,9 @@ impl<T: MarfTrieId> MARF<T> {
         // Derive the temp directory from dst_path: use the parent directory.
         let tmp_dir = std::path::Path::new(dst_path)
             .parent()
+            .filter(|p| !p.as_os_str().is_empty())
             .and_then(|p| p.to_str())
-            .unwrap_or("/tmp");
+            .unwrap_or(".");
         log_memory_snapshot("before trie DFS");
         info!("[{label}] [3/8] Collect trie nodes: starting DFS...");
         let start = Instant::now();
@@ -1351,9 +1352,7 @@ impl<T: MarfTrieId> MARF<T> {
             fmt_duration(overall_start.elapsed())
         );
 
-        Ok(SquashStats {
-            leaf_count: node_count,
-        })
+        Ok(SquashStats { node_count })
     }
 
     /// DFS collection pass: gather all trie nodes reachable from `block_hash`.

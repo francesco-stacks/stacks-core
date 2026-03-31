@@ -190,7 +190,7 @@ pub fn squash_and_copy_one(
     };
 
     println!("Squash complete ({label}) at height {height}");
-    println!("Leaf count: {}", stats.leaf_count);
+    println!("Node count: {}", stats.node_count);
     println!(
         "Original: db={original_db_size} bytes, blobs={original_blobs_size} bytes, total={original_total} bytes"
     );
