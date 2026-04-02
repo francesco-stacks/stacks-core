@@ -240,7 +240,7 @@ pub fn copy_confirmed_epoch2_microblocks(
     )
     .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{src_index_path}' AS src"))
+    conn.execute("ATTACH DATABASE ?1 AS src", params![src_index_path])
         .map_err(Error::SQLError)?;
 
     let (selected_hashes, selected_parents, mut stats) = derive_confirmed_microblock_set(&conn)?;
@@ -388,7 +388,7 @@ pub fn copy_nakamoto_staging_blocks(
     )
     .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{src_nakamoto_path}' AS src"))
+    conn.execute("ATTACH DATABASE ?1 AS src", params![src_nakamoto_path])
         .map_err(Error::SQLError)?;
 
     clone_schemas_from_source(&conn, &["nakamoto_staging_blocks", "db_version"])?;
@@ -396,7 +396,7 @@ pub fn copy_nakamoto_staging_blocks(
     conn.execute("INSERT INTO db_version SELECT * FROM src.db_version", [])
         .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{squashed_index_path}' AS idx"))
+    conn.execute("ATTACH DATABASE ?1 AS idx", params![squashed_index_path])
         .map_err(Error::SQLError)?;
 
     conn.execute(
@@ -438,7 +438,7 @@ pub fn validate_microblock_streams(
     )
     .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{src_index_path}' AS src"))
+    conn.execute("ATTACH DATABASE ?1 AS src", params![src_index_path])
         .map_err(Error::SQLError)?;
 
     let (selected_hashes, selected_parents, _stats) = derive_confirmed_microblock_set(&conn)?;
@@ -514,10 +514,10 @@ pub fn validate_nakamoto_staging_blocks(
     )
     .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{src_nakamoto_path}' AS src"))
+    conn.execute("ATTACH DATABASE ?1 AS src", params![src_nakamoto_path])
         .map_err(Error::SQLError)?;
 
-    conn.execute_batch(&format!("ATTACH DATABASE '{squashed_index_path}' AS idx"))
+    conn.execute("ATTACH DATABASE ?1 AS idx", params![squashed_index_path])
         .map_err(Error::SQLError)?;
 
     let metadata_columns = "block_hash, consensus_hash, parent_block_id, is_tenure_start, \

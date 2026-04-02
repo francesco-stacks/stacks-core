@@ -298,13 +298,13 @@ fn test_validate_index_side_tables_detects_extra_rows() {
 
 use super::sortition::{copy_sortition_side_tables, validate_sortition_side_tables};
 use crate::chainstate::burn::db::sortdb::{
-    SORTITION_DB_INITIAL_SCHEMA, SORTITION_DB_SCHEMA_10, SORTITION_DB_SCHEMA_2,
-    SORTITION_DB_SCHEMA_3, SORTITION_DB_SCHEMA_4, SORTITION_DB_SCHEMA_5, SORTITION_DB_SCHEMA_6,
-    SORTITION_DB_SCHEMA_7, SORTITION_DB_SCHEMA_8, SORTITION_DB_SCHEMA_9,
+    SORTITION_DB_INITIAL_SCHEMA, SORTITION_DB_SCHEMA_10, SORTITION_DB_SCHEMA_11,
+    SORTITION_DB_SCHEMA_2, SORTITION_DB_SCHEMA_3, SORTITION_DB_SCHEMA_4, SORTITION_DB_SCHEMA_5,
+    SORTITION_DB_SCHEMA_6, SORTITION_DB_SCHEMA_7, SORTITION_DB_SCHEMA_8, SORTITION_DB_SCHEMA_9,
 };
 
 /// Create a sortition source DB with the real schema (all migrations
-/// through schema 10). Applies only the DDL; epoch data inserts are
+/// through schema 11). Applies only the DDL; epoch data inserts are
 /// skipped since tests only need the table structure.
 fn create_sortition_source_db(path: &std::path::Path) -> Connection {
     let conn = Connection::open(path).unwrap();
@@ -338,8 +338,11 @@ fn create_sortition_source_db(path: &std::path::Path) -> Connection {
     for cmd in SORTITION_DB_SCHEMA_10 {
         conn.execute_batch(cmd).unwrap();
     }
+    for cmd in SORTITION_DB_SCHEMA_11 {
+        conn.execute_batch(cmd).unwrap();
+    }
     conn.execute(
-        "INSERT OR REPLACE INTO db_config (version) VALUES ('10')",
+        "INSERT OR REPLACE INTO db_config (version) VALUES ('11')",
         [],
     )
     .unwrap();
@@ -796,6 +799,69 @@ fn test_sortition_optional_table_asymmetry() {
     assert!(
         !validation.is_valid(),
         "asymmetric optional table must fail"
+    );
+}
+
+#[test]
+fn test_sortition_stacks_chain_tips_by_burn_view_copied() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src_sort.sqlite");
+    let conn = create_sortition_source_db(&src_path);
+
+    // Insert canonical snapshots.
+    insert_snapshot(&conn, "sort_0", "bhh_0", 0);
+    insert_snapshot(&conn, "sort_1", "bhh_1", 1);
+    insert_epoch(&conn, 0, 2);
+
+    // Insert stacks_chain_tips_by_burn_view rows (schema 11 table).
+    // consensus_hash and burn_view_consensus_hash must reference
+    // existing snapshots(consensus_hash) due to FK constraints.
+    conn.execute(
+        "INSERT INTO stacks_chain_tips_by_burn_view \
+         (sortition_id, consensus_hash, burn_view_consensus_hash, block_hash, block_height) \
+         VALUES ('sort_0', 'ch_sort_0', 'ch_sort_0', 'bh_0', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO stacks_chain_tips_by_burn_view \
+         (sortition_id, consensus_hash, burn_view_consensus_hash, block_hash, block_height) \
+         VALUES ('sort_1', 'ch_sort_1', 'ch_sort_1', 'bh_1', 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_sort.sqlite");
+    create_sortition_dest_db(&dst_path, &["sort_0", "sort_1"]);
+
+    let stats =
+        copy_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap()).unwrap();
+
+    // The stats struct should reflect the copied rows.
+    assert_eq!(
+        stats.stacks_chain_tips_by_burn_view_rows, 2,
+        "stats should report 2 stacks_chain_tips_by_burn_view rows"
+    );
+
+    // Verify the rows actually exist in the destination.
+    let dst_conn = Connection::open(&dst_path).unwrap();
+    let count: i64 = dst_conn
+        .query_row(
+            "SELECT COUNT(*) FROM stacks_chain_tips_by_burn_view",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+
+    // Validation should pass.
+    let validation =
+        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .unwrap();
+    assert!(
+        validation.is_valid(),
+        "validation should pass: {validation:?}"
     );
 }
 

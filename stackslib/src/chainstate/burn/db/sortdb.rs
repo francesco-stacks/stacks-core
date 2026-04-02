@@ -726,7 +726,7 @@ pub(crate) static SORTITION_DB_SCHEMA_9: &[&str] =
     &[r#"ALTER TABLE block_commits ADD punished TEXT DEFAULT NULL;"#];
 pub(crate) static SORTITION_DB_SCHEMA_10: &[&str] = &[r#"DROP TABLE IF EXISTS ast_rule_heights;"#];
 
-static SORTITION_DB_SCHEMA_11: &[&str] = &[r#"
+pub(crate) static SORTITION_DB_SCHEMA_11: &[&str] = &[r#"
     -- replacement for `stacks_chain_tips`, which considers the Nakamoto block burn view.
     -- Unlike `stacks_chain_tips`, rows in this table are only inserted for Nakamoto blocks
     -- if they happen to have the same burn view as the given sortition.

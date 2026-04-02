@@ -453,9 +453,10 @@ fn print_sortition_side_table_validation(v: &SortitionSideTableValidation) {
         v.snapshot_transition_ops_match
     );
     println!("  stacks_chain_tips_match: {}", v.stacks_chain_tips_match);
-    if let Some(m) = v.stacks_chain_tips_by_burn_view_match {
-        println!("  stacks_chain_tips_by_burn_view_match: {m}");
-    }
+    println!(
+        "  stacks_chain_tips_by_burn_view_match: {}",
+        v.stacks_chain_tips_by_burn_view_match
+    );
     println!(
         "  preprocessed_reward_sets_match: {}",
         v.preprocessed_reward_sets_match
@@ -470,9 +471,6 @@ fn print_sortition_side_table_validation(v: &SortitionSideTableValidation) {
     );
     println!("  epochs_match: {}", v.epochs_match);
     println!("  db_config_match: {}", v.db_config_match);
-    if let Some(m) = v.ast_rule_heights_match {
-        println!("  ast_rule_heights_match: {m}");
-    }
     if let Some(m) = v.snapshot_burn_distributions_match {
         println!("  snapshot_burn_distributions_match: {m}");
     }

@@ -18,8 +18,8 @@ use stacks_common::types::chainstate::SortitionId;
 
 use super::common::{
     check_optional_table_match, clone_optional_schemas_from_source, clone_schemas_from_source,
-    copy_canonical_fork_storage, execute_copy_specs, full_row_except_match, table_exists,
-    TableCopySpec,
+    collect_leaf_value_hashes, copy_canonical_fork_storage, execute_copy_specs,
+    full_row_except_match, table_exists, TableCopySpec,
 };
 use crate::chainstate::stacks::index::Error;
 
@@ -32,6 +32,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "block_commit_parents",
     "snapshot_transition_ops",
     "stacks_chain_tips",
+    "stacks_chain_tips_by_burn_view",
     "missed_commits",
     "stack_stx",
     "transfer_stx",
@@ -43,9 +44,7 @@ const REQUIRED_TABLES: &[&str] = &[
 
 /// Optional sortition tables (may not exist in all source DBs).
 const OPTIONAL_TABLES: &[&str] = &[
-    "stacks_chain_tips_by_burn_view", // added in SORTITION_DB_SCHEMA_11
-    "ast_rule_heights",               // dropped by SORTITION_DB_SCHEMA_10
-    "snapshot_burn_distributions",    // test-only (#[cfg(test)])
+    "snapshot_burn_distributions", // test-only (#[cfg(test)])
 ];
 
 /// Row-count statistics returned by [`copy_sortition_side_tables`].
@@ -87,7 +86,7 @@ pub struct SortitionSideTableValidation {
     pub block_commit_parents_match: bool,
     pub snapshot_transition_ops_match: bool,
     pub stacks_chain_tips_match: bool,
-    pub stacks_chain_tips_by_burn_view_match: Option<bool>,
+    pub stacks_chain_tips_by_burn_view_match: bool,
     pub preprocessed_reward_sets_match: bool,
     pub missed_commits_match: bool,
     pub stack_stx_match: bool,
@@ -97,7 +96,6 @@ pub struct SortitionSideTableValidation {
     pub epochs_match: bool,
     pub db_config_match: bool,
     pub fork_storage_match: bool,
-    pub ast_rule_heights_match: Option<bool>,
     pub snapshot_burn_distributions_match: Option<bool>,
 }
 
@@ -111,7 +109,7 @@ impl SortitionSideTableValidation {
             && self.block_commit_parents_match
             && self.snapshot_transition_ops_match
             && self.stacks_chain_tips_match
-            && self.stacks_chain_tips_by_burn_view_match.unwrap_or(true)
+            && self.stacks_chain_tips_by_burn_view_match
             && self.preprocessed_reward_sets_match
             && self.missed_commits_match
             && self.stack_stx_match
@@ -121,7 +119,6 @@ impl SortitionSideTableValidation {
             && self.epochs_match
             && self.db_config_match
             && self.fork_storage_match
-            && self.ast_rule_heights_match.unwrap_or(true)
             && self.snapshot_burn_distributions_match.unwrap_or(true)
     }
 }
@@ -192,6 +189,12 @@ fn sortition_copy_specs() -> Vec<TableCopySpec> {
             table: "stacks_chain_tips",
             source_sql: format!(
                 "SELECT * FROM src.stacks_chain_tips WHERE sortition_id IN ({sid})"
+            ),
+        },
+        TableCopySpec {
+            table: "stacks_chain_tips_by_burn_view",
+            source_sql: format!(
+                "SELECT * FROM src.stacks_chain_tips_by_burn_view WHERE sortition_id IN ({sid})"
             ),
         },
         TableCopySpec {
@@ -301,17 +304,10 @@ fn copy_sortition_tables_inner(
     let results = execute_copy_specs(conn, &specs)?;
 
     // Optional tables: copy if present in source.
-    for (table, filter) in [
-        (
-            "stacks_chain_tips_by_burn_view",
-            " WHERE sortition_id IN (SELECT sortition_id FROM canonical_sortitions)",
-        ),
-        ("ast_rule_heights", ""),
-        (
-            "snapshot_burn_distributions",
-            " WHERE sortition_id IN (SELECT sortition_id FROM canonical_sortitions)",
-        ),
-    ] {
+    for (table, filter) in [(
+        "snapshot_burn_distributions",
+        " WHERE sortition_id IN (SELECT sortition_id FROM canonical_sortitions)",
+    )] {
         let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM src.sqlite_master WHERE type='table' AND name=?1",
@@ -463,10 +459,10 @@ pub fn validate_sortition_side_tables(
         "SELECT * FROM stacks_chain_tips",
         &format!("SELECT * FROM src.stacks_chain_tips WHERE sortition_id IN ({sid})"),
     );
-    let stacks_chain_tips_by_burn_view_match = check_optional_table_match(
+    let stacks_chain_tips_by_burn_view_match = full_row_except_match(
         &conn,
-        "stacks_chain_tips_by_burn_view",
-        Some(&format!("WHERE sortition_id IN ({sid})")),
+        &format!("SELECT * FROM stacks_chain_tips_by_burn_view WHERE sortition_id IN ({sid})"),
+        &format!("SELECT * FROM src.stacks_chain_tips_by_burn_view WHERE sortition_id IN ({sid})"),
     );
     let preprocessed_reward_sets_match = full_row_except_match(
         &conn,
@@ -510,28 +506,60 @@ pub fn validate_sortition_side_tables(
         "SELECT * FROM src.db_config",
     );
 
-    // __fork_storage: canonical-only copy. Destination is a subset of source.
+    // __fork_storage: canonical-only copy. Validate against the canonical
+    // filtered source set (same leaf-hash filter used by copy_canonical_fork_storage).
     let fork_storage_match = {
         let dst_has = table_exists(&conn, "", "__fork_storage");
         let src_has = table_exists(&conn, "src", "__fork_storage");
         match (dst_has, src_has) {
-            (false, false) => true, // neither has it (test fixtures)
+            (false, false) => true,
             (true, true) => {
-                // No destination rows should be absent from source.
-                conn.query_row(
-                    "SELECT COUNT(*) FROM (SELECT * FROM __fork_storage EXCEPT SELECT * FROM src.__fork_storage)",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(1)
-                    == 0
+                let has_marf_data = table_exists(&conn, "", "marf_data");
+
+                if has_marf_data {
+                    let (_tip, leaf_hashes) = collect_leaf_value_hashes::<SortitionId>(dst_path)?;
+
+                    conn.execute_batch(
+                        "CREATE TEMP TABLE val_fork_leaf_values (value_hash TEXT PRIMARY KEY)",
+                    )
+                    .map_err(Error::SQLError)?;
+
+                    {
+                        let mut stmt = conn
+                            .prepare(
+                                "INSERT OR IGNORE INTO val_fork_leaf_values (value_hash) VALUES (?1)",
+                            )
+                            .map_err(Error::SQLError)?;
+                        for hash in &leaf_hashes {
+                            stmt.execute([hash]).map_err(Error::SQLError)?;
+                        }
+                    }
+
+                    let ok = full_row_except_match(
+                        &conn,
+                        "SELECT * FROM __fork_storage",
+                        "SELECT f.* FROM src.__fork_storage f \
+                         INNER JOIN val_fork_leaf_values lv ON f.value_hash = lv.value_hash",
+                    );
+
+                    conn.execute_batch("DROP TABLE IF EXISTS val_fork_leaf_values")
+                        .map_err(Error::SQLError)?;
+
+                    ok
+                } else {
+                    // fixture fallback, matching copy_canonical_fork_storage()
+                    full_row_except_match(
+                        &conn,
+                        "SELECT * FROM __fork_storage",
+                        "SELECT * FROM src.__fork_storage",
+                    )
+                }
             }
-            _ => false, // mismatch: one has it, other doesn't
+            _ => false,
         }
     };
 
     // Optional tables
-    let ast_rule_heights_match = check_optional_table_match(&conn, "ast_rule_heights", None);
     let snapshot_burn_distributions_match = check_optional_table_match(
         &conn,
         "snapshot_burn_distributions",
@@ -562,7 +590,6 @@ pub fn validate_sortition_side_tables(
         epochs_match,
         db_config_match,
         fork_storage_match,
-        ast_rule_heights_match,
         snapshot_burn_distributions_match,
     })
 }
