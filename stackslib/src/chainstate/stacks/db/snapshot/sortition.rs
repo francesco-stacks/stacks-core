@@ -461,7 +461,7 @@ pub fn validate_sortition_side_tables(
     );
     let stacks_chain_tips_by_burn_view_match = full_row_except_match(
         &conn,
-        &format!("SELECT * FROM stacks_chain_tips_by_burn_view WHERE sortition_id IN ({sid})"),
+        "SELECT * FROM stacks_chain_tips_by_burn_view",
         &format!("SELECT * FROM src.stacks_chain_tips_by_burn_view WHERE sortition_id IN ({sid})"),
     );
     let preprocessed_reward_sets_match = full_row_except_match(
