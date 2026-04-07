@@ -2192,7 +2192,7 @@ fn test_burnchain_db_missing_source_is_error() {
         sort_path.to_str().unwrap(),
         0,
     );
-    // Should error because the source tables don't exist when ATTACHed.
+    // Should error because the source file does not exist.
     assert!(result.is_err());
 }
 
@@ -2389,7 +2389,6 @@ fn test_spv_headers_copy_and_validate() {
 
     let stats =
         super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 4500)
-            .unwrap()
             .unwrap();
 
     // Headers 0..=4500 = 4501 rows.
@@ -2404,7 +2403,6 @@ fn test_spv_headers_copy_and_validate() {
         dst_path.to_str().unwrap(),
         4500,
     )
-    .unwrap()
     .unwrap();
     assert!(v.is_valid(), "validation failed: {v:?}");
 }
@@ -2427,7 +2425,6 @@ fn test_spv_headers_chain_work_boundary_0() {
 
     let stats =
         super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0)
-            .unwrap()
             .unwrap();
 
     assert_eq!(stats.headers_rows, 1);
@@ -2457,7 +2454,6 @@ fn test_spv_headers_chain_work_boundary_2015() {
 
     let stats =
         super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 2015)
-            .unwrap()
             .unwrap();
 
     assert_eq!(stats.headers_rows, 2016);
@@ -2487,7 +2483,6 @@ fn test_spv_headers_chain_work_boundary_2016() {
 
     let stats =
         super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 2016)
-            .unwrap()
             .unwrap();
 
     assert_eq!(stats.headers_rows, 2017);
@@ -2520,7 +2515,6 @@ fn test_spv_headers_chain_work_boundary_4031() {
 
     let stats =
         super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 4031)
-            .unwrap()
             .unwrap();
 
     assert_eq!(stats.headers_rows, 4032);
@@ -2554,7 +2548,6 @@ fn test_spv_headers_chain_work_boundary_4032() {
 
     let stats =
         super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 4032)
-            .unwrap()
             .unwrap();
 
     assert_eq!(stats.headers_rows, 4033);
@@ -2563,15 +2556,14 @@ fn test_spv_headers_chain_work_boundary_4032() {
 }
 
 #[test]
-fn test_spv_headers_missing_source_returns_none() {
+fn test_spv_headers_missing_source_is_error() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("nonexistent.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
 
     let result =
-        super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 100)
-            .unwrap();
-    assert!(result.is_none());
+        super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 100);
+    assert!(result.is_err(), "missing source should error");
 }
 
 #[test]
@@ -2591,7 +2583,7 @@ fn test_spv_headers_validate_source_present_dest_missing_fails() {
 }
 
 #[test]
-fn test_spv_headers_validate_both_absent_passes() {
+fn test_spv_headers_validate_both_absent_is_error() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("no_src.sqlite");
     let dst_path = dir.path().join("no_dst.sqlite");
@@ -2600,9 +2592,8 @@ fn test_spv_headers_validate_both_absent_passes() {
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         100,
-    )
-    .unwrap();
-    assert!(result.is_none());
+    );
+    assert!(result.is_err(), "both absent should error");
 }
 
 #[test]
@@ -2693,7 +2684,7 @@ fn test_burnchain_db_validate_detects_missing_canonical_hash() {
 }
 
 #[test]
-fn test_spv_headers_stale_destination_removed_when_source_absent() {
+fn test_spv_headers_stale_destination_errors_when_source_absent() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("nonexistent.sqlite");
     let dst_path = dir.path().join("stale_headers.sqlite");
@@ -2703,13 +2694,10 @@ fn test_spv_headers_stale_destination_removed_when_source_absent() {
     assert!(dst_path.exists());
 
     let result =
-        super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 100)
-            .unwrap();
-
-    assert!(result.is_none());
+        super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 100);
     assert!(
-        !dst_path.exists(),
-        "stale destination should be removed when source is absent"
+        result.is_err(),
+        "missing source should error even with stale destination"
     );
 }
 
@@ -2812,13 +2800,11 @@ fn test_spv_headers_reused_output_dir() {
 
     // First copy.
     super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 10)
-        .unwrap()
         .unwrap();
 
     // Second copy into the same destination (reused output dir).
     let stats =
         super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 10)
-            .unwrap()
             .unwrap();
 
     assert_eq!(stats.headers_rows, 11);
@@ -2829,7 +2815,6 @@ fn test_spv_headers_reused_output_dir() {
         dst_path.to_str().unwrap(),
         10,
     )
-    .unwrap()
     .unwrap();
     assert!(
         v.is_valid(),

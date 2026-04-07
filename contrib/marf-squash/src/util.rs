@@ -55,6 +55,17 @@ pub fn compute_checksums(
         checksums.insert(rel_str, hash);
     }
 
+    // When an expected set is provided, verify all expected files were found.
+    if let Some(expected) = expected_files {
+        for name in expected {
+            if !checksums.contains_key(name) {
+                return Err(format!(
+                    "expected file missing from output directory: {name}"
+                ));
+            }
+        }
+    }
+
     Ok(checksums)
 }
 

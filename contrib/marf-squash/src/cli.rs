@@ -50,7 +50,7 @@ pub struct SquashArgs {
     /// Squash the Sortition MARF (burnchain/sortition/marf.sqlite).
     #[arg(long)]
     pub sortition: bool,
-    /// Squash all three MARFs (Clarity, Index, Sortition).
+    /// Squash all three MARFs and copy all auxiliary data (blocks + bitcoin).
     #[arg(long)]
     pub all: bool,
     /// Copy canonical block data (epoch 2.x files, confirmed microblocks, nakamoto.sqlite).

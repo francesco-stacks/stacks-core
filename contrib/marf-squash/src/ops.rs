@@ -613,7 +613,7 @@ pub fn validate_bitcoin_aux_files(
         dst_hdr.to_str().unwrap(),
         burn_height,
     ) {
-        Ok(Some(v)) => {
+        Ok(v) => {
             println!("  spv_headers_match: {}", v.headers_match);
             println!("  spv_chain_work_match: {}", v.chain_work_match);
             println!("  spv_db_config_match: {}", v.db_config_match);
@@ -621,9 +621,6 @@ pub fn validate_bitcoin_aux_files(
             if !v.is_valid() {
                 valid = false;
             }
-        }
-        Ok(None) => {
-            println!("  headers.sqlite: both absent, skipped");
         }
         Err(e) => {
             eprintln!("  headers.sqlite validation error: {e:?}");
@@ -674,14 +671,11 @@ pub fn copy_bitcoin_aux_files(
         dst_hdr.to_str().unwrap(),
         burn_height,
     ) {
-        Ok(Some(spv_stats)) => {
+        Ok(spv_stats) => {
             println!(
                 "  headers={}, chain_work={}",
                 spv_stats.headers_rows, spv_stats.chain_work_rows
             );
-        }
-        Ok(None) => {
-            println!("  headers.sqlite not found in source (will be rebuilt on startup)");
         }
         Err(e) => {
             eprintln!("Failed to copy headers.sqlite: {e:?}");
