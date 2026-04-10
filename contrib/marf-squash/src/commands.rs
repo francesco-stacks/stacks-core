@@ -12,7 +12,8 @@ use crate::util::{
     bitcoin_height_to_sortition_marf_height, build_pox_constants, chainstate_paths,
     enforce_minimum_tenure_height, ensure_flag_requires, ensure_targets_selected,
     find_tenure_end_stacks_height, read_db_config, read_first_burn_height, selected_targets,
-    squash_marf_open_opts, target_out_paths, target_out_paths_sortition, warn_if_in_prepare_phase,
+    sortition_open_opts_for_path, squash_marf_open_opts, target_out_paths,
+    target_out_paths_sortition, warn_if_in_prepare_phase,
 };
 use crate::verify::verify_gss;
 
@@ -143,7 +144,7 @@ pub fn run_squash(args: SquashArgs) {
             &out,
             sortition_marf_height,
             SideTableMode::Sortition,
-            sortition_open_opts(),
+            sortition_open_opts_for_path(&paths.sortition.db),
         );
         sortition_out = Some((out, sortition_marf_height));
     }
@@ -331,7 +332,7 @@ pub fn run_squash(args: SquashArgs) {
                 *marf_height,
                 args.full,
                 SideTableMode::Sortition,
-                sortition_open_opts(),
+                sortition_open_opts_for_path(&paths.sortition.db),
             ) {
                 all_valid = false;
             }
@@ -485,7 +486,7 @@ pub fn run_validate(args: ValidateArgs) {
             sortition_marf_height,
             args.full,
             SideTableMode::Sortition,
-            sortition_open_opts(),
+            sortition_open_opts_for_path(&source_paths.sortition.db),
         )
     {
         all_valid = false;

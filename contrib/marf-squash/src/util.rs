@@ -415,10 +415,6 @@ pub fn squash_marf_open_opts() -> MARFOpenOpts {
     marf_open_opts(true)
 }
 
-pub fn sortition_open_opts() -> MARFOpenOpts {
-    marf_open_opts(false)
-}
-
 pub fn sortition_open_opts_for_path(db_path: &Path) -> MARFOpenOpts {
     let blobs_path = PathBuf::from(format!("{}.blobs", db_path.display()));
     marf_open_opts(blobs_path.exists())
