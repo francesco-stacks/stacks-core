@@ -1,10 +1,6 @@
-use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 use stackslib::chainstate::stacks::db::snapshot::{
     copy_confirmed_epoch2_microblocks, copy_epoch2_block_files, copy_nakamoto_staging_blocks,
 };
-use stackslib::chainstate::stacks::index::marf::{MARF, MarfConnection};
-use stackslib::chainstate::stacks::index::storage::TrieFileStorage;
-use stackslib::chainstate::stacks::index::trie_sql;
 
 use crate::cli::{BlocksSection, SquashArgs, ValidateArgs, VerifyArgs};
 use crate::manifest::generate_manifest;
@@ -14,10 +10,9 @@ use crate::ops::{
 };
 use crate::util::{
     bitcoin_height_to_sortition_marf_height, build_pox_constants, chainstate_paths,
-    ensure_blobs_match, ensure_flag_requires, ensure_targets_selected,
-    find_tenure_end_stacks_height, read_db_config, read_first_burn_height, selected_targets,
-    sortition_open_opts, squash_marf_open_opts, target_out_paths, target_out_paths_sortition,
-    warn_if_in_prepare_phase,
+    ensure_flag_requires, ensure_targets_selected, find_tenure_end_stacks_height, read_db_config,
+    read_first_burn_height, selected_targets, sortition_open_opts, squash_marf_open_opts,
+    target_out_paths, target_out_paths_sortition, warn_if_in_prepare_phase,
 };
 use crate::verify::verify_gss;
 
@@ -30,6 +25,23 @@ pub fn run_squash(args: SquashArgs) {
         args.bitcoin,
         args.all,
     );
+
+    // Require --out-dir to be absent or empty. Re-running into an existing
+    // output tree can leave partial or duplicate data (e.g. nakamoto.sqlite
+    // rows inserted twice) that is difficult to diagnose.
+    if args.out_dir.exists() {
+        let is_empty = std::fs::read_dir(&args.out_dir)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        if !is_empty {
+            eprintln!(
+                "Error: --out-dir '{}' already exists and is not empty.\n\
+                 Remove it or choose a different path to avoid partial/duplicate output.",
+                args.out_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
 
     let paths = chainstate_paths(&args.chainstate);
     let (do_clarity, do_index, do_sortition) =

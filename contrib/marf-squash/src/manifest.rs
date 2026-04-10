@@ -11,7 +11,8 @@ use crate::cli::{
     SquashRootsSection, TargetPaths,
 };
 use crate::util::{
-    compute_checksums, format_timestamp, sortition_open_opts_for_path, squash_marf_open_opts,
+    compute_aggregate_checksum, compute_checksums, format_timestamp, sortition_open_opts_for_path,
+    squash_marf_open_opts,
 };
 
 /// Read squash metadata from a just-squashed MARF DB.
@@ -225,8 +226,8 @@ pub fn generate_manifest(
         format!("0x{btc_hash}")
     };
 
-    // Build the set of expected files so that stale files in a reused
-    // out-dir are rejected rather than blessed into the manifest.
+    // Build the set of individually hashed files so that stale files in a
+    // reused out-dir are rejected rather than blessed into the manifest.
     let mut expected = HashSet::new();
 
     // MARF databases + blobs.
@@ -247,16 +248,38 @@ pub fn generate_manifest(
     expected.insert("burnchain/burnchain.sqlite".to_string());
     expected.insert("headers.sqlite".to_string());
 
-    // Block data files.
-    for rel in copied_block_rel_paths {
-        expected.insert(rel.clone());
+    // `nakamoto.sqlite` is hashed individually; epoch-2 block files are
+    // covered by one aggregate checksum to keep the manifest compact.
+    expected.insert("chainstate/blocks/nakamoto.sqlite".to_string());
+    let epoch2_block_rel_paths: Vec<String> = copied_block_rel_paths
+        .iter()
+        .filter(|rel| rel.as_str() != "chainstate/blocks/nakamoto.sqlite")
+        .cloned()
+        .collect();
+    if epoch2_block_rel_paths.len() as u64 != blocks_section.epoch2x_files {
+        eprintln!(
+            "Manifest error: copied {} epoch-2 block files, expected {}",
+            epoch2_block_rel_paths.len(),
+            blocks_section.epoch2x_files
+        );
+        std::process::exit(1);
     }
 
-    let files = compute_checksums(out_dir, Some(&expected)).unwrap_or_else(|e| {
-        eprintln!("Failed to compute checksums: {e}");
-        std::process::exit(1);
-    });
-    println!("Computed SHA-256 checksums for {} files", files.len());
+    let skipped_epoch2: HashSet<String> = epoch2_block_rel_paths.iter().cloned().collect();
+    let files =
+        compute_checksums(out_dir, Some(&expected), Some(&skipped_epoch2)).unwrap_or_else(|e| {
+            eprintln!("Failed to compute checksums: {e}");
+            std::process::exit(1);
+        });
+    let epoch2_block_archive_hash = compute_aggregate_checksum(out_dir, &epoch2_block_rel_paths)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to compute epoch-2 block archive hash: {e}");
+            std::process::exit(1);
+        });
+    println!(
+        "Computed SHA-256 checksums for {} files plus one epoch-2 block archive hash",
+        files.len()
+    );
 
     let manifest = SquashManifest {
         snapshot: SnapshotSection {
@@ -280,7 +303,10 @@ pub fn generate_manifest(
             sortition_squash_root_node_hash: s_squash,
         },
         blocks: Some(blocks_section),
-        checksums: Some(ChecksumsSection { files }),
+        checksums: Some(ChecksumsSection {
+            files,
+            epoch2_block_archive_hash: Some(epoch2_block_archive_hash),
+        }),
     };
 
     let toml_str = toml::to_string(&manifest).unwrap_or_else(|e| {

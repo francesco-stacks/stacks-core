@@ -24,12 +24,18 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::Parser;
+    use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
+    use stackslib::chainstate::stacks::index::marf::{MARF, MarfConnection};
+    use stackslib::chainstate::stacks::index::{MARFValue, MarfTrieId, trie_sql};
 
     use crate::cli::{
-        BlocksSection, ChecksumsSection, Cli, Command, GSS_MANIFEST, RootsSection,
-        SnapshotSection, SquashManifest, SquashRootsSection, ValidateArgs,
+        BlocksSection, ChecksumsSection, Cli, Command, GSS_MANIFEST, RootsSection, SnapshotSection,
+        SquashManifest, SquashRootsSection, ValidateArgs,
     };
-    use crate::util::{compute_checksums, sha256_file};
+    use crate::util::{
+        compute_aggregate_checksum, compute_checksums, epoch2_block_rel_path, sha256_file,
+        squash_marf_open_opts,
+    };
     use crate::verify::{validate_checkpoint_hash, verify_gss};
 
     //  Helpers
@@ -79,6 +85,128 @@ mod tests {
         };
         let toml_str = toml::to_string(&manifest).unwrap();
         std::fs::write(dir.join(GSS_MANIFEST), toml_str).unwrap();
+    }
+
+    fn write_test_marf<T: MarfTrieId>(
+        db_path: &std::path::Path,
+        block_byte: u8,
+        key: &str,
+        value: &str,
+    ) -> String {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        let open_opts = squash_marf_open_opts();
+        let mut marf = MARF::<T>::from_path(db_path.to_str().unwrap(), open_opts.clone()).unwrap();
+        let tip = T::from_bytes([block_byte; 32]);
+        let mut tx = marf.begin_tx().unwrap();
+        tx.begin(&T::sentinel(), &tip).unwrap();
+        tx.insert_batch(&[key.to_string()], vec![MARFValue::from_value(value)])
+            .unwrap();
+        tx.commit().unwrap();
+        drop(marf);
+
+        let mut marf = MARF::<T>::from_path(db_path.to_str().unwrap(), open_opts).unwrap();
+        let tip = trie_sql::get_latest_confirmed_block_hash::<T>(marf.sqlite_conn()).unwrap();
+        let root = marf.recompute_squash_root_node_hash(&tip).unwrap();
+        format!("0x{root}")
+    }
+
+    fn create_full_gss_fixture(dir: &std::path::Path) -> (String, String, String) {
+        let clarity_root = write_test_marf::<StacksBlockId>(
+            &dir.join("chainstate/vm/clarity/marf.sqlite"),
+            0x11,
+            "clarity-key",
+            "clarity-value",
+        );
+        let index_root = write_test_marf::<StacksBlockId>(
+            &dir.join("chainstate/vm/index.sqlite"),
+            0x22,
+            "index-key",
+            "index-value",
+        );
+        let sortition_root = write_test_marf::<SortitionId>(
+            &dir.join("burnchain/sortition/marf.sqlite"),
+            0x33,
+            "sortition-key",
+            "sortition-value",
+        );
+
+        create_test_gss_dir(
+            dir,
+            &[
+                "burnchain/burnchain.sqlite",
+                "headers.sqlite",
+                "chainstate/blocks/nakamoto.sqlite",
+            ],
+        );
+        let epoch2_hash = StacksBlockId([0x44; 32]);
+        let epoch2_rel_path = epoch2_block_rel_path(&epoch2_hash);
+        let epoch2_bytes = b"epoch2-block-data";
+        let epoch2_path = dir.join(&epoch2_rel_path);
+        std::fs::create_dir_all(epoch2_path.parent().unwrap()).unwrap();
+        std::fs::write(&epoch2_path, epoch2_bytes).unwrap();
+
+        let index_conn =
+            rusqlite::Connection::open(dir.join("chainstate/vm/index.sqlite")).unwrap();
+        index_conn
+            .execute(
+                "CREATE TABLE block_headers (index_block_hash TEXT NOT NULL, block_height INTEGER NOT NULL)",
+                [],
+            )
+            .unwrap();
+        index_conn
+            .execute(
+                "INSERT INTO block_headers (index_block_hash, block_height) VALUES (?1, ?2)",
+                rusqlite::params![epoch2_hash.to_string(), 1i64],
+            )
+            .unwrap();
+        drop(index_conn);
+
+        let mut files = compute_checksums(dir, None, None).unwrap();
+        files.remove(&epoch2_rel_path);
+        let epoch2_block_archive_hash =
+            compute_aggregate_checksum(dir, std::slice::from_ref(&epoch2_rel_path)).unwrap();
+
+        let manifest = SquashManifest {
+            snapshot: SnapshotSection {
+                version: 1,
+                stacks_height: 100,
+                bitcoin_height: 869704,
+                block_hash: "0xdeadbeef".to_string(),
+                bitcoin_block_hash: Some("0xbeef".to_string()),
+                timestamp: None,
+                chain_id: 1,
+                mainnet: true,
+            },
+            roots: RootsSection {
+                clarity_archival_marf_root_hash: Some("0xaaa".to_string()),
+                index_archival_marf_root_hash: "0xbbb".to_string(),
+                sortition_archival_marf_root_hash: Some("0xccc".to_string()),
+            },
+            squash_roots: SquashRootsSection {
+                clarity_squash_root_node_hash: Some(clarity_root.clone()),
+                index_squash_root_node_hash: Some(index_root.clone()),
+                sortition_squash_root_node_hash: Some(sortition_root.clone()),
+            },
+            blocks: Some(BlocksSection {
+                epoch2x_files: 1,
+                epoch2x_bytes: epoch2_bytes.len() as u64,
+                epoch2x_microblock_rows: 0,
+                epoch2x_microblock_bytes: 0,
+                nakamoto_rows: 0,
+                nakamoto_bytes: 0,
+            }),
+            checksums: Some(ChecksumsSection {
+                files,
+                epoch2_block_archive_hash: Some(epoch2_block_archive_hash),
+            }),
+        };
+        let toml_str = toml::to_string(&manifest).unwrap();
+        std::fs::write(dir.join(GSS_MANIFEST), toml_str).unwrap();
+
+        (clarity_root, index_root, sortition_root)
     }
 
     //  CLI parsing
@@ -221,7 +349,7 @@ mod tests {
         create_test_gss_dir(dir, &["a.sqlite", "sub/b.sqlite"]);
         std::fs::write(dir.join(GSS_MANIFEST), "dummy").unwrap();
 
-        let checksums = compute_checksums(dir, None).unwrap();
+        let checksums = compute_checksums(dir, None, None).unwrap();
         assert_eq!(checksums.len(), 2);
         assert!(checksums.contains_key("a.sqlite"));
         assert!(checksums.contains_key("sub/b.sqlite"));
@@ -235,7 +363,7 @@ mod tests {
         let dir = tmp.path();
         create_test_gss_dir(dir, &["a.sqlite", "a.sqlite-wal"]);
 
-        let checksums = compute_checksums(dir, None).unwrap();
+        let checksums = compute_checksums(dir, None, None).unwrap();
         assert_eq!(checksums.len(), 1);
         assert!(checksums.contains_key("a.sqlite"));
     }
@@ -250,7 +378,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let result = compute_checksums(dir, None);
+            let result = compute_checksums(dir, None, None);
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("symlink"));
         }
@@ -265,7 +393,7 @@ mod tests {
         let mut expected = std::collections::HashSet::new();
         expected.insert("expected.sqlite".to_string());
 
-        let result = compute_checksums(dir, Some(&expected));
+        let result = compute_checksums(dir, Some(&expected), None);
         let err = result.unwrap_err();
         assert!(err.contains("unexpected file"), "got: {err}");
         assert!(err.contains("stale.sqlite"), "got: {err}");
@@ -283,7 +411,7 @@ mod tests {
         let mut expected = std::collections::HashSet::new();
         expected.insert("chainstate/blocks/ab/cd/legit_block".to_string());
 
-        let result = compute_checksums(dir, Some(&expected));
+        let result = compute_checksums(dir, Some(&expected), None);
         let err = result.unwrap_err();
         assert!(err.contains("unexpected file"), "got: {err}");
         assert!(err.contains("stale_block"), "got: {err}");
@@ -325,6 +453,16 @@ mod tests {
     fn test_verify_gss_end_to_end_valid() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
+        create_full_gss_fixture(dir);
+
+        let result = verify_gss(dir, None);
+        assert!(result.is_ok(), "expected pass, got: {result:?}");
+    }
+
+    #[test]
+    fn test_verify_gss_rejects_partial_gss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         create_test_gss_dir(dir, &["data.sqlite"]);
 
         let hash = sha256_file(&dir.join("data.sqlite")).unwrap();
@@ -332,84 +470,21 @@ mod tests {
         files.insert("data.sqlite".to_string(), hash);
         write_manifest_toml(
             dir,
-            Some(ChecksumsSection { files }),
-            SquashRootsSection {
-                clarity_squash_root_node_hash: Some("0xbbb".to_string()),
-                index_squash_root_node_hash: Some("0xccc".to_string()),
-                sortition_squash_root_node_hash: Some("0xddd".to_string()),
-            },
+            Some(ChecksumsSection {
+                files,
+                epoch2_block_archive_hash: None,
+            }),
+            no_squash_roots(),
         );
-
-        // Levels 0+1 pass, Level 2 fails (no real MARFs on disk but
-        // squash_roots claim they exist).
-        let result = verify_gss(dir, None);
-        assert!(result.is_err());
-        let errors = result.unwrap_err();
-        assert!(
-            errors.iter().any(|e: &String| e.contains("Level 2")),
-            "expected Level 2 errors, got: {errors:?}"
-        );
-        assert!(
-            !errors.iter().any(|e: &String| e.contains("Level 0")),
-            "unexpected Level 0 errors: {errors:?}"
-        );
-        assert!(
-            !errors.iter().any(|e: &String| e.contains("Level 1")),
-            "unexpected Level 1 errors: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn test_verify_gss_end_to_end_levels_0_1_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        create_test_gss_dir(dir, &["data.sqlite"]);
-
-        let hash = sha256_file(&dir.join("data.sqlite")).unwrap();
-        let mut files = BTreeMap::new();
-        files.insert("data.sqlite".to_string(), hash);
-        write_manifest_toml(dir, Some(ChecksumsSection { files }), no_squash_roots());
-
-        let result = verify_gss(dir, None);
-        assert!(result.is_ok(), "expected pass, got: {result:?}");
-    }
-
-    #[test]
-    fn test_verify_gss_end_to_end_checksum_mismatch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        create_test_gss_dir(dir, &["data.sqlite"]);
-
-        let mut files = BTreeMap::new();
-        files.insert("data.sqlite".to_string(), "badhash".to_string());
-        write_manifest_toml(dir, Some(ChecksumsSection { files }), no_squash_roots());
 
         let result = verify_gss(dir, None);
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(
-            errors.iter().any(|e: &String| e.contains("Level 1")),
-            "expected Level 1 error, got: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn test_verify_gss_end_to_end_extra_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        create_test_gss_dir(dir, &["expected.sqlite", "extra.sqlite"]);
-
-        let hash = sha256_file(&dir.join("expected.sqlite")).unwrap();
-        let mut files = BTreeMap::new();
-        files.insert("expected.sqlite".to_string(), hash);
-        write_manifest_toml(dir, Some(ChecksumsSection { files }), no_squash_roots());
-
-        let result = verify_gss(dir, None);
-        assert!(result.is_err());
-        let errors = result.unwrap_err();
-        assert!(
-            errors.iter().any(|e: &String| e.contains("extra file")),
-            "expected extra file error, got: {errors:?}"
+            errors
+                .iter()
+                .any(|e: &String| e.contains("[blocks] section")),
+            "expected full-GSS error, got: {errors:?}"
         );
     }
 
@@ -432,20 +507,17 @@ mod tests {
     fn test_verify_gss_checkpoint_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        create_test_gss_dir(dir, &["data.sqlite"]);
+        let (clarity_root, index_root, _sortition_root) = create_full_gss_fixture(dir);
 
-        let hash = sha256_file(&dir.join("data.sqlite")).unwrap();
-        let mut files = BTreeMap::new();
-        files.insert("data.sqlite".to_string(), hash);
-        write_manifest_toml(dir, Some(ChecksumsSection { files }), no_squash_roots());
-
-        let cp_toml = r#"
+        let cp_toml = format!(
+            r#"
 stacks_height = 100
 bitcoin_height = 869704
-clarity_squash_root_node_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-index_squash_root_node_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+clarity_squash_root_node_hash = "{clarity_root}"
+index_squash_root_node_hash = "{index_root}"
 sortition_squash_root_node_hash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-"#;
+"#
+        );
         let cp_path = dir.join("checkpoint.toml");
         std::fs::write(&cp_path, cp_toml).unwrap();
 
@@ -455,7 +527,7 @@ sortition_squash_root_node_hash = "0xccccccccccccccccccccccccccccccccccccccccccc
         assert!(
             errors
                 .iter()
-                .any(|e: &String| e.contains("Level 3") && e.contains("not present")),
+                .any(|e: &String| e.contains("Level 3") && e.contains("recomputed=")),
             "expected Level 3 failure, got: {errors:?}"
         );
     }

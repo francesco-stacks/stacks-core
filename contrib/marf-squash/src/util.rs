@@ -4,6 +4,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::util::hash::to_hex;
 use stackslib::burnchains::PoxConstants;
 use stackslib::chainstate::burn::db::sortdb::SortitionDB;
 use stackslib::chainstate::nakamoto::NakamotoChainState;
@@ -14,18 +16,18 @@ use stackslib::config::ConfigFile;
 
 use crate::cli::{ChainstatePaths, GSS_MANIFEST, SQLITE_SIDECAR_EXTENSIONS, TargetPaths};
 
-/// Compute SHA-256 checksums for all files in `out_dir`, enforcing directory
-/// cleanliness. Skips transient SQLite sidecars, fails on symlink and non-regular files.
-///
-/// When `expected_files` is `Some`, any regular file on disk that is NOT in the
-/// expected set (and not a manifest) is a hard error.  This prevents stale files
-/// in a reused output directory from being silently blessed into the manifest.
+/// Compute SHA-256 checksums for selected files in `out_dir`, allowing a set of
+/// files to be present on disk without materializing individual checksum
+/// entries for them.
 pub fn compute_checksums(
     out_dir: &Path,
     expected_files: Option<&HashSet<String>>,
+    skipped_files: Option<&HashSet<String>>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut checksums = BTreeMap::new();
     let mut entries: Vec<PathBuf> = Vec::new();
+    let empty_skipped = HashSet::new();
+    let skipped_files = skipped_files.unwrap_or(&empty_skipped);
 
     collect_files_recursive(out_dir, out_dir, &mut entries)?;
     entries.sort();
@@ -38,6 +40,11 @@ pub fn compute_checksums(
 
         // Skip the manifest files themselves.
         if rel_str == GSS_MANIFEST {
+            continue;
+        }
+
+        // Allow some files to be present without individual checksum entries.
+        if skipped_files.contains(&rel_str) {
             continue;
         }
 
@@ -67,6 +74,41 @@ pub fn compute_checksums(
     }
 
     Ok(checksums)
+}
+
+pub fn compute_aggregate_checksum(base_dir: &Path, rel_paths: &[String]) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    let mut sorted_paths: Vec<&String> = rel_paths.iter().collect();
+    sorted_paths.sort();
+
+    for rel_path in sorted_paths {
+        let file_path = base_dir.join(rel_path);
+        let rel_bytes = rel_path.as_bytes();
+        hasher.update((rel_bytes.len() as u64).to_le_bytes());
+        hasher.update(rel_bytes);
+
+        let metadata = fs::metadata(&file_path)
+            .map_err(|e| format!("metadata {}: {e}", file_path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("expected regular file: {}", file_path.display()));
+        }
+        hasher.update(metadata.len().to_le_bytes());
+
+        let mut file =
+            fs::File::open(&file_path).map_err(|e| format!("open {}: {e}", file_path.display()))?;
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .map_err(|e| format!("read {}: {e}", file_path.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Recursively collect regular files, rejecting symlinks and non-regular
@@ -131,6 +173,41 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn epoch2_block_rel_path(index_block_hash: &StacksBlockId) -> String {
+    let block_hash_bytes = index_block_hash.as_bytes();
+    format!(
+        "chainstate/blocks/{}/{}/{}",
+        to_hex(&block_hash_bytes[0..2]),
+        to_hex(&block_hash_bytes[2..4]),
+        index_block_hash
+    )
+}
+
+pub fn derive_expected_epoch2_block_rel_paths(index_db_path: &Path) -> Result<Vec<String>, String> {
+    let conn = rusqlite::Connection::open(index_db_path)
+        .map_err(|e| format!("open {}: {e}", index_db_path.display()))?;
+    let mut stmt = conn
+        .prepare("SELECT index_block_hash, block_height FROM block_headers ORDER BY block_height")
+        .map_err(|e| format!("prepare block_headers query: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, StacksBlockId>(0)?, row.get::<_, u64>(1)?))
+        })
+        .map_err(|e| format!("query block_headers: {e}"))?;
+
+    let mut rel_paths = Vec::new();
+    for row in rows {
+        let (index_block_hash, block_height) =
+            row.map_err(|e| format!("read block_headers row: {e}"))?;
+        if block_height == 0 {
+            continue;
+        }
+        rel_paths.push(epoch2_block_rel_path(&index_block_hash));
+    }
+
+    Ok(rel_paths)
 }
 
 pub fn chainstate_paths(root: &Path) -> ChainstatePaths {

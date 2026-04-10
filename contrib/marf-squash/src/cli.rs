@@ -201,6 +201,8 @@ pub struct BlocksSection {
 
 #[derive(Serialize, Deserialize)]
 pub struct ChecksumsSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch2_block_archive_hash: Option<String>,
     pub files: BTreeMap<String, String>,
 }
 

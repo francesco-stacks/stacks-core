@@ -3,7 +3,8 @@
 Offline CLI for producing Genesis State Snapshots (GSS) from a Stacks node's
 chainstate. Squashes the three MARFs (Clarity, Index, Sortition), copies
 canonical block data and Bitcoin auxiliary files, generates a manifest with
-SHA-256 checksums, and provides offline verification against WSCP checkpoints.
+SHA-256 checksums for fixed artifacts plus one aggregate hash for the epoch-2
+block archive, and provides offline verification against WSCP checkpoints.
 
 ## Build
 
@@ -30,14 +31,13 @@ marf-squash squash \
   --chainstate /data/mainnet \
   --out-dir /tmp/gss \
   --tenure-start-bitcoin-height 880000 \
-  --all --blocks
+  --all
 ```
 
-`--all` squashes all three MARFs (Clarity, Index, Sortition). `--blocks` copies
-canonical block data (epoch 2.x files, confirmed microblocks, nakamoto.sqlite).
-When all three MARFs and blocks are included, Bitcoin auxiliary files
-(burnchain.sqlite, headers.sqlite) are also copied and a `GSS_manifest.toml` is
-generated with SHA-256 checksums for every artifact.
+`--all` squashes all three MARFs, copies canonical block data, copies Bitcoin
+auxiliary files, and generates a `GSS_manifest.toml` with SHA-256 checksums for
+the fixed artifacts plus one aggregate hash for the epoch-2 block archive under
+`chainstate/blocks/`.
 
 Individual MARFs can be squashed selectively with `--clarity`, `--index`, or
 `--sortition`. `--blocks` requires `--index` (or `--all`).
@@ -57,18 +57,19 @@ marf-squash validate \
   --source-chainstate /data/mainnet \
   --squashed-chainstate /tmp/gss \
   --tenure-start-bitcoin-height 880000 \
-  --all --blocks
+  --all
 ```
 
 ### Verify a standalone GSS
 
 Consumer-side offline verification of a GSS directory. Does not require access
-to the original chainstate. Runs four verification levels:
+to the original chainstate. `verify` only accepts a full GSS produced with
+`marf-squash squash --all`. It runs four verification levels:
 
 | Level | Check |
 |-------|-------|
 | 0 | Directory cleanliness - no extra files, symlinks, or SQLite sidecars |
-| 1 | SHA-256 checksum verification of every artifact |
+| 1 | SHA-256 verification of fixed artifacts plus the aggregate epoch-2 block archive hash |
 | 2 | Squash root node hash recomputation from MARF contents |
 | 3 | WSCP checkpoint comparison (requires `--checkpoint-file`) |
 
@@ -130,7 +131,8 @@ offline via `marf-squash verify`.
 
 - **WSCP (Weak-Subjectivity Checkpoint)** authenticates the three squashed MARFs
   via their recomputed content hashes. These are the trust anchor.
-- **Manifest checksums** verify artifact integrity (file-level SHA-256). The
+- **Manifest checksums** verify artifact integrity: file-level SHA-256 for the
+  fixed artifacts and one aggregate hash for the epoch-2 block archive. The
   manifest itself is part of the untrusted artifact - it is NOT authenticated by
   the WSCP.
 - Level 2 recomputes squash root hashes by walking the trie structure

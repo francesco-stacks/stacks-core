@@ -6,10 +6,23 @@ use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, MarfConnect
 use stackslib::chainstate::stacks::index::storage::TrieFileStorage;
 use stackslib::chainstate::stacks::index::{MarfTrieId, trie_sql};
 
-use crate::cli::{CheckpointFile, GSS_MANIFEST, SquashManifest};
+use crate::cli::{CheckpointFile, ChecksumsSection, GSS_MANIFEST, SquashManifest};
 use crate::util::{
-    collect_files_recursive, sha256_file, sortition_open_opts_for_path, squash_marf_open_opts,
+    collect_files_recursive, compute_aggregate_checksum, derive_expected_epoch2_block_rel_paths,
+    sha256_file, sortition_open_opts_for_path, squash_marf_open_opts,
 };
+
+const REQUIRED_GSS_FILES: &[&str] = &[
+    "chainstate/vm/clarity/marf.sqlite",
+    "chainstate/vm/clarity/marf.sqlite.blobs",
+    "chainstate/vm/index.sqlite",
+    "chainstate/vm/index.sqlite.blobs",
+    "chainstate/blocks/nakamoto.sqlite",
+    "burnchain/burnchain.sqlite",
+    "burnchain/sortition/marf.sqlite",
+    "burnchain/sortition/marf.sqlite.blobs",
+    "headers.sqlite",
+];
 
 /// Validate a `0x`-prefixed 64-hex-char hash string.  Returns `Ok(())` or an
 /// error message describing what is wrong.
@@ -29,9 +42,74 @@ pub fn validate_checkpoint_hash(field_name: &str, value: &str) -> Result<(), Str
     Ok(())
 }
 
+fn validate_full_gss_manifest(
+    manifest: &SquashManifest,
+    checksums: &ChecksumsSection,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    if manifest.blocks.is_none() {
+        errors.push(format!(
+            "{GSS_MANIFEST} is missing the [blocks] section; \
+             verify requires a full GSS produced by `squash --all`"
+        ));
+    }
+
+    for (label, hash) in [
+        (
+            "clarity",
+            manifest
+                .squash_roots
+                .clarity_squash_root_node_hash
+                .as_deref(),
+        ),
+        (
+            "index",
+            manifest.squash_roots.index_squash_root_node_hash.as_deref(),
+        ),
+        (
+            "sortition",
+            manifest
+                .squash_roots
+                .sortition_squash_root_node_hash
+                .as_deref(),
+        ),
+    ] {
+        if hash.is_none() {
+            errors.push(format!(
+                "{GSS_MANIFEST} is missing the {label} squash root; \
+                 verify requires a full GSS produced by `squash --all`"
+            ));
+        }
+    }
+
+    for required_file in REQUIRED_GSS_FILES {
+        if !checksums.files.contains_key(*required_file) {
+            errors.push(format!(
+                "{GSS_MANIFEST} is missing the checksum entry for required GSS file \
+                 `{required_file}`"
+            ));
+        }
+    }
+    if checksums.epoch2_block_archive_hash.is_none() {
+        errors.push(format!(
+            "{GSS_MANIFEST} is missing `checksums.epoch2_block_archive_hash`; \
+             verify requires a full GSS produced by `squash --all --blocks`"
+        ));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 /// Core verification logic for a GSS directory.  Returns `Ok(())` when all
 /// requested levels pass, or `Err(errors)` with accumulated failure messages.
-/// Levels 0-2 always run; Level 3 runs when `checkpoint_file` is provided.
+/// Rejects partial outputs; the directory must be a full GSS produced by
+/// `squash --all`. Levels 0-2 always run; Level 3 runs when
+/// `checkpoint_file` is provided.
 pub fn verify_gss(gss_dir: &Path, checkpoint_file: Option<&Path>) -> Result<(), Vec<String>> {
     let mut errors: Vec<String> = Vec::new();
 
@@ -54,6 +132,22 @@ pub fn verify_gss(gss_dir: &Path, checkpoint_file: Option<&Path>) -> Result<(), 
         .checksums
         .as_ref()
         .ok_or_else(|| vec![format!("{GSS_MANIFEST} is missing the [checksums] section")])?;
+    validate_full_gss_manifest(&manifest, checksums)?;
+    let expected_epoch2_files =
+        derive_expected_epoch2_block_rel_paths(&gss_dir.join("chainstate/vm/index.sqlite"))
+            .map_err(|e| {
+                vec![format!(
+                    "Failed to derive expected epoch-2 block files from index.sqlite: {e}"
+                )]
+            })?;
+    let expected_epoch2_count = expected_epoch2_files.len() as u64;
+    let manifest_epoch2_count = manifest.blocks.as_ref().unwrap().epoch2x_files;
+    if expected_epoch2_count != manifest_epoch2_count {
+        errors.push(format!(
+            "Level 0: manifest blocks.epoch2x_files {} != derived epoch-2 file count {}",
+            manifest_epoch2_count, expected_epoch2_count
+        ));
+    }
 
     // Level 0: Directory cleanliness
     println!("Level 0: Checking directory cleanliness...");
@@ -64,6 +158,7 @@ pub fn verify_gss(gss_dir: &Path, checkpoint_file: Option<&Path>) -> Result<(), 
         // Build set of expected relative paths.
         let mut expected: std::collections::HashSet<String> =
             checksums.files.keys().cloned().collect();
+        expected.extend(expected_epoch2_files.iter().cloned());
         expected.insert(GSS_MANIFEST.to_string());
 
         for path in &disk_files {
@@ -118,8 +213,27 @@ pub fn verify_gss(gss_dir: &Path, checkpoint_file: Option<&Path>) -> Result<(), 
             }
         }
     }
+    let expected_epoch2_hash = checksums.epoch2_block_archive_hash.as_ref().unwrap();
+    match compute_aggregate_checksum(gss_dir, &expected_epoch2_files) {
+        Ok(actual_hash) => {
+            if actual_hash != *expected_epoch2_hash {
+                errors.push(format!(
+                    "Level 1: epoch-2 block archive: expected {}, got {}",
+                    expected_epoch2_hash, actual_hash
+                ));
+                checksum_failures += 1;
+            }
+        }
+        Err(e) => {
+            errors.push(format!("Level 1: epoch-2 block archive: {e}"));
+            checksum_failures += 1;
+        }
+    }
     if checksum_failures == 0 {
-        println!("  PASS: {} files verified", checksums.files.len());
+        println!(
+            "  PASS: {} fixed files verified and epoch-2 block archive hash matched",
+            checksums.files.len()
+        );
     }
 
     // Level 2: Squash root recomputation
