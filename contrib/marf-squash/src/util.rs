@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::util::hash::to_hex;
 use stackslib::burnchains::PoxConstants;
@@ -12,9 +13,70 @@ use stackslib::chainstate::nakamoto::NakamotoChainState;
 use stackslib::chainstate::stacks::db::StacksChainState;
 use stackslib::chainstate::stacks::index::marf::MARFOpenOpts;
 use stackslib::chainstate::stacks::index::storage::TrieHashCalculationMode;
-use stackslib::config::ConfigFile;
+use stackslib::config::{Config, ConfigFile};
 
 use crate::cli::{ChainstatePaths, GSS_MANIFEST, SQLITE_SIDECAR_EXTENSIONS, TargetPaths};
+
+/// On mainnet, Bitcoin height 943332 was a fast-block (no Stacks tenure
+/// started there), so the last tenure that belongs entirely to epoch 3.3
+/// is at height 943331. This is the minimum acceptable value for
+/// squash on mainnet.
+const MAINNET_MIN_TENURE_HEIGHT: u64 = 943_331;
+
+/// Enforce that `bitcoin_height` is at least the last tenure of epoch 3.3.
+///
+/// A squashed snapshot is only usable from epoch 3.4 onwards, so the
+/// selected tenure must be the last tenure of epoch 3.3 or later.
+///
+/// * Mainnet: the minimum is [`MAINNET_MIN_TENURE_HEIGHT`]
+/// * non-mainnet: the minimum is `epoch_3.4_start_height - 1`, derived
+///   from the node config TOML.
+pub fn enforce_minimum_tenure_height(
+    bitcoin_height: u64,
+    mainnet: bool,
+    config_path: Option<&Path>,
+) {
+    let min = if mainnet {
+        MAINNET_MIN_TENURE_HEIGHT
+    } else {
+        let config_path = config_path
+            .expect("enforce_minimum_tenure_height called for non-mainnet without --config");
+        let config_file =
+            ConfigFile::from_path(config_path.to_str().unwrap()).unwrap_or_else(|e| {
+                eprintln!(
+                    "Failed to parse config file '{}': {e}",
+                    config_path.display()
+                );
+                std::process::exit(1);
+            });
+        let config = Config::from_config_file(config_file, false).unwrap_or_else(|e| {
+            eprintln!("Failed to load config '{}': {e}", config_path.display());
+            std::process::exit(1);
+        });
+        let epochs = config.burnchain.get_epoch_list();
+        let epoch_34 = epochs.get(StacksEpochId::Epoch34).unwrap_or_else(|| {
+            eprintln!(
+                "Error: config '{}' does not define epoch 3.4.\n\
+                 Epoch 3.4 activation height is required to validate \
+                 --tenure-start-bitcoin-height.",
+                config_path.display()
+            );
+            std::process::exit(1);
+        });
+        epoch_34.start_height - 1
+    };
+
+    if bitcoin_height < min {
+        eprintln!(
+            "Error: --tenure-start-bitcoin-height {bitcoin_height} is below the minimum \
+             acceptable height {min}.\n\
+             A squashed snapshot can only be used from epoch 3.4 onwards. The tenure at \
+             height {min} is the last tenure of epoch 3.3; its blocks are the last ones \
+             included before epoch 3.4 activates."
+        );
+        std::process::exit(1);
+    }
+}
 
 /// Compute SHA-256 checksums for selected files in `out_dir`, allowing a set of
 /// files to be present on disk without materializing individual checksum

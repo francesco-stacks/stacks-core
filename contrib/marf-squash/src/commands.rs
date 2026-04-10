@@ -10,9 +10,9 @@ use crate::ops::{
 };
 use crate::util::{
     bitcoin_height_to_sortition_marf_height, build_pox_constants, chainstate_paths,
-    ensure_flag_requires, ensure_targets_selected, find_tenure_end_stacks_height, read_db_config,
-    read_first_burn_height, selected_targets, sortition_open_opts, squash_marf_open_opts,
-    target_out_paths, target_out_paths_sortition, warn_if_in_prepare_phase,
+    enforce_minimum_tenure_height, ensure_flag_requires, ensure_targets_selected,
+    find_tenure_end_stacks_height, read_db_config, read_first_burn_height, selected_targets,
+    squash_marf_open_opts, target_out_paths, target_out_paths_sortition, warn_if_in_prepare_phase,
 };
 use crate::verify::verify_gss;
 
@@ -52,6 +52,9 @@ pub fn run_squash(args: SquashArgs) {
     // Read network config.
     let (mainnet, chain_id) = read_db_config(&paths.index.db);
     let pox = build_pox_constants(mainnet, args.config.as_deref());
+
+    // A squashed snapshot is only usable from epoch 3.4 onwards.
+    enforce_minimum_tenure_height(bitcoin_height, mainnet, args.config.as_deref());
 
     // Derive chainstate root: paths.index.db = ".../chainstate/vm/index.sqlite"
     let chainstate_root = paths
@@ -405,6 +408,10 @@ pub fn run_validate(args: ValidateArgs) {
     // Resolve the same way as run_squash.
     let (mainnet, chain_id) = read_db_config(&source_paths.index.db);
     let pox = build_pox_constants(mainnet, args.config.as_deref());
+
+    // A squashed snapshot is only usable from epoch 3.4 onwards.
+    enforce_minimum_tenure_height(bitcoin_height, mainnet, args.config.as_deref());
+
     let chainstate_root = source_paths
         .index
         .db
