@@ -1642,10 +1642,10 @@ fn test_microblock_stream_copy_and_validate() {
 
     // Clone schemas from source for staging tables.
     dst_conn
-        .execute_batch(&format!(
-            "ATTACH DATABASE '{}' AS src",
-            src_path.to_str().unwrap()
-        ))
+        .execute(
+            "ATTACH DATABASE ?1 AS src",
+            params![src_path.to_str().unwrap()],
+        )
         .unwrap();
     super::common::clone_schemas_from_source(
         &dst_conn,
@@ -1759,10 +1759,10 @@ fn test_microblock_stream_unprocessed_skipped() {
     create_dest_db_with_canonical_blocks(&dst_path, &[]);
     let dst_conn = Connection::open(&dst_path).unwrap();
     dst_conn
-        .execute_batch(&format!(
-            "ATTACH DATABASE '{}' AS src",
-            src_path.to_str().unwrap()
-        ))
+        .execute(
+            "ATTACH DATABASE ?1 AS src",
+            params![src_path.to_str().unwrap()],
+        )
         .unwrap();
     super::common::clone_schemas_from_source(
         &dst_conn,

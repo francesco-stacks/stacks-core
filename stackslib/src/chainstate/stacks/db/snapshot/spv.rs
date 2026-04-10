@@ -60,8 +60,7 @@ impl SpvHeadersValidation {
 
 /// Copy canonical SPV headers up to `burn_height` into a new destination.
 ///
-/// Returns `Ok(None)` if the source file does not exist (the SpvClient
-/// auto-creates and re-downloads headers on startup).
+/// Returns an error if the source file does not exist.
 pub fn copy_spv_headers(
     src_path: &str,
     dst_path: &str,
