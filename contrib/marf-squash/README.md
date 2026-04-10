@@ -82,7 +82,8 @@ The checkpoint file is a TOML file with trusted squash root hashes published by
 an independent source:
 
 ```toml
-height = 150000
+stacks_height = 150000
+bitcoin_height = 880000
 clarity_squash_root_node_hash = "0x..."
 index_squash_root_node_hash = "0x..."
 sortition_squash_root_node_hash = "0x..."
@@ -92,7 +93,7 @@ Levels 0-2 always run. Level 3 runs only when `--checkpoint-file` is provided.
 
 ## GSS output layout
 
-A full GSS (`--all --blocks`) mirrors the node's working directory structure:
+A full GSS (`--all`) mirrors the node's working directory structure:
 
 ```
 /tmp/gss/
@@ -101,14 +102,15 @@ A full GSS (`--all --blocks`) mirrors the node's working directory structure:
 │   │   ├── clarity/
 │   │   │   ├── marf.sqlite
 │   │   │   └── marf.sqlite.blobs
-│   │   └── index.sqlite
-│   │       └── index.sqlite.blobs
+│   │   ├── index.sqlite
+│   │   └── index.sqlite.blobs
 │   └── blocks/
 │       ├── nakamoto.sqlite
-│       └── {XX}/{YY}/{hash}...
+│       └── {XX}/{YY}/{hash}... # Epoch 2.x blocks
 ├── burnchain/
 │   ├── sortition/
-│   │   └── marf.sqlite
+│   │   ├── marf.sqlite
+│   │   └── marf.sqlite.blobs
 │   └── burnchain.sqlite
 ├── headers.sqlite
 └── GSS_manifest.toml

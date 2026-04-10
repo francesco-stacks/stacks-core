@@ -93,7 +93,7 @@ pub struct ValidateArgs {
     /// Validate the Sortition MARF.
     #[arg(long)]
     pub sortition: bool,
-    /// Validate all three MARFs.
+    /// Validate all three MARFs and auxiliary data (blocks + bitcoin).
     #[arg(long)]
     pub all: bool,
     /// Validate block data (epoch 2.x files, confirmed microblocks, nakamoto.sqlite).
