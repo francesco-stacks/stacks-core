@@ -6,7 +6,7 @@ use stackslib::chainstate::stacks::index::marf::{MARF, MarfConnection};
 use stackslib::chainstate::stacks::index::storage::TrieFileStorage;
 use stackslib::chainstate::stacks::index::trie_sql;
 
-use crate::cli::{BlocksSection, LatestHeightArgs, SquashArgs, ValidateArgs, VerifyArgs};
+use crate::cli::{BlocksSection, SquashArgs, ValidateArgs, VerifyArgs};
 use crate::manifest::generate_manifest;
 use crate::ops::{
     SideTableMode, copy_bitcoin_aux_files, squash_and_copy_one, validate_bitcoin_aux_files,
@@ -541,87 +541,4 @@ pub fn run_verify(args: VerifyArgs) {
             std::process::exit(1);
         }
     }
-}
-
-pub fn run_latest_height(args: LatestHeightArgs) {
-    let selected_count = args.clarity as u8 + args.index as u8 + args.sortition as u8;
-    if selected_count != 1 {
-        eprintln!("Specify exactly one of --clarity, --index, or --sortition");
-        std::process::exit(1);
-    }
-
-    let paths = chainstate_paths(&args.chainstate);
-
-    if args.sortition {
-        let open_opts = sortition_open_opts();
-        let src_storage =
-            TrieFileStorage::open_readonly(paths.sortition.db.to_str().unwrap(), open_opts)
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to open sortition MARF: {e:?}");
-                    std::process::exit(1);
-                });
-        let mut src = MARF::<SortitionId>::from_storage(src_storage);
-        let tip = match trie_sql::get_latest_confirmed_block_hash::<SortitionId>(src.sqlite_conn())
-        {
-            Ok(tip) => tip,
-            Err(e) => {
-                eprintln!("Failed to read latest block hash: {e:?}");
-                std::process::exit(1);
-            }
-        };
-        let height = match src.with_conn(|conn| MARF::get_block_height_miner_tip(conn, &tip, &tip))
-        {
-            Ok(Some(height)) => height,
-            Ok(None) => {
-                eprintln!("Latest block height not found");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("Failed to read latest height: {e:?}");
-                std::process::exit(1);
-            }
-        };
-
-        println!("{height}");
-        eprintln!("(burn block height)");
-        return;
-    }
-
-    let target = if args.clarity {
-        &paths.clarity
-    } else {
-        &paths.index
-    };
-
-    if let Some(ref blobs) = target.blobs {
-        ensure_blobs_match(target.db.to_str().unwrap(), blobs.to_str().unwrap());
-    }
-
-    let open_opts = squash_marf_open_opts();
-    let src_storage = TrieFileStorage::open_readonly(target.db.to_str().unwrap(), open_opts)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to open MARF: {e:?}");
-            std::process::exit(1);
-        });
-    let mut src = MARF::<StacksBlockId>::from_storage(src_storage);
-    let tip = match trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(src.sqlite_conn()) {
-        Ok(tip) => tip,
-        Err(e) => {
-            eprintln!("Failed to read latest block hash: {e:?}");
-            std::process::exit(1);
-        }
-    };
-    let height = match src.with_conn(|conn| MARF::get_block_height_miner_tip(conn, &tip, &tip)) {
-        Ok(Some(height)) => height,
-        Ok(None) => {
-            eprintln!("Latest block height not found");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Failed to read latest height: {e:?}");
-            std::process::exit(1);
-        }
-    };
-
-    println!("{height}");
 }

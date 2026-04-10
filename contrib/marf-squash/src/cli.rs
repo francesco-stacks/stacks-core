@@ -23,8 +23,6 @@ pub enum Command {
     Validate(ValidateArgs),
     /// Verify a standalone GSS directory's integrity and optionally check WSCP checkpoint.
     Verify(VerifyArgs),
-    /// Print the latest confirmed block height in a MARF.
-    LatestHeight(LatestHeightArgs),
 }
 
 /// Arguments for generating squashed MARFs.
@@ -112,23 +110,6 @@ pub struct ValidateArgs {
     /// By default, validation uses the fast hash-based check.
     #[arg(long)]
     pub full: bool,
-}
-
-/// Arguments for reporting the latest confirmed height.
-#[derive(Parser, Debug)]
-pub struct LatestHeightArgs {
-    /// Path to the chainstate folder.
-    #[arg(long, value_name = "DIR")]
-    pub chainstate: PathBuf,
-    /// Read the latest height from the Clarity MARF.
-    #[arg(long)]
-    pub clarity: bool,
-    /// Read the latest height from the Index MARF.
-    #[arg(long)]
-    pub index: bool,
-    /// Read the latest height from the Sortition MARF (prints burn block height).
-    #[arg(long)]
-    pub sortition: bool,
 }
 
 /// Arguments for standalone GSS verification.

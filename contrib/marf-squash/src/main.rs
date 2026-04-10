@@ -7,7 +7,7 @@ mod verify;
 
 use clap::Parser;
 use cli::{Cli, Command};
-use commands::{run_latest_height, run_squash, run_validate, run_verify};
+use commands::{run_squash, run_validate, run_verify};
 
 fn main() {
     let cli = Cli::parse();
@@ -15,7 +15,6 @@ fn main() {
         Command::Squash(args) => run_squash(args),
         Command::Validate(args) => run_validate(args),
         Command::Verify(args) => run_verify(args),
-        Command::LatestHeight(args) => run_latest_height(args),
     }
 }
 
@@ -27,7 +26,7 @@ mod tests {
     use clap::Parser;
 
     use crate::cli::{
-        ChecksumsSection, Cli, Command, GSS_MANIFEST, LatestHeightArgs, RootsSection,
+        BlocksSection, ChecksumsSection, Cli, Command, GSS_MANIFEST, RootsSection,
         SnapshotSection, SquashManifest, SquashRootsSection, ValidateArgs,
     };
     use crate::util::{compute_checksums, sha256_file};
@@ -171,31 +170,6 @@ mod tests {
             _ => panic!("expected validate command"),
         }
     }
-
-    #[test]
-    fn test_parse_latest_height_args_ok() {
-        let args = vec![
-            "marf-squash",
-            "latest-height",
-            "--chainstate",
-            "/tmp/chainstate",
-            "--index",
-        ]
-        .into_iter()
-        .map(String::from);
-
-        let cli = Cli::try_parse_from(args).unwrap();
-        match cli.command {
-            Command::LatestHeight(LatestHeightArgs {
-                chainstate, index, ..
-            }) => {
-                assert_eq!(chainstate, PathBuf::from("/tmp/chainstate"));
-                assert!(index);
-            }
-            _ => panic!("expected latest-height command"),
-        }
-    }
-
     #[test]
     fn test_parse_verify_args_ok() {
         let args = vec![

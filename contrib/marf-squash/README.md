@@ -20,7 +20,6 @@ cargo build -p marf-squash --release
 | `squash` | Produce a complete GSS from a running node's chainstate |
 | `validate` | Producer-side comparison of squashed output against source |
 | `verify` | Consumer-side offline verification of a standalone GSS |
-| `latest-height` | Print the latest confirmed block height in a MARF |
 
 ## Usage
 
@@ -90,16 +89,6 @@ sortition_squash_root_node_hash = "0x..."
 ```
 
 Levels 0-2 always run. Level 3 runs only when `--checkpoint-file` is provided.
-
-### Report the latest height
-
-```bash
-marf-squash latest-height \
-  --chainstate /data/mainnet \
-  --index
-```
-
-Also accepts `--clarity` or `--sortition` (prints burn block height).
 
 ## GSS output layout
 
