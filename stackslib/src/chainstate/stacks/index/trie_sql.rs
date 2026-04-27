@@ -78,8 +78,11 @@ INSERT OR REPLACE INTO migrated_version (version) VALUES (1);
 
 pub static SQL_MARF_SCHEMA_VERSION: u64 = 2;
 
-/// SQL table for squash metadata (root hash and height).
-/// Stored outside the trie so it does not affect the MARF root hash.
+/// SQL tables for squash metadata, stored outside the trie so they do
+/// not affect the MARF root hash.
+///
+/// Only squashed chainstates populate these tables. Existing DBs are
+/// intentionally not migrated and treated as non-squashed.
 static SQL_MARF_SQUASH_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS marf_squash_info (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -93,7 +96,7 @@ CREATE TABLE IF NOT EXISTS marf_squash_archival_marf_roots (
 );
 CREATE TABLE IF NOT EXISTS marf_squash_block_heights (
     block_hash TEXT PRIMARY KEY,
-    height INTEGER NOT NULL
+    height INTEGER NOT NULL UNIQUE
 );
 ";
 
