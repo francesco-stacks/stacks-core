@@ -24,7 +24,7 @@ use super::ClarityVersion;
 use super::costs::{CostErrors, CostOverflowingMath};
 use super::errors::VmInternalError;
 use super::types::signatures::CallableSubtype;
-use crate::vm::contexts::ContractContext;
+use crate::vm::contexts::{ContractContext, ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
 use crate::vm::costs::runtime_cost;
 use crate::vm::errors::{RuntimeCheckErrorKind, VmExecutionError, check_argument_count};
@@ -33,7 +33,7 @@ use crate::vm::types::{
     CallableData, ListData, ListTypeData, OptionalData, PrincipalData, ResponseData, SequenceData,
     SequenceSubtype, TraitIdentifier, TupleData, TypeSignature,
 };
-use crate::vm::{Environment, LocalContext, Value, eval};
+use crate::vm::{LocalContext, Value, eval};
 
 #[allow(clippy::type_complexity, clippy::large_enum_variant)]
 pub enum CallableType {
@@ -60,7 +60,8 @@ pub enum CallableType {
         &'static str,
         &'static dyn Fn(
             &[SymbolicExpression],
-            &mut Environment,
+            &mut ExecutionState,
+            &InvocationContext,
             &LocalContext,
         ) -> Result<Value, VmExecutionError>,
         /// The Clarity-facing function name.
@@ -93,14 +94,21 @@ pub enum NativeHandle {
     DoubleArg(&'static dyn Fn(Value, Value) -> Result<Value, VmExecutionError>),
     MoreArg(&'static dyn Fn(Vec<Value>) -> Result<Value, VmExecutionError>),
     #[allow(clippy::type_complexity)]
-    MoreArgEnv(&'static dyn Fn(Vec<Value>, &mut Environment) -> Result<Value, VmExecutionError>),
+    MoreArgEnv(
+        &'static dyn Fn(
+            Vec<Value>,
+            &mut ExecutionState,
+            &InvocationContext,
+        ) -> Result<Value, VmExecutionError>,
+    ),
 }
 
 impl NativeHandle {
     pub fn apply(
         &self,
         mut args: Vec<Value>,
-        env: &mut Environment,
+        exec_state: &mut ExecutionState,
+        invoke_ctx: &InvocationContext,
     ) -> Result<Value, VmExecutionError> {
         match self {
             Self::SingleArg(function) => {
@@ -121,7 +129,7 @@ impl NativeHandle {
                 function(first, second)
             }
             Self::MoreArg(function) => function(args),
-            Self::MoreArgEnv(function) => function(args, env),
+            Self::MoreArgEnv(function) => function(args, exec_state, invoke_ctx),
         }
     }
 }
@@ -157,26 +165,35 @@ impl DefinedFunction {
         }
     }
 
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
     pub fn execute_apply(
         &self,
         args: &[Value],
-        env: &mut Environment,
+        exec_state: &mut ExecutionState,
+        invoke_ctx: &InvocationContext,
     ) -> Result<Value, VmExecutionError> {
         runtime_cost(
             ClarityCostFunction::UserFunctionApplication,
-            env,
+            exec_state,
             self.arguments.len(),
         )?;
 
-        if env.epoch().uses_arg_size_for_cost() {
+        if exec_state.epoch().uses_arg_size_for_cost() {
             for arg in args.iter() {
-                runtime_cost(ClarityCostFunction::InnerTypeCheckCost, env, arg.size()?)?;
+                runtime_cost(
+                    ClarityCostFunction::InnerTypeCheckCost,
+                    exec_state,
+                    arg.size()?,
+                )?;
             }
         } else {
             for arg_type in self.arg_types.iter() {
                 runtime_cost(
                     ClarityCostFunction::InnerTypeCheckCost,
-                    env,
+                    exec_state,
                     arg_type.size()?,
                 )?;
             }
@@ -201,13 +218,13 @@ impl DefinedFunction {
             let ((name, type_sig), value) = arg;
 
             // Clarity 1 behavior
-            if *env.contract_context.get_clarity_version() < ClarityVersion::Clarity2 {
+            if *invoke_ctx.contract_context.get_clarity_version() < ClarityVersion::Clarity2 {
                 match (type_sig, value) {
                     // Epoch < 2.1 uses TraitReferenceType
                     (
                         TypeSignature::TraitReferenceType(trait_identifier),
                         Value::Principal(PrincipalData::Contract(callee_contract_id)),
-                    ) if *env.epoch() < StacksEpochId::Epoch21 => {
+                    ) if *exec_state.epoch() < StacksEpochId::Epoch21 => {
                         // Argument is a trait reference, probably leading to a dynamic contract call
                         // We keep a reference of the mapping (var-name: (callee_contract_id, trait_id)) in the context.
                         // The code fetching and checking the trait is implemented in the contract_call eval function.
@@ -223,7 +240,7 @@ impl DefinedFunction {
                     (
                         TypeSignature::CallableType(CallableSubtype::Trait(trait_identifier)),
                         Value::Principal(PrincipalData::Contract(callee_contract_id)),
-                    ) if *env.epoch() >= StacksEpochId::Epoch21 => {
+                    ) if *exec_state.epoch() >= StacksEpochId::Epoch21 => {
                         // Argument is a trait reference, probably leading to a dynamic contract call
                         // We keep a reference of the mapping (var-name: (callee_contract_id, trait_id)) in the context.
                         // The code fetching and checking the trait is implemented in the contract_call eval function.
@@ -254,10 +271,10 @@ impl DefinedFunction {
                         );
                     }
                     _ => {
-                        if !type_sig.admits(env.epoch(), value)? {
+                        if !type_sig.admits(exec_state.epoch(), value)? {
                             return Err(RuntimeCheckErrorKind::TypeValueError(
                                 Box::new(type_sig.clone()),
-                                Box::new(value.clone()),
+                                value.to_error_string(),
                             )
                             .into());
                         }
@@ -301,10 +318,10 @@ impl DefinedFunction {
                         );
                     }
                     _ => {
-                        if !type_sig.admits(env.epoch(), &cast_value)? {
+                        if !type_sig.admits(exec_state.epoch(), &cast_value)? {
                             return Err(RuntimeCheckErrorKind::TypeValueError(
                                 Box::new(type_sig.clone()),
-                                Box::new(cast_value),
+                                cast_value.to_error_string(),
                             )
                             .into());
                         }
@@ -317,12 +334,12 @@ impl DefinedFunction {
             }
         }
 
-        let result = eval(&self.body, env, &context);
+        let result = eval(&self.body, exec_state, invoke_ctx, &context);
 
         // if the error wasn't actually an error, but a function return,
         //    pull that out and return it.
         match result {
-            Ok(r) => Ok(r),
+            Ok(r) => Ok(r.clone_with_cost(exec_state)?),
             Err(e) => match e {
                 VmExecutionError::EarlyReturn(v) => Ok(v.into()),
                 _ => Err(e),
@@ -367,11 +384,20 @@ impl DefinedFunction {
         self.define_type == DefineType::ReadOnly
     }
 
-    pub fn apply(&self, args: &[Value], env: &mut Environment) -> Result<Value, VmExecutionError> {
+    pub fn apply(
+        &self,
+        args: &[Value],
+        exec_state: &mut ExecutionState,
+        invoke_ctx: &InvocationContext,
+    ) -> Result<Value, VmExecutionError> {
         match self.define_type {
-            DefineType::Private => self.execute_apply(args, env),
-            DefineType::Public => env.execute_function_as_transaction(self, args, None, false),
-            DefineType::ReadOnly => env.execute_function_as_transaction(self, args, None, false),
+            DefineType::Private => self.execute_apply(args, exec_state, invoke_ctx),
+            DefineType::Public => {
+                exec_state.execute_function_as_transaction(invoke_ctx, self, args, None, false)
+            }
+            DefineType::ReadOnly => {
+                exec_state.execute_function_as_transaction(invoke_ctx, self, args, None, false)
+            }
         }
     }
 
@@ -417,61 +443,6 @@ impl CallableType {
             CallableType::NativeFunction205(s, _, _, _, _) => {
                 FunctionIdentifier::new_native_function(s)
             }
-        }
-    }
-
-    pub fn apply_special(
-        &self,
-        args: &[SymbolicExpression],
-        env: &mut Environment,
-        context: &LocalContext,
-    ) -> Result<Value, VmExecutionError> {
-        match self {
-            CallableType::SpecialFunction(rust_name, function, clarity_name) => {
-                let _span = crate::profiler::begin_builtin_span(clarity_name, rust_name);
-                function(args, env, context)
-            }
-            _ => Err(VmInternalError::Expect("Should be unreachable.".into()).into()),
-        }
-    }
-
-    pub fn apply_evaluated(
-        &self,
-        evaluated_args: Vec<Value>,
-        env: &mut Environment,
-    ) -> Result<Value, VmExecutionError> {
-        match self {
-            CallableType::NativeFunction(rust_name, function, cost_function, clarity_name) => {
-                let _span = crate::profiler::begin_builtin_span(clarity_name, rust_name);
-                runtime_cost(*cost_function, env, evaluated_args.len())
-                    .map_err(VmExecutionError::from)?;
-                function.apply(evaluated_args, env)
-            }
-            CallableType::NativeFunction205(
-                rust_name,
-                function,
-                cost_function,
-                cost_input_handle,
-                clarity_name,
-            ) => {
-                let _span = crate::profiler::begin_builtin_span(clarity_name, rust_name);
-                let cost_input = if env.epoch() >= &StacksEpochId::Epoch2_05 {
-                    cost_input_handle(evaluated_args.as_slice())?
-                } else {
-                    evaluated_args.len() as u64
-                };
-                runtime_cost(*cost_function, env, cost_input).map_err(VmExecutionError::from)?;
-                function.apply(evaluated_args, env)
-            }
-            CallableType::UserFunction(function) => {
-                let _span = crate::profiler::begin_user_fn_span(
-                    function.name.as_str(),
-                    &function.define_type,
-                    function.get_identifier().to_string(),
-                );
-                function.apply(&evaluated_args, env)
-            }
-            _ => Err(VmInternalError::Expect("Should be unreachable.".into()).into()),
         }
     }
 }
@@ -545,7 +516,7 @@ fn clarity2_implicit_cast(
                         // This should be unreachable if the type-checker has already run successfully
                         return Err(RuntimeCheckErrorKind::TypeValueError(
                             Box::new(type_sig.clone()),
-                            Box::new(value.clone()),
+                            value.to_error_string(),
                         )
                         .into());
                     }
