@@ -31,3 +31,18 @@ table! {
         block_height -> BigInt,
     }
 }
+
+// Post-Nakamoto canonical Stacks tip storage. Introduced by stacks-core
+// commit 5aa6af4e96 ("fix: track and report both tenure and burn view
+// consensus hash for stacks tips"). The legacy `stacks_chain_tips` is
+// only populated by the schema-8 one-shot backfill of pre-Nakamoto
+// snapshot rows; for epoch ≥ 3.0 the canonical tip is here.
+table! {
+    stacks_chain_tips_by_burn_view (sortition_id, burn_view_consensus_hash) {
+        sortition_id -> Text,
+        consensus_hash -> Text,
+        burn_view_consensus_hash -> Text,
+        block_hash -> Text,
+        block_height -> BigInt,
+    }
+}

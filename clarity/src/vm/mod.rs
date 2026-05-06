@@ -319,7 +319,7 @@ fn dispatch_args(
     let mut resp = match function {
         CallableType::NativeFunction(rust_name, function, cost_function, clarity_name) => {
             let _span = crate::profiler::begin_builtin_span(clarity_name, rust_name);
-            runtime_cost(cost_function.clone(), exec_state, args.len())
+            runtime_cost(*cost_function, exec_state, args.len())
                 .map_err(VmExecutionError::from)
                 .and_then(|_| function.apply(args, exec_state, invoke_ctx))
         }
@@ -336,7 +336,7 @@ fn dispatch_args(
             } else {
                 args.len() as u64
             };
-            runtime_cost(cost_function.clone(), exec_state, cost_input)
+            runtime_cost(*cost_function, exec_state, cost_input)
                 .map_err(VmExecutionError::from)
                 .and_then(|_| function.apply(args, exec_state, invoke_ctx))
         }

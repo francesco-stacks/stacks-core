@@ -116,3 +116,26 @@ pub struct StacksChainTip {
     pub block_hash: String,
     pub block_height: i64,
 }
+
+/// Post-Nakamoto canonical Stacks tip row. Same shape as [`StacksChainTip`]
+/// for the columns we care about, plus a `burn_view_consensus_hash` we ignore.
+#[derive(Queryable, Selectable, Debug, Clone)]
+#[diesel(table_name = schema::stacks_chain_tips_by_burn_view)]
+pub struct StacksChainTipByBurnView {
+    pub sortition_id: String,
+    pub consensus_hash: String,
+    pub burn_view_consensus_hash: String,
+    pub block_hash: String,
+    pub block_height: i64,
+}
+
+impl From<StacksChainTipByBurnView> for StacksChainTip {
+    fn from(t: StacksChainTipByBurnView) -> Self {
+        Self {
+            sortition_id: t.sortition_id,
+            consensus_hash: t.consensus_hash,
+            block_hash: t.block_hash,
+            block_height: t.block_height,
+        }
+    }
+}
