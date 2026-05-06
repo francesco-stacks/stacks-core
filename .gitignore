@@ -80,3 +80,7 @@ coverage.lcov
 .idea
 .claude
 .vite
+
+# proptest regression files
+proptest-regressions/
+*.proptest-regressions
