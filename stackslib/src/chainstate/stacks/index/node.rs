@@ -135,7 +135,7 @@ pub const fn clear_u64_ptr(id: u8) -> u8 {
     id & 0xdf
 }
 
-/// Clear all control bits (backptr, compressed, u64-pointer, annotation)
+/// Clear all control bits (backptr, compressed, u64-pointer, squash annotation)
 pub fn clear_ctrl_bits(id: u8) -> u8 {
     id & 0x0f
 }
@@ -698,7 +698,6 @@ impl TriePtr {
             // Backpointers and squash annotations append a 4-byte `back_block` after the compressed ptr payload.
             let back_block_offset = TriePtr::encoded_size_compressed_for_id(encoded_id);
             let back_block_end = back_block_offset + 4;
-            // Backpointers append a 4-byte `back_block` after the compressed ptr payload.
             assert!(bytes.len() >= back_block_end);
             u32::from_be_bytes(bytes[back_block_offset..back_block_end].try_into().unwrap())
         } else {
@@ -1164,7 +1163,8 @@ impl TrieNode16 {
 #[derive(Clone)]
 pub struct TrieNode48 {
     pub path: Vec<u8>,
-    pub(crate) indexes: [i8; 256], // indexes[i], if non-negative, is an index into ptrs.
+    /// If indexes[i] is non-negative, then it is an index into ptrs.
+    pub indexes: [i8; 256],
     pub ptrs: [TriePtr; 48],
     /// If this node was created by copy-on-write, then this points to the node it was copied from.
     pub cowptr: Option<TrieCowPtr>,

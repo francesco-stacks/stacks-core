@@ -13,8 +13,6 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#[cfg(test)]
-use std::collections::HashSet;
 use std::ops::DerefMut;
 #[cfg(any(test, feature = "testing"))]
 use std::sync::LazyLock;
@@ -26,10 +24,7 @@ use rusqlite::{Connection, Transaction};
 use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
-pub use super::squash::{
-    SquashStats, SquashValidationStats, MARF_SQUASHED_BLOCK_ROOT_HASH_KEY, MARF_SQUASH_HEIGHT_KEY,
-    MARF_SQUASH_ROOT_KEY,
-};
+pub use super::squash::{SquashStats, SquashValidationStats};
 use super::storage::ReopenedTrieStorageConnection;
 use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
 use crate::chainstate::stacks::index::node::{
@@ -627,22 +622,6 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         Ok(())
     }
 
-    pub fn insert_raw(&mut self, path: TrieHash, marf_leaf: TrieLeaf) -> Result<(), Error> {
-        if self.storage.readonly() {
-            return Err(Error::ReadOnlyError);
-        }
-        let block_hash = match self.open_chain_tip {
-            None => Err(Error::WriteNotBegunError),
-            Some(WriteChainTip { ref block_hash, .. }) => Ok(block_hash.clone()),
-        }?;
-
-        let (cur_block_hash, cur_block_id) = self.storage.get_cur_block_and_id();
-        let result = MARF::insert_leaf(&mut self.storage, &block_hash, &path, &marf_leaf);
-        self.storage
-            .open_block_maybe_id(&cur_block_hash, cur_block_id)?;
-        result
-    }
-
     /// Begin extending the MARF to an unconfirmed trie.  The resulting trie will have a block hash
     /// equal to MARF::make_unconfirmed_block_hash(chain_tip) to avoid collision
     /// and block hash reuse.
@@ -1157,6 +1136,20 @@ impl<T: MarfTrieId> MARF<T> {
     ) -> Result<Option<TrieLeaf>, Error> {
         trace!("MARF::get_path({block_hash:?}) {path:?}");
 
+        // In a squashed MARF, blocks below the squash height share the same blob, so reject
+        // historical reads from them.
+        if let Some(squash_height) = storage.squash_info().map(|info| info.height) {
+            if let Some(h) = trie_sql::read_squash_block_height(storage.sqlite_conn(), block_hash)?
+            {
+                if h < squash_height {
+                    return Err(Error::HistoricalReadInSquashedRange {
+                        block_height: h,
+                        squash_height,
+                    });
+                }
+            }
+        }
+
         // a NotFoundError _here_ means that a block didn't exist
         storage.open_block(block_hash).inspect_err(|_e| {
             test_debug!("Failed to open block {block_hash:?}: {_e:?}");
@@ -1368,7 +1361,7 @@ impl<T: MarfTrieId> MARF<T> {
         // In a squashed MARF, OWN_BLOCK_HEIGHT_KEY returns the squash
         // height H for every block in the squashed range.  Use the
         // side-table when available.
-        if storage.squash_info().is_some() {
+        if storage.is_squashed() {
             if let Some(h) = trie_sql::read_squash_block_height(storage.sqlite_conn(), block_hash)?
             {
                 return Ok(Some(h));
@@ -1422,6 +1415,19 @@ impl<T: MarfTrieId> MARF<T> {
 
         if height == current_block_height {
             return Ok(Some(current_block_hash.clone()));
+        }
+
+        // Squashed MARFs keep historical height -> block mappings in
+        // `marf_squashed_blocks`, not in per-height trie state. When the
+        // caller is inside the squashed range, answer from the side table
+        // and preserve the usual "no future blocks" behavior.
+        if let Some(squash_height) = storage.squash_info().map(|info| info.height) {
+            if current_block_height <= squash_height {
+                if height > current_block_height {
+                    return Ok(None);
+                }
+                return trie_sql::read_squash_block_hash::<T>(storage.sqlite_conn(), height);
+            }
         }
 
         let height_key = format!("{}::{}", BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, height);
@@ -1711,18 +1717,12 @@ impl<T: MarfTrieId> MARF<T> {
         self.open_chain_tip.as_ref().map(|x| x.height)
     }
 
-    /// Access internal storage
-    #[cfg(test)]
-    pub fn borrow_storage_backend(&mut self) -> TrieStorageConnection<'_, T> {
-        self.storage.connection()
-    }
-
     /// Build the set of trusted squash trie root-node hashes from this
     /// MARF's squash metadata.  Returns an empty set for archival
     /// (non-squashed) MARFs.
     #[cfg(test)]
-    pub fn trusted_squash_node_hashes(&self) -> HashSet<TrieHash> {
-        let mut set = HashSet::new();
+    pub fn trusted_squash_node_hashes(&self) -> std::collections::HashSet<TrieHash> {
+        let mut set = std::collections::HashSet::new();
         if let Some(info) = self.storage.squash_info() {
             let h = info.squash_root_node_hash;
             if h != TrieHash::from_data(&[]) {
@@ -1730,6 +1730,12 @@ impl<T: MarfTrieId> MARF<T> {
             }
         }
         set
+    }
+
+    /// Access internal storage
+    #[cfg(test)]
+    pub fn borrow_storage_backend(&mut self) -> TrieStorageConnection<'_, T> {
+        self.storage.connection()
     }
 
     #[cfg(test)]
@@ -1814,8 +1820,20 @@ impl<T: MarfTrieId> MARF<T> {
     where
         F: FnMut(TrieHash, MARFValue) -> Result<(), Error>,
     {
+        if let Some(squash_height) = storage.squash_info().map(|info| info.height) {
+            if let Some(h) = trie_sql::read_squash_block_height(storage.sqlite_conn(), block_hash)?
+            {
+                if h < squash_height {
+                    return Err(Error::HistoricalReadInSquashedRange {
+                        block_height: h,
+                        squash_height,
+                    });
+                }
+            }
+        }
+
         let (original_block_hash, original_block_id) = storage.get_cur_block_and_id();
-        let result = Self::inner_each_leaf(storage, block_hash, &mut handle_leaf);
+        let result = Self::for_each_leaf_inner(storage, block_hash, &mut handle_leaf);
 
         storage
             .open_block_maybe_id(&original_block_hash, original_block_id)
@@ -1832,7 +1850,7 @@ impl<T: MarfTrieId> MARF<T> {
         result
     }
 
-    fn inner_each_leaf<F>(
+    fn for_each_leaf_inner<F>(
         storage: &mut TrieStorageConnection<T>,
         block_hash: &T,
         handle_leaf: &mut F,
@@ -1846,44 +1864,15 @@ impl<T: MarfTrieId> MARF<T> {
         let mut leaf_count = 0u64;
         let mut stack: Vec<(TriePtr, Vec<u8>, T, Option<u32>)> = Vec::new();
 
-        // Process a node: emit leaf or push children onto the stack.
-        let mut process_node = |node: TrieNodeType,
-                                prefix: Vec<u8>,
-                                block_hash: T,
-                                block_id: Option<u32>,
-                                stack: &mut Vec<(TriePtr, Vec<u8>, T, Option<u32>)>|
-         -> Result<bool, Error> {
-            let mut full_prefix = prefix;
-            full_prefix.extend_from_slice(node.path_bytes());
-
-            match node {
-                TrieNodeType::Leaf(leaf) => {
-                    if full_prefix.len() != TRIEHASH_ENCODED_SIZE {
-                        return Err(Error::CorruptionError(
-                            "Leaf path length invalid".to_string(),
-                        ));
-                    }
-                    let path = TrieHash::from_bytes(&full_prefix).ok_or_else(|| {
-                        Error::CorruptionError("Failed to decode leaf path".to_string())
-                    })?;
-                    handle_leaf(path, leaf.data)?;
-                    Ok(true)
-                }
-                _ => {
-                    for ptr in node.ptrs().iter() {
-                        if ptr.id() != TrieNodeID::Empty as u8 {
-                            let mut child_prefix = full_prefix.clone();
-                            child_prefix.push(ptr.chr());
-                            stack.push((*ptr, child_prefix, block_hash.clone(), block_id));
-                        }
-                    }
-                    Ok(false)
-                }
-            }
-        };
-
         let (cur_block, cur_id) = storage.get_cur_block_and_id();
-        if process_node(root_node, vec![], cur_block, cur_id, &mut stack)? {
+        if Self::process_leaf_walk_node(
+            root_node,
+            vec![],
+            cur_block,
+            cur_id,
+            &mut stack,
+            handle_leaf,
+        )? {
             leaf_count += 1;
         }
 
@@ -1908,12 +1897,71 @@ impl<T: MarfTrieId> MARF<T> {
             }
 
             let (node, node_block_hash, node_block_id) = Self::read_node_for_ptr(storage, &ptr)?;
-            if process_node(node, prefix, node_block_hash, node_block_id, &mut stack)? {
+            if Self::process_leaf_walk_node(
+                node,
+                prefix,
+                node_block_hash,
+                node_block_id,
+                &mut stack,
+                handle_leaf,
+            )? {
                 leaf_count += 1;
             }
         }
 
         Ok(leaf_count)
+    }
+
+    /// Process one node during the leaf-walk DFS.
+    ///
+    /// Returns:
+    ///  - `true` if `node` was a leaf and was emitted via `handle_leaf`.
+    ///  - `false` if `node` was internal and its children were queued.
+    ///
+    /// `prefix` is the path accumulated before this node.
+    ///
+    /// `block_hash` and `block_id` identify the block where queued child pointers
+    /// should be resolved. Inline children stay in the currently-open block, while
+    /// children of a node reached through a backpointer use the backpointer target
+    /// returned by `read_node_for_ptr`.
+    fn process_leaf_walk_node<F>(
+        node: TrieNodeType,
+        prefix: Vec<u8>,
+        block_hash: T,
+        block_id: Option<u32>,
+        stack: &mut Vec<(TriePtr, Vec<u8>, T, Option<u32>)>,
+        handle_leaf: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(TrieHash, MARFValue) -> Result<(), Error>,
+    {
+        let mut full_prefix = prefix;
+        full_prefix.extend_from_slice(node.path_bytes());
+
+        match node {
+            TrieNodeType::Leaf(leaf) => {
+                if full_prefix.len() != TRIEHASH_ENCODED_SIZE {
+                    return Err(Error::CorruptionError(
+                        "Leaf path length invalid".to_string(),
+                    ));
+                }
+                let path = TrieHash::from_bytes(&full_prefix).ok_or_else(|| {
+                    Error::CorruptionError("Failed to decode leaf path".to_string())
+                })?;
+                handle_leaf(path, leaf.data)?;
+                Ok(true)
+            }
+            _ => {
+                for ptr in node.ptrs().iter() {
+                    if ptr.id() != TrieNodeID::Empty as u8 {
+                        let mut child_prefix = full_prefix.clone();
+                        child_prefix.push(ptr.chr());
+                        stack.push((*ptr, child_prefix, block_hash.clone(), block_id));
+                    }
+                }
+                Ok(false)
+            }
+        }
     }
 
     /// Read a node referenced by `ptr`, following backpointers when necessary.
