@@ -7,6 +7,8 @@ use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
 use blockstack_lib::chainstate::stacks::db::StacksChainState;
 use blockstack_lib::chainstate::stacks::index::marf::MARFOpenOpts;
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
+use blockstack_lib::core::{STACKS_EPOCHS_MAINNET, STACKS_EPOCHS_REGTEST, STACKS_EPOCHS_TESTNET};
+use clarity::vm::costs::ExecutionCost;
 use futures::{Stream, StreamExt};
 use stacks_common::types::StacksEpochId;
 
@@ -21,16 +23,106 @@ use crate::{
 
 const BURNCHAIN_NAME: &str = "bitcoin";
 
-pub struct BenchEnvOpts {
+/// Returns an epoch list suitable for opening stackslib against a copied DB.
+fn normalize_sortdb_open_epochs(
     network: Network,
+    archive_epochs: &[StacksEpoch],
+) -> Vec<StacksEpoch> {
+    let builtin_epochs = match network {
+        Network::Mainnet => Some(STACKS_EPOCHS_MAINNET.as_ref()),
+        Network::Testnet => Some(STACKS_EPOCHS_TESTNET.as_ref()),
+        Network::Regtest => Some(STACKS_EPOCHS_REGTEST.as_ref()),
+    };
+
+    let Some(builtin_epochs) = builtin_epochs else {
+        return archive_epochs.to_vec();
+    };
+
+    let builtin_epochs: Vec<StacksEpoch> = builtin_epochs.iter().map(epoch_from_core).collect();
+    if source_epochs_are_compatible_prefix(archive_epochs, &builtin_epochs) {
+        builtin_epochs
+    } else {
+        archive_epochs.to_vec()
+    }
+}
+
+/// Converts stackslib's epoch representation into the local app model.
+fn epoch_from_core(epoch: &stacks_common::types::StacksEpoch<ExecutionCost>) -> StacksEpoch {
+    StacksEpoch {
+        epoch_id: epoch.epoch_id,
+        network_epoch_id: epoch.network_epoch.into(),
+        start_block_height: epoch.start_height,
+        end_block_height: epoch.end_height,
+        write_length_budget: epoch.block_limit.write_length,
+        write_count_budget: epoch.block_limit.write_count,
+        read_length_budget: epoch.block_limit.read_length,
+        read_count_budget: epoch.block_limit.read_count,
+        runtime_budget: epoch.block_limit.runtime,
+    }
+}
+
+/// Checks whether source epochs are an older prefix of the built-in schedule.
+fn source_epochs_are_compatible_prefix(
+    source_epochs: &[StacksEpoch],
+    builtin_epochs: &[StacksEpoch],
+) -> bool {
+    if source_epochs.is_empty() || source_epochs.len() > builtin_epochs.len() {
+        return false;
+    }
+
+    source_epochs.iter().enumerate().all(|(idx, source_epoch)| {
+        let Some(builtin_epoch) = builtin_epochs.get(idx) else {
+            return false;
+        };
+
+        if idx + 1 == source_epochs.len() && source_epochs.len() < builtin_epochs.len() {
+            epochs_match_except_end_height(source_epoch, builtin_epoch)
+        } else {
+            source_epoch == builtin_epoch
+        }
+    })
+}
+
+/// Compares epoch identity and limits while allowing an older open-ended tail.
+fn epochs_match_except_end_height(left: &StacksEpoch, right: &StacksEpoch) -> bool {
+    left.epoch_id == right.epoch_id
+        && left.network_epoch_id == right.network_epoch_id
+        && left.start_block_height == right.start_block_height
+        && left.write_length_budget == right.write_length_budget
+        && left.write_count_budget == right.write_count_budget
+        && left.read_length_budget == right.read_length_budget
+        && left.read_count_budget == right.read_count_budget
+        && left.runtime_budget == right.runtime_budget
+}
+
+pub struct BenchEnvOpts {
+    /// The Stacks network to target for the benchmark. Typically determined
+    /// based on the source chainstate, but may be overridden.
+    network: Network,
+    /// The Stacks chain ID to target for the benchmark. Typically determined
+    /// based on the source chainstate, but may be overridden.
     chain_id: u32,
+    /// Optional start block for the benchmark. If not provided, defaults to the
+    /// genesis block.
     start_at: Option<StacksBlockRef>,
+    /// Optional end block for the benchmark.
+    ///
+    /// If provided it must be a descendent of the determined starting block; if
+    /// not provided, it defaults to the current tip.
     end_at: Option<StacksBlockRef>,
+    /// Optional block count to determine the end block based on the start block.
     block_count: Option<u32>,
     /// The chain tip to be used by the context.
     tip: Option<StacksBlockRef>,
     /// The epochs which are applicable for the context.
     epochs: Vec<StacksEpoch>,
+    /// Epochs supplied to stackslib when opening the shadow sortition DB.
+    ///
+    /// This can differ from `epochs` for historical chainstates. `epochs` is also
+    /// used by the current replay planner with Stacks block heights, so keep it
+    /// faithful to the archive. Opening stackslib, however, needs the current
+    /// network epoch schedule so runtime epoch validation accepts old DBs.
+    sortdb_open_epochs: Vec<StacksEpoch>,
 }
 
 impl BenchEnvOpts {
@@ -39,6 +131,7 @@ impl BenchEnvOpts {
         I: IntoIterator<Item = StacksEpoch>,
     {
         let epochs: Vec<StacksEpoch> = epochs.into_iter().collect();
+        let sortdb_open_epochs = normalize_sortdb_open_epochs(network, &epochs);
 
         Ok(Self {
             network,
@@ -48,6 +141,7 @@ impl BenchEnvOpts {
             block_count: None,
             tip: None,
             epochs,
+            sortdb_open_epochs,
         })
     }
 
@@ -78,6 +172,7 @@ pub struct BenchEnv {
     pub chainstate_dir: ChainStateDir,
     pub burnchain_dir: BurnChainDir,
     pub epochs: Arc<Vec<StacksEpoch>>,
+    pub sortdb_open_epochs: Arc<Vec<StacksEpoch>>,
     pub network: Network,
     pub chain_id: u32,
 }
@@ -103,6 +198,7 @@ impl BenchEnv {
             chainstate_dir,
             burnchain_dir,
             epochs: Arc::new(opts.epochs),
+            sortdb_open_epochs: Arc::new(opts.sortdb_open_epochs),
             network: opts.network,
             chain_id: opts.chain_id,
         };
@@ -196,9 +292,8 @@ impl<'a> BenchContext<'a> {
         // Open the sortition DB using SortitionDB::connect() which applies
         // schema migrations if needed. This is safe because we operate on a
         // CoW copy of the chainstate.
-        let sortdb_epochs: Vec<
-            stacks_common::types::StacksEpoch<clarity::vm::costs::ExecutionCost>,
-        > = self.env.epochs.iter().map(Into::into).collect();
+        let sortdb_epochs: Vec<stacks_common::types::StacksEpoch<ExecutionCost>> =
+            self.env.sortdb_open_epochs.iter().map(Into::into).collect();
         let sort_db_path = burnchain.get_db_path();
         drop(SortitionDB::connect(
             &sort_db_path,

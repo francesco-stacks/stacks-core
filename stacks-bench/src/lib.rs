@@ -29,7 +29,7 @@ pub mod provenance;
 pub mod replay;
 pub mod shadow;
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct StacksEpoch {
     epoch_id: StacksEpochId,
     network_epoch_id: u32,
