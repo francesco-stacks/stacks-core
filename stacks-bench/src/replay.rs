@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use blockstack_lib::burnchains::{Burnchain, Txid};
-use blockstack_lib::chainstate::burn::db::sortdb::SortitionDB;
+use blockstack_lib::chainstate::burn::db::sortdb::{SortitionDB, get_ancestor_sort_id};
 use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
 use blockstack_lib::chainstate::nakamoto::miner::{MinerTenureInfoCause, NakamotoBlockBuilder};
 use blockstack_lib::chainstate::stacks::db::StacksChainState;
@@ -543,7 +543,51 @@ fn execute_segment(
         &cur_parent_info.anchored_header.block_hash(),
     );
 
-    let burn_dbconn = sortdb.index_handle_at_block(chainstate, &cur_parent_block_id)?;
+    // Tenure-change blocks execute against the burn view named by the tenure-change payload, not
+    // necessarily the parent Stacks block's burn view. This mirrors canonical Nakamoto append_block
+    // replay.
+    let burn_dbconn = if let Some(tenure_change_tx) = segment_tenure_change_tx {
+        let tenure_change = tenure_change_tx
+            .try_as_tenure_change()
+            .expect("tenure change tx checked by caller");
+
+        if let Some(ref parent_burn_view) = cur_parent_info.burn_view {
+            let parent_burn_view_sn =
+                SortitionDB::get_block_snapshot_consensus(sortdb.conn(), parent_burn_view)?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "parent block burn view {parent_burn_view} was not found while replaying tenure-change block {}",
+                            block.block_id()
+                        )
+                    })?;
+            let handle = sortdb.index_handle_at_ch(&tenure_change.burn_view_consensus_hash)?;
+            let connected_sort_id = get_ancestor_sort_id(
+                &handle,
+                parent_burn_view_sn.block_height,
+                &handle.context.chain_tip,
+            )?
+            .ok_or_else(|| {
+                anyhow!(
+                    "tenure-change burn view {} does not descend from parent burn view {parent_burn_view} while replaying block {}",
+                    tenure_change.burn_view_consensus_hash,
+                    block.block_id()
+                )
+            })?;
+            if connected_sort_id != parent_burn_view_sn.sortition_id {
+                bail!(
+                    "tenure-change burn view {} is not connected to parent burn view {parent_burn_view} while replaying block {}",
+                    tenure_change.burn_view_consensus_hash,
+                    block.block_id()
+                );
+            }
+
+            handle
+        } else {
+            sortdb.index_handle_at_ch(&tenure_change.burn_view_consensus_hash)?
+        }
+    } else {
+        sortdb.index_handle_at_block(chainstate, &cur_parent_block_id)?
+    };
 
     let mut miner_tenure_info =
         builder.load_tenure_info(chainstate, &burn_dbconn, segment_cause)?;
