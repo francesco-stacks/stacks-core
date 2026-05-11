@@ -11,7 +11,6 @@ use blockstack_lib::chainstate::stacks::miner::{
     BlockBuilder, BlockLimitFunction, TransactionResult,
 };
 use blockstack_lib::config::DEFAULT_MAX_TENURE_BYTES;
-use clarity::types::chainstate::ConsensusHash;
 use clarity::vm::costs::ExecutionCost;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 
@@ -803,37 +802,30 @@ where
     for i in 0..n_blocks {
         let setup_start = Instant::now();
 
-        // Prefer the parent's burn_view (Nakamoto), but fall back to the parent's
-        // election consensus hash if the burn_view snapshot is missing.
-        let preferred_view: Option<ConsensusHash> = cur_parent_info.burn_view.clone();
-        let mut baseline_view =
-            preferred_view.unwrap_or_else(|| cur_parent_info.consensus_hash.clone());
+        // Empty baseline blocks extend the parent's current tenure. In Nakamoto
+        // terms the block header consensus hash is the tenure/election consensus
+        // hash, not the parent's current burn view; the burn view may be a
+        // no-sortition burn block and therefore have no winning block commit.
+        let tenure_id_consensus_hash = cur_parent_info.consensus_hash.clone();
 
-        if !SortitionDB::has_block_snapshot_consensus(sortdb.conn(), &baseline_view)? {
-            // fallback path (common culprit for the "Not found" you're seeing)
-            baseline_view = cur_parent_info.consensus_hash.clone();
-        }
-
-        let baseline_sn = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), &baseline_view)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "baseline: missing sortition snapshot for view {baseline_view} (iter {i})"
-                )
-            })?;
+        let baseline_sn =
+            SortitionDB::get_block_snapshot_consensus(sortdb.conn(), &tenure_id_consensus_hash)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "baseline: missing sortition snapshot for tenure consensus hash \
+                         {tenure_id_consensus_hash} (iter {i})"
+                    )
+                })?;
 
         let burn_dbconn = sortdb.index_handle(&baseline_sn.sortition_id);
 
-        // Ensure subsequent burn-view derivations (e.g. get_block_burn_view) stay consistent
-        // with whatever view we were able to open.
-        cur_parent_info.burn_view = Some(baseline_view.clone());
-
         let mut builder = NakamotoBlockBuilder::new(
             &cur_parent_info,
-            &baseline_view, // ensures later snapshot lookup (by mined header CH) is valid
-            0,              // total_burn
-            None,           // tenure_change tx
-            None,           // coinbase tx
-            0,              // pox bitvec len
+            &tenure_id_consensus_hash,
+            0,
+            None,
+            None,
+            0,
             None,
             None,
             None,
