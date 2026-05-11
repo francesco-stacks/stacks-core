@@ -106,7 +106,7 @@ impl StacksBenchServer {
         let indexer_ui: IndexerUiSpawner = if let Some(token) = progress_token {
             let client = client.clone();
             Box::new(move |rx, _start, _end, _tip| {
-                tokio::spawn(forward_indexer_events(rx, client, token))
+                tokio::spawn(forward_indexer_events(rx, client.clone(), token.clone()))
             })
         } else {
             crate::commands::common::silent_indexer_ui()

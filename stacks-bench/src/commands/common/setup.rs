@@ -181,7 +181,7 @@ pub async fn setup_bench_env_and_plan<'a, A: IndexerArgs, P: AsRef<Path> + 'a>(
     Ok((env, plan))
 }
 
-async fn resolve_ref_height(
+pub async fn resolve_ref_height(
     chainstate_db: &ChainStateDb<stacks_bench::db::ReadOnly>,
     r: &StacksBlockRef,
     label: &'static str,

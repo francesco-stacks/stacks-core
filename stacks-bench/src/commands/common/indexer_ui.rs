@@ -5,14 +5,18 @@ use tokio::sync::mpsc;
 /// Spawner for indexer event consumers. The caller provides this to control
 /// how indexer progress is rendered (CLI progress bar, MCP notifications,
 /// or silent drain).
+///
+/// Implementations must be re-invocable so multi-target benchmark runs can
+/// drive one UI session per indexed window.
 pub type IndexerUiSpawner = Box<
-    dyn FnOnce(
+    dyn Fn(
             mpsc::UnboundedReceiver<IndexerEvent>,
             u64, // start_height
             u64, // end_height
             u64, // tip_height
         ) -> tokio::task::JoinHandle<Result<()>>
-        + Send,
+        + Send
+        + Sync,
 >;
 
 /// Returns an [`IndexerUiSpawner`] that silently drains all events.

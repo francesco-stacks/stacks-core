@@ -16,20 +16,26 @@ use crate::commands::common::{IndexerArgs, IndexerUiSpawner, TxIdArg};
 
 // TODO: Add a `--contract` arg to filter by qualified contract id
 #[derive(clap::Args, Debug, Serialize, Deserialize)]
+#[command(group(
+    clap::ArgGroup::new("target_mode")
+        .args(["txid", "block"])
+        .multiple(false)
+        .required(false),
+))]
 pub struct RunArgs {
     /// Stacks node data dir (the directory containing the `chainstate` folder).
     #[arg(long = "source", short = 's')]
     source_dir: PathBuf,
 
     /// The Stacks block (height or hex block id) to start at, inclusive. Cannot be used with the
-    /// `txid` flag.
-    #[arg(long, conflicts_with = "txid", default_value = "1")]
+    /// `txid` or `block` flags.
+    #[arg(long, conflicts_with_all = ["txid", "block"], default_value = "1")]
     #[serde(skip_serializing_if = "Option::is_none")]
     start_at: Option<StacksBlockRef>,
 
     /// The Stacks block (height or hex block id) to end at, inclusive. Cannot be used with the
-    /// `txid` or `count` flags.
-    #[arg(long, conflicts_with_all = ["txid", "block_count"])]
+    /// `txid`, `block`, or `count` flags.
+    #[arg(long, conflicts_with_all = ["txid", "block", "block_count"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     end_at: Option<StacksBlockRef>,
 
@@ -46,22 +52,48 @@ pub struct RunArgs {
     network: Option<Network>,
 
     /// The number of blocks to process, starting from `start-at`.
-    #[arg(long = "count", short = 'c', conflicts_with_all = ["end_at", "txid"], requires = "start_at")]
+    #[arg(
+        long = "count",
+        short = 'c',
+        conflicts_with_all = ["end_at", "txid", "block"],
+        requires = "start_at",
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     block_count: Option<u32>,
 
-    /// A specific transaction id (hex) to benchmark. May not be used with `start-at`, `end-at`, or
-    /// `count`.
-    #[arg(long, conflicts_with_all = ["start_at", "end_at", "block_count", "filter"])]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    txid: Option<TxIdArg>,
+    /// A specific transaction id (hex) to benchmark. May be passed multiple times to benchmark
+    /// several transactions in a single run; each transaction is replayed `--repetitions` times
+    /// from its own parent block. Cannot be combined with `--start-at`, `--end-at`, `--count`,
+    /// `--filter`, or `--block`.
+    #[arg(
+        long,
+        num_args = 1..,
+        action = clap::ArgAction::Append,
+        conflicts_with_all = ["start_at", "end_at", "block_count", "filter"],
+    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    txid: Vec<TxIdArg>,
 
-    /// Number of measured times to replay the target transaction's block in `--txid` mode.
+    /// A specific Stacks block (height or hex block id) to benchmark. May be passed multiple
+    /// times to benchmark several blocks in a single run; each block is replayed `--repetitions`
+    /// times from its own parent block. Resolved against `--tip` for canonical history.
+    /// Cannot be combined with `--start-at`, `--end-at`, `--count`, `--filter`, or `--txid`.
+    #[arg(
+        long,
+        num_args = 1..,
+        action = clap::ArgAction::Append,
+        value_name = "BLOCK",
+        conflicts_with_all = ["start_at", "end_at", "block_count", "filter"],
+    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    block: Vec<StacksBlockRef>,
+
+    /// Number of measured times to replay each target's block in `--txid` or `--block` mode.
     ///
     /// Warmup runs (from `--warmup`) are additional and executed before these measured
-    /// repetitions. Each replay forks from the same parent block, producing an independent
-    /// measurement.
-    #[arg(long, default_value_t = 10, requires = "txid")]
+    /// repetitions, per target. Each replay forks from the target's own parent block, producing
+    /// independent measurements.
+    #[arg(long, default_value_t = 10, requires = "target_mode")]
     repetitions: u32,
 
     /// Number of measured blocks to collect before fitting the commit cost
@@ -70,7 +102,7 @@ pub struct RunArgs {
         long,
         value_name = "CALIBRATION_BLOCKS",
         default_value_t = 20,
-        conflicts_with = "txid"
+        conflicts_with_all = ["txid", "block"],
     )]
     calibration: usize,
 
@@ -79,13 +111,13 @@ pub struct RunArgs {
     /// In block-range mode, this is the number of warmup blocks (the earliest
     /// selected blocks).
     ///
-    /// In `--txid` mode, this is the number of warmup repetitions (discarded
-    /// before measurement begins). These runs are additive to `--repetitions`.
+    /// In `--txid` or `--block` mode, this is the number of warmup repetitions per target
+    /// (discarded before measurement begins). These runs are additive to `--repetitions`.
     #[arg(long, default_value_t = 0)]
     warmup: usize,
 
     /// Filter to apply when selecting transactions to process.
-    #[arg(long, short = 'f', conflicts_with_all = ["txid"])]
+    #[arg(long, short = 'f', conflicts_with_all = ["txid", "block"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     filter: Option<FilterArg>,
 
@@ -143,6 +175,7 @@ impl From<&RunArgs> for BenchRunParams {
             network: args.network,
             block_count: args.block_count,
             txid: args.txid.clone(),
+            block: args.block.clone(),
             repetitions: args.repetitions,
             calibration: args.calibration,
             warmup: args.warmup,

@@ -23,29 +23,42 @@ pub struct RunBenchmarkParams {
     pub source_dir: String,
 
     /// Stacks block (height or hex block id) to start at, inclusive.
-    /// Defaults to block 1 if omitted.
+    /// Defaults to block 1 if omitted. Not allowed when `txid` or `block` is
+    /// non-empty.
     #[serde(default)]
     pub start_at: Option<String>,
 
-    /// Stacks block (height or hex block id) to end at, inclusive.
+    /// Stacks block (height or hex block id) to end at, inclusive. Not
+    /// allowed when `txid` or `block` is non-empty.
     #[serde(default)]
     pub end_at: Option<String>,
 
-    /// Number of blocks to process, starting from `start_at`.
+    /// Number of blocks to process, starting from `start_at`. Not allowed
+    /// when `txid` or `block` is non-empty.
     #[serde(default)]
     pub count: Option<u32>,
 
-    /// A specific transaction id (hex) to benchmark. When set, `start_at`,
-    /// `end_at`, and `count` are ignored.
+    /// Transaction ids (hex) to benchmark. When non-empty, `start_at`,
+    /// `end_at`, `count`, and `filter` must be omitted. Each transaction is
+    /// replayed `repetitions` times independently from its own parent block.
+    /// Mutually exclusive with `block`.
     #[serde(default)]
-    pub txid: Option<String>,
+    pub txid: Vec<String>,
 
-    /// Number of measured repetitions in `--txid` mode. Default: 10.
+    /// Stacks blocks (height or hex block id) to benchmark. When non-empty,
+    /// `start_at`, `end_at`, `count`, `filter`, and `txid` must be omitted.
+    /// Each block is replayed `repetitions` times from its own parent block.
+    /// Mutually exclusive with `txid`.
+    #[serde(default)]
+    pub block: Vec<String>,
+
+    /// Number of measured repetitions per target. Requires `txid` or `block`
+    /// to be non-empty. Default when omitted: 10.
     #[serde(default)]
     pub repetitions: Option<u32>,
 
-    /// Number of warmup blocks (block-range mode) or warmup repetitions
-    /// (txid mode) before measurement begins. Default: 0.
+    /// Number of warmup blocks (block-range mode) or warmup repetitions per
+    /// target (txid/block mode) before measurement begins. Default: 0.
     #[serde(default)]
     pub warmup: Option<u32>,
 
@@ -53,7 +66,8 @@ pub struct RunBenchmarkParams {
     #[serde(default)]
     pub name: Option<String>,
 
-    /// Transaction filter. Currently only `"contract_call"` is supported.
+    /// Transaction filter. Currently only `"contract-call"` is supported.
+    /// Not allowed when `txid` or `block` is non-empty.
     #[serde(default)]
     pub filter: Option<String>,
 
@@ -73,10 +87,10 @@ impl RunBenchmarkParams {
     fn into_bench_params(self) -> Result<BenchRunParams, String> {
         let filter = match self.filter.as_deref() {
             None => None,
-            Some("contract_call") => Some(FilterKind::ContractCall),
+            Some("contract-call") => Some(FilterKind::ContractCall),
             Some(other) => {
                 return Err(format!(
-                    "Unknown filter '{other}'. Supported filters: contract_call"
+                    "Unknown filter '{other}'. Supported filters: contract-call"
                 ));
             }
         };
@@ -89,20 +103,74 @@ impl RunBenchmarkParams {
             ),
         };
 
-        let txid = match self.txid {
-            None => None,
-            Some(ref hex) => {
-                let parsed: TxIdArg = hex
-                    .parse()
-                    .map_err(|e| format!("Invalid txid '{hex}': {e}"))?;
-                Some(parsed)
-            }
-        };
+        let txid: Vec<TxIdArg> = self
+            .txid
+            .iter()
+            .map(|hex| {
+                hex.parse::<TxIdArg>()
+                    .map_err(|e| format!("Invalid txid '{hex}': {e}"))
+            })
+            .collect::<Result<_, _>>()?;
 
         let parse_block_ref = |s: &str| -> Result<StacksBlockRef, String> {
             s.parse()
                 .map_err(|e| format!("Invalid block ref '{s}': {e}"))
         };
+
+        let block: Vec<StacksBlockRef> = self
+            .block
+            .iter()
+            .map(|s| parse_block_ref(s))
+            .collect::<Result<_, _>>()?;
+
+        if !txid.is_empty() && !block.is_empty() {
+            return Err("txid and block are mutually exclusive".to_string());
+        }
+
+        // Mirror the CLI conflict matrix (which clap enforces there): targeted
+        // modes reject range/filter flags rather than silently ignoring them.
+        // Unlike the CLI's `RunArgs.start_at` (clap default = "1"), our
+        // `start_at` here is None unless the caller explicitly passed it, so a
+        // simple `is_some()` check matches user intent.
+        let targeted_mode = if !txid.is_empty() {
+            Some("txid")
+        } else if !block.is_empty() {
+            Some("block")
+        } else {
+            None
+        };
+        if let Some(mode) = targeted_mode {
+            for (name, present) in [
+                ("start_at", self.start_at.is_some()),
+                ("end_at", self.end_at.is_some()),
+                ("count", self.count.is_some()),
+                ("filter", self.filter.is_some()),
+            ] {
+                if present {
+                    return Err(format!(
+                        "{name} is not allowed when {mode} is set (range/filter and targeted modes are mutually exclusive)"
+                    ));
+                }
+            }
+        } else {
+            // Range mode. CLI's `block_count` arg has
+            // `conflicts_with_all = ["end_at", ...]`; mirror that here.
+            if self.end_at.is_some() && self.count.is_some() {
+                return Err(
+                    "end_at and count are mutually exclusive (specify a range either by end_at or by start_at+count)"
+                        .to_string(),
+                );
+            }
+            // CLI's `--repetitions` has `requires = "target_mode"`; an explicit
+            // value is meaningless in range mode (calibration drives sample
+            // count there). Caller-omitted = `None`, which we honor; explicit
+            // `Some(_)` is rejected.
+            if self.repetitions.is_some() {
+                return Err(
+                    "repetitions requires txid or block (no effect in range mode)".to_string(),
+                );
+            }
+        }
 
         Ok(BenchRunParams {
             source_dir: self.source_dir.into(),
@@ -112,6 +180,7 @@ impl RunBenchmarkParams {
             network,
             block_count: self.count,
             txid,
+            block,
             repetitions: self.repetitions.unwrap_or(10),
             calibration: 20,
             warmup: self.warmup.unwrap_or(0) as usize,

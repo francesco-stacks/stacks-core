@@ -48,8 +48,15 @@ pub struct BenchRunParams {
     pub network: Option<Network>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub txid: Option<TxIdArg>,
+    /// Transaction ids to benchmark. Empty = range/filter mode; one or more =
+    /// txid mode (each tx replayed independently from its own parent block).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub txid: Vec<TxIdArg>,
+    /// Block refs (height or hex block id) to benchmark. Empty = range/txid
+    /// mode; one or more = block mode (each block replayed independently from
+    /// its own parent block). Mutually exclusive with `txid`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block: Vec<StacksBlockRef>,
     pub repetitions: u32,
     pub calibration: usize,
     pub warmup: usize,
@@ -65,7 +72,6 @@ pub struct BenchRunParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilterKind {
     ContractCall,
-    Txid(TxIdArg),
 }
 
 impl IndexerArgs for BenchRunParams {
@@ -90,17 +96,6 @@ impl BenchRunParams {
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string(self).context("Failed to serialize BenchRunParams to JSON")
     }
-
-    /// Returns the effective filter, mapping the legacy `txid` field to
-    /// [`FilterKind::Txid`] when present. This allows the unified
-    /// [`run_benchmark`] function to branch on a single discriminant.
-    pub fn resolved_filter(&self) -> Option<FilterKind> {
-        if let Some(ref txid) = self.txid {
-            Some(FilterKind::Txid(txid.clone()))
-        } else {
-            self.filter.clone()
-        }
-    }
 }
 
 /// Structured result returned by benchmark runs.
@@ -113,6 +108,11 @@ pub struct RunResult {
     pub duration_secs: f64,
     pub interrupted: bool,
     pub summary: Option<RunSummaryJson>,
+    /// Per-target summaries. `None` for range mode and for single-`--txid`
+    /// runs (preserves the legacy flat output shape). `Some(...)` whenever
+    /// the run targets more than one transaction or block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub targets: Option<Vec<TargetSummary>>,
 }
 
 /// Aggregated benchmark metrics for JSON output.
@@ -128,11 +128,59 @@ pub struct RunSummaryJson {
     pub read_length: u64,
 }
 
+/// Discriminator for what kind of target a [`TargetSummary`] describes.
+#[derive(serde::Serialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetKind {
+    Txid,
+    Block,
+}
+
+/// Per-target measurement summary. Emitted in [`RunResult::targets`] for
+/// multi-target runs so downstream tooling can attribute metrics back to the
+/// specific txid or block being benchmarked.
+#[derive(serde::Serialize)]
+pub struct TargetSummary {
+    pub kind: TargetKind,
+    /// Hex txid (txid mode) or hex block id (block mode).
+    pub identifier: String,
+    /// Height of the parent block from which each replay was forked.
+    pub parent_block: u64,
+    pub warmup_count: u32,
+    pub measured_count: u32,
+    /// Aggregated measurement summary for this target. `None` if no
+    /// measurements were recorded (e.g. interrupted before completing any
+    /// measured iteration).
+    pub summary: Option<RunSummaryJson>,
+}
+
 /// Result of scanning the canonical chain for a specific transaction.
 struct TxidScanResult {
     block_header: StacksBlockHeader,
     #[allow(dead_code)]
     tx_index: usize,
+}
+
+/// One transaction target inside a [`ResolvedTarget::Txs`] run.
+struct TxTarget {
+    txid: Txid,
+    scan: TxidScanResult,
+}
+
+/// A `--block` ref after height resolution but before indexer canonicalization.
+/// Carries the expected canonical block id for Id-form inputs so non-canonical
+/// (forked-off) ids can be rejected once the indexer reveals the canonical
+/// block at the resolved height.
+struct ResolvedBlockRef {
+    /// Original textual form of the user's `--block` argument, for error
+    /// messages.
+    ref_text: String,
+    /// Canonical block height to index up to.
+    height: u64,
+    /// Block id the user explicitly asked for (`StacksBlockRef::Id`). `None`
+    /// for height-form inputs, since the canonical block at that height under
+    /// `--tip` is unambiguous.
+    expected_id: Option<StacksBlockId>,
 }
 
 /// The resolved target for a benchmark run, produced after the indexer
@@ -145,8 +193,26 @@ enum ResolvedTarget {
         block_ids: Vec<StacksBlockId>,
         filter: Option<FilterKind>,
     },
-    /// Replay a single transaction's block repeatedly (SingleTx mode).
-    SingleTx { txid: Txid, scan: TxidScanResult },
+    /// Replay one or more transaction targets, each `repetitions` times,
+    /// from each target's own parent block. `targets.len() == 1` is the
+    /// legacy single-`--txid` path.
+    Txs { targets: Vec<TxTarget> },
+    /// Replay one or more full-block targets (FR-2 `--block` mode). Each
+    /// block is re-executed in full (`ReplayMode::Follower`) `repetitions`
+    /// times from its own parent. Refs come from the indexer pipeline, so
+    /// each one is canonical under the run's anchor tip.
+    Blocks { refs: Vec<BlockRef> },
+}
+
+/// Per-target descriptor carried on the [`ReplayPlan`] so the execution loop
+/// can build per-target measurement summaries without re-deriving identity.
+#[derive(Clone)]
+struct TargetDescriptor {
+    kind: TargetKind,
+    /// Hex string identifying the target (txid or block id).
+    identifier: String,
+    /// Height of the parent block from which each replay forks.
+    parent_block: u64,
 }
 
 /// A single entry in the replay schedule.
@@ -155,6 +221,17 @@ struct ScheduledBlock {
     /// Repetition index for this block. Always 0 for range mode (each block
     /// replayed once). In txid mode, increments 0..N across warmup + measured.
     repetition: u32,
+    /// How to replay this specific block (Follower, SegmentedFiltered,
+    /// SingleTx). Per-entry so multi-target modes can schedule heterogeneous
+    /// replay shapes (e.g. one `SingleTx` per txid).
+    replay_mode: ReplayMode,
+    /// Whether this entry is a warmup iteration (discarded from measurements).
+    is_warmup: bool,
+    /// Index of the logical target this entry belongs to. Zero for the current
+    /// single-target modes (one txid or one block range); future multi-target
+    /// modes will use this to group entries by target.
+    #[allow(dead_code)]
+    target_index: usize,
 }
 
 /// Fully resolved replay plan. Captures all mode-dependent decisions so the
@@ -164,12 +241,20 @@ struct ScheduledBlock {
 struct ReplayPlan {
     /// Ordered replay schedule — each entry is one block replay iteration.
     schedule: Vec<ScheduledBlock>,
-    /// Number of warmup iterations at the start of the schedule.
-    warmup_count: usize,
-    /// Number of measured iterations after warmup.
-    measured_count: usize,
-    /// How to replay each block (Follower, SegmentedFiltered, SingleTx).
-    replay_mode: ReplayMode,
+    /// Per-machine overhead baseline warmup blocks. Always `params.warmup` —
+    /// deliberately not scaled by target count, since the baseline measures
+    /// machine overhead, not target-specific work.
+    baseline_warmup_blocks: usize,
+    /// Total warmup iterations across all targets in the schedule. For range
+    /// mode this equals `params.warmup`; for multi-target txid mode it is
+    /// `params.warmup * targets.len()`.
+    total_warmup_entries: usize,
+    /// Total measured iterations across all targets in the schedule.
+    total_measured_entries: usize,
+    /// Per-target descriptors, indexed by `ScheduledBlock.target_index`. Used
+    /// to attribute schedule entries to identifiable targets in the final
+    /// [`RunResult.targets`] output.
+    targets: Vec<TargetDescriptor>,
     /// Whether cost model calibration should run. False for txid mode (starts
     /// pre-calibrated with heuristic attribution).
     needs_calibration: bool,
@@ -391,12 +476,15 @@ fn create_shadow_dir_with_events(
 
 /// Run the chainstate indexer pipeline with a UI consumer, returning the
 /// resolved range and the ordered list of block IDs in the range.
+///
+/// `indexer_ui` is borrowed so multi-target callers can drive one UI session
+/// per indexed window.
 async fn run_indexer_pipeline(
     app_db: &mut AppDb,
     env: &BenchEnv,
     plan: ChainIndexPlan,
     interrupted: &Arc<AtomicBool>,
-    indexer_ui: IndexerUiSpawner,
+    indexer_ui: &IndexerUiSpawner,
 ) -> Result<(ResolvedRange, Vec<StacksBlockId>)> {
     let tip_height = plan.anchor_tip.height;
     let idx_start = plan.start_height;
@@ -471,6 +559,9 @@ struct ReplayOutcome {
     completed_measured: usize,
     replay_start: Instant,
     accumulator: MetricsAccumulator,
+    /// Per-target summaries when the run had more than one logical target;
+    /// `None` for range mode and single-`--txid` (preserves legacy shape).
+    target_summaries: Option<Vec<TargetSummary>>,
     total_checkpoint_duration: Duration,
     was_interrupted: bool,
 }
@@ -540,6 +631,7 @@ async fn finalize_run(
         duration_secs: duration.as_secs_f64(),
         interrupted: outcome.was_interrupted,
         summary: build_run_summary(&summary),
+        targets: outcome.target_summaries,
     })
 }
 
@@ -550,29 +642,111 @@ async fn finalize_run(
 /// never inspects the original filter or mode flags.
 fn build_replay_plan(params: &BenchRunParams, target: ResolvedTarget) -> Result<ReplayPlan> {
     match target {
-        ResolvedTarget::SingleTx { txid, scan } => {
-            let block_id = scan.block_header.id.clone();
-            let warmup = params.warmup;
-            let measured = params.repetitions as usize;
-            let total = warmup + measured;
+        ResolvedTarget::Txs { targets } => {
+            if targets.is_empty() {
+                bail!("internal error: ResolvedTarget::Txs constructed with zero targets");
+            }
+            let warmup_per_target = params.warmup;
+            let measured_per_target = params.repetitions as usize;
+            let entries_per_target = warmup_per_target + measured_per_target;
+            let target_count = targets.len();
 
-            let schedule: Vec<ScheduledBlock> = (0..total)
-                .map(|i| ScheduledBlock {
-                    block_id: block_id.clone(),
-                    repetition: i as u32,
-                })
-                .collect();
+            let mode_label = if target_count == 1 {
+                format!("SingleTx({})", targets[0].txid)
+            } else {
+                format!("SingleTx(\u{00d7}{target_count})")
+            };
 
-            let mode_label = format!("SingleTx({})", txid);
-            let replay_mode = ReplayMode::SingleTx(TxFilter::Txid(txid));
+            // Capacity = target_count * (warmup + measured); grouped per target
+            // so each target's warmup precedes its measured reps.
+            let mut schedule: Vec<ScheduledBlock> =
+                Vec::with_capacity(target_count * entries_per_target);
+            let mut descriptors: Vec<TargetDescriptor> = Vec::with_capacity(target_count);
+
+            for (target_index, t) in targets.into_iter().enumerate() {
+                let block_id = t.scan.block_header.id.clone();
+                let block_height = t.scan.block_header.height;
+                let identifier = format!("0x{}", t.txid.to_hex());
+                let replay_mode = ReplayMode::SingleTx(TxFilter::Txid(t.txid));
+
+                for i in 0..entries_per_target {
+                    schedule.push(ScheduledBlock {
+                        block_id: block_id.clone(),
+                        repetition: i as u32,
+                        replay_mode: replay_mode.clone(),
+                        is_warmup: i < warmup_per_target,
+                        target_index,
+                    });
+                }
+
+                descriptors.push(TargetDescriptor {
+                    kind: TargetKind::Txid,
+                    identifier,
+                    parent_block: block_height.saturating_sub(1),
+                });
+            }
 
             Ok(ReplayPlan {
                 schedule,
-                warmup_count: warmup,
-                measured_count: measured,
-                replay_mode,
+                baseline_warmup_blocks: warmup_per_target,
+                total_warmup_entries: warmup_per_target * target_count,
+                total_measured_entries: measured_per_target * target_count,
+                targets: descriptors,
                 needs_calibration: false,
                 name_prefix: "txid-",
+                mode_label,
+            })
+        }
+        ResolvedTarget::Blocks { refs } => {
+            if refs.is_empty() {
+                bail!("internal error: ResolvedTarget::Blocks constructed with zero targets");
+            }
+            let warmup_per_target = params.warmup;
+            let measured_per_target = params.repetitions as usize;
+            let entries_per_target = warmup_per_target + measured_per_target;
+            let target_count = refs.len();
+
+            let mode_label = if target_count == 1 {
+                format!("Block({})", refs[0].id)
+            } else {
+                format!("Block(\u{00d7}{target_count})")
+            };
+            let replay_mode = ReplayMode::Follower;
+
+            let mut schedule: Vec<ScheduledBlock> =
+                Vec::with_capacity(target_count * entries_per_target);
+            let mut descriptors: Vec<TargetDescriptor> = Vec::with_capacity(target_count);
+
+            for (target_index, block_ref) in refs.into_iter().enumerate() {
+                let block_id = block_ref.id.clone();
+                let block_height = block_ref.height;
+                let identifier = block_ref.id.to_string();
+
+                for i in 0..entries_per_target {
+                    schedule.push(ScheduledBlock {
+                        block_id: block_id.clone(),
+                        repetition: i as u32,
+                        replay_mode: replay_mode.clone(),
+                        is_warmup: i < warmup_per_target,
+                        target_index,
+                    });
+                }
+
+                descriptors.push(TargetDescriptor {
+                    kind: TargetKind::Block,
+                    identifier,
+                    parent_block: block_height.saturating_sub(1),
+                });
+            }
+
+            Ok(ReplayPlan {
+                schedule,
+                baseline_warmup_blocks: warmup_per_target,
+                total_warmup_entries: warmup_per_target * target_count,
+                total_measured_entries: measured_per_target * target_count,
+                targets: descriptors,
+                needs_calibration: false,
+                name_prefix: "block-",
                 mode_label,
             })
         }
@@ -587,14 +761,6 @@ fn build_replay_plan(params: &BenchRunParams, target: ResolvedTarget) -> Result<
             }
             let measured = block_ids.len() - warmup;
 
-            let schedule: Vec<ScheduledBlock> = block_ids
-                .into_iter()
-                .map(|id| ScheduledBlock {
-                    block_id: id,
-                    repetition: 0,
-                })
-                .collect();
-
             let replay_mode = match filter {
                 Some(FilterKind::ContractCall) => {
                     ReplayMode::SegmentedFiltered(TxFilter::ContractCall)
@@ -603,11 +769,27 @@ fn build_replay_plan(params: &BenchRunParams, target: ResolvedTarget) -> Result<
             };
             let mode_label = replay_mode.to_string();
 
+            let schedule: Vec<ScheduledBlock> = block_ids
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| ScheduledBlock {
+                    block_id: id,
+                    repetition: 0,
+                    replay_mode: replay_mode.clone(),
+                    is_warmup: i < warmup,
+                    target_index: 0,
+                })
+                .collect();
+
+            // Range mode has a single logical target (the range itself); we
+            // do not emit per-target summaries for it (descriptors is left
+            // empty and execute_replay_plan suppresses RunResult.targets).
             Ok(ReplayPlan {
                 schedule,
-                warmup_count: warmup,
-                measured_count: measured,
-                replay_mode,
+                baseline_warmup_blocks: warmup,
+                total_warmup_entries: warmup,
+                total_measured_entries: measured,
+                targets: Vec::new(),
                 needs_calibration: true,
                 name_prefix: "",
                 mode_label,
@@ -634,8 +816,10 @@ async fn execute_replay_plan(
     let (mut chainstate, burnchain) = bench_context.open_stacks_chainstate()?;
 
     // --- Overhead baselines ---
+    // Baseline measures per-machine overhead and is deliberately NOT scaled
+    // by target count in multi-target modes.
     let (bl1, bl2) = run_overhead_baselines(
-        plan.warmup_count,
+        plan.baseline_warmup_blocks,
         &mut chainstate,
         &burnchain,
         &bench_context.end_block().id,
@@ -648,18 +832,19 @@ async fn execute_replay_plan(
             ev,
             BenchEvent::ReplayInterrupted {
                 completed: 0,
-                total: plan.measured_count,
+                total: plan.total_measured_entries,
             },
         );
         run_cleanup_with_events(app_db.clone(), shadow_dir, ev).await?;
         return Ok(RunResult {
             run_id: run_model.id,
             blocks: plan.total_iterations(),
-            warmup_blocks: plan.warmup_count,
+            warmup_blocks: plan.total_warmup_entries,
             measured_blocks: 0,
             duration_secs: 0.0,
             interrupted: true,
             summary: None,
+            targets: None,
         });
     }
 
@@ -676,7 +861,7 @@ async fn execute_replay_plan(
         .save_block_processing_baseline(
             run_model.id,
             &bench_context.end_block().id,
-            plan.warmup_count as u32,
+            plan.baseline_warmup_blocks as u32,
             BASELINE_MEASURED_BLOCKS,
             &averaged,
         )
@@ -686,16 +871,24 @@ async fn execute_replay_plan(
 
     let mut calibration = CalibrationState::new(plan.needs_calibration, params.calibration);
     let mut completed_measured: usize = 0;
+    let mut warmup_done: usize = 0;
     let mut total_clarity_db_checkpoint_duration = Duration::ZERO;
     let mut last_storage_delta: i64 = 0;
 
     let mut accumulator = MetricsAccumulator::default();
+    // Per-target accumulators and measured counters, indexed by
+    // `entry.target_index`. Empty for range mode (plan.targets is empty); the
+    // run-level `accumulator` covers that case alone.
+    let mut target_accumulators: Vec<MetricsAccumulator> = (0..plan.targets.len())
+        .map(|_| MetricsAccumulator::default())
+        .collect();
+    let mut target_measured_counts: Vec<u32> = vec![0; plan.targets.len()];
 
     bench_events::emit(
         ev,
         BenchEvent::ReplayStarted {
             total_blocks: plan.total_iterations(),
-            warmup_blocks: plan.warmup_count,
+            warmup_blocks: plan.total_warmup_entries,
             mode: plan.mode_label.clone(),
         },
     );
@@ -703,19 +896,19 @@ async fn execute_replay_plan(
     // --- Replay loop ---
     let mut warmup_complete_emitted = false;
     let start = Instant::now();
-    for (i, entry) in plan.schedule.iter().enumerate() {
+    for entry in plan.schedule.iter() {
         if interrupted.load(Ordering::Relaxed) {
             bench_events::emit(
                 ev,
                 BenchEvent::ReplayInterrupted {
                     completed: completed_measured,
-                    total: plan.measured_count,
+                    total: plan.total_measured_entries,
                 },
             );
             break;
         }
 
-        let is_warmup = i < plan.warmup_count;
+        let is_warmup = entry.is_warmup;
         Profiler::clear();
 
         if !is_warmup && !params.no_profiler_kv {
@@ -741,18 +934,19 @@ async fn execute_replay_plan(
             &mut bench_context,
             &mut chainstate,
             &burnchain,
-            &plan.replay_mode,
+            &entry.replay_mode,
             &block,
             entry.repetition,
             Some(&mut on_segment),
         )?;
 
         if is_warmup {
+            warmup_done += 1;
             bench_events::emit(
                 ev,
                 BenchEvent::ReplayWarmupProgress {
-                    completed: i + 1,
-                    total: plan.warmup_count,
+                    completed: warmup_done,
+                    total: plan.total_warmup_entries,
                 },
             );
             continue;
@@ -760,11 +954,11 @@ async fn execute_replay_plan(
 
         completed_measured += 1;
 
-        if !warmup_complete_emitted && plan.warmup_count > 0 {
+        if !warmup_complete_emitted && plan.total_warmup_entries > 0 {
             bench_events::emit(
                 ev,
                 BenchEvent::ReplayWarmupComplete {
-                    warmup_blocks: plan.warmup_count,
+                    warmup_blocks: plan.total_warmup_entries,
                     duration: start.elapsed(),
                 },
             );
@@ -775,7 +969,7 @@ async fn execute_replay_plan(
             ev,
             BenchEvent::ReplayProgress {
                 completed: completed_measured,
-                total: plan.measured_count,
+                total: plan.total_measured_entries,
             },
         );
 
@@ -784,6 +978,10 @@ async fn execute_replay_plan(
         };
 
         accumulator.add_many(&metrics_vec);
+        if !plan.targets.is_empty() {
+            target_accumulators[entry.target_index].add_many(&metrics_vec);
+            target_measured_counts[entry.target_index] += 1;
+        }
 
         if let Some(batch) = calibration.observe(metrics_vec) {
             app_db
@@ -808,15 +1006,47 @@ async fn execute_replay_plan(
             .await?;
     }
 
+    // Build per-target summaries when the plan has more than one logical
+    // target. Single-target txid mode (and range mode, which has zero
+    // descriptors) preserves the legacy flat output shape.
+    let target_summaries = if plan.targets.len() > 1 {
+        let warmup_per_target = if plan.total_warmup_entries > 0 {
+            (plan.total_warmup_entries / plan.targets.len()) as u32
+        } else {
+            0
+        };
+        let summaries: Vec<TargetSummary> = plan
+            .targets
+            .iter()
+            .zip(target_accumulators.iter())
+            .zip(target_measured_counts.iter())
+            .map(|((descriptor, accumulator), measured)| {
+                let s = accumulator.summary();
+                TargetSummary {
+                    kind: descriptor.kind,
+                    identifier: descriptor.identifier.clone(),
+                    parent_block: descriptor.parent_block,
+                    warmup_count: warmup_per_target,
+                    measured_count: *measured,
+                    summary: build_run_summary(&s),
+                }
+            })
+            .collect();
+        Some(summaries)
+    } else {
+        None
+    };
+
     finalize_run(
         app_db,
         ReplayOutcome {
             run_id: run_model.id,
             total_blocks: plan.total_iterations(),
-            warmup_blocks: plan.warmup_count,
+            warmup_blocks: plan.total_warmup_entries,
             completed_measured,
             replay_start: start,
             accumulator,
+            target_summaries,
             total_checkpoint_duration: total_clarity_db_checkpoint_duration,
             was_interrupted: interrupted.load(Ordering::Relaxed),
         },
@@ -826,8 +1056,9 @@ async fn execute_replay_plan(
     .await
 }
 
-/// Run a benchmark. Handles block-range, filtered, and single-transaction
-/// modes via [`BenchRunParams::resolved_filter`].
+/// Run a benchmark. Handles block-range, filtered, and (single or multi)
+/// transaction modes; mode is determined by [`BenchRunParams::txid`] (empty =
+/// range mode, non-empty = txid mode).
 ///
 /// The caller is responsible for:
 /// - Wiring the `interrupted` flag to their cancellation source (ctrl-c, MCP
@@ -843,122 +1074,86 @@ pub async fn run_benchmark(
 ) -> Result<RunResult> {
     Profiler::disable_record();
 
-    let effective_filter = params.resolved_filter();
-
-    // Parse the target Txid once (used for scanning and replay mode).
-    let target_txid = match &effective_filter {
-        Some(FilterKind::Txid(txid_arg)) => Some(
-            Txid::from_bytes(txid_arg.as_bytes())
-                .ok_or_else(|| anyhow::anyhow!("Failed to convert txid bytes to Txid"))?,
-        ),
-        _ => None,
-    };
+    // Pre-flight validation — runs before any expensive setup (shadow dir,
+    // env, etc.) so the user sees the error immediately.
+    validate_run_params(params)?;
 
     let shadow_dir =
         create_shadow_dir_with_events(&params.source_dir, params.include_pre_nakamoto_blocks, &ev)?;
 
-    // --- Resolve environment, index plan, and (for txid mode) locate the target tx ---
-    let (env, index_plan, txid_scan) =
-        if let Some(FilterKind::Txid(ref txid_arg)) = effective_filter {
-            let target_txid = target_txid.as_ref().unwrap();
-            let (env, anchor_tip) =
-                setup_bench_env(&shadow_dir, params.network, params.tip.as_ref()).await?;
+    if !params.txid.is_empty() {
+        run_benchmark_txids(app_db, params, shadow_dir, ev, interrupted, &indexer_ui).await
+    } else if !params.block.is_empty() {
+        run_benchmark_blocks(app_db, params, shadow_dir, ev, interrupted, &indexer_ui).await
+    } else {
+        run_benchmark_range(app_db, params, shadow_dir, ev, interrupted, &indexer_ui).await
+    }
+}
 
-            bench_events::emit(
-                &ev,
-                BenchEvent::EnvironmentReady {
-                    chain_id: env.chain_id,
-                    network: env.network.to_string(),
-                    epochs: env.epochs.iter().map(|e| e.to_string()).collect(),
-                    source_dir: shadow_dir.source().display().to_string(),
-                    shadow_dir: shadow_dir.path().display().to_string(),
-                    target_txid: Some(txid_arg.to_string()),
-                    target_block: None,
-                    target_block_height: None,
-                    repetitions: Some(params.repetitions),
-                },
+/// Cross-flag validation that clap can't express directly. Runs before any
+/// expensive setup so errors surface immediately.
+fn validate_run_params(params: &BenchRunParams) -> Result<()> {
+    if !params.txid.is_empty() && !params.block.is_empty() {
+        bail!("--txid and --block are mutually exclusive");
+    }
+
+    // Reject duplicate --txid values: each target derives synthetic block ids
+    // from (origin_block, segment, tx_range, repetition); two identical txids
+    // would collide on the `(benchmark_run_id, synthetic_block_id)` unique
+    // constraint when persisting metrics. Surface the conflict up front rather
+    // than failing mid-run.
+    let mut seen_txids: std::collections::HashSet<&[u8]> =
+        std::collections::HashSet::with_capacity(params.txid.len());
+    for t in &params.txid {
+        if !seen_txids.insert(t.as_bytes()) {
+            bail!(
+                "duplicate --txid: {t} appears more than once. Use --repetitions to repeat the same target."
             );
+        }
+    }
 
-            // Scan for the target transaction
-            bench_events::emit(
-                &ev,
-                BenchEvent::TxidScanStarted {
-                    txid: txid_arg.to_string(),
-                },
+    // Same rationale for --block: identical block refs would produce
+    // identical synthetic block ids and collide. Textual dedup catches the
+    // same-form case; cross-form duplicates (e.g. height vs hex of the same
+    // canonical block) are caught later, after height resolution.
+    let mut seen_blocks: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(params.block.len());
+    for b in &params.block {
+        if !seen_blocks.insert(b.to_string()) {
+            bail!(
+                "duplicate --block: {b} appears more than once. Use --repetitions to repeat the same target."
             );
-            let scan_start = Instant::now();
+        }
+    }
+    Ok(())
+}
 
-            let scan_result = if let Some(block_header) = app_db
-                .find_block_for_tx_hash_on_chain_tip(txid_arg.as_bytes(), &anchor_tip.id)
-                .await?
-            {
-                TxidScanResult {
-                    block_header,
-                    tx_index: 0,
-                }
-            } else {
-                let ev_scan = ev.clone();
-                let txid_str = txid_arg.to_string();
-                scan_for_txid(
-                    app_db,
-                    shadow_dir.path(),
-                    &anchor_tip,
-                    target_txid,
-                    |scanned, height| {
-                        bench_events::emit(
-                            &ev_scan,
-                            BenchEvent::TxidScanProgress {
-                                scanned,
-                                current_height: height,
-                            },
-                        );
-                        let _ = &txid_str;
-                    },
-                )
-                .await?
-            };
+/// Block-range / filtered benchmark mode.
+async fn run_benchmark_range(
+    app_db: &mut AppDb,
+    params: &BenchRunParams,
+    shadow_dir: ShadowDir,
+    ev: BenchEventSender,
+    interrupted: Arc<AtomicBool>,
+    indexer_ui: &IndexerUiSpawner,
+) -> Result<RunResult> {
+    let (env, index_plan) = setup_bench_env_and_plan(&shadow_dir, params).await?;
 
-            bench_events::emit(
-                &ev,
-                BenchEvent::TxidScanComplete {
-                    txid: txid_arg.to_string(),
-                    block_id: scan_result.block_header.id.to_string(),
-                    block_height: scan_result.block_header.height,
-                    duration: scan_start.elapsed(),
-                },
-            );
+    bench_events::emit(
+        &ev,
+        BenchEvent::EnvironmentReady {
+            chain_id: env.chain_id,
+            network: env.network.to_string(),
+            epochs: env.epochs.iter().map(|e| e.to_string()).collect(),
+            source_dir: shadow_dir.source().display().to_string(),
+            shadow_dir: shadow_dir.path().display().to_string(),
+            target_txid: None,
+            target_block: None,
+            target_block_height: None,
+            repetitions: None,
+        },
+    );
 
-            let target_height = scan_result.block_header.height;
-            let index_start = target_height.saturating_sub(1).max(1);
-            let index_plan = ChainIndexPlan {
-                anchor_tip,
-                start_height: index_start,
-                end_height: target_height,
-            };
-
-            (env, index_plan, Some(scan_result))
-        } else {
-            let (env, index_plan) = setup_bench_env_and_plan(&shadow_dir, params).await?;
-
-            bench_events::emit(
-                &ev,
-                BenchEvent::EnvironmentReady {
-                    chain_id: env.chain_id,
-                    network: env.network.to_string(),
-                    epochs: env.epochs.iter().map(|e| e.to_string()).collect(),
-                    source_dir: shadow_dir.source().display().to_string(),
-                    shadow_dir: shadow_dir.path().display().to_string(),
-                    target_txid: None,
-                    target_block: None,
-                    target_block_height: None,
-                    repetitions: None,
-                },
-            );
-
-            (env, index_plan, None)
-        };
-
-    // --- Indexer pipeline ---
     let (resolved, block_ids) =
         run_indexer_pipeline(app_db, &env, index_plan, &interrupted, indexer_ui).await?;
 
@@ -973,21 +1168,313 @@ pub async fn run_benchmark(
         resolved.end.clone(),
     );
 
-    // --- Resolve target ---
-    let target = match (txid_scan, target_txid) {
-        (Some(scan), Some(txid)) => ResolvedTarget::SingleTx { txid, scan },
-        (None, None) => ResolvedTarget::BlockRange {
-            block_ids,
-            filter: effective_filter,
-        },
-        (Some(_), None) | (None, Some(_)) => {
-            bail!(
-                "inconsistent resolution state: txid_scan and target_txid must both be Some or both be None"
-            )
-        }
+    let target = ResolvedTarget::BlockRange {
+        block_ids,
+        filter: params.filter.clone(),
     };
 
-    // --- Build replay plan and execute ---
+    let plan = build_replay_plan(params, target)?;
+
+    execute_replay_plan(
+        app_db,
+        &plan,
+        params,
+        shadow_dir,
+        bench_context,
+        chainstate_model.id,
+        interrupted,
+        &ev,
+    )
+    .await
+}
+
+/// Multi-target txid benchmark mode. Resolves each `--txid` independently,
+/// indexes a `[parent, target]` window per target (cache fast-path applies
+/// per target), then schedules grouped warmup + measured replay reps per
+/// target.
+async fn run_benchmark_txids(
+    app_db: &mut AppDb,
+    params: &BenchRunParams,
+    shadow_dir: ShadowDir,
+    ev: BenchEventSender,
+    interrupted: Arc<AtomicBool>,
+    indexer_ui: &IndexerUiSpawner,
+) -> Result<RunResult> {
+    let (env, anchor_tip) =
+        setup_bench_env(&shadow_dir, params.network, params.tip.as_ref()).await?;
+
+    let txid_summary = if params.txid.len() == 1 {
+        Some(params.txid[0].to_string())
+    } else {
+        Some(format!("{} txids", params.txid.len()))
+    };
+
+    bench_events::emit(
+        &ev,
+        BenchEvent::EnvironmentReady {
+            chain_id: env.chain_id,
+            network: env.network.to_string(),
+            epochs: env.epochs.iter().map(|e| e.to_string()).collect(),
+            source_dir: shadow_dir.source().display().to_string(),
+            shadow_dir: shadow_dir.path().display().to_string(),
+            target_txid: txid_summary,
+            target_block: None,
+            target_block_height: None,
+            repetitions: Some(params.repetitions),
+        },
+    );
+
+    // --- Per-target scan + indexer pipeline ---
+    let mut tx_targets: Vec<TxTarget> = Vec::with_capacity(params.txid.len());
+    let mut highest_block: Option<BlockRef> = None;
+    let mut lowest_block: Option<BlockRef> = None;
+
+    for txid_arg in &params.txid {
+        let target_txid = Txid::from_bytes(txid_arg.as_bytes())
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert txid bytes to Txid"))?;
+
+        bench_events::emit(
+            &ev,
+            BenchEvent::TxidScanStarted {
+                txid: txid_arg.to_string(),
+            },
+        );
+        let scan_start = Instant::now();
+
+        let scan_result = if let Some(block_header) = app_db
+            .find_block_for_tx_hash_on_chain_tip(txid_arg.as_bytes(), &anchor_tip.id)
+            .await?
+        {
+            TxidScanResult {
+                block_header,
+                tx_index: 0,
+            }
+        } else {
+            let ev_scan = ev.clone();
+            scan_for_txid(
+                app_db,
+                shadow_dir.path(),
+                &anchor_tip,
+                &target_txid,
+                |scanned, height| {
+                    bench_events::emit(
+                        &ev_scan,
+                        BenchEvent::TxidScanProgress {
+                            scanned,
+                            current_height: height,
+                        },
+                    );
+                },
+            )
+            .await?
+        };
+
+        bench_events::emit(
+            &ev,
+            BenchEvent::TxidScanComplete {
+                txid: txid_arg.to_string(),
+                block_id: scan_result.block_header.id.to_string(),
+                block_height: scan_result.block_header.height,
+                duration: scan_start.elapsed(),
+            },
+        );
+
+        let target_height = scan_result.block_header.height;
+        let index_start = target_height.saturating_sub(1).max(1);
+        let index_plan = ChainIndexPlan {
+            anchor_tip: anchor_tip.clone(),
+            start_height: index_start,
+            end_height: target_height,
+        };
+
+        // Drive a fresh indexer UI session per target window so progress
+        // remains attributable to each target.
+        let (_resolved, _block_ids) =
+            run_indexer_pipeline(app_db, &env, index_plan, &interrupted, indexer_ui).await?;
+
+        let block_ref = BlockRef {
+            id: scan_result.block_header.id.clone(),
+            height: target_height,
+        };
+        match &highest_block {
+            Some(h) if h.height >= block_ref.height => {}
+            _ => highest_block = Some(block_ref.clone()),
+        }
+        match &lowest_block {
+            Some(l) if l.height <= block_ref.height => {}
+            _ => lowest_block = Some(block_ref.clone()),
+        }
+
+        tx_targets.push(TxTarget {
+            txid: target_txid,
+            scan: scan_result,
+        });
+    }
+
+    let (chainstate_model, _) = app_db
+        .get_or_create_chainstate(env.network, env.chain_id, &anchor_tip, &env.epochs)
+        .await?;
+
+    // Anchor BenchContext at the highest target's block. The baseline runs
+    // once against this anchor (representative machine overhead); per-target
+    // replays still fork from each target's own parent inside `replay_block`.
+    let end_block = highest_block.expect("non-empty params.txid");
+    let start_block = lowest_block.expect("non-empty params.txid");
+    let bench_context = BenchContext::from_env(&env, anchor_tip, start_block, end_block);
+
+    let target = ResolvedTarget::Txs {
+        targets: tx_targets,
+    };
+    let plan = build_replay_plan(params, target)?;
+
+    execute_replay_plan(
+        app_db,
+        &plan,
+        params,
+        shadow_dir,
+        bench_context,
+        chainstate_model.id,
+        interrupted,
+        &ev,
+    )
+    .await
+}
+
+/// Multi-target block benchmark mode (FR-2 `--block`). Resolves each block
+/// ref against the anchor tip via the indexer pipeline, then schedules
+/// grouped warmup + measured full-block replay reps per target.
+async fn run_benchmark_blocks(
+    app_db: &mut AppDb,
+    params: &BenchRunParams,
+    shadow_dir: ShadowDir,
+    ev: BenchEventSender,
+    interrupted: Arc<AtomicBool>,
+    indexer_ui: &IndexerUiSpawner,
+) -> Result<RunResult> {
+    let (env, anchor_tip) =
+        setup_bench_env(&shadow_dir, params.network, params.tip.as_ref()).await?;
+
+    // Resolve each --block ref to a canonical height under the anchor tip.
+    // The indexer pipeline below produces the canonical block at that height
+    // and persists the [parent, target] window in the app DB. For Id-form
+    // refs we also remember the expected canonical id so we can detect
+    // non-canonical (forked-off) inputs after the pipeline resolves them.
+    let chainstate_dir = stacks_bench::paths::ChainStateDir::from_node_root(shadow_dir.path());
+    let chainstate_db =
+        stacks_bench::db::node::ChainStateDb::open_for_read(chainstate_dir.index_db_path()).await?;
+    let mut resolved_targets: Vec<ResolvedBlockRef> = Vec::with_capacity(params.block.len());
+    for r in &params.block {
+        let h = crate::commands::common::resolve_ref_height(&chainstate_db, r, "block").await?;
+        let expected_id = match r {
+            StacksBlockRef::Id(id) => Some(id.clone()),
+            StacksBlockRef::Height(_) => None,
+        };
+        resolved_targets.push(ResolvedBlockRef {
+            ref_text: r.to_string(),
+            height: h,
+            expected_id,
+        });
+    }
+    drop(chainstate_db);
+
+    // Post-resolve dedup: catches cross-form duplicates (e.g. height N and
+    // the hex id that resolves to the same canonical height under this tip).
+    let mut seen_heights: std::collections::HashSet<u64> =
+        std::collections::HashSet::with_capacity(resolved_targets.len());
+    for target in &resolved_targets {
+        if !seen_heights.insert(target.height) {
+            bail!(
+                "--block {} resolves to height {}, which is already targeted by another --block ref",
+                target.ref_text,
+                target.height
+            );
+        }
+    }
+
+    // For a single --block target, populate the existing block-specific
+    // event fields. For multi-target we leave them None (a richer multi-block
+    // UI breakdown can come later if needed); the per-target context still
+    // surfaces in the post-run `targets` summary.
+    let (target_block, target_block_height) = if params.block.len() == 1 {
+        match &params.block[0] {
+            StacksBlockRef::Id(id) => (Some(id.to_string()), None),
+            StacksBlockRef::Height(h) => (None, Some(*h)),
+        }
+    } else {
+        (None, None)
+    };
+
+    bench_events::emit(
+        &ev,
+        BenchEvent::EnvironmentReady {
+            chain_id: env.chain_id,
+            network: env.network.to_string(),
+            epochs: env.epochs.iter().map(|e| e.to_string()).collect(),
+            source_dir: shadow_dir.source().display().to_string(),
+            shadow_dir: shadow_dir.path().display().to_string(),
+            target_txid: None,
+            target_block,
+            target_block_height,
+            repetitions: Some(params.repetitions),
+        },
+    );
+
+    // --- Per-target indexer pipeline ---
+    let mut target_refs: Vec<BlockRef> = Vec::with_capacity(resolved_targets.len());
+    let mut highest_block: Option<BlockRef> = None;
+    let mut lowest_block: Option<BlockRef> = None;
+
+    for target in &resolved_targets {
+        let target_height = target.height;
+        let index_start = target_height.saturating_sub(1).max(1);
+        let index_plan = ChainIndexPlan {
+            anchor_tip: anchor_tip.clone(),
+            start_height: index_start,
+            end_height: target_height,
+        };
+
+        let (resolved, _block_ids) =
+            run_indexer_pipeline(app_db, &env, index_plan, &interrupted, indexer_ui).await?;
+
+        // For Id-form refs, the user named a specific block. After the
+        // indexer resolves canonical history under --tip, verify that the
+        // canonical block at this height matches what was asked for —
+        // otherwise the input names a block that exists in the DB but is
+        // not on the selected tip's canonical chain.
+        if let Some(expected) = &target.expected_id
+            && expected != &resolved.end.id
+        {
+            bail!(
+                "--block {} is not on the canonical history of the selected tip \
+                 (resolved canonical block at height {} is {}, not {})",
+                target.ref_text,
+                resolved.end.height,
+                resolved.end.id,
+                expected
+            );
+        }
+
+        let block_ref = resolved.end.clone();
+        match &highest_block {
+            Some(h) if h.height >= block_ref.height => {}
+            _ => highest_block = Some(block_ref.clone()),
+        }
+        match &lowest_block {
+            Some(l) if l.height <= block_ref.height => {}
+            _ => lowest_block = Some(block_ref.clone()),
+        }
+        target_refs.push(block_ref);
+    }
+
+    let (chainstate_model, _) = app_db
+        .get_or_create_chainstate(env.network, env.chain_id, &anchor_tip, &env.epochs)
+        .await?;
+
+    let end_block = highest_block.expect("non-empty params.block");
+    let start_block = lowest_block.expect("non-empty params.block");
+    let bench_context = BenchContext::from_env(&env, anchor_tip, start_block, end_block);
+
+    let target = ResolvedTarget::Blocks { refs: target_refs };
     let plan = build_replay_plan(params, target)?;
 
     execute_replay_plan(

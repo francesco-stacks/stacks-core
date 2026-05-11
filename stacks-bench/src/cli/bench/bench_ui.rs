@@ -127,8 +127,17 @@ impl BenchRenderer {
                 if let Some(txid) = target_txid {
                     lines.push_str(&format!("\nTarget Tx:  {txid}"));
                 }
-                if let (Some(block), Some(height)) = (target_block, target_block_height) {
-                    lines.push_str(&format!("\nTx Block:   {block} (height {height})"));
+                match (target_block, target_block_height) {
+                    (Some(block), Some(height)) => {
+                        lines.push_str(&format!("\nBlock:      {block} (height {height})"));
+                    }
+                    (Some(block), None) => {
+                        lines.push_str(&format!("\nBlock:      {block}"));
+                    }
+                    (None, Some(height)) => {
+                        lines.push_str(&format!("\nBlock:      height {height}"));
+                    }
+                    (None, None) => {}
                 }
                 if let Some(reps) = repetitions {
                     lines.push_str(&format!("\nRepetitions: {reps}"));
