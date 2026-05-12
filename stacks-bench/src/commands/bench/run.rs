@@ -70,6 +70,12 @@ pub struct BenchRunParams {
     pub contract: Vec<ContractArg>,
     pub no_profiler_kv: bool,
     pub include_pre_nakamoto_blocks: bool,
+    /// Override the parent directory under which the shadow tempdir is
+    /// created. Useful for sandboxed environments where the default
+    /// (`source_dir.parent()`) is not writable. The shadow tempdir is still
+    /// auto-named and auto-cleaned; only its parent location changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_dir_root: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -466,11 +472,12 @@ fn run_overhead_baselines(
 fn create_shadow_dir_with_events(
     source_dir: &Path,
     include_pre_nakamoto: bool,
+    shadow_dir_root: Option<&Path>,
     ev: &BenchEventSender,
 ) -> Result<ShadowDir> {
     bench_events::emit(ev, BenchEvent::ShadowDirStarted);
     let timer = Instant::now();
-    let shadow_dir = create_shadow_dir(source_dir, include_pre_nakamoto)?;
+    let shadow_dir = create_shadow_dir(source_dir, include_pre_nakamoto, shadow_dir_root)?;
     bench_events::emit(
         ev,
         BenchEvent::ShadowDirComplete {
@@ -1103,8 +1110,12 @@ pub async fn run_benchmark(
     // env, etc.) so the user sees the error immediately.
     validate_run_params(params)?;
 
-    let shadow_dir =
-        create_shadow_dir_with_events(&params.source_dir, params.include_pre_nakamoto_blocks, &ev)?;
+    let shadow_dir = create_shadow_dir_with_events(
+        &params.source_dir,
+        params.include_pre_nakamoto_blocks,
+        params.shadow_dir_root.as_deref(),
+        &ev,
+    )?;
 
     if !params.txid.is_empty() {
         run_benchmark_txids(app_db, params, shadow_dir, ev, interrupted, &indexer_ui).await

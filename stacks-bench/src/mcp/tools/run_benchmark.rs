@@ -1,5 +1,6 @@
 //! `run_benchmark` tool – executes a benchmark run via the shared commands layer.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -91,6 +92,18 @@ pub struct RunBenchmarkParams {
     /// resolution. Defaults to the node's current canonical tip.
     #[serde(default)]
     pub tip: Option<String>,
+
+    /// Parent directory under which the shadow (reflink) copy of the source
+    /// chainstate is created. Defaults to the source directory's parent.
+    /// Override when running in a sandbox where the default parent is not
+    /// writable.
+    ///
+    /// Constraints: must be on the same filesystem as `source_dir` (reflinks
+    /// fail across filesystems), and must not resolve inside the source tree
+    /// (would recurse). The shadow tempdir is still auto-named and
+    /// auto-cleaned.
+    #[serde(default)]
+    pub shadow_dir_root: Option<String>,
 }
 
 impl RunBenchmarkParams {
@@ -220,6 +233,7 @@ impl RunBenchmarkParams {
             contract,
             no_profiler_kv: false,
             include_pre_nakamoto_blocks: false,
+            shadow_dir_root: self.shadow_dir_root.map(PathBuf::from),
             name: self.name,
         })
     }

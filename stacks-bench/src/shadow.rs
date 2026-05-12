@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use tempfile::TempDir;
@@ -195,6 +195,10 @@ pub struct ShadowDirBuilder {
     globs: Vec<String>,
     allow_plain_copy: bool, // false => strict reflink
     watch_files: Vec<PathBuf>,
+    /// Parent directory under which the uniquely-named shadow tempdir is
+    /// created. `None` falls back to `source.parent()` for reflink locality;
+    /// `Some` lets sandboxed callers redirect creation to a writable root.
+    parent_dir: Option<PathBuf>,
 }
 
 impl ShadowDirBuilder {
@@ -204,7 +208,16 @@ impl ShadowDirBuilder {
             globs: Vec::new(),
             allow_plain_copy: false,
             watch_files: Vec::new(),
+            parent_dir: None,
         }
+    }
+
+    /// Override the directory under which the shadow tempdir is created.
+    /// When unset (the default), the tempdir is created next to the source
+    /// directory to maximize reflink locality.
+    pub fn parent_dir<P: Into<PathBuf>>(mut self, parent: P) -> Self {
+        self.parent_dir = Some(parent.into());
+        self
     }
 
     // Add a glob relative to the source root (e.g., "burnchain/**", "chainstate/**")
@@ -229,8 +242,41 @@ impl ShadowDirBuilder {
     pub fn copy(self) -> Result<ShadowDir> {
         let source = self.source;
 
-        // Place tempdir on the same FS to maximize reflink success
-        let parent = source.parent().unwrap_or_else(|| Path::new("/"));
+        // Choose the parent under which the shadow tempdir is created:
+        // caller override wins, otherwise fall back to `source.parent()` to
+        // maximize reflink locality (same filesystem).
+        let parent: &Path = self
+            .parent_dir
+            .as_deref()
+            .unwrap_or_else(|| source.parent().unwrap_or_else(|| Path::new("/")));
+
+        // Reject overrides that resolve inside the source tree. The
+        // `WalkBuilder` below walks the source, and if the shadow tempdir is
+        // also under `source`, the walker discovers its own destination and
+        // tries to copy it into itself — recursively, until inode/disk
+        // exhaustion. Canonicalize both paths so symlinks don't sneak past.
+        if let Some(parent_override) = self.parent_dir.as_deref()
+            && parent_override.exists()
+        {
+            let canon_source = fs::canonicalize(&source).with_context(|| {
+                format!("failed to canonicalize source dir {}", source.display())
+            })?;
+            let canon_parent = fs::canonicalize(parent_override).with_context(|| {
+                format!(
+                    "failed to canonicalize shadow_dir_root {}",
+                    parent_override.display()
+                )
+            })?;
+            if canon_parent.starts_with(&canon_source) {
+                bail!(
+                    "shadow_dir_root ({}) resolves inside the source tree ({}); \
+                     choose a parent directory outside the source dir to avoid recursive copying",
+                    canon_parent.display(),
+                    canon_source.display(),
+                );
+            }
+        }
+
         let tmp = tempfile::Builder::new()
             .prefix(ShadowDir::TMP_PREFIX)
             .tempdir_in(parent)
@@ -337,5 +383,50 @@ impl ShadowDirBuilder {
             source,
             watched_files: self.watch_files,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `shadow_dir_root` pointing inside the source tree must be rejected —
+    /// otherwise the `WalkBuilder` discovers the shadow tempdir as a copy
+    /// candidate and recurses into itself.
+    #[test]
+    fn rejects_parent_dir_inside_source() {
+        let source_tmp = tempfile::tempdir().unwrap();
+        let source = source_tmp.path();
+        // Pretend the source has a `chainstate/vm` subdir; aim the override
+        // at it so the resulting tempdir would land inside the source tree.
+        let inner = source.join("chainstate").join("vm");
+        fs::create_dir_all(&inner).unwrap();
+
+        let err = ShadowDirBuilder::new(source)
+            .parent_dir(&inner)
+            .copy()
+            .expect_err("expected rejection for parent_dir inside source");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("inside the source tree"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// Same-path is also "inside" — `parent_dir == source` must reject.
+    #[test]
+    fn rejects_parent_dir_equal_to_source() {
+        let source_tmp = tempfile::tempdir().unwrap();
+        let source = source_tmp.path();
+
+        let err = ShadowDirBuilder::new(source)
+            .parent_dir(source)
+            .copy()
+            .expect_err("expected rejection for parent_dir == source");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("inside the source tree"),
+            "unexpected error message: {msg}"
+        );
     }
 }

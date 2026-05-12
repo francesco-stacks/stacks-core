@@ -27,6 +27,7 @@ pub fn get_git_hash() -> Option<Vec<u8>> {
 pub fn create_shadow_dir<P: AsRef<Path>>(
     source_dir: P,
     with_pre_nakamoto_blocks: bool,
+    shadow_dir_root: Option<&Path>,
 ) -> Result<ShadowDir> {
     let mut builder = ShadowDirBuilder::new(source_dir.as_ref())
         .glob("burnchain/**")
@@ -47,6 +48,10 @@ pub fn create_shadow_dir<P: AsRef<Path>>(
         .watch("chainstate/vm/index.sqlite")
         .watch("chainstate/vm/index.sqlite.blobs")
         .watch("chainstate/vm/index.sqlite-wal");
+
+    if let Some(root) = shadow_dir_root {
+        builder = builder.parent_dir(root);
+    }
 
     let shadow_dir = builder.copy()?;
     Ok(shadow_dir)

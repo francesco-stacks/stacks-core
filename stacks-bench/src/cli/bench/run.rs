@@ -154,6 +154,24 @@ pub struct RunArgs {
     #[arg(long = "with-pre-naka", default_value_t = false)]
     include_pre_nakamoto_blocks: bool,
 
+    /// Parent directory under which the shadow (reflink) copy of the source
+    /// chainstate is created. Defaults to the source directory's parent so
+    /// the shadow lives on the same filesystem and benefits from reflinks.
+    /// Override this when running in a sandbox where the default parent is
+    /// not writable.
+    ///
+    /// Constraints:
+    ///   * Must be on the same filesystem as `--source` — reflinks fail
+    ///     across filesystems and the strict reflink check will refuse to
+    ///     proceed.
+    ///   * Must not resolve inside the source tree (would recurse).
+    ///
+    /// The shadow tempdir is still auto-named (uniquely) and auto-cleaned at
+    /// end of run.
+    #[arg(long = "shadow-dir-root", value_name = "DIR")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadow_dir_root: Option<PathBuf>,
+
     /// Human-readable name for this benchmark run. If not provided, an
     /// auto-generated timestamp-based name is used. Useful for labeling
     /// runs in `bench list` and `bench compare` (e.g. "baseline-before-refactor").
@@ -203,6 +221,7 @@ impl From<&RunArgs> for BenchRunParams {
             contract: normalize_contract_args(args.contract.clone()),
             no_profiler_kv: args.no_profiler_kv,
             include_pre_nakamoto_blocks: args.include_pre_nakamoto_blocks,
+            shadow_dir_root: args.shadow_dir_root.clone(),
             name: args.name.clone(),
         }
     }
