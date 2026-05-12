@@ -14,7 +14,7 @@ use stacks_bench::db::DbOpenForRead;
 use stacks_bench::db::app::AppDb;
 use stacks_bench::db::app::models::BenchmarkRun;
 use stacks_bench::db::node::{ChainStateDb, NakamotoDb};
-use stacks_bench::filter::TxFilter;
+use stacks_bench::filter::{ContractMatcher, TxFilter};
 use stacks_bench::indexer::{ChainIndexPlan, ChainstateIndexer, ResolvedRange};
 use stacks_bench::metrics::{BlockMetrics, CalibrationState, MetricsAccumulator, MetricsSummary};
 use stacks_bench::paths::ChainStateDir;
@@ -27,7 +27,7 @@ use stacks_profiler::Profiler;
 use tokio::sync::mpsc;
 
 use crate::commands::common::{
-    IndexerArgs, IndexerUiSpawner, TxIdArg, create_shadow_dir, get_git_hash,
+    ContractArg, IndexerArgs, IndexerUiSpawner, TxIdArg, create_shadow_dir, get_git_hash,
     run_cleanup_with_events, setup_bench_env, setup_bench_env_and_plan,
 };
 
@@ -62,6 +62,12 @@ pub struct BenchRunParams {
     pub warmup: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<FilterKind>,
+    /// Contract-call filter targets (`ADDR.NAME[.FN]`). Empty = no contract
+    /// filter; non-empty acts as a stricter contract-call filter (mutually
+    /// exclusive with `filter`, `txid`, `block`). The Vec is expected to be
+    /// already normalized via `normalize_contract_args` at construction time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contract: Vec<ContractArg>,
     pub no_profiler_kv: bool,
     pub include_pre_nakamoto_blocks: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -761,11 +767,30 @@ fn build_replay_plan(params: &BenchRunParams, target: ResolvedTarget) -> Result<
             }
             let measured = block_ids.len() - warmup;
 
-            let replay_mode = match filter {
-                Some(FilterKind::ContractCall) => {
-                    ReplayMode::SegmentedFiltered(TxFilter::ContractCall)
+            // `--contract` and `--filter contract-call` are mutually exclusive
+            // (enforced by clap + validate_run_params); both reduce to a
+            // single `TxFilter::ContractCall(matchers)` here, with an empty
+            // matchers vec for the bare `--filter contract-call` case.
+            let replay_mode = if !params.contract.is_empty() {
+                let matchers: Vec<ContractMatcher> = params
+                    .contract
+                    .iter()
+                    .map(|c| {
+                        ContractMatcher::new(
+                            c.address.clone(),
+                            c.contract_name.clone(),
+                            c.function_name.clone(),
+                        )
+                    })
+                    .collect();
+                ReplayMode::SegmentedFiltered(TxFilter::ContractCall(matchers))
+            } else {
+                match filter {
+                    Some(FilterKind::ContractCall) => {
+                        ReplayMode::SegmentedFiltered(TxFilter::ContractCall(vec![]))
+                    }
+                    _ => ReplayMode::Follower,
                 }
-                _ => ReplayMode::Follower,
             };
             let mode_label = replay_mode.to_string();
 
@@ -1095,6 +1120,22 @@ pub async fn run_benchmark(
 fn validate_run_params(params: &BenchRunParams) -> Result<()> {
     if !params.txid.is_empty() && !params.block.is_empty() {
         bail!("--txid and --block are mutually exclusive");
+    }
+
+    // `--contract` is a stricter form of `--filter contract-call` and targets
+    // a specific set of contract-call destinations. It is mutually exclusive
+    // with the other target/filter modes (clap enforces on the CLI side; this
+    // catches MCP and other programmatic callers).
+    if !params.contract.is_empty() {
+        if params.filter.is_some() {
+            bail!("--contract and --filter are mutually exclusive");
+        }
+        if !params.txid.is_empty() {
+            bail!("--contract and --txid are mutually exclusive");
+        }
+        if !params.block.is_empty() {
+            bail!("--contract and --block are mutually exclusive");
+        }
     }
 
     // Reject duplicate --txid values: each target derives synthetic block ids

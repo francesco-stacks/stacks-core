@@ -12,9 +12,10 @@ use crate::cli::common::{CliContext, ExecCommand, run_indexer_progress_ui};
 // Re-export for use by rerun.rs and other CLI consumers
 pub use crate::commands::bench::run::RunResult;
 use crate::commands::bench::run::{BenchRunParams, FilterKind};
-use crate::commands::common::{IndexerArgs, IndexerUiSpawner, TxIdArg};
+use crate::commands::common::{
+    ContractArg, IndexerArgs, IndexerUiSpawner, TxIdArg, normalize_contract_args,
+};
 
-// TODO: Add a `--contract` arg to filter by qualified contract id
 #[derive(clap::Args, Debug, Serialize, Deserialize)]
 #[command(group(
     clap::ArgGroup::new("target_mode")
@@ -64,12 +65,12 @@ pub struct RunArgs {
     /// A specific transaction id (hex) to benchmark. May be passed multiple times to benchmark
     /// several transactions in a single run; each transaction is replayed `--repetitions` times
     /// from its own parent block. Cannot be combined with `--start-at`, `--end-at`, `--count`,
-    /// `--filter`, or `--block`.
+    /// `--filter`, `--contract`, or `--block`.
     #[arg(
         long,
         num_args = 1..,
         action = clap::ArgAction::Append,
-        conflicts_with_all = ["start_at", "end_at", "block_count", "filter"],
+        conflicts_with_all = ["start_at", "end_at", "block_count", "filter", "contract"],
     )]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     txid: Vec<TxIdArg>,
@@ -77,13 +78,14 @@ pub struct RunArgs {
     /// A specific Stacks block (height or hex block id) to benchmark. May be passed multiple
     /// times to benchmark several blocks in a single run; each block is replayed `--repetitions`
     /// times from its own parent block. Resolved against `--tip` for canonical history.
-    /// Cannot be combined with `--start-at`, `--end-at`, `--count`, `--filter`, or `--txid`.
+    /// Cannot be combined with `--start-at`, `--end-at`, `--count`, `--filter`, `--contract`,
+    /// or `--txid`.
     #[arg(
         long,
         num_args = 1..,
         action = clap::ArgAction::Append,
         value_name = "BLOCK",
-        conflicts_with_all = ["start_at", "end_at", "block_count", "filter"],
+        conflicts_with_all = ["start_at", "end_at", "block_count", "filter", "contract"],
     )]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     block: Vec<StacksBlockRef>,
@@ -117,9 +119,27 @@ pub struct RunArgs {
     warmup: usize,
 
     /// Filter to apply when selecting transactions to process.
-    #[arg(long, short = 'f', conflicts_with_all = ["txid", "block"])]
+    #[arg(long, short = 'f', conflicts_with_all = ["txid", "block", "contract"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     filter: Option<FilterArg>,
+
+    /// Restrict benchmarking to blocks that call one or more specific contracts.
+    ///
+    /// Each value has the form `ADDR.CONTRACT[.FUNCTION]`. When a function name
+    /// is omitted, the filter matches any function call on that contract. May
+    /// be passed multiple times to OR-combine targets. Blocks with no matching
+    /// contract-call are skipped from measurement (range-mode behavior).
+    /// Compatible with `--start-at`, `--end-at`, and `--count`. Cannot be
+    /// combined with `--txid`, `--block`, or `--filter`.
+    #[arg(
+        long,
+        num_args = 1..,
+        action = clap::ArgAction::Append,
+        value_name = "ADDR.CONTRACT[.FUNCTION]",
+        conflicts_with_all = ["txid", "block", "filter"],
+    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    contract: Vec<ContractArg>,
 
     /// Disable capturing of profiler key-value records generated via `record!` and `counter!`
     /// macros. This can provide a slight performance benefit and reduce storage if you do not need
@@ -180,6 +200,7 @@ impl From<&RunArgs> for BenchRunParams {
             calibration: args.calibration,
             warmup: args.warmup,
             filter: args.filter.as_ref().map(FilterKind::from),
+            contract: normalize_contract_args(args.contract.clone()),
             no_profiler_kv: args.no_profiler_kv,
             include_pre_nakamoto_blocks: args.include_pre_nakamoto_blocks,
             name: args.name.clone(),

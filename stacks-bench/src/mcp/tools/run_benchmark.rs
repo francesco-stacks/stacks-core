@@ -12,7 +12,9 @@ use stacks_bench::bench_events::BenchEvent;
 use tokio::sync::mpsc;
 
 use crate::commands::bench::run::{BenchRunParams, FilterKind, RunResult};
-use crate::commands::common::{IndexerUiSpawner, TxIdArg, silent_indexer_ui};
+use crate::commands::common::{
+    ContractArg, IndexerUiSpawner, TxIdArg, normalize_contract_args, silent_indexer_ui,
+};
 use crate::mcp::server::StacksBenchServer;
 
 /// Parameters for the `run_benchmark` tool.
@@ -67,9 +69,18 @@ pub struct RunBenchmarkParams {
     pub name: Option<String>,
 
     /// Transaction filter. Currently only `"contract-call"` is supported.
-    /// Not allowed when `txid` or `block` is non-empty.
+    /// Not allowed when `txid`, `block`, or `contract` is non-empty.
     #[serde(default)]
     pub filter: Option<String>,
+
+    /// Restrict benchmarking to blocks that call one or more specific
+    /// contracts. Each entry has the form `ADDR.CONTRACT[.FUNCTION]`. When
+    /// the function suffix is omitted, the filter matches any function call
+    /// on that contract. Multiple entries OR-combine. Compatible with range
+    /// flags (`start_at`/`end_at`/`count`); mutually exclusive with `txid`,
+    /// `block`, and `filter`.
+    #[serde(default)]
+    pub contract: Vec<String>,
 
     /// Network name (e.g. `"mainnet"`, `"testnet"`). Inferred from the
     /// chainstate if omitted.
@@ -123,8 +134,29 @@ impl RunBenchmarkParams {
             .map(|s| parse_block_ref(s))
             .collect::<Result<_, _>>()?;
 
+        let contract: Vec<ContractArg> = self
+            .contract
+            .iter()
+            .map(|s| {
+                s.parse::<ContractArg>()
+                    .map_err(|e| format!("Invalid contract '{s}': {e}"))
+            })
+            .collect::<Result<_, _>>()?;
+        let contract = normalize_contract_args(contract);
+
         if !txid.is_empty() && !block.is_empty() {
             return Err("txid and block are mutually exclusive".to_string());
+        }
+        if !contract.is_empty() {
+            if !txid.is_empty() {
+                return Err("contract and txid are mutually exclusive".to_string());
+            }
+            if !block.is_empty() {
+                return Err("contract and block are mutually exclusive".to_string());
+            }
+            if self.filter.is_some() {
+                return Err("contract and filter are mutually exclusive".to_string());
+            }
         }
 
         // Mirror the CLI conflict matrix (which clap enforces there): targeted
@@ -185,6 +217,7 @@ impl RunBenchmarkParams {
             calibration: 20,
             warmup: self.warmup.unwrap_or(0) as usize,
             filter,
+            contract,
             no_profiler_kv: false,
             include_pre_nakamoto_blocks: false,
             name: self.name,
