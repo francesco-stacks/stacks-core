@@ -562,16 +562,17 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         // blob whose OWN_BLOCK_HEIGHT_KEY is H. Use the squashed-blocks
         // side-table helper to get the correct per-block height when the
         // block falls within the squashed range.
-        let ancestor_height =
-            if let Some(h) = storage.squashed_block_height(&ancestor_block_hash)? {
-                h
-            } else {
-                MARF::get_block_height_miner_tip(storage, &ancestor_block_hash, &block_header)?
+        let ancestor_height = if let Some(h) =
+            storage.squashed_block_height(&ancestor_block_hash)?
+        {
+            h
+        } else {
+            MARF::get_block_height_miner_tip(storage, &ancestor_block_hash, &block_header)?
                     .ok_or_else(|| {
                         Error::CorruptionError(format!(
                             "Could not find block height of ancestor block {ancestor_block_hash} from {block_header}"                    ))
                     })?
-            };
+        };
         let mut current_height = if let Some(h) = storage.squashed_block_height(&block_header)? {
             h
         } else {
