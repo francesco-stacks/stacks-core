@@ -84,18 +84,45 @@ fn create_source_db(path: &std::path::Path) -> Connection {
     conn
 }
 
+/// Render a short test identifier as the lowercase-hex form of its UTF-8 bytes.
+///
+/// The production squash code stores 32-byte `index_block_hash` values as
+/// BLOB in `marf_squashed_blocks.block_hash` and joins them against the
+/// chainstate `index_block_hash` TEXT columns via `lower(hex(block_hash))`.
+/// Tests use short labels like `"ibh1"` for readability; this helper converts
+/// such a label to the matching lower-hex TEXT so a label-based fixture is
+/// consistent with what production code expects to see in the chainstate
+/// tables.
+fn hex_id(label: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(label.len() * 2);
+    for b in label.as_bytes() {
+        write!(out, "{:02x}", b).unwrap();
+    }
+    out
+}
+
 /// Create a destination DB that simulates a squashed MARF by adding the
-/// `marf_squash_block_heights` table with the given canonical block hashes.
+/// `marf_squashed_blocks` table with the given canonical block-hash labels.
+///
+/// Each label is stored as raw UTF-8 bytes in the BLOB column, so
+/// `lower(hex(block_hash))` returns the same TEXT that test chainstate
+/// inserts write via [`hex_id`].
 fn create_dest_db_with_canonical_blocks(path: &std::path::Path, canonical: &[&str]) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS marf_squash_block_heights (block_hash TEXT NOT NULL, height INTEGER NOT NULL)",
-        )
-        .unwrap();
+        "CREATE TABLE IF NOT EXISTS marf_squashed_blocks (
+            height INTEGER PRIMARY KEY,
+            block_hash BLOB NOT NULL UNIQUE,
+            marf_root_hash BLOB NOT NULL
+        )",
+    )
+    .unwrap();
     for (h, bh) in canonical.iter().enumerate() {
         conn.execute(
-            "INSERT INTO marf_squash_block_heights (block_hash, height) VALUES (?1, ?2)",
-            params![bh, h as i64],
+            "INSERT INTO marf_squashed_blocks (height, block_hash, marf_root_hash) \
+             VALUES (?1, ?2, X'00')",
+            params![h as i64, bh.as_bytes()],
         )
         .unwrap();
     }
@@ -112,7 +139,7 @@ fn insert_block_header(conn: &Connection, height: u32, suffix: &str) {
              VALUES (1,'0','0','p','par','mb',0,'mr','sr','mph',?1,?2,?3,'ir',?4,'bhh',?3,0,'pid','0','0')",
             params![
                 format!("bh{suffix}"),
-                format!("ibh{suffix}"),
+                hex_id(&format!("ibh{suffix}")),
                 height,
                 format!("ch{suffix}"),
             ],
@@ -132,18 +159,21 @@ fn insert_payment(conn: &Connection, height: u32, suffix: &str) {
             format!("bh{suffix}"),
             format!("ch{suffix}"),
             height,
-            format!("ibh{suffix}"),
+            hex_id(&format!("ibh{suffix}")),
         ],
     )
     .unwrap();
 }
 
-/// Insert a transaction row for the given index_block_hash.
-fn insert_transaction(conn: &Connection, id: i64, ibh: &str) {
+/// Insert a transaction row for the given index_block_hash label.
+///
+/// Callers pass a short label (e.g. `"ibh1"`); we store it as
+/// [`hex_id`] so it joins against the squash side-table.
+fn insert_transaction(conn: &Connection, id: i64, ibh_label: &str) {
     conn.execute(
         "INSERT INTO transactions (id, txid, index_block_hash, tx_hex, result) \
              VALUES (?1, ?2, ?3, '0x00', 'ok')",
-        params![id, format!("tx{id}"), ibh],
+        params![id, format!("tx{id}"), hex_id(ibh_label)],
     )
     .unwrap();
 }
@@ -163,13 +193,13 @@ fn test_copy_index_side_tables_round_trip() {
     conn.execute(
             "INSERT INTO nakamoto_tenure_events (tenure_id_consensus_hash, prev_tenure_id_consensus_hash, \
              burn_view_consensus_hash, cause, block_hash, block_id, coinbase_height, num_blocks_confirmed) \
-             VALUES ('ch1','ch0','bv1',0,'bh1','ibh1',1,0)",
-            [],
+             VALUES ('ch1','ch0','bv1',0,'bh1',?1,1,0)",
+            params![hex_id("ibh1")],
         )
         .unwrap();
     conn.execute(
-        "INSERT INTO nakamoto_reward_sets (index_block_hash, reward_set) VALUES ('ibh1','{}')",
-        [],
+        "INSERT INTO nakamoto_reward_sets (index_block_hash, reward_set) VALUES (?1,'{}')",
+        params![hex_id("ibh1")],
     )
     .unwrap();
     drop(conn);
@@ -271,8 +301,8 @@ fn test_validate_index_side_tables_detects_extra_rows() {
     {
         let conn = Connection::open(&dst_path).unwrap();
         conn.execute(
-            "INSERT INTO transactions VALUES (99, 'tx_bad', 'ibh_UNKNOWN', '0x00', 'ok')",
-            [],
+            "INSERT INTO transactions VALUES (99, 'tx_bad', ?1, '0x00', 'ok')",
+            params![hex_id("ibh_UNKNOWN")],
         )
         .unwrap();
     }
@@ -293,7 +323,10 @@ fn test_validate_index_side_tables_detects_extra_rows() {
 }
 
 /// Insert a minimal nakamoto_block_headers row into the source DB.
-fn insert_nakamoto_header(conn: &Connection, ibh: &str, burn_height: u32) {
+///
+/// `ibh_label` is a short test label; we store it as [`hex_id`] so it joins
+/// against `marf_squashed_blocks` the same way real chainstate hashes do.
+fn insert_nakamoto_header(conn: &Connection, ibh_label: &str, burn_height: u32) {
     conn.execute(
         "INSERT INTO nakamoto_block_headers ( \
              block_height, index_root, burn_header_hash, burn_header_height, \
@@ -305,7 +338,7 @@ fn insert_nakamoto_header(conn: &Connection, ibh: &str, burn_height: u32) {
              total_tenure_size) \
          VALUES (?1,'ir','bhh',?2,0,'0',1,?1,0,'ch','pid','mr','sr','ms','ss','bv', \
                  'nakamoto','bh',?3,'0','0',0,'0',NULL,0,NULL,0,0)",
-        params![burn_height, burn_height, ibh],
+        params![burn_height, burn_height, hex_id(ibh_label)],
     )
     .unwrap();
 }
@@ -473,8 +506,8 @@ fn test_matured_rewards_validates_with_source_growth() {
         "INSERT INTO matured_rewards (address, recipient, vtxindex, coinbase, \
              tx_fees_anchored, tx_fees_streamed_confirmed, tx_fees_streamed_produced, \
              child_index_block_hash, parent_index_block_hash) \
-         VALUES ('addr1', NULL, 0, '100', '0', '0', '0', 'ibh1', 'pibh0')",
-        [],
+         VALUES ('addr1', NULL, 0, '100', '0', '0', '0', ?1, 'pibh0')",
+        params![hex_id("ibh1")],
     )
     .unwrap();
     drop(conn);
@@ -494,8 +527,8 @@ fn test_matured_rewards_validates_with_source_growth() {
                 "INSERT INTO matured_rewards (address, recipient, vtxindex, coinbase, \
                      tx_fees_anchored, tx_fees_streamed_confirmed, tx_fees_streamed_produced, \
                      child_index_block_hash, parent_index_block_hash) \
-                 VALUES ('addr2', NULL, 0, '0', '0', '0', '0', 'ibh1', 'pibh0')",
-                [],
+                 VALUES ('addr2', NULL, 0, '0', '0', '0', '0', ?1, 'pibh0')",
+                params![hex_id("ibh1")],
             )
             .unwrap();
     }
@@ -541,8 +574,8 @@ fn test_matured_rewards_detects_fabricated_rows() {
                 "INSERT INTO matured_rewards (address, recipient, vtxindex, coinbase, \
                      tx_fees_anchored, tx_fees_streamed_confirmed, tx_fees_streamed_produced, \
                      child_index_block_hash, parent_index_block_hash) \
-                 VALUES ('addr_FAKE', NULL, 0, '999', '0', '0', '0', 'ibh1', 'pibh0')",
-                [],
+                 VALUES ('addr_FAKE', NULL, 0, '999', '0', '0', '0', ?1, 'pibh0')",
+                params![hex_id("ibh1")],
             )
             .unwrap();
     }
@@ -615,10 +648,14 @@ fn create_sortition_source_db(path: &std::path::Path) -> Connection {
     conn
 }
 
-/// Insert a snapshot row for the given sortition_id and burn_header_hash.
+/// Insert a snapshot row for the given sortition_id and burn_header_hash labels.
+///
+/// `sortition_id` is stored as its [`hex_id`] form so it joins against the
+/// canonical-sortitions temp table that `populate_canonical_sortitions`
+/// builds via `lower(hex(block_hash))` from `marf_squashed_blocks`.
 fn insert_snapshot(
     conn: &Connection,
-    sortition_id: &str,
+    sortition_id_label: &str,
     burn_header_hash: &str,
     block_height: u32,
 ) {
@@ -640,27 +677,30 @@ fn insert_snapshot(
         params![
             block_height,
             burn_header_hash,
-            sortition_id,
-            format!("ch_{sortition_id}"),
-            format!("ir_{sortition_id}"),
+            hex_id(sortition_id_label),
+            format!("ch_{sortition_id_label}"),
+            format!("ir_{sortition_id_label}"),
         ],
     )
     .unwrap();
 }
 
-/// Insert a leader_keys row for the given sortition_id.
-fn insert_leader_key(conn: &Connection, sortition_id: &str) {
+/// Insert a leader_keys row for the given sortition_id label.
+fn insert_leader_key(conn: &Connection, sortition_id_label: &str) {
     conn.execute(
         "INSERT INTO leader_keys (txid, vtxindex, block_height, burn_header_hash, \
              sortition_id, consensus_hash, public_key, memo) \
              VALUES (?1, 0, 1, 'bhh', ?2, 'ch', 'pk', 'memo')",
-        params![format!("lk_tx_{sortition_id}"), sortition_id],
+        params![
+            format!("lk_tx_{sortition_id_label}"),
+            hex_id(sortition_id_label),
+        ],
     )
     .unwrap();
 }
 
-/// Insert a block_commits row for the given sortition_id.
-fn insert_block_commit(conn: &Connection, sortition_id: &str) {
+/// Insert a block_commits row for the given sortition_id label.
+fn insert_block_commit(conn: &Connection, sortition_id_label: &str) {
     conn.execute(
         "INSERT INTO block_commits (txid, vtxindex, block_height, burn_header_hash, \
              sortition_id, block_header_hash, new_seed, parent_block_ptr, parent_vtxindex, \
@@ -668,17 +708,23 @@ fn insert_block_commit(conn: &Connection, sortition_id: &str) {
              input, apparent_sender, burn_parent_modulus, punished) \
              VALUES (?1, 0, 1, 'bhh', ?2, 'bhh', 'seed', 0, 0, 0, 0, '', '', '0', '0', \
              'input', 'sender', 0, NULL)",
-        params![format!("bc_tx_{sortition_id}"), sortition_id],
+        params![
+            format!("bc_tx_{sortition_id_label}"),
+            hex_id(sortition_id_label),
+        ],
     )
     .unwrap();
 }
 
 /// Insert a block_commit_parents row.
-fn insert_block_commit_parent(conn: &Connection, sortition_id: &str) {
+fn insert_block_commit_parent(conn: &Connection, sortition_id_label: &str) {
     conn.execute(
         "INSERT INTO block_commit_parents (block_commit_txid, block_commit_sortition_id, \
              parent_sortition_id) VALUES (?1, ?2, 'parent_sort')",
-        params![format!("bc_tx_{sortition_id}"), sortition_id],
+        params![
+            format!("bc_tx_{sortition_id_label}"),
+            hex_id(sortition_id_label),
+        ],
     )
     .unwrap();
 }
@@ -705,18 +751,26 @@ fn insert_epoch(conn: &Connection, start: u32, epoch_id: u32) {
 }
 
 /// Create a sortition dest DB simulating a squashed MARF with the given
-/// canonical sortition IDs.
+/// canonical sortition-ID labels.
+///
+/// Each label is stored as raw UTF-8 bytes in the `marf_squashed_blocks` BLOB
+/// column, so `lower(hex(block_hash))` returns the hex form that test
+/// chainstate inserts use (sortition IDs in `snapshots` are TEXT).
 fn create_sortition_dest_db(path: &std::path::Path, canonical_sortition_ids: &[&str]) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS marf_squash_block_heights \
-             (block_hash TEXT NOT NULL, height INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS marf_squashed_blocks (
+            height INTEGER PRIMARY KEY,
+            block_hash BLOB NOT NULL UNIQUE,
+            marf_root_hash BLOB NOT NULL
+        )",
     )
     .unwrap();
     for (h, sid) in canonical_sortition_ids.iter().enumerate() {
         conn.execute(
-            "INSERT INTO marf_squash_block_heights (block_hash, height) VALUES (?1, ?2)",
-            params![sid, h as i64],
+            "INSERT INTO marf_squashed_blocks (height, block_hash, marf_root_hash) \
+             VALUES (?1, ?2, X'00')",
+            params![h as i64, sid.as_bytes()],
         )
         .unwrap();
     }
@@ -748,56 +802,56 @@ fn test_sortition_copy_excludes_fork_data() {
     // Transition ops.
     conn.execute(
         "INSERT INTO snapshot_transition_ops (sortition_id, accepted_ops, consumed_keys) \
-             VALUES ('sort_1', '[]', '[]')",
-        [],
+             VALUES (?1, '[]', '[]')",
+        params![hex_id("sort_1")],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO snapshot_transition_ops (sortition_id, accepted_ops, consumed_keys) \
-             VALUES ('sort_1_fork', '[]', '[]')",
-        [],
+             VALUES (?1, '[]', '[]')",
+        params![hex_id("sort_1_fork")],
     )
     .unwrap();
 
     // Stacks chain tips.
     conn.execute(
         "INSERT INTO stacks_chain_tips (sortition_id, consensus_hash, block_hash, block_height) \
-             VALUES ('sort_1', 'ch', 'bh', 1)",
-        [],
+             VALUES (?1, 'ch', 'bh', 1)",
+        params![hex_id("sort_1")],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO stacks_chain_tips (sortition_id, consensus_hash, block_hash, block_height) \
-             VALUES ('sort_1_fork', 'ch2', 'bh2', 1)",
-        [],
+             VALUES (?1, 'ch2', 'bh2', 1)",
+        params![hex_id("sort_1_fork")],
     )
     .unwrap();
 
     // Missed commits.
     conn.execute(
         "INSERT INTO missed_commits (txid, input, intended_sortition_id) \
-             VALUES ('mc_tx', 'input', 'sort_1')",
-        [],
+             VALUES ('mc_tx', 'input', ?1)",
+        params![hex_id("sort_1")],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO missed_commits (txid, input, intended_sortition_id) \
-             VALUES ('mc_tx_fork', 'input', 'sort_1_fork')",
-        [],
+             VALUES ('mc_tx_fork', 'input', ?1)",
+        params![hex_id("sort_1_fork")],
     )
     .unwrap();
 
     // Preprocessed reward sets.
     conn.execute(
         "INSERT INTO preprocessed_reward_sets (sortition_id, reward_set) \
-             VALUES ('sort_1', '{}')",
-        [],
+             VALUES (?1, '{}')",
+        params![hex_id("sort_1")],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO preprocessed_reward_sets (sortition_id, reward_set) \
-             VALUES ('sort_1_fork', '{}')",
-        [],
+             VALUES (?1, '{}')",
+        params![hex_id("sort_1_fork")],
     )
     .unwrap();
 
@@ -862,8 +916,8 @@ fn test_sortition_validate_detects_payload_corruption() {
     {
         let conn = Connection::open(&dst_path).unwrap();
         conn.execute(
-            "UPDATE snapshots SET burn_header_timestamp = 9999 WHERE sortition_id = 'sort_0'",
-            [],
+            "UPDATE snapshots SET burn_header_timestamp = 9999 WHERE sortition_id = ?1",
+            params![hex_id("sort_0")],
         )
         .unwrap();
     }
@@ -901,8 +955,8 @@ fn test_sortition_validate_detects_extra_rows() {
         conn.execute(
             "INSERT INTO leader_keys (txid, vtxindex, block_height, burn_header_hash, \
                  sortition_id, consensus_hash, public_key, memo) \
-                 VALUES ('extra_tx', 0, 1, 'bhh', 'sort_0', 'ch', 'pk', 'memo')",
-            [],
+                 VALUES ('extra_tx', 0, 1, 'bhh', ?1, 'ch', 'pk', 'memo')",
+            params![hex_id("sort_0")],
         )
         .unwrap();
     }
@@ -1020,8 +1074,8 @@ fn test_sortition_optional_table_asymmetry() {
     .unwrap();
     conn.execute(
         "INSERT INTO snapshot_burn_distributions (sortition_id, data) \
-             VALUES ('sort_0', 'dist_data')",
-        [],
+             VALUES (?1, 'dist_data')",
+        params![hex_id("sort_0")],
     )
     .unwrap();
 
@@ -1085,15 +1139,15 @@ fn test_sortition_stacks_chain_tips_by_burn_view_copied() {
     conn.execute(
         "INSERT INTO stacks_chain_tips_by_burn_view \
          (sortition_id, consensus_hash, burn_view_consensus_hash, block_hash, block_height) \
-         VALUES ('sort_0', 'ch_sort_0', 'ch_sort_0', 'bh_0', 0)",
-        [],
+         VALUES (?1, 'ch_sort_0', 'ch_sort_0', 'bh_0', 0)",
+        params![hex_id("sort_0")],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO stacks_chain_tips_by_burn_view \
          (sortition_id, consensus_hash, burn_view_consensus_hash, block_hash, block_height) \
-         VALUES ('sort_1', 'ch_sort_1', 'ch_sort_1', 'bh_1', 1)",
-        [],
+         VALUES (?1, 'ch_sort_1', 'ch_sort_1', 'bh_1', 1)",
+        params![hex_id("sort_1")],
     )
     .unwrap();
     drop(conn);
@@ -1153,7 +1207,7 @@ fn insert_staging_block(conn: &Connection, suffix: &str, height: u32) {
             format!("parent_ch{suffix}"),
             "0000000000000000000000000000000000000000000000000000000000000000",
             height,
-            format!("ibh{suffix}"),
+            hex_id(&format!("ibh{suffix}")),
         ],
     )
     .unwrap();
@@ -1186,12 +1240,13 @@ fn test_staging_blocks_populated_for_canonical() {
     // Verify all columns preserved verbatim.
     let dst_conn = Connection::open(&dst_path).unwrap();
     let (download_time, arrival_time, processed_time): (i64, i64, i64) = dst_conn
-            .query_row(
-                "SELECT download_time, arrival_time, processed_time FROM staging_blocks WHERE index_block_hash = 'ibh1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
+        .query_row(
+            "SELECT download_time, arrival_time, processed_time \
+                 FROM staging_blocks WHERE index_block_hash = ?1",
+            params![hex_id("ibh1")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
     assert_eq!(download_time, 100);
     assert_eq!(arrival_time, 200);
     assert_eq!(processed_time, 300);
@@ -1199,8 +1254,8 @@ fn test_staging_blocks_populated_for_canonical() {
     // ibh3 should NOT be present.
     let count: i64 = dst_conn
         .query_row(
-            "SELECT COUNT(*) FROM staging_blocks WHERE index_block_hash = 'ibh3'",
-            [],
+            "SELECT COUNT(*) FROM staging_blocks WHERE index_block_hash = ?1",
+            params![hex_id("ibh3")],
             |row| row.get(0),
         )
         .unwrap();
@@ -1231,11 +1286,12 @@ fn test_staging_blocks_validation_detects_drift() {
     // Now corrupt a column in destination staging_blocks.
     let dst_conn = Connection::open(&dst_path).unwrap();
     dst_conn
-            .execute(
-                "UPDATE staging_blocks SET parent_consensus_hash = 'corrupted' WHERE index_block_hash = 'ibh1'",
-                [],
-            )
-            .unwrap();
+        .execute(
+            "UPDATE staging_blocks SET parent_consensus_hash = 'corrupted' \
+                 WHERE index_block_hash = ?1",
+            params![hex_id("ibh1")],
+        )
+        .unwrap();
     drop(dst_conn);
 
     // Validation should now fail.

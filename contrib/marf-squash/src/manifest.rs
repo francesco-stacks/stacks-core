@@ -25,11 +25,10 @@ pub fn read_squash_metadata<T: MarfTrieId + std::fmt::Display>(
         eprintln!("Failed to open squashed MARF for manifest: {e:?}");
         std::process::exit(1);
     });
-    let tip =
-        trie_sql::get_latest_confirmed_block_hash::<T>(marf.sqlite_conn()).unwrap_or_else(|e| {
-            eprintln!("Failed to read latest block hash: {e:?}");
-            std::process::exit(1);
-        });
+    let tip = trie_sql::get_latest_confirmed_block_hash(marf.sqlite_conn()).unwrap_or_else(|e| {
+        eprintln!("Failed to read latest block hash: {e:?}");
+        std::process::exit(1);
+    });
     let squash_info = trie_sql::read_squash_info(marf.sqlite_conn()).unwrap_or_else(|e| {
         eprintln!("Failed to read squash info: {e:?}");
         std::process::exit(1);
@@ -55,73 +54,36 @@ fn insert_expected_rel(base: &Path, abs_path: &Path, set: &mut HashSet<String>) 
     }
 }
 
-/// Read the burn_header_timestamp for the snapshot at the squash height.
-/// When sortition DB is available, uses the explicit burn_height to look up
-/// the canonical sortition ID rather than re-deriving from MAX(height).
-pub fn read_snapshot_timestamp(
-    sortition_out: Option<(&TargetPaths, u32)>,
-    index_out: &TargetPaths,
-    height: u32,
-) -> Option<String> {
-    // Try sortition DB first, using the explicit burn_height.
-    if let Some((s_out, burn_height)) = sortition_out {
-        let conn = rusqlite::Connection::open(s_out.db.to_str().unwrap()).ok()?;
-        let sort_id: Option<String> = conn
-            .query_row(
-                "SELECT block_hash FROM marf_squash_block_heights WHERE height = ?1",
-                [burn_height],
-                |row| row.get(0),
-            )
-            .ok();
-        if let Some(sid) = sort_id {
-            let ts: Option<i64> = conn
-                .query_row(
-                    "SELECT burn_header_timestamp FROM snapshots WHERE sortition_id = ?1",
-                    [&sid],
-                    |row| row.get(0),
-                )
-                .ok();
-            if let Some(ts) = ts {
-                return Some(format_timestamp(ts));
-            }
-        }
-    }
-
-    // Fallback: try index DB block_headers, then nakamoto_block_headers.
-    let conn = rusqlite::Connection::open(index_out.db.to_str().unwrap()).ok()?;
-    let ibh: Option<String> = conn
+/// Read the burn_header_timestamp for the snapshot at the squash height
+/// from the squashed sortition DB. Exits on failure.
+pub fn read_snapshot_timestamp(sortition_out: &TargetPaths, sortition_marf_height: u32) -> String {
+    let conn = rusqlite::Connection::open(sortition_out.db.to_str().unwrap()).unwrap_or_else(|e| {
+        eprintln!("Failed to open squashed sortition DB for snapshot timestamp: {e}");
+        std::process::exit(1);
+    });
+    let sort_id: String = conn
         .query_row(
-            "SELECT block_hash FROM marf_squash_block_heights WHERE height = ?1",
-            [height],
+            "SELECT lower(hex(block_hash)) FROM marf_squashed_blocks WHERE height = ?1",
+            [sortition_marf_height],
             |row| row.get(0),
         )
-        .ok();
-    if let Some(ibh) = ibh {
-        // Try epoch 2.x headers first.
-        let ts: Option<i64> = conn
-            .query_row(
-                "SELECT burn_header_timestamp FROM block_headers WHERE index_block_hash = ?1",
-                [&ibh],
-                |row| row.get(0),
-            )
-            .ok();
-        if let Some(ts) = ts {
-            return Some(format_timestamp(ts));
-        }
-        // Try Nakamoto headers.
-        let ts: Option<i64> = conn
-            .query_row(
-                "SELECT burn_header_timestamp FROM nakamoto_block_headers WHERE index_block_hash = ?1",
-                [&ibh],
-                |row| row.get(0),
-            )
-            .ok();
-        if let Some(ts) = ts {
-            return Some(format_timestamp(ts));
-        }
-    }
-
-    None
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to read sortition ID at sortition MARF height {sortition_marf_height} from squashed sortition DB: {e}"
+            );
+            std::process::exit(1);
+        });
+    let ts: i64 = conn
+        .query_row(
+            "SELECT burn_header_timestamp FROM snapshots WHERE sortition_id = ?1",
+            [&sort_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read burn_header_timestamp for sortition_id {sort_id}: {e}");
+            std::process::exit(1);
+        });
+    format_timestamp(ts)
 }
 
 /// Generate the GSS manifest. Only called for a complete GSS (all MARFs +
@@ -166,11 +128,17 @@ pub fn generate_manifest(
         std::process::exit(1);
     }
 
-    let (s_out, _) = &sortition_out;
-    let (_s_tip, s_archival, s_squash, _s_h) = read_squash_metadata::<SortitionId>(
-        s_out.db.to_str().unwrap(),
-        sortition_open_opts_for_path(&s_out.db),
+    let (sortition_paths, sortition_marf_height) = sortition_out;
+    let (_s_tip, s_archival, s_squash, s_h) = read_squash_metadata::<SortitionId>(
+        sortition_paths.db.to_str().unwrap(),
+        sortition_open_opts_for_path(&sortition_paths.db),
     );
+    if s_h != sortition_marf_height {
+        eprintln!(
+            "Manifest error: Sortition squash height {s_h} != requested {sortition_marf_height}"
+        );
+        std::process::exit(1);
+    }
 
     // Read db_config from the squashed index DB.
     let (chain_id, mainnet) = {
@@ -191,25 +159,28 @@ pub fn generate_manifest(
         (row.0 as u32, row.1 != 0)
     };
 
-    // Read timestamp from sortition snapshots, falling back to index headers.
-    let timestamp = read_snapshot_timestamp(Some(sortition_out), index_out, stacks_height);
+    // Read timestamp from squashed sortition snapshots.
+    let timestamp = Some(read_snapshot_timestamp(
+        sortition_paths,
+        sortition_marf_height,
+    ));
 
     // Read bitcoin block hash from sortition DB.
     let bitcoin_block_hash = {
-        let (s_out, bh) = &sortition_out;
-        let conn = rusqlite::Connection::open(s_out.db.to_str().unwrap()).unwrap_or_else(|e| {
-            eprintln!("Failed to open squashed sortition DB for bitcoin metadata: {e}");
-            std::process::exit(1);
-        });
+        let conn =
+            rusqlite::Connection::open(sortition_paths.db.to_str().unwrap()).unwrap_or_else(|e| {
+                eprintln!("Failed to open squashed sortition DB for bitcoin metadata: {e}");
+                std::process::exit(1);
+            });
         let sort_id: String = conn
             .query_row(
-                "SELECT block_hash FROM marf_squash_block_heights WHERE height = ?1",
-                [bh],
+                "SELECT lower(hex(block_hash)) FROM marf_squashed_blocks WHERE height = ?1",
+                [sortition_marf_height],
                 |row| row.get(0),
             )
             .unwrap_or_else(|e| {
                 eprintln!(
-                    "Failed to read sortition ID at MARF height {bh} from squashed sortition DB: {e}"
+                    "Failed to read sortition ID at sortition MARF height {sortition_marf_height} from squashed sortition DB: {e}"
                 );
                 std::process::exit(1);
             });
@@ -239,8 +210,8 @@ pub fn generate_manifest(
     if let Some(b) = &index_out.blobs {
         insert_expected_rel(out_dir, b, &mut expected);
     }
-    insert_expected_rel(out_dir, &sortition_out.0.db, &mut expected);
-    if let Some(b) = &sortition_out.0.blobs {
+    insert_expected_rel(out_dir, &sortition_paths.db, &mut expected);
+    if let Some(b) = &sortition_paths.blobs {
         insert_expected_rel(out_dir, b, &mut expected);
     }
 

@@ -11,9 +11,9 @@ use crate::ops::{
 use crate::util::{
     bitcoin_height_to_sortition_marf_height, build_pox_constants, chainstate_paths,
     enforce_minimum_tenure_height, ensure_flag_requires, ensure_targets_selected,
-    find_tenure_end_stacks_height, read_db_config, read_first_burn_height, selected_targets,
-    sortition_open_opts_for_path, squash_marf_open_opts, target_out_paths,
-    target_out_paths_sortition, warn_if_in_prepare_phase,
+    find_tenure_end_stacks_height, read_canonical_sortition_tip, read_db_config,
+    read_first_burn_height, selected_targets, sortition_open_opts_for_path, squash_marf_open_opts,
+    target_out_paths, target_out_paths_sortition, warn_if_in_prepare_phase,
 };
 use crate::verify::verify_gss;
 
@@ -72,8 +72,8 @@ pub fn run_squash(args: SquashArgs) {
         .parent()
         .expect("cannot derive sortition dir from sortition db path");
 
-    // Find the Stacks height at the end of this tenure.
-    let stacks_height = find_tenure_end_stacks_height(
+    // Find the Stacks height at the end of this tenure and its canonical tip.
+    let (stacks_height, stacks_tip) = find_tenure_end_stacks_height(
         chainstate_root.to_str().unwrap(),
         sortition_db_dir.to_str().unwrap(),
         bitcoin_height,
@@ -88,18 +88,24 @@ pub fn run_squash(args: SquashArgs) {
 
     eprintln!(
         "Squash at tenure start Bitcoin height {bitcoin_height}, \
-         Stacks tenure end height {stacks_height}"
+         Stacks tenure end height {stacks_height}, canonical Stacks tip {stacks_tip}"
     );
 
     // Prepare-phase warning.
     let first_burn_height = read_first_burn_height(paths.sortition.db.to_str().unwrap());
     warn_if_in_prepare_phase(bitcoin_height, &pox, first_burn_height);
 
-    // Sortition MARF height.
+    // Sortition MARF height and canonical sortition tip.
     let sortition_marf_height = bitcoin_height_to_sortition_marf_height(
         paths.sortition.db.to_str().unwrap(),
         bitcoin_height,
     );
+    let sortition_tip =
+        read_canonical_sortition_tip(sortition_db_dir.to_str().unwrap(), pox.clone())
+            .unwrap_or_else(|e: String| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            });
 
     let mut clarity_out = None;
     let mut index_out = None;
@@ -113,6 +119,7 @@ pub fn run_squash(args: SquashArgs) {
             "clarity",
             &paths.clarity,
             &out,
+            &stacks_tip,
             stacks_height,
             SideTableMode::Clarity,
             squash_marf_open_opts(),
@@ -126,6 +133,7 @@ pub fn run_squash(args: SquashArgs) {
             "index",
             &paths.index,
             &out,
+            &stacks_tip,
             stacks_height,
             SideTableMode::Index {
                 first_burn_height,
@@ -142,6 +150,7 @@ pub fn run_squash(args: SquashArgs) {
             "sortition",
             &paths.sortition,
             &out,
+            &sortition_tip,
             sortition_marf_height,
             SideTableMode::Sortition,
             sortition_open_opts_for_path(&paths.sortition.db),
@@ -294,9 +303,9 @@ pub fn run_squash(args: SquashArgs) {
 
         if do_clarity
             && !validate_one(
-                "clarity",
                 &paths.clarity,
                 clarity_out.as_ref().unwrap(),
+                &stacks_tip,
                 stacks_height,
                 args.full,
                 SideTableMode::Clarity,
@@ -308,9 +317,9 @@ pub fn run_squash(args: SquashArgs) {
 
         if do_index
             && !validate_one(
-                "index",
                 &paths.index,
                 index_out.as_ref().unwrap(),
+                &stacks_tip,
                 stacks_height,
                 args.full,
                 SideTableMode::Index {
@@ -326,9 +335,9 @@ pub fn run_squash(args: SquashArgs) {
         if do_sortition {
             let (_, marf_height) = sortition_out.as_ref().unwrap();
             if !validate_one(
-                "sortition",
                 &paths.sortition,
                 &sortition_out.as_ref().unwrap().0,
+                &sortition_tip,
                 *marf_height,
                 args.full,
                 SideTableMode::Sortition,
@@ -425,7 +434,7 @@ pub fn run_validate(args: ValidateArgs) {
         .parent()
         .expect("cannot derive sortition dir");
 
-    let stacks_height = find_tenure_end_stacks_height(
+    let (stacks_height, stacks_tip) = find_tenure_end_stacks_height(
         chainstate_root.to_str().unwrap(),
         sortition_db_dir.to_str().unwrap(),
         bitcoin_height,
@@ -442,6 +451,12 @@ pub fn run_validate(args: ValidateArgs) {
         source_paths.sortition.db.to_str().unwrap(),
         bitcoin_height,
     );
+    let sortition_tip =
+        read_canonical_sortition_tip(sortition_db_dir.to_str().unwrap(), pox.clone())
+            .unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            });
 
     let first_burn_height = read_first_burn_height(source_paths.sortition.db.to_str().unwrap());
 
@@ -449,9 +464,9 @@ pub fn run_validate(args: ValidateArgs) {
 
     if do_clarity
         && !validate_one(
-            "clarity",
             &source_paths.clarity,
             &squashed_paths.clarity,
+            &stacks_tip,
             stacks_height,
             args.full,
             SideTableMode::Clarity,
@@ -463,9 +478,9 @@ pub fn run_validate(args: ValidateArgs) {
 
     if do_index
         && !validate_one(
-            "index",
             &source_paths.index,
             &squashed_paths.index,
+            &stacks_tip,
             stacks_height,
             args.full,
             SideTableMode::Index {
@@ -480,9 +495,9 @@ pub fn run_validate(args: ValidateArgs) {
 
     if do_sortition
         && !validate_one(
-            "sortition",
             &source_paths.sortition,
             &squashed_paths.sortition,
+            &sortition_tip,
             sortition_marf_height,
             args.full,
             SideTableMode::Sortition,

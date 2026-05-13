@@ -273,8 +273,6 @@ pub enum Error {
         block_height: u32,
         squash_height: u32,
     },
-    /// Operation is not supported on a squashed MARF (e.g. proof generation).
-    UnsupportedOnSquashedMarf(&'static str),
     /// A destination path required to be empty already exists. Carries the
     /// offending path.
     DestinationExists(String),
@@ -356,9 +354,6 @@ impl fmt::Display for Error {
                 "Historical read at height {block_height} below squash height {squash_height} \
                  is not supported on a squashed MARF"
             ),
-            Error::UnsupportedOnSquashedMarf(op) => {
-                write!(f, "Operation `{op}` is not supported on a squashed MARF")
-            }
             Error::DestinationExists(ref p) => {
                 write!(f, "Destination path already exists: {p}")
             }

@@ -1,13 +1,13 @@
 use std::fs;
 use std::path::Path;
 
-use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 use stackslib::chainstate::stacks::db::snapshot::{
     IndexSideTableValidation, SortitionSideTableValidation, copy_burnchain_db,
     copy_index_side_tables, copy_sortition_side_tables, copy_spv_headers, validate_burnchain_db,
     validate_epoch2_block_files, validate_index_side_tables, validate_microblock_streams,
     validate_nakamoto_staging_blocks, validate_sortition_side_tables, validate_spv_headers,
 };
+use stackslib::chainstate::stacks::index::MarfTrieId;
 use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, SquashValidationStats};
 use stackslib::clarity_vm::database::snapshot::{
     copy_clarity_side_tables, validate_clarity_side_tables,
@@ -26,11 +26,22 @@ pub enum SideTableMode {
     Sortition,
 }
 
+impl SideTableMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SideTableMode::Clarity => "clarity",
+            SideTableMode::Index { .. } => "index",
+            SideTableMode::Sortition => "sortition",
+        }
+    }
+}
+
 /// Squash a single MARF target and copy its side tables. Exits on error.
-pub fn squash_and_copy_one(
+pub fn squash_and_copy_one<T: MarfTrieId>(
     label: &str,
     source: &TargetPaths,
     out: &TargetPaths,
+    tip: &T,
     height: u32,
     side_table_mode: SideTableMode,
     open_opts: MARFOpenOpts,
@@ -49,34 +60,18 @@ pub fn squash_and_copy_one(
         std::process::exit(1);
     }
 
-    let is_sortition = matches!(side_table_mode, SideTableMode::Sortition);
-    let stats = if is_sortition {
-        match MARF::<SortitionId>::squash_to_path(
-            source.db.to_str().unwrap(),
-            out.db.to_str().unwrap(),
-            open_opts,
-            height,
-            label,
-        ) {
-            Ok(stats) => stats,
-            Err(e) => {
-                eprintln!("Failed to squash {label} MARF: {e:?}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        match MARF::<StacksBlockId>::squash_to_path(
-            source.db.to_str().unwrap(),
-            out.db.to_str().unwrap(),
-            open_opts,
-            height,
-            label,
-        ) {
-            Ok(stats) => stats,
-            Err(e) => {
-                eprintln!("Failed to squash {label} MARF: {e:?}");
-                std::process::exit(1);
-            }
+    let stats = match MARF::squash_to_path(
+        source.db.to_str().unwrap(),
+        out.db.to_str().unwrap(),
+        open_opts,
+        tip,
+        height,
+        label,
+    ) {
+        Ok(stats) => stats,
+        Err(e) => {
+            eprintln!("Failed to squash {label} MARF: {e:?}");
+            std::process::exit(1);
         }
     };
 
@@ -205,25 +200,30 @@ pub fn squash_and_copy_one(
 }
 
 /// Validate a single MARF target. Returns `true` if all validations passed.
-pub fn validate_one(
-    label: &str,
+pub fn validate_one<T: MarfTrieId>(
     source: &TargetPaths,
     squashed: &TargetPaths,
+    tip: &T,
     height: u32,
     full: bool,
     side_table_mode: SideTableMode,
     open_opts: MARFOpenOpts,
 ) -> bool {
-    let is_sortition = matches!(side_table_mode, SideTableMode::Sortition);
+    let label = side_table_mode.label();
     let validation = validate_or_exit(
         source.db.to_str().unwrap(),
         source.blobs.as_deref().map(|p| p.to_str().unwrap()),
         squashed.db.to_str().unwrap(),
-        squashed.blobs.as_deref().map(|p| p.to_str().unwrap()),
+        squashed
+            .blobs
+            .as_deref()
+            .expect("squashed output always has external blobs")
+            .to_str()
+            .unwrap(),
         open_opts,
+        tip,
         height,
         full,
-        is_sortition,
     );
     println!("Validation results for {label}:");
     print_validation(&validation);
@@ -313,50 +313,33 @@ pub fn validate_one(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_or_exit(
+fn validate_or_exit<T: MarfTrieId>(
     source_db: &str,
     source_blobs: Option<&str>,
     squashed_db: &str,
-    squashed_blobs: Option<&str>,
+    squashed_blobs: &str,
     open_opts: MARFOpenOpts,
+    tip: &T,
     height: u32,
     full_leaf_scan: bool,
-    is_sortition: bool,
 ) -> SquashValidationStats {
     if let Some(blobs) = source_blobs {
         ensure_blobs_match(source_db, blobs);
     }
-    if let Some(blobs) = squashed_blobs {
-        ensure_blobs_match(squashed_db, blobs);
-    }
+    ensure_blobs_match(squashed_db, squashed_blobs);
 
-    if is_sortition {
-        match MARF::<SortitionId>::validate_squashed_at_height(
-            source_db,
-            squashed_db,
-            open_opts,
-            height,
-            full_leaf_scan,
-        ) {
-            Ok(stats) => stats,
-            Err(e) => {
-                eprintln!("Failed to validate squashed MARF: {e:?}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        match MARF::<StacksBlockId>::validate_squashed_at_height(
-            source_db,
-            squashed_db,
-            open_opts,
-            height,
-            full_leaf_scan,
-        ) {
-            Ok(stats) => stats,
-            Err(e) => {
-                eprintln!("Failed to validate squashed MARF: {e:?}");
-                std::process::exit(1);
-            }
+    match MARF::validate_squashed_at_height(
+        source_db,
+        squashed_db,
+        open_opts,
+        tip,
+        height,
+        full_leaf_scan,
+    ) {
+        Ok(stats) => stats,
+        Err(e) => {
+            eprintln!("Failed to validate squashed MARF: {e:?}");
+            std::process::exit(1);
         }
     }
 }

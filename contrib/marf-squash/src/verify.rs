@@ -389,9 +389,9 @@ fn recompute_marf_root<T: MarfTrieId>(
             return None;
         }
     };
-    let mut marf = MARF::from_storage(storage);
+    let mut marf = MARF::<T>::from_storage(storage);
 
-    let tip = match trie_sql::get_latest_confirmed_block_hash::<T>(marf.sqlite_conn()) {
+    let tip = match trie_sql::get_latest_confirmed_block_hash(marf.sqlite_conn()) {
         Ok(t) => t,
         Err(e) => {
             errors.push(format!("Level 2: {name}: failed to read tip: {e:?}"));

@@ -98,7 +98,7 @@ mod tests {
         }
 
         let open_opts = squash_marf_open_opts();
-        let mut marf = MARF::<T>::from_path(db_path.to_str().unwrap(), open_opts.clone()).unwrap();
+        let mut marf = MARF::from_path(db_path.to_str().unwrap(), open_opts.clone()).unwrap();
         let tip = T::from_bytes([block_byte; 32]);
         let mut tx = marf.begin_tx().unwrap();
         tx.begin(&T::sentinel(), &tip).unwrap();
@@ -107,7 +107,7 @@ mod tests {
         tx.commit().unwrap();
         drop(marf);
 
-        let mut marf = MARF::<T>::from_path(db_path.to_str().unwrap(), open_opts).unwrap();
+        let mut marf = MARF::from_path(db_path.to_str().unwrap(), open_opts).unwrap();
         let tip = trie_sql::get_latest_confirmed_block_hash::<T>(marf.sqlite_conn()).unwrap();
         let root = marf.recompute_squash_root_node_hash(&tip).unwrap();
         format!("0x{root}")

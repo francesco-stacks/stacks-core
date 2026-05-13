@@ -76,7 +76,7 @@ pub struct SortitionSideTableStats {
 #[derive(Debug, Clone)]
 pub struct SortitionSideTableValidation {
     pub required_tables_present: bool,
-    /// Every sortition_id in destination `marf_squash_block_heights` exists in
+    /// Every sortition_id in destination `marf_squashed_blocks` exists in
     /// the source `snapshots` table. False if the destination claims sortition IDs
     /// that the source doesn't have.
     pub canonical_set_in_source: bool,
@@ -129,7 +129,7 @@ fn populate_canonical_sortitions(conn: &Connection) -> Result<(), Error> {
         .map_err(Error::SQLError)?;
     conn.execute(
         "INSERT OR IGNORE INTO canonical_sortitions (sortition_id) \
-         SELECT block_hash FROM marf_squash_block_heights",
+         SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
         [],
     )
     .map_err(Error::SQLError)?;
@@ -238,7 +238,7 @@ fn sortition_copy_specs() -> Vec<TableCopySpec> {
 
 /// Copy required non-MARF tables from the source sortition DB into the
 /// squashed destination. Only canonical rows (determined by the squashed MARF's
-/// `marf_squash_block_heights`) are included.
+/// `marf_squashed_blocks`) are included.
 pub fn copy_sortition_side_tables(
     src_path: &str,
     dst_path: &str,
@@ -364,7 +364,7 @@ fn copy_sortition_tables_inner(
 /// # Trust boundary
 ///
 /// This validator checks that side-table rows are consistent with the canonical
-/// set declared by the destination's `marf_squash_block_heights` metadata, which
+/// set declared by the destination's `marf_squashed_blocks` metadata, which
 /// was populated during the MARF squash by walking the canonical tip. It does NOT
 /// independently re-derive the canonical chain from the source MARF - that is the
 /// job of `validate_squashed_at_height` on the MARF trie itself. The
@@ -393,14 +393,16 @@ pub fn validate_sortition_side_tables(
     });
 
     // Build canonical set from squash metadata.
-    let _ = conn.execute_batch(
+    conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS canonical_sortitions (sortition_id TEXT PRIMARY KEY)",
-    );
-    let _ = conn.execute(
+    )
+    .map_err(Error::SQLError)?;
+    conn.execute(
         "INSERT OR IGNORE INTO canonical_sortitions (sortition_id) \
-         SELECT block_hash FROM marf_squash_block_heights",
+         SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
         [],
-    );
+    )
+    .map_err(Error::SQLError)?;
 
     // Cross-check: every sortition_id the destination claims as canonical must
     // actually exist in the source snapshots table.
@@ -411,17 +413,19 @@ pub fn validate_sortition_side_tables(
             [],
             |row| row.get(0),
         )
-        .unwrap_or(false);
+        .map_err(Error::SQLError)?;
 
-    let _ = conn.execute_batch(
+    conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS canonical_burn_hashes (burn_header_hash TEXT PRIMARY KEY)",
-    );
-    let _ = conn.execute(
+    )
+    .map_err(Error::SQLError)?;
+    conn.execute(
         "INSERT OR IGNORE INTO canonical_burn_hashes (burn_header_hash) \
          SELECT DISTINCT s.burn_header_hash FROM src.snapshots s \
          INNER JOIN canonical_sortitions cs ON s.sortition_id = cs.sortition_id",
         [],
-    );
+    )
+    .map_err(Error::SQLError)?;
 
     let sid = "SELECT sortition_id FROM canonical_sortitions";
     let bhh = "SELECT burn_header_hash FROM canonical_burn_hashes";

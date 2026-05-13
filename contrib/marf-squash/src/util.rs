@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use stacks_common::types::StacksEpochId;
-use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 use stacks_common::util::hash::to_hex;
 use stackslib::burnchains::PoxConstants;
 use stackslib::chainstate::burn::db::sortdb::SortitionDB;
@@ -506,6 +506,23 @@ pub fn bitcoin_height_to_sortition_marf_height(
     (bitcoin_height - first_burn_height) as u32
 }
 
+/// Return the canonical sortition tip `SortitionId` from a sortition DB.
+///
+/// `MARF::squash_to_path` and `MARF::validate_squashed_at_height` need an
+/// explicit tip that lives on the canonical burn-chain fork; using the
+/// highest-`block_id` row (the default in `get_latest_confirmed_block_hash`)
+/// can pick a non-canonical fork on a sortition DB with reorgs.
+pub fn read_canonical_sortition_tip(
+    sortition_db_dir: &str,
+    pox_constants: PoxConstants,
+) -> Result<SortitionId, String> {
+    let sortition_db = SortitionDB::open(sortition_db_dir, false, pox_constants, None)
+        .map_err(|e| format!("Failed to open sortition DB at '{sortition_db_dir}': {e}"))?;
+    SortitionDB::get_canonical_burn_chain_tip(sortition_db.conn())
+        .map(|snapshot| snapshot.sortition_id)
+        .map_err(|e| format!("Failed to read canonical burn-chain tip: {e}"))
+}
+
 /// Find the highest canonical Stacks block in the tenure that started at
 /// `bitcoin_height`.
 ///
@@ -514,7 +531,11 @@ pub fn bitcoin_height_to_sortition_marf_height(
 /// `NakamotoChainState::find_highest_known_block_header_in_tenure_by_block_height`
 /// helper for burn_view-aware canonical selection.
 ///
-/// Returns the Stacks block height at the end of the tenure.
+/// Returns the (Stacks block height, canonical `StacksBlockId`) at the end of
+/// the tenure. The block id is the explicit tip that `MARF::squash_to_path`
+/// and `MARF::validate_squashed_at_height` require to walk the canonical fork,
+/// rather than letting the engine pick the highest-`block_id` row (which can
+/// pick a non-canonical fork).
 pub fn find_tenure_end_stacks_height(
     chainstate_root: &str,
     sortition_db_dir: &str,
@@ -522,7 +543,7 @@ pub fn find_tenure_end_stacks_height(
     mainnet: bool,
     chain_id: u32,
     pox_constants: PoxConstants,
-) -> Result<u32, String> {
+) -> Result<(u32, StacksBlockId), String> {
     // Open the DBs with the correct APIs.
     let (chainstate, _) = StacksChainState::open(mainnet, chain_id, chainstate_root, None)
         .map_err(|e| format!("Failed to open chainstate at '{chainstate_root}': {e}"))?;
@@ -588,7 +609,7 @@ pub fn find_tenure_end_stacks_height(
         format!("No Nakamoto blocks found at Bitcoin height {bitcoin_height}. This may predate Nakamoto activation.")
     })?;
 
-    Ok(header.stacks_block_height as u32)
+    Ok((header.stacks_block_height as u32, header.index_block_hash()))
 }
 
 /// Apply PoX overrides from a node config TOML file to the given PoxConstants.

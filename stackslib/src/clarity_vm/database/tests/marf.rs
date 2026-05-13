@@ -118,6 +118,7 @@ fn clarity_marf_db_path(dir: &std::path::Path) -> PathBuf {
 fn squash_clarity_marf(
     src_dir: &std::path::Path,
     dst_dir: &std::path::Path,
+    tip: &StacksBlockId,
     height: u32,
 ) -> PathBuf {
     std::fs::create_dir_all(dst_dir).unwrap();
@@ -129,6 +130,7 @@ fn squash_clarity_marf(
         src_db.to_str().unwrap(),
         dst_db.to_str().unwrap(),
         open_opts,
+        tip,
         height,
         "test",
     )
@@ -146,9 +148,14 @@ fn squash_clarity_marf(
 fn test_copy_clarity_side_tables_round_trip() {
     let dir = tempdir().unwrap();
     let src_dir = dir.path().join("src");
-    let _blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
+    let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
 
-    let squashed_db = squash_clarity_marf(&src_dir, &dir.path().join("squashed"), 3);
+    let squashed_db = squash_clarity_marf(
+        &src_dir,
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        3,
+    );
 
     // Validate side tables.
     let validation = validate_clarity_side_tables(
@@ -175,9 +182,14 @@ fn test_copy_clarity_side_tables_round_trip() {
 fn test_squashed_clarity_marf_check_schema_passes() {
     let dir = tempdir().unwrap();
     let src_dir = dir.path().join("src");
-    let _blocks = build_clarity_marf(&src_dir, 3, "test-contract", "");
+    let blocks = build_clarity_marf(&src_dir, 3, "test-contract", "");
 
-    let squashed_db = squash_clarity_marf(&src_dir, &dir.path().join("squashed"), 2);
+    let squashed_db = squash_clarity_marf(
+        &src_dir,
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        2,
+    );
 
     // check_schema must pass on the squashed DB.
     let conn = rusqlite::Connection::open(&squashed_db).unwrap();
@@ -191,7 +203,12 @@ fn test_squashed_clarity_marf_data_reads_work() {
     let src_dir = dir.path().join("src");
     let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
 
-    let squashed_db = squash_clarity_marf(&src_dir, &dir.path().join("squashed"), 3);
+    let squashed_db = squash_clarity_marf(
+        &src_dir,
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        3,
+    );
 
     // Open the squashed MARF via MarfedKV.
     let squashed_dir = dir.path().join("squashed");
@@ -220,7 +237,12 @@ fn test_squashed_clarity_marf_metadata_reads_work() {
     let src_dir = dir.path().join("src");
     let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
 
-    let squashed_db = squash_clarity_marf(&src_dir, &dir.path().join("squashed"), 3);
+    let squashed_db = squash_clarity_marf(
+        &src_dir,
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        3,
+    );
 
     // Open the squashed MARF via MarfedKV.
     let squashed_dir = dir.path().join("squashed");
@@ -247,7 +269,12 @@ fn test_squashed_clarity_marf_extend_hash_equality() {
     let blocks = build_clarity_marf(&src_dir, 5, "test-contract", "");
 
     // Squash at height 3, copy side tables.
-    let squashed_db = squash_clarity_marf(&src_dir, &dir.path().join("squashed"), 3);
+    let squashed_db = squash_clarity_marf(
+        &src_dir,
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        3,
+    );
 
     // Open both MARFs at the raw MARF level for hash comparison.
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
@@ -305,6 +332,7 @@ fn test_mismatched_clarity_db_causes_data_read_failure() {
         src_db.to_str().unwrap(),
         dst_db.to_str().unwrap(),
         open_opts,
+        blocks.last().unwrap(),
         3,
         "test",
     )
@@ -341,7 +369,7 @@ fn test_validate_clarity_side_tables_detects_mismatch() {
     let src_dir = dir.path().join("src");
     let other_dir = dir.path().join("other");
 
-    let _blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
+    let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
     let _other_blocks = build_clarity_marf(&other_dir, 4, "other-contract", "_other");
 
     // Squash source, but copy side tables from other.
@@ -355,6 +383,7 @@ fn test_validate_clarity_side_tables_detects_mismatch() {
         src_db.to_str().unwrap(),
         dst_db.to_str().unwrap(),
         open_opts,
+        blocks.last().unwrap(),
         3,
         "test",
     )
@@ -382,7 +411,12 @@ fn test_copy_clarity_side_tables_with_double_colon_metadata_keys() {
     let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
     assert!(!blocks.is_empty());
 
-    let squashed_db = squash_clarity_marf(&src_dir, &dir.path().join("squashed"), 3);
+    let squashed_db = squash_clarity_marf(
+        &src_dir,
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        3,
+    );
 
     // Validate side tables - this would previously fail with a
     // CorruptionError("Failed to parse contract identifier ...").

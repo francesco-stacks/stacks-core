@@ -492,20 +492,18 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         // carries the archival trie hash directly. The verifier uses this
         // hash instead of computing it from the content hash + ancestors.
         let cur_block = storage.get_cur_block();
-        if let Some(block_height) = storage.squash_info().and_then(|_| {
-            trie_sql::read_squash_block_height(storage.sqlite_conn(), &cur_block)
-                .ok()
-                .flatten()
-        }) {
+        if let Some(block_height) = storage.squashed_block_height(&cur_block)? {
             // Inside the squash trie: produce a squash shunt with the
             // archival trie hash for this height.
-            let archival_trie_hash =
-                trie_sql::read_squash_archival_marf_root_hash(storage.sqlite_conn(), block_height)?
-                    .ok_or_else(|| {
-                        Error::CorruptionError(format!(
-                            "Missing archival root hash at height {block_height} for squash shunt"
-                        ))
-                    })?;
+            let archival_trie_hash = trie_sql::read_squashed_block_root_hash_by_height(
+                storage.sqlite_conn(),
+                block_height,
+            )?
+            .ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "Missing archival root hash at height {block_height} for squash shunt"
+                ))
+            })?;
 
             trace!(
                 "Squash shunt proof: height={block_height}, archival_trie_hash={archival_trie_hash:?}"
@@ -561,27 +559,20 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         // to read the root hash (from the blob vs. from the SQL table).
         //
         // In a squashed MARF, all blocks at heights 0..=H share a single
-        // blob whose OWN_BLOCK_HEIGHT_KEY is H. Use the SQL side-table
-        // to get the correct per-block height when the block falls within
-        // the squashed range.
-        let ancestor_height = if let Some(h) = storage.squash_info().and_then(|_| {
-            trie_sql::read_squash_block_height(storage.sqlite_conn(), &ancestor_block_hash)
-                .ok()
-                .flatten()
-        }) {
-            h
-        } else {
-            MARF::get_block_height_miner_tip(storage, &ancestor_block_hash, &block_header)?
-                .ok_or_else(|| {
-                    Error::CorruptionError(format!(
-                        "Could not find block height of ancestor block {ancestor_block_hash} from {block_header}"                    ))
-                })?
-        };
-        let mut current_height = if let Some(h) = storage.squash_info().and_then(|_| {
-            trie_sql::read_squash_block_height(storage.sqlite_conn(), &block_header)
-                .ok()
-                .flatten()
-        }) {
+        // blob whose OWN_BLOCK_HEIGHT_KEY is H. Use the squashed-blocks
+        // side-table helper to get the correct per-block height when the
+        // block falls within the squashed range.
+        let ancestor_height =
+            if let Some(h) = storage.squashed_block_height(&ancestor_block_hash)? {
+                h
+            } else {
+                MARF::get_block_height_miner_tip(storage, &ancestor_block_hash, &block_header)?
+                    .ok_or_else(|| {
+                        Error::CorruptionError(format!(
+                            "Could not find block height of ancestor block {ancestor_block_hash} from {block_header}"                    ))
+                    })?
+            };
+        let mut current_height = if let Some(h) = storage.squashed_block_height(&block_header)? {
             h
         } else {
             MARF::get_block_height_miner_tip(storage, &block_header, &block_header)?.ok_or_else(
@@ -599,11 +590,14 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         // hash - not the root hash for the specific block we opened. Read the
         // correct per-height root hash from the SQL table instead.
         let ancestor_root_hash = if storage
-            .squash_info()
-            .is_some_and(|info| ancestor_height <= info.height)
+            .squash_height()
+            .is_some_and(|h| ancestor_height <= h)
         {
-            trie_sql::read_squash_archival_marf_root_hash(storage.sqlite_conn(), ancestor_height)?
-                .ok_or_else(|| {
+            trie_sql::read_squashed_block_root_hash_by_height(
+                storage.sqlite_conn(),
+                ancestor_height,
+            )?
+            .ok_or_else(|| {
                 Error::CorruptionError(format!(
                     "Could not obtain squashed root hash at height {ancestor_height}"
                 ))
@@ -695,17 +689,16 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                 // the verifier uses it directly, bypassing the incorrect
                 // content hash computation.
                 let prev_height = current_height + (1u32 << (idx - 1));
-                if storage
-                    .squash_info()
-                    .is_some_and(|info| prev_height <= info.height)
-                {
-                    let archival_trie =
-                        trie_sql::read_squash_archival_marf_root_hash(storage.sqlite_conn(), prev_height)?
-                            .ok_or_else(|| {
-                                Error::CorruptionError(format!(
-                                    "Missing archival root hash at height {prev_height} for intermediate squash shunt"
-                                ))
-                            })?;
+                if storage.squash_height().is_some_and(|h| prev_height <= h) {
+                    let archival_trie = trie_sql::read_squashed_block_root_hash_by_height(
+                        storage.sqlite_conn(),
+                        prev_height,
+                    )?
+                    .ok_or_else(|| {
+                        Error::CorruptionError(format!(
+                            "Missing archival root hash at height {prev_height} for intermediate squash shunt"
+                        ))
+                    })?;
 
                     trace!(
                         "Intermediate squash shunt: height={prev_height}, archival_trie_hash={archival_trie:?}"
@@ -1571,13 +1564,6 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         expected_value: &MARFValue,
         root_block_header: &T,
     ) -> Result<TrieMerkleProof<T>, Error> {
-        // Squash-aware proofs are not currently supported.
-        if storage.is_squashed() {
-            return Err(Error::UnsupportedOnSquashedMarf(
-                "TrieMerkleProof::from_path",
-            ));
-        }
-
         // accumulate proofs in reverse order -- each proof will be from an earlier and earlier
         // trie, so we'll reverse them in the end so the proof starts with the latest trie.
         let mut segment_proofs = vec![];

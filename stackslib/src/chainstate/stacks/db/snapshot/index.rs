@@ -111,13 +111,15 @@ impl IndexSideTableValidation {
 }
 
 /// Populate a temp table with the canonical block hashes from the squashed MARF's
-/// `marf_squash_block_heights` metadata.
+/// `marf_squashed_blocks` metadata. The MARF stores `block_hash` as raw BLOB
+/// bytes, but chainstate `index_block_hash` columns are lowercase hex TEXT,
+/// so we convert via `lower(hex(block_hash))` to keep the joins compatible.
 fn populate_canonical_blocks(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch("CREATE TEMP TABLE canonical_blocks (index_block_hash TEXT PRIMARY KEY)")
         .map_err(Error::SQLError)?;
     conn.execute(
         "INSERT OR IGNORE INTO canonical_blocks (index_block_hash) \
-         SELECT block_hash FROM marf_squash_block_heights",
+         SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
         [],
     )
     .map_err(Error::SQLError)?;
@@ -133,8 +135,9 @@ fn derive_max_reward_cycle(
     let tip_burn_height: Option<u64> = conn
         .query_row(
             "SELECT nh.burn_header_height \
-             FROM marf_squash_block_heights mh \
-             JOIN src.nakamoto_block_headers nh ON nh.index_block_hash = mh.block_hash \
+             FROM marf_squashed_blocks mh \
+             JOIN src.nakamoto_block_headers nh \
+               ON nh.index_block_hash = lower(hex(mh.block_hash)) \
              ORDER BY mh.height DESC LIMIT 1",
             [],
             |row| row.get::<_, i64>(0),
@@ -219,7 +222,7 @@ fn index_copy_specs() -> Vec<TableCopySpec> {
 
 /// Copy required non-MARF tables from the source `index.sqlite` into the
 /// squashed destination. Only canonical rows (determined by the squashed MARF's
-/// `marf_squash_block_heights`) are included, excluding non-canonical fork data.
+/// `marf_squashed_blocks`) are included, excluding non-canonical fork data.
 pub fn copy_index_side_tables(
     src_path: &str,
     dst_path: &str,
@@ -468,14 +471,16 @@ pub fn validate_index_side_tables(
     };
 
     // Build canonical block set.
-    let _ = conn.execute_batch(
+    conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS val_canonical_blocks (index_block_hash TEXT PRIMARY KEY)",
-    );
-    let _ = conn.execute(
+    )
+    .map_err(Error::SQLError)?;
+    conn.execute(
         "INSERT OR IGNORE INTO val_canonical_blocks (index_block_hash) \
-         SELECT block_hash FROM marf_squash_block_heights",
+         SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
         [],
-    );
+    )
+    .map_err(Error::SQLError)?;
 
     let cb = "SELECT index_block_hash FROM val_canonical_blocks";
 
