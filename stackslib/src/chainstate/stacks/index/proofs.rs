@@ -568,10 +568,11 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             h
         } else {
             MARF::get_block_height_miner_tip(storage, &ancestor_block_hash, &block_header)?
-                    .ok_or_else(|| {
-                        Error::CorruptionError(format!(
-                            "Could not find block height of ancestor block {ancestor_block_hash} from {block_header}"                    ))
-                    })?
+                .ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "Could not find block height of ancestor block {ancestor_block_hash} from {block_header}"
+                    ))
+                })?
         };
         let mut current_height = if let Some(h) = storage.squashed_block_height(&block_header)? {
             h

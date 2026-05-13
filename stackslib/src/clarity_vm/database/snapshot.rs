@@ -23,7 +23,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 use crate::chainstate::stacks::db::snapshot::common::{
     checkpoint_destination_wal, collect_leaf_value_hashes,
 };
-use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
+use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{trie_sql, Error};
 
