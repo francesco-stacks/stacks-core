@@ -814,7 +814,10 @@ pub fn reserved_root_size(base_len: usize, ptrs: &[TriePtr]) -> Result<u64, Erro
 
 /// Rewrite inline child pointers from in-memory node indices to blob-local
 /// byte offsets. Backpointers and empty pointers are left untouched.
-pub fn update_inline_child_ptrs(ptrs: &mut [TriePtr], file_offsets: &[u64]) -> Result<(), Error> {
+pub fn resolve_inline_child_offsets(
+    ptrs: &mut [TriePtr],
+    file_offsets: &[u64],
+) -> Result<(), Error> {
     for ptr in ptrs.iter_mut() {
         if !is_inline_child_ptr(ptr) {
             continue;
@@ -847,7 +850,7 @@ pub fn update_inline_child_ptrs(ptrs: &mut [TriePtr], file_offsets: &[u64]) -> R
 pub fn write_nodetype_bytes<F: Write + Seek>(
     f: &mut F,
     node: &TrieNodeType,
-    hash: TrieHash,
+    hash: &TrieHash,
 ) -> Result<u64, Error> {
     let start = f.stream_position().map_err(Error::IOError)?;
     f.write_all(hash.as_bytes())?;

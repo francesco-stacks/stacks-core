@@ -21,7 +21,7 @@ use tempfile::tempdir;
 
 use super::marf::setup_marf;
 use crate::chainstate::stacks::index::bits::{
-    get_node_byte_len, read_nodetype, update_inline_child_ptrs,
+    get_node_byte_len, read_nodetype, resolve_inline_child_offsets,
 };
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, SquashStats, MARF, OWN_BLOCK_HEIGHT_KEY,
@@ -51,7 +51,7 @@ fn squash_helper(
     std::fs::create_dir_all(dst_dir).unwrap();
     let dst_db_path = dst_dir.join("index.sqlite");
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let stats = MARF::<StacksBlockId>::squash_to_path(
+    let stats = MARF::squash_to_path(
         src_path,
         dst_db_path.to_str().unwrap(),
         open_opts,
@@ -85,8 +85,7 @@ fn build_archival_and_squashed_marfs(
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     (archival, squashed, blocks)
 }
@@ -103,7 +102,7 @@ fn assert_roots_match_at(
         let arch = archival.get_root_hash_at(bh).unwrap();
         let sq = squashed.get_root_hash_at(bh).unwrap();
         assert_eq!(arch, sq, "{context}: root hash mismatch at block #{i}");
-        assert_ne!(arch, TrieHash([0u8; 32]), "{context}: root #{i} is zero");
+        assert_ne!(arch, TrieHash::ZERO, "{context}: root #{i} is zero");
     }
 }
 
@@ -128,13 +127,12 @@ fn test_squash_to_path_outputs_data() {
         1,
     );
 
-    assert!(stats.node_count > 0);
+    assert_eq!(stats.node_count, 29);
     assert!(dst_db_path.exists());
     assert!(PathBuf::from(format!("{}.blobs", dst_db_path.display())).exists());
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut dst =
-        MARF::<StacksBlockId>::from_path(dst_db_path.to_str().unwrap(), open_opts).unwrap();
+    let mut dst = MARF::from_path(dst_db_path.to_str().unwrap(), open_opts).unwrap();
     let k1 = dst.get(&blocks[1], "k1").unwrap().unwrap();
     assert_eq!(k1, MARFValue::from_value("v1_at_1"));
     let own_height = dst.get(&blocks[1], OWN_BLOCK_HEIGHT_KEY).unwrap().unwrap();
@@ -212,8 +210,7 @@ fn test_squashed_marf_can_extend_past_snapshot_height() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(dst_db_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(dst_db_path.to_str().unwrap(), open_opts).unwrap();
 
     let b2 = blocks[1].clone();
     let b3 = StacksBlockId::from_bytes(&[3u8; 32]).unwrap();
@@ -248,6 +245,8 @@ fn test_squashed_historical_root_hash_and_height() {
         .map(|i| archival.get_root_hash_at(&blocks[i]).unwrap())
         .collect();
 
+    assert_ne!(archival_roots[0], archival_roots[4]);
+
     // Squash at height 4 (blocks 0..=4 are in the squashed range).
     let (squashed_path, _) = squash_helper(
         archival_path.to_str().unwrap(),
@@ -257,8 +256,7 @@ fn test_squashed_historical_root_hash_and_height() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     // (a) get_root_hash_at must return the archival per-height root, not
     //     the shared squash blob root.
@@ -282,9 +280,6 @@ fn test_squashed_historical_root_hash_and_height() {
             "height mismatch for block at index {i}: expected {i}, got {h}"
         );
     }
-
-    // (c) The archival roots should not all be identical (sanity).
-    assert_ne!(archival_roots[0], archival_roots[4]);
 }
 
 /// Verify that `test_squash_info_detected_on_open` also asserts the
@@ -316,16 +311,12 @@ fn test_squash_info_sql_squash_root_asserted() {
         })
         .unwrap();
 
-    // sql_squash_root may be None if not yet computed (squash_to_path sets
-    // it after blob commit).  If present, it must match the cached value.
-    if let Some(sql_root) = sql_squash_root {
-        assert_eq!(sql_root, cached_root, "cached vs SQL squash root mismatch");
-    }
-    // Either way, the cached root must not be the zero hash (squash_to_path
-    // computes and stores it).
+    let sql_root = sql_squash_root.expect("squash_root_node_hash should be set after squash");
+    assert_eq!(sql_root, cached_root, "cached vs SQL squash root mismatch");
+
     assert_ne!(
         cached_root,
-        TrieHash::from_data(&[]),
+        TrieHash::EMPTY,
         "squash root node hash should be populated after squash"
     );
 }
@@ -346,8 +337,7 @@ fn test_large_marf_squash_extend_root_hash_matches_archival() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     let b_new_9 = StacksBlockId::from_bytes(&[101u8; 32]).unwrap();
     let b_new_10 = StacksBlockId::from_bytes(&[102u8; 32]).unwrap();
@@ -407,8 +397,8 @@ fn test_large_marf_squash_extend_root_hash_matches_archival() {
         "Root hash mismatch at height 10"
     );
 
-    assert_ne!(archival_root_9, TrieHash([0u8; 32]), "root at 9 is zero");
-    assert_ne!(archival_root_10, TrieHash([0u8; 32]), "root at 10 is zero");
+    assert_ne!(archival_root_9, TrieHash::ZERO, "root at 9 is zero");
+    assert_ne!(archival_root_10, TrieHash::ZERO, "root at 10 is zero");
     assert_ne!(
         archival_root_9, archival_root_10,
         "roots at 9 and 10 should differ"
@@ -490,8 +480,7 @@ fn test_dense_writes_after_squash_hash_equality() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     // Extend with blocks that write MANY keys each - simulating a block
     // with many contract calls (like mainnet block 201697 with 42 txs).
@@ -582,8 +571,7 @@ fn test_squash_historical_read_rejected() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     let tip_block = &blocks[squash_height as usize];
     let early_block = &blocks[10];
@@ -633,8 +621,7 @@ fn test_squash_historical_read_intermittent_key_rejected() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     let early_block = &blocks[10];
 
@@ -682,8 +669,7 @@ fn test_deep_extension_hash_equality() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     let mut prev_block = blocks[squash_height as usize].clone();
     let mut new_blocks: Vec<StacksBlockId> = Vec::new();
@@ -792,8 +778,7 @@ fn test_walk_cow_preserves_backpointer_identity() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     let b_new = StacksBlockId::from_bytes(&[250u8; 32]).unwrap();
     squashed.begin(&blocks[8], &b_new).unwrap();
@@ -840,9 +825,7 @@ fn test_squash_internal_blobs_extend_with_compression() {
     let src_db_path = dir.path().join("sort.sqlite");
 
     let squash_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", false);
-    let mut src =
-        MARF::<StacksBlockId>::from_path(src_db_path.to_str().unwrap(), squash_opts.clone())
-            .unwrap();
+    let mut src = MARF::from_path(src_db_path.to_str().unwrap(), squash_opts.clone()).unwrap();
 
     let b1 = StacksBlockId::from_bytes(&[1u8; 32]).unwrap();
     let b2 = StacksBlockId::from_bytes(&[2u8; 32]).unwrap();
@@ -873,7 +856,7 @@ fn test_squash_internal_blobs_extend_with_compression() {
     std::fs::create_dir_all(&dst_dir).unwrap();
     let dst_db_path = dst_dir.join("sort.sqlite");
 
-    MARF::<StacksBlockId>::squash_to_path(
+    MARF::squash_to_path(
         src_db_path.to_str().unwrap(),
         dst_db_path.to_str().unwrap(),
         squash_opts,
@@ -885,8 +868,7 @@ fn test_squash_internal_blobs_extend_with_compression() {
 
     let compressed_opts =
         MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true).with_compression(true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(dst_db_path.to_str().unwrap(), compressed_opts).unwrap();
+    let mut squashed = MARF::from_path(dst_db_path.to_str().unwrap(), compressed_opts).unwrap();
 
     squashed.begin(&b2, &b3).unwrap();
     squashed
@@ -996,7 +978,7 @@ fn test_node_store_roundtrip_all_variants() {
     let rt_leaf = store.read_node_with(&mut reader, 0).unwrap();
     assert!(rt_leaf.is_leaf());
     assert_eq!(rt_leaf.path_bytes(), &[1, 2, 3]);
-    assert_eq!(store.hash(0), leaf_hash);
+    assert_eq!(*store.hash(0), leaf_hash);
     assert_eq!(store.block_id(0), 10);
 
     // Node4 round-trip
@@ -1031,7 +1013,7 @@ fn test_node_store_spill_file_cleaned_on_drop() {
         spill_path = store.path.clone();
 
         let leaf = make_test_leaf(&[1], 0x01);
-        store.push(&leaf, TrieHash::from_data(&[]), 0).unwrap();
+        store.push(&leaf, TrieHash::EMPTY, 0).unwrap();
         store.finish_writing().unwrap();
 
         // File should exist while store is alive
@@ -1255,11 +1237,11 @@ fn test_stream_squash_blob_at_nonzero_offset() {
     );
 }
 
-/// Test `update_inline_child_ptrs` directly: verify it replaces forward
+/// Test `resolve_inline_child_offsets` directly: verify it replaces forward
 /// child pointers with their blob offsets, leaves back/empty pointers
 /// untouched, and returns CorruptionError for out-of-bounds indices.
 #[test]
-fn test_update_inline_child_ptrs() {
+fn test_resolve_inline_child_offsets() {
     // Build a Node4 with a mix of pointer types:
     //   slot 0: forward ptr to child index 1
     //   slot 1: back ptr (should be left untouched)
@@ -1282,7 +1264,7 @@ fn test_update_inline_child_ptrs() {
     );
 
     let offsets: Vec<u64> = vec![100, 200, 300];
-    update_inline_child_ptrs(node.ptrs_mut(), &offsets).unwrap();
+    resolve_inline_child_offsets(node.ptrs_mut(), &offsets).unwrap();
 
     let ptrs = node.ptrs();
     // Forward ptrs remapped to blob offsets.
@@ -1296,7 +1278,7 @@ fn test_update_inline_child_ptrs() {
 
     // Empty pointer slices are a no-op.
     let mut empty: [TriePtr; 0] = [];
-    update_inline_child_ptrs(&mut empty, &offsets).unwrap();
+    resolve_inline_child_offsets(&mut empty, &offsets).unwrap();
 
     // Out-of-bounds child index returns CorruptionError.
     let mut bad_node = make_test_node4(
@@ -1308,13 +1290,13 @@ fn test_update_inline_child_ptrs() {
             TriePtr::default(),
         ],
     );
-    assert!(update_inline_child_ptrs(bad_node.ptrs_mut(), &offsets).is_err());
+    assert!(resolve_inline_child_offsets(bad_node.ptrs_mut(), &offsets).is_err());
 }
 
-/// Verify that `update_inline_child_ptrs` with offsets > u32::MAX causes
+/// Verify that `resolve_inline_child_offsets` with offsets > u32::MAX causes
 /// the node's serialized size to grow (u32 -> u64 pointer encoding).
 #[test]
-fn test_update_inline_child_ptrs_u64_encoding_widens_node() {
+fn test_resolve_inline_child_offsets_u64_encoding_widens_node() {
     let mut node = make_test_node4(
         &[0],
         [
@@ -1329,7 +1311,7 @@ fn test_update_inline_child_ptrs_u64_encoding_widens_node() {
 
     // One offset below u32::MAX, one above -> mixed encoding.
     let offsets: Vec<u64> = vec![1000, u64::from(u32::MAX) + 1];
-    update_inline_child_ptrs(node.ptrs_mut(), &offsets).unwrap();
+    resolve_inline_child_offsets(node.ptrs_mut(), &offsets).unwrap();
 
     let size_after = get_node_byte_len(&node);
 
@@ -1363,8 +1345,7 @@ fn test_squash_rejects_proof_generation() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     // Squash-aware proofs are out of scope for this PR. The squashed MARF
     // must reject both `get_with_proof` entry points so callers don't get
@@ -1403,8 +1384,7 @@ fn test_trie_merkle_proof_from_path_rejects_squashed_marf() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     let tip = blocks[2].clone();
     let value = MARFValue::from_value("v1_at_2");
@@ -1438,8 +1418,7 @@ fn test_get_block_at_height_works_for_pre_squash_caller() {
     );
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut squashed =
-        MARF::<StacksBlockId>::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
 
     // Stand on a pre-squash block and ask for an even earlier height. The
     // answer must come from `marf_squashed_blocks`, not from a trie metadata
@@ -1472,6 +1451,31 @@ fn test_get_block_at_height_works_for_pre_squash_caller() {
     assert_eq!(resolved_tip, blocks[0]);
 }
 
+#[test]
+fn test_get_block_height_of_same_pre_squash_block() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("index.sqlite");
+    let (_, blocks, _) = setup_marf(src_path.to_str().unwrap(), 16, 1);
+
+    let squash_height: u32 = 12;
+    let (squashed_path, _) = squash_helper(
+        src_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        squash_height,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    let standing_block = &blocks[8];
+    let height = squashed
+        .get_block_height_of(standing_block, standing_block)
+        .unwrap();
+
+    assert_eq!(height, Some(8));
+}
+
 /// `squash_to_path` must follow the explicit `tip` argument, not the
 /// highest `block_id` in `marf_data`. Build a forked MARF where the
 /// canonical tip is inserted *before* the non-canonical fork, so picking by
@@ -1484,8 +1488,7 @@ fn test_squash_follows_explicit_tip_on_forked_marf() {
     let src_path = dir.path().join("index.sqlite");
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut src =
-        MARF::<StacksBlockId>::from_path(src_path.to_str().unwrap(), open_opts.clone()).unwrap();
+    let mut src = MARF::from_path(src_path.to_str().unwrap(), open_opts.clone()).unwrap();
 
     let g = StacksBlockId::from_bytes(&[0x01; 32]).unwrap();
     let canonical_tip = StacksBlockId::from_bytes(&[0x02; 32]).unwrap();
@@ -1520,7 +1523,7 @@ fn test_squash_follows_explicit_tip_on_forked_marf() {
         1,
     );
 
-    let mut squashed = MARF::<StacksBlockId>::from_path(
+    let mut squashed = MARF::from_path(
         dst_path.to_str().unwrap(),
         MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true),
     )
@@ -1558,7 +1561,7 @@ fn test_squash_rejects_existing_destination() {
     std::fs::write(&dst_db_path, b"").unwrap();
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let result = MARF::<StacksBlockId>::squash_to_path(
+    let result = MARF::squash_to_path(
         src_db_path.to_str().unwrap(),
         dst_db_path.to_str().unwrap(),
         open_opts,
@@ -1577,7 +1580,7 @@ fn test_squash_rejects_existing_destination() {
     std::fs::write(&dst_blobs_path, b"").unwrap();
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let result = MARF::<StacksBlockId>::squash_to_path(
+    let result = MARF::squash_to_path(
         src_db_path.to_str().unwrap(),
         dst_db_path.to_str().unwrap(),
         open_opts,
@@ -1604,7 +1607,7 @@ fn test_squash_rejects_compress_true() {
     let mut open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
     open_opts.compress = true;
 
-    let result = MARF::<StacksBlockId>::squash_to_path(
+    let result = MARF::squash_to_path(
         src_db_path.to_str().unwrap(),
         dst_db_path.to_str().unwrap(),
         open_opts,
@@ -1766,8 +1769,7 @@ fn test_squash_extend_many_keys_patch_backptr_regression() {
     let b3 = StacksBlockId::from_bytes(&[3u8; 32]).unwrap();
 
     // --- Build archival source MARF ---
-    let mut src =
-        MARF::<StacksBlockId>::from_path(src_db_path.to_str().unwrap(), open_opts.clone()).unwrap();
+    let mut src = MARF::from_path(src_db_path.to_str().unwrap(), open_opts.clone()).unwrap();
 
     src.begin(&StacksBlockId::sentinel(), &b1).unwrap();
     for i in 0..num_keys {
@@ -1807,7 +1809,7 @@ fn test_squash_extend_many_keys_patch_backptr_regression() {
 
     // squash_to_path requires compress=false; compression is for the extend step.
     let squash_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", false);
-    MARF::<StacksBlockId>::squash_to_path(
+    MARF::squash_to_path(
         src_db_path.to_str().unwrap(),
         dst_db_path.to_str().unwrap(),
         squash_opts,
@@ -1822,8 +1824,7 @@ fn test_squash_extend_many_keys_patch_backptr_regression() {
     let squashed_opts =
         MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true).with_compression(true);
     let mut squashed =
-        MARF::<StacksBlockId>::from_path(dst_db_path.to_str().unwrap(), squashed_opts.clone())
-            .unwrap();
+        MARF::from_path(dst_db_path.to_str().unwrap(), squashed_opts.clone()).unwrap();
 
     squashed.begin(&b2, &b3).unwrap();
     squashed.insert_raw(make_path(0), make_leaf(255)).unwrap();

@@ -27,7 +27,7 @@ use sha2::Digest;
 
 use crate::chainstate::stacks::index::bits::{
     get_node_byte_len, get_node_byte_len_compressed, is_inline_child_ptr, read_hash_bytes,
-    read_nodetype, read_root_hash, reserved_root_size, update_inline_child_ptrs,
+    read_nodetype, read_root_hash, reserved_root_size, resolve_inline_child_offsets,
     write_nodetype_bytes, write_nodetype_bytes_compressed,
 };
 use crate::chainstate::stacks::index::cache::*;
@@ -916,10 +916,10 @@ impl<T: MarfTrieId> TrieRAM<T> {
             })?;
 
             if !entry.0.is_leaf() {
-                update_inline_child_ptrs(entry.0.ptrs_mut(), &file_offsets)?;
+                resolve_inline_child_offsets(entry.0.ptrs_mut(), &file_offsets)?;
             }
 
-            write_nodetype_bytes(f, &entry.0, entry.1)?;
+            write_nodetype_bytes(f, &entry.0, &entry.1)?;
         }
 
         let end_offset = f.stream_position()?;
@@ -931,10 +931,10 @@ impl<T: MarfTrieId> TrieRAM<T> {
             .ok_or_else(|| Error::CorruptionError("Invalid root pointer in dump_consume".into()))?;
 
         if !entry.0.is_leaf() {
-            update_inline_child_ptrs(entry.0.ptrs_mut(), &file_offsets)?;
+            resolve_inline_child_offsets(entry.0.ptrs_mut(), &file_offsets)?;
         }
         f.seek(SeekFrom::Start(header_size))?;
-        let root_written = write_nodetype_bytes(f, &entry.0, entry.1)?;
+        let root_written = write_nodetype_bytes(f, &entry.0, &entry.1)?;
         debug_assert!(
             root_written <= root_reserved_size,
             "root wrote {root_written} bytes but only {root_reserved_size} were reserved"
@@ -1182,13 +1182,13 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 Error::CorruptionError("Node index out of range in dump_compressed_consume".into())
             })? = f.stream_position()?;
             if let Some(patch) = dp.patch_mut() {
-                update_inline_child_ptrs(patch.ptr_diff.as_mut_slice(), &file_offsets)?;
+                resolve_inline_child_offsets(patch.ptr_diff.as_mut_slice(), &file_offsets)?;
             } else {
                 let entry = self.data.get_mut(dp_idx).ok_or_else(|| {
                     Error::CorruptionError("Invalid node pointer in dump_compressed_consume".into())
                 })?;
                 if !entry.0.is_leaf() {
-                    update_inline_child_ptrs(entry.0.ptrs_mut(), &file_offsets)?;
+                    resolve_inline_child_offsets(entry.0.ptrs_mut(), &file_offsets)?;
                 }
             }
             write_dump_ptr(f, dp, &self.data)?;
@@ -1198,13 +1198,13 @@ impl<T: MarfTrieId> TrieRAM<T> {
 
         // Step 4: write the root node into its reserved space.
         if let Some(patch) = root_dp.patch_mut() {
-            update_inline_child_ptrs(patch.ptr_diff.as_mut_slice(), &file_offsets)?;
+            resolve_inline_child_offsets(patch.ptr_diff.as_mut_slice(), &file_offsets)?;
         } else {
             let entry = self.data.get_mut(root_dp.ptr() as usize).ok_or_else(|| {
                 Error::CorruptionError("Invalid root pointer in dump_compressed_consume".into())
             })?;
             if !entry.0.is_leaf() {
-                update_inline_child_ptrs(entry.0.ptrs_mut(), &file_offsets)?;
+                resolve_inline_child_offsets(entry.0.ptrs_mut(), &file_offsets)?;
             }
         }
         f.seek(SeekFrom::Start(header_size))?;
@@ -2488,6 +2488,11 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         self.data.squash_info.as_ref()
     }
 
+    /// Returns the configured squash height, if this storage is squashed.
+    pub fn squash_height(&self) -> Option<u32> {
+        self.squash_info().map(|info| info.height)
+    }
+
     /// Set cached squashing metadata for this storage connection.
     pub(crate) fn set_squash_info(&mut self, squash_info: Option<SquashInfo>) {
         self.data.set_squash_info(squash_info);
@@ -2496,6 +2501,52 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     /// Returns a reference to the underlying SQLite connection.
     pub(crate) fn sqlite_conn(&self) -> &Connection {
         &self.db
+    }
+
+    /// Read this block's height from the squashed-block side table.
+    ///
+    /// Returns `None` for archival MARFs and for blocks outside the squashed
+    /// range.
+    pub fn squashed_block_height(&self, block_hash: &T) -> Result<Option<u32>, Error> {
+        if !self.is_squashed() {
+            return Ok(None);
+        }
+
+        trie_sql::read_squashed_block_height_by_hash(self.sqlite_conn(), block_hash)
+    }
+
+    /// Read this block's archival MARF root hash from the squashed-block side
+    /// table.
+    ///
+    /// Returns `None` for archival MARFs and for blocks outside the squashed
+    /// range.
+    pub fn squashed_block_root_hash(&self, block_hash: &T) -> Result<Option<TrieHash>, Error> {
+        if !self.is_squashed() {
+            return Ok(None);
+        }
+
+        trie_sql::read_squashed_block_root_hash_by_hash(self.sqlite_conn(), block_hash)
+    }
+
+    /// Reject trie traversal below the squash height, where blocks share the
+    /// squash blob.
+    pub fn check_historical_read_allowed(&self, block_hash: &T) -> Result<(), Error> {
+        let Some(squash_height) = self.squash_height() else {
+            return Ok(());
+        };
+
+        let Some(block_height) = self.squashed_block_height(block_hash)? else {
+            return Ok(());
+        };
+
+        if block_height < squash_height {
+            return Err(Error::HistoricalReadInSquashedRange {
+                block_height,
+                squash_height,
+            });
+        }
+
+        Ok(())
     }
 
     pub fn set_cached_ancestor_hashes_bytes(&mut self, bhh: &T, bytes: Vec<TrieHash>) {
@@ -2507,18 +2558,9 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     }
 
     pub fn get_root_hash_at(&mut self, tip: &T) -> Result<TrieHash, Error> {
-        // In a squashed MARF, blocks within 0..=H share a single blob
-        // whose root hash is the squash root, not the per-height archival
-        // root.  Use the side-table when available.
-        if self.is_squashed() {
-            if let Some(h) = trie_sql::read_squash_block_height(self.sqlite_conn(), tip)? {
-                return trie_sql::read_squash_archival_marf_root_hash(self.sqlite_conn(), h)?
-                    .ok_or_else(|| {
-                        Error::CorruptionError(format!(
-                            "Missing archival root hash at height {h} for block {tip}"
-                        ))
-                    });
-            }
+        // Squashed historical blocks keep their archival roots in SQL.
+        if let Some(root_hash) = self.squashed_block_root_hash(tip)? {
+            return Ok(root_hash);
         }
 
         let cur_block_hash = self.get_cur_block();
@@ -2626,12 +2668,14 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         // trie hashes stored during squashing.
         if let Some(info) = self.data.squash_info.clone() {
             for h in 0..=info.height {
-                let Some(bh) = trie_sql::read_squash_block_hash::<T>(self.sqlite_conn(), h)? else {
+                let Some(bh) =
+                    trie_sql::read_squashed_block_hash_by_height::<T>(self.sqlite_conn(), h)?
+                else {
                     continue;
                 };
 
                 let Some(archival_trie_hash) =
-                    trie_sql::read_squash_archival_marf_root_hash(self.sqlite_conn(), h)?
+                    trie_sql::read_squashed_block_root_hash_by_height(self.sqlite_conn(), h)?
                 else {
                     continue;
                 };
