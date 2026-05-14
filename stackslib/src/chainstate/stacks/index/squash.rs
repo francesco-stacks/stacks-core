@@ -19,7 +19,7 @@
 //! height H plus the metadata needed for ancestor hash lookups and
 //! block-height resolution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -45,7 +45,12 @@ pub(crate) use stream::stream_squash_blob;
 use stream::{recompute_content_hashes, BlobReader};
 
 /// Read exactly `buf.len()` bytes at `offset` without moving the file cursor.
-/// Unix uses `pread`; Windows loops `seek_read` to handle short reads.
+///
+/// On Unix this is a single `pread(2)` syscall via `FileExt::read_exact_at`.
+/// On Windows it loops `seek_read` (which may return short reads) until
+/// the caller's buffer is full.
+///
+/// Each read is one syscall - no `lseek` + `read`
 pub(super) fn read_exact_at(
     file: &std::fs::File,
     buf: &mut [u8],
@@ -1201,20 +1206,17 @@ impl<T: MarfTrieId> MARF<T> {
         let squashed_block_at_height =
             trie_sql::get_latest_confirmed_block_hash::<T>(squashed.sqlite_conn())?;
 
-        let height_key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{height}");
-        // Resolve the canonical block at `height` by walking from `source_tip`.
+        // Resolve the canonical block at `height` from `source_tip`.
         // A missing mapping here means the caller passed a tip that does not
-        // descend from `height`, so refuse to silently validate against the
-        // squashed block hash instead.
-        let source_block_at_height = src
-            .with_conn(|conn| Self::get_by_key(conn, source_tip, &height_key))?
-            .map(T::from)
-            .ok_or_else(|| {
-                Error::CorruptionError(format!(
-                    "validate_squashed_at_height: no canonical block at height {height} \
+        // descend from `height`.
+        let source_block_at_height =
+            src.get_block_at_height(height, source_tip)?
+                .ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "validate_squashed_at_height: no canonical block at height {height} \
                      under tip {source_tip}"
-                ))
-            })?;
+                    ))
+                })?;
 
         let mut stats = SquashValidationStats {
             archival_root_present: false,
@@ -1259,16 +1261,16 @@ impl<T: MarfTrieId> MARF<T> {
             HashMap::with_capacity((height + 1) as usize);
         let mut last_log = Instant::now();
         for h in 0..=height {
-            let h_key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{h}");
-            let val = src
-                .with_conn(|conn| Self::get_by_key(conn, source_tip, &h_key))?
-                .ok_or_else(|| {
-                    Error::CorruptionError(format!(
-                        "validate_squashed_at_height: source MARF has no height->hash \
+            // `get_block_at_height` returns the canonical block at `h` under
+            // `source_tip`, short-circuiting when `h == source_tip.height` so
+            // we get the real committed hash rather than the stale dummy that
+            // a `commit_to(real_bhh)` leaves in the trie's height index.
+            let bh = src.get_block_at_height(h, source_tip)?.ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "validate_squashed_at_height: source MARF has no height->hash \
                          mapping at height {h} under tip {source_tip}"
-                    ))
-                })?;
-            let bh = T::from(val);
+                ))
+            })?;
             let &(block_id, blob_offset) = source_block_map.get(&bh).ok_or_else(|| {
                 Error::CorruptionError(format!(
                     "validate_squashed_at_height: block {bh} at height {h} is in the \

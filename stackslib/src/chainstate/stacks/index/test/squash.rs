@@ -2221,7 +2221,7 @@ fn test_squashed_marf_proof_at_extended_height() {
         // squashed range differ (the squash trie has a different internal
         // structure).  The squashed root-to-block map accounts for this
         // by computing per-height trie hashes from the squash trie root node hash.
-        let trusted = squashed.trusted_squash_node_hashes();
+        let trusted = squashed.trusted_squash_hashes();
         let squashed_ok = squashed_proof.verify(
             &path,
             &marf_value,
@@ -2288,7 +2288,7 @@ fn test_squashed_marf_proof_across_many_extended_heights() {
         .read_root_to_block_table()
         .unwrap();
 
-    let trusted = squashed.trusted_squash_node_hashes();
+    let trusted = squashed.trusted_squash_hashes();
 
     // At each extended height, prove a key from the squashed range (k2,
     // inserted at height 1) and a key from the extended range.
@@ -2399,7 +2399,7 @@ fn test_squashed_proof_rejected_without_trusted_hash() {
     let path = TrieHash::from_key("k2");
     let marf_value = MARFValue::from_value("v2_at_1");
 
-    // With an empty trusted set, the squash shunt should be rejected.
+    // With an empty trusted anchor set, the squash shunt should be rejected.
     assert!(
         !proof.verify(
             &path,
@@ -2411,11 +2411,11 @@ fn test_squashed_proof_rejected_without_trusted_hash() {
         "Proof should have been rejected with no trusted squash hashes"
     );
 
-    // With the correct trusted set, it should pass.
-    let trusted = squashed.trusted_squash_node_hashes();
+    // With the correct trusted anchor set, it should pass.
+    let trusted = squashed.trusted_squash_hashes();
     assert!(
         !trusted.is_empty(),
-        "Squashed MARF should have a trusted hash"
+        "Squashed MARF should have trusted hash anchors"
     );
     assert!(
         proof.verify(
@@ -2425,12 +2425,12 @@ fn test_squashed_proof_rejected_without_trusted_hash() {
             &squashed_root_to_block,
             &trusted,
         ),
-        "Proof should pass with the correct trusted hash"
+        "Proof should pass with the correct trusted hash anchor"
     );
 }
 
-/// Verify that a squashed proof is rejected when the trusted hash set
-/// contains a wrong hash.
+/// Verify that a squashed proof is rejected when the trusted hash anchor set
+/// contains a wrong anchor.
 #[test]
 fn test_squashed_proof_rejected_with_wrong_trusted_hash() {
     let dir = tempdir().unwrap();
@@ -2471,9 +2471,9 @@ fn test_squashed_proof_rejected_with_wrong_trusted_hash() {
     let path = TrieHash::from_key("k2");
     let marf_value = MARFValue::from_value("v2_at_1");
 
-    // A wrong trusted hash should cause rejection.
+    // A wrong trusted anchor should cause rejection.
     let mut wrong_trusted = HashSet::new();
-    wrong_trusted.insert(TrieHash::from_data(b"totally_wrong_hash"));
+    wrong_trusted.insert(TrieHash::from_data(b"totally_wrong_squash_hash"));
     assert!(
         !proof.verify(
             &path,
@@ -2482,7 +2482,7 @@ fn test_squashed_proof_rejected_with_wrong_trusted_hash() {
             &squashed_root_to_block,
             &wrong_trusted,
         ),
-        "Proof should have been rejected with a wrong trusted hash"
+        "Proof should have been rejected with a wrong trusted hash anchor"
     );
 }
 
@@ -2528,7 +2528,7 @@ fn test_squashed_marf_get_with_proof_public_api() {
     squashed.commit().unwrap();
 
     // Call the public `MARF::get_with_proof` (the inherent-impl variant) and
-    // verify the returned proof against the squashed root + trusted hash set.
+    // verify the returned proof against the squashed root + trusted hash anchors.
     let (value, proof) = squashed
         .get_with_proof(&b_new, "k2")
         .expect("get_with_proof must not error")
@@ -2545,7 +2545,7 @@ fn test_squashed_marf_get_with_proof_public_api() {
         .borrow_storage_backend()
         .read_root_to_block_table()
         .unwrap();
-    let trusted = squashed.trusted_squash_node_hashes();
+    let trusted = squashed.trusted_squash_hashes();
     assert!(
         proof.verify(
             &path,
@@ -2554,7 +2554,7 @@ fn test_squashed_marf_get_with_proof_public_api() {
             &squashed_root_to_block,
             &trusted,
         ),
-        "proof returned by public API must verify against squash root+trust set"
+        "proof returned by public API must verify against squash root+trusted anchors"
     );
 
     // Also exercise the trait-route entry point (`MarfConnection::get_with_proof`
