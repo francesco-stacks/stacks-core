@@ -19,7 +19,7 @@
 //! height H plus the metadata needed for ancestor hash lookups and
 //! block-height resolution.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

@@ -383,48 +383,6 @@ pub fn bulk_read_block_entries<T: MarfTrieId>(
     Ok(result)
 }
 
-/// Bulk-read every row of `marf_squashed_blocks`.
-///
-/// Returns `(height, block_hash, marf_root_hash)` for every row.  Used by
-/// validation to avoid per-height SQL lookups *and* to cross-check the
-/// `block_hash` column - snapshot side-table copies trust it to determine
-/// the canonical set, so it must be verified, not just the root hashes.
-pub fn bulk_read_squashed_blocks<T: MarfTrieId>(
-    conn: &Connection,
-) -> Result<Vec<(u32, T, TrieHash)>, Error> {
-    let mut stmt = conn.prepare(
-        "SELECT height, block_hash, marf_root_hash FROM marf_squashed_blocks ORDER BY height",
-    )?;
-    let rows = stmt.query_map(NO_PARAMS, |row| {
-        let height: i64 = row.get(0)?;
-        let block_hash_bytes: Vec<u8> = row.get(1)?;
-        let marf_root_hash_bytes: Vec<u8> = row.get(2)?;
-        Ok((height, block_hash_bytes, marf_root_hash_bytes))
-    })?;
-    let mut result = Vec::new();
-    for row in rows {
-        let (height, block_hash_bytes, marf_root_hash_bytes) = row?;
-        let h = u32::try_from(height)
-            .map_err(|_| Error::CorruptionError("Invalid squash block height".to_string()))?;
-        let block_hash_arr: [u8; 32] = block_hash_bytes.as_slice().try_into().map_err(|_| {
-            Error::CorruptionError(format!(
-                "Invalid squash block_hash length {} at height {h}",
-                block_hash_bytes.len()
-            ))
-        })?;
-        let bh = T::from_bytes(block_hash_arr);
-        if marf_root_hash_bytes.len() != TRIEHASH_ENCODED_SIZE {
-            return Err(Error::CorruptionError(
-                "Invalid squash root hash length".to_string(),
-            ));
-        }
-        let root = TrieHash::from_bytes(&marf_root_hash_bytes)
-            .ok_or_else(|| Error::CorruptionError("Invalid squash root hash bytes".to_string()))?;
-        result.push((h, bh, root));
-    }
-    Ok(result)
-}
-
 /// Count how many `marf_data` rows have a blob offset/length that differs
 /// from the expected values.  Used by validation to check that all
 /// historical entries share the same shared squash trie storage.
