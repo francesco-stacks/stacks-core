@@ -246,6 +246,7 @@ fn test_squashed_historical_root_hash_and_height() {
         .map(|i| archival.get_root_hash_at(&blocks[i]).unwrap())
         .collect();
 
+    // The archival roots should not all be identical (sanity).
     assert_ne!(archival_roots[0], archival_roots[4]);
 
     // Squash at height 4 (blocks 0..=4 are in the squashed range).
@@ -969,36 +970,33 @@ fn test_node_store_roundtrip_all_variants() {
     let n256_hash = TrieHash::from_data(&[5]);
     store.push(&n256, n256_hash, 50).unwrap();
 
-    store.finish_writing().unwrap();
+    store.flush().unwrap();
     assert_eq!(store.len(), 5);
 
-    // Read back and verify
-    let mut reader = store.open_reader().unwrap();
-
     // Leaf round-trip
-    let rt_leaf = store.read_node_with(&mut reader, 0).unwrap();
+    let rt_leaf = store.read_node(0).unwrap();
     assert!(rt_leaf.is_leaf());
     assert_eq!(rt_leaf.path_bytes(), &[1, 2, 3]);
     assert_eq!(*store.hash(0), leaf_hash);
     assert_eq!(store.block_id(0), 10);
 
     // Node4 round-trip
-    let rt_n4 = store.read_node_with(&mut reader, 1).unwrap();
+    let rt_n4 = store.read_node(1).unwrap();
     assert_eq!(rt_n4.ptrs()[0].chr(), b'a');
     assert_eq!(rt_n4.ptrs()[0].ptr(), 100);
 
     // Node16 round-trip
-    let rt_n16 = store.read_node_with(&mut reader, 2).unwrap();
+    let rt_n16 = store.read_node(2).unwrap();
     assert_eq!(rt_n16.ptrs()[0].chr(), b'b');
     assert_eq!(rt_n16.ptrs()[0].ptr(), 200);
 
     // Node48 round-trip
-    let rt_n48 = store.read_node_with(&mut reader, 3).unwrap();
+    let rt_n48 = store.read_node(3).unwrap();
     assert_eq!(rt_n48.ptrs()[0].chr(), b'c');
     assert_eq!(rt_n48.ptrs()[0].ptr(), 300);
 
     // Node256 round-trip
-    let rt_n256 = store.read_node_with(&mut reader, 4).unwrap();
+    let rt_n256 = store.read_node(4).unwrap();
     assert_eq!(rt_n256.ptrs()[b'd' as usize].chr(), b'd');
     assert_eq!(rt_n256.ptrs()[b'd' as usize].ptr(), 400);
 }
@@ -1015,7 +1013,7 @@ fn test_node_store_spill_file_cleaned_on_drop() {
 
         let leaf = make_test_leaf(&[1], 0x01);
         store.push(&leaf, TrieHash::EMPTY, 0).unwrap();
-        store.finish_writing().unwrap();
+        store.flush().unwrap();
 
         // File should exist while store is alive
         assert!(spill_path.exists(), "spill file should exist before drop");
@@ -1166,7 +1164,7 @@ fn test_stream_squash_blob_mixed_node_types() {
     // Index 6: Leaf
     store.push(&make_test_leaf(&[8, 9], 0xCC), h, 0).unwrap();
 
-    store.finish_writing().unwrap();
+    store.flush().unwrap();
 
     let parent_hash = StacksBlockId::sentinel();
     let mut output = Cursor::new(Vec::new());
@@ -1217,7 +1215,7 @@ fn test_stream_squash_blob_at_nonzero_offset() {
     );
     store.push(&root, TrieHash::from_data(&[0xAA]), 0).unwrap();
     store.push(&leaf, TrieHash::from_data(&[0xBB]), 0).unwrap();
-    store.finish_writing().unwrap();
+    store.flush().unwrap();
 
     let parent_hash = StacksBlockId::sentinel();
 
@@ -1594,7 +1592,7 @@ fn test_stream_squash_blob_rejects_non_preorder_nodes() {
         ],
     );
     store.push(&inner, h, 0).unwrap();
-    store.finish_writing().unwrap();
+    store.flush().unwrap();
 
     let parent_hash = StacksBlockId::sentinel();
     let mut output = Cursor::new(Vec::new());
@@ -1630,7 +1628,7 @@ fn stream_squash_blob_large_offset_sets_u64_ptr_bit() {
             .push(&TrieNodeType::Node256(Box::new(node)), hash, 0)
             .expect("push trie node");
     }
-    store.finish_writing().expect("finish node store");
+    store.flush().expect("flush node store");
 
     let parent_hash = StacksBlockId([0x55; 32]);
     let mut file = std::fs::OpenOptions::new()

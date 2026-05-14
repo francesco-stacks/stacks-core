@@ -98,7 +98,6 @@ fn remap_child_ptrs(
 ) -> Result<(), Error> {
     let remap_start = Instant::now();
     let node_count = store.len();
-    let mut reader = store.open_reader()?;
 
     for idx in 0..node_count {
         if idx > 0 && idx % 1_000_000 == 0 {
@@ -108,7 +107,7 @@ fn remap_child_ptrs(
             );
         }
 
-        let mut node = store.read_node_with(&mut reader, idx)?;
+        let mut node = store.read_node(idx)?;
         let origin_block_id = store.block_id(idx);
 
         if node.is_leaf() {
@@ -578,7 +577,8 @@ impl<T: MarfTrieId> MARF<T> {
             label,
         );
 
-        if result.is_err() {
+        if let Err(e) = &result {
+            error!("[{label}] squash failed: {e}; cleaning up partial output at {dst_path}");
             let _ = std::fs::remove_file(&dst_db_path);
             let _ = std::fs::remove_file(&dst_blobs_path);
         }
@@ -978,7 +978,7 @@ impl<T: MarfTrieId> MARF<T> {
             }
         }
 
-        store.finish_writing()?;
+        store.flush()?;
 
         info!(
             "Trie DFS: {} nodes in {}",

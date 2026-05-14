@@ -240,6 +240,8 @@ impl<W: Seek> Seek for CountingWriter<W> {
 pub(crate) struct NodeStore {
     /// Temp file holding serialized nodes (write handle).
     writer: CountingWriter<BufWriter<File>>,
+    /// Lazily-opened read handle to the temp file. Opened on first read.
+    reader: BufReader<File>,
     /// Path to the temp file (for re-opening as reader).
     pub(crate) path: std::path::PathBuf,
     /// Byte offset in the temp file for each node.
@@ -254,31 +256,21 @@ impl NodeStore {
     pub(crate) fn new(dir: &str) -> Result<Self, Error> {
         let pid = std::process::id();
         // Try up to 16 times with atomic create_new to avoid collision.
-        for attempt in 0u32..16 {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let mut path = std::path::PathBuf::from(dir);
-            path.push(format!(".squash_nodes_{pid}_{nanos}_{attempt}.tmp"));
-            match File::options().write(true).create_new(true).open(&path) {
-                Ok(file) => {
-                    return Ok(NodeStore {
-                        writer: CountingWriter::new(BufWriter::with_capacity(1 << 20, file)),
-                        path,
-                        file_offsets: Vec::new(),
-                        hashes: Vec::new(),
-                        block_ids: Vec::new(),
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(Error::IOError(e)),
-            }
-        }
-        Err(Error::IOError(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "failed to create unique NodeStore temp file after 16 attempts",
-        )))
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut path = std::path::PathBuf::from(dir);
+        path.push(format!(".squash_nodes_{pid}_{nanos}.tmp"));
+        let temp_file = File::options().write(true).create_new(true).open(&path)?;
+        Ok(NodeStore {
+            writer: CountingWriter::new(BufWriter::with_capacity(1 << 20, temp_file)),
+            reader: BufReader::new(File::open(&path)?),
+            path,
+            file_offsets: Vec::new(),
+            hashes: Vec::new(),
+            block_ids: Vec::new(),
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -301,24 +293,20 @@ impl NodeStore {
         Ok(idx)
     }
 
-    /// Flush the writer and return a sequential reader over all nodes.
-    pub(crate) fn finish_writing(&mut self) -> Result<(), Error> {
-        self.writer.flush().map_err(Error::IOError)?;
-        Ok(())
-    }
-
-    /// Overwrite the node at `idx` in place using the existing writer handle.
+    /// Overwrite the node at `idx` in place.
     ///
-    /// Call only after `finish_writing` and only when the new serialization
+    /// Call only after `flush` and only when the new serialization
     /// length matches the original.
     pub(crate) fn overwrite_node(&mut self, idx: usize, node: &TrieNodeType) -> Result<(), Error> {
         let offset = *self.file_offsets.get(idx).ok_or_else(|| {
             Error::CorruptionError(format!("overwrite_node: index {idx} out of bounds"))
         })?;
         let next_offset = self.file_offsets.get(idx + 1);
-        self.writer
-            .seek(SeekFrom::Start(offset))
-            .map_err(Error::IOError)?;
+        if self.writer.position() != offset {
+            self.writer
+                .seek(SeekFrom::Start(offset))
+                .map_err(Error::IOError)?;
+        }
         serialize_node(&mut self.writer, node)?;
         if let Some(expected_end) = next_offset {
             debug_assert_eq!(
@@ -330,31 +318,25 @@ impl NodeStore {
         Ok(())
     }
 
-    /// Flush any buffered writes to the underlying file.
+    /// Flush buffered writes so subsequent reads see them.
     pub(crate) fn flush(&mut self) -> Result<(), Error> {
         self.writer.flush().map_err(Error::IOError)?;
         Ok(())
     }
 
-    /// Open a reader for random-access reads.
-    pub(crate) fn open_reader(&self) -> Result<BufReader<File>, Error> {
-        let file = File::open(&self.path).map_err(Error::IOError)?;
-        Ok(BufReader::with_capacity(1 << 20, file))
-    }
-
-    /// Read a node from the temp file using the given reader.
-    pub(crate) fn read_node_with(
-        &self,
-        reader: &mut BufReader<File>,
-        idx: usize,
-    ) -> Result<TrieNodeType, Error> {
+    /// Read the node at `idx`. Lazily opens a shared `BufReader` on first call.
+    ///
+    /// Reads see only flushed writes; re-reading an overwritten node requires
+    /// a preceding `flush`.
+    pub(crate) fn read_node(&mut self, idx: usize) -> Result<TrieNodeType, Error> {
         let offset = *self.file_offsets.get(idx).ok_or_else(|| {
             Error::CorruptionError(format!("NodeStore: index {idx} out of bounds"))
         })?;
-        reader
+
+        self.reader
             .seek(SeekFrom::Start(offset))
             .map_err(Error::IOError)?;
-        deserialize_node(reader)
+        deserialize_node(&mut self.reader)
     }
 
     pub(crate) fn hash(&self, idx: usize) -> &TrieHash {
