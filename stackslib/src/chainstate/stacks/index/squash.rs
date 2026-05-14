@@ -159,13 +159,7 @@ fn remap_child_ptrs(
 /// The validator walks a *committed* squash blob and re-derives the content
 /// root hash from scratch. The hash computation only reads each node's
 /// content + its children's hashes (via `recompute_content_hashes`), it
-/// never inspects `back_block`. So we can skip the squashed-block-id map
-/// entirely here and zero the annotation - this is hashing-only state that
-/// is never written back to disk.
-///
-/// Keeping this in its own helper preserves the invariant that the squash
-/// pipeline's `remap_child_ptrs` always sets a real `back_block`, which
-/// PR #7060 tightened from the previous `Option<&HashMap>` signature.
+/// never inspects `back_block`.
 fn remap_child_ptrs_for_hashing(
     store: &mut NodeStore,
     source_to_idx: &HashMap<(u32, u64), usize>,
@@ -173,7 +167,6 @@ fn remap_child_ptrs_for_hashing(
 ) -> Result<(), Error> {
     let remap_start = Instant::now();
     let node_count = store.len();
-    let mut reader = store.open_reader()?;
 
     for idx in 0..node_count {
         if idx > 0 && idx % 1_000_000 == 0 {
@@ -183,7 +176,7 @@ fn remap_child_ptrs_for_hashing(
             );
         }
 
-        let mut node = store.read_node_with(&mut reader, idx)?;
+        let mut node = store.read_node(idx)?;
         let origin_block_id = store.block_id(idx);
 
         if node.is_leaf() {
