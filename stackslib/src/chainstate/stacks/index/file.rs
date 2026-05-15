@@ -368,25 +368,13 @@ impl NodeHashReader for TrieFileNodeHashReader<'_> {
 }
 
 impl TrieFile {
-    /// Warm the offset cache from confirmed `marf_data` rows.
-    pub fn warm_trie_offsets(&mut self, db: &Connection) -> Result<(), Error> {
-        let mut stmt =
-            db.prepare("SELECT block_id, external_offset FROM marf_data WHERE unconfirmed = 0")?;
-        let rows = stmt.query_map([], |row| {
-            let block_id: u32 = row.get(0)?;
-            let offset_i64: i64 = row.get(1)?;
-            Ok((block_id, offset_i64))
-        })?;
+    /// Cache a known trie blob offset.
+    pub(crate) fn cache_trie_offset(&mut self, block_id: u32, offset: u64) {
         let offsets_cache = match self {
             TrieFile::RAM(ref mut ram) => &mut ram.trie_offsets,
             TrieFile::Disk(ref mut disk) => &mut disk.trie_offsets,
         };
-        for row in rows {
-            let (block_id, offset_i64) = row?;
-            let offset = u64::try_from(offset_i64).map_err(|_| Error::OverflowError)?;
-            offsets_cache.insert(block_id, offset);
-        }
-        Ok(())
+        offsets_cache.insert(block_id, offset);
     }
 
     /// Determine the file offset in the TrieFile where a serialized trie starts.

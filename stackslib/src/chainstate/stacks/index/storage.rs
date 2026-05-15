@@ -2504,15 +2504,15 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         &self.db
     }
 
-    /// Warm the file-backed blob offset cache.
+    /// Warm the file-backed blob offset cache from rows already loaded by the caller.
     ///
     /// No-op for SQLite-internal storage.
-    pub fn warm_trie_offsets(&mut self) -> Result<(), Error> {
-        let db: &Connection = &self.db;
+    pub(crate) fn warm_trie_offsets_from_entries(&mut self, block_entries: &[(u32, T, u64)]) {
         if let Some(trie_file) = self.blobs.as_deref_mut() {
-            trie_file.warm_trie_offsets(db)?;
+            for (block_id, _, offset) in block_entries {
+                trie_file.cache_trie_offset(*block_id, *offset);
+            }
         }
-        Ok(())
     }
 
     /// Read `(parent_hash, root_hash)` for a block.
