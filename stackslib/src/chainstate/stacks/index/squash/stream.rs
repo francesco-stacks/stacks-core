@@ -13,18 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::fs::File;
-use std::io::{Read as _, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::time::Instant;
 
-use rusqlite::DatabaseName;
 use sha2::Digest as _;
-use stacks_common::types::chainstate::{
-    StacksBlockId, TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE,
-};
+use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 
+use super::fmt_duration;
 use super::node_store::{CountingWriter, NodeStore};
-use super::{fmt_duration, read_exact_at};
 use crate::chainstate::stacks::index::bits::{
     get_leaf_hash, get_node_byte_len, is_inline_child_ptr, reserved_root_size,
     resolve_inline_child_offsets, write_nodetype_bytes,
@@ -32,37 +28,22 @@ use crate::chainstate::stacks::index::bits::{
 use crate::chainstate::stacks::index::node::{is_backptr, TrieNodeType};
 use crate::chainstate::stacks::index::{blob_layout, BlockMap, Error, MarfTrieId, TrieHasher};
 
-/// Recompute content hashes using a `NodeStore`.
+/// Recompute content hashes in reverse NodeStore order.
 ///
-/// Leaf hashes are computed by reading each leaf from the temp file.
-/// Internal node hashes are computed bottom-up (reverse order) using
-/// the in-memory hashes Vec for child lookups and reading the node
-/// structure from the temp file.
+/// The squash collector writes tree nodes in DFS preorder, so inline children
+/// are expected to appear after their parent.
 pub(super) fn recompute_content_hashes(store: &mut NodeStore) -> Result<(), Error> {
     let empty_hash = TrieHash::EMPTY;
     let node_count = store.len();
     let start = Instant::now();
 
-    // Pass 1: compute leaf hashes
-    for idx in 0..node_count {
+    for idx in (0..node_count).rev() {
         let node = store.read_node(idx)?;
         if let TrieNodeType::Leaf(ref leaf) = node {
             store.set_hash(idx, get_leaf_hash(leaf));
-        }
-    }
-    info!(
-        "Trie hash: leaf pass done in {}",
-        fmt_duration(start.elapsed())
-    );
-
-    // Pass 2: internal nodes in reverse order
-    for idx in (0..node_count).rev() {
-        let node = store.read_node(idx)?;
-        if node.is_leaf() {
             continue;
         }
 
-        // Collect child hashes
         let ptrs = node.ptrs();
         let mut child_hashes = Vec::with_capacity(ptrs.len());
         for child_ptr in ptrs {
@@ -70,9 +51,12 @@ pub(super) fn recompute_content_hashes(store: &mut NodeStore) -> Result<(), Erro
                 child_hashes.push(empty_hash);
             } else {
                 let child_idx = child_ptr.ptr() as usize;
-                if child_idx >= node_count {
+                // Reverse order only works for parent-before-child storage.
+                if child_idx <= idx || child_idx >= node_count {
                     return Err(Error::CorruptionError(format!(
-                        "Invalid child index {child_idx} at node {idx}"
+                        "invalid child index {child_idx} at node {idx} \
+                         (node_count={node_count}); preorder DFS invariant requires \
+                         parent < child < node_count"
                     )));
                 }
                 child_hashes.push(*store.hash(child_idx));
@@ -196,87 +180,6 @@ pub(crate) fn stream_squash_blob<T: MarfTrieId, F: Write + Seek>(
     .map_err(Error::IOError)?;
 
     Ok(total_size)
-}
-
-/// Reads trie headers from external blobs or SQLite BLOB columns.
-pub(super) enum BlobReader {
-    External(File),
-    Internal(rusqlite::Connection),
-}
-
-impl BlobReader {
-    pub(super) fn new(db_path: &str, external_blobs: bool) -> Result<Self, Error> {
-        if external_blobs {
-            let blobs_path = format!("{db_path}.blobs");
-            let file = File::open(&blobs_path).map_err(Error::IOError)?;
-            Ok(BlobReader::External(file))
-        } else {
-            let conn = rusqlite::Connection::open_with_flags(
-                db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )?;
-            Ok(BlobReader::Internal(conn))
-        }
-    }
-
-    /// Read the root hash for a block.
-    pub(super) fn read_root_hash(
-        &mut self,
-        block_id: u32,
-        blob_offset: u64,
-    ) -> Result<TrieHash, Error> {
-        let root_ptr_offset = blob_layout::ROOT_NODE_OFFSET as u64;
-        let mut hash_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
-        match self {
-            BlobReader::External(file) => {
-                read_exact_at(file, &mut hash_bytes, blob_offset + root_ptr_offset)?;
-            }
-            BlobReader::Internal(conn) => {
-                let mut blob = conn.blob_open(
-                    DatabaseName::Main,
-                    "marf_data",
-                    "data",
-                    block_id.into(),
-                    true, // readonly
-                )?;
-                blob.seek(SeekFrom::Start(root_ptr_offset))?;
-                blob.read_exact(&mut hash_bytes)?;
-            }
-        }
-        Ok(TrieHash(hash_bytes))
-    }
-
-    /// Read `(parent_hash, root_hash)` from the blob header.
-    pub(super) fn read_parent_and_root_hash<T: MarfTrieId>(
-        &mut self,
-        block_id: u32,
-        blob_offset: u64,
-    ) -> Result<(T, TrieHash), Error> {
-        let mut buf = [0u8; blob_layout::READER_PREFIX_LEN];
-        match self {
-            BlobReader::External(file) => {
-                read_exact_at(file, &mut buf, blob_offset)?;
-            }
-            BlobReader::Internal(conn) => {
-                let mut blob = conn.blob_open(
-                    DatabaseName::Main,
-                    "marf_data",
-                    "data",
-                    block_id.into(),
-                    true, // readonly
-                )?;
-                blob.read_exact(&mut buf)?;
-            }
-        }
-        let mut parent_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
-        parent_bytes.copy_from_slice(&buf[..BLOCK_HEADER_HASH_ENCODED_SIZE]);
-        let mut root_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
-        root_bytes.copy_from_slice(
-            &buf[blob_layout::ROOT_NODE_OFFSET
-                ..blob_layout::ROOT_NODE_OFFSET + TRIEHASH_ENCODED_SIZE],
-        );
-        Ok((T::from_bytes(parent_bytes), TrieHash(root_bytes)))
-    }
 }
 
 /// A `BlockMap` for nodes whose backpointers were already made inline.
