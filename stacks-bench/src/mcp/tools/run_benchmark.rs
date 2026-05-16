@@ -10,6 +10,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use stacks_bench::StacksBlockRef;
 use stacks_bench::bench_events::BenchEvent;
+use stacks_bench::db::app::ProfilerThreshold;
 use tokio::sync::mpsc;
 
 use crate::commands::bench::run::{BenchRunParams, FilterKind, RunResult};
@@ -82,6 +83,34 @@ pub struct RunBenchmarkParams {
     /// `block`, and `filter`.
     #[serde(default)]
     pub contract: Vec<String>,
+
+    /// Store only stacks-bench generated profiler spans. Node/Clarity profiler
+    /// spans are omitted from persistence.
+    #[serde(default)]
+    pub no_profiler: bool,
+
+    /// Persist non-stacks-bench profiler spans only when a timing metric
+    /// reaches this threshold, e.g. `"1ms"`, `"wall:1000us"`, or
+    /// `"self-cpu:1.3s"`. Bare durations use inclusive wall time. Multiple
+    /// thresholds are OR-combined.
+    #[serde(default)]
+    pub profiler_threshold: Vec<String>,
+
+    /// Opt-in profiler span glob patterns. Patterns match both the span name
+    /// and `module::path::name`. Mutually exclusive with `ignore_span`.
+    #[serde(default)]
+    pub span: Vec<String>,
+
+    /// Opt-out profiler span glob patterns. Patterns match both the span name
+    /// and `module::path::name`. Mutually exclusive with `span`.
+    #[serde(default)]
+    pub ignore_span: Vec<String>,
+
+    /// Disable capture and persistence of profiler key-value records generated
+    /// via `record!` and `counter!` macros. Span timing records are still
+    /// stored unless filtered by the profiler persistence options above.
+    #[serde(default)]
+    pub no_profiler_kv: bool,
 
     /// Network name (e.g. `"mainnet"`, `"testnet"`). Inferred from the
     /// chainstate if omitted.
@@ -157,8 +186,27 @@ impl RunBenchmarkParams {
             .collect::<Result<_, _>>()?;
         let contract = normalize_contract_args(contract);
 
+        let profiler_threshold = self
+            .profiler_threshold
+            .iter()
+            .map(|value| {
+                value
+                    .parse::<ProfilerThreshold>()
+                    .map_err(|e| format!("Invalid profiler_threshold '{value}': {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         if !txid.is_empty() && !block.is_empty() {
             return Err("txid and block are mutually exclusive".to_string());
+        }
+        if self.no_profiler && !profiler_threshold.is_empty() {
+            return Err("no_profiler and profiler_threshold are mutually exclusive".to_string());
+        }
+        if self.no_profiler && (!self.span.is_empty() || !self.ignore_span.is_empty()) {
+            return Err("no_profiler cannot be combined with span or ignore_span".to_string());
+        }
+        if !self.span.is_empty() && !self.ignore_span.is_empty() {
+            return Err("span and ignore_span are mutually exclusive".to_string());
         }
         if !contract.is_empty() {
             if !txid.is_empty() {
@@ -231,7 +279,11 @@ impl RunBenchmarkParams {
             warmup: self.warmup.unwrap_or(0) as usize,
             filter,
             contract,
-            no_profiler_kv: false,
+            no_profiler: self.no_profiler,
+            profiler_threshold,
+            span: self.span,
+            ignore_span: self.ignore_span,
+            no_profiler_kv: self.no_profiler_kv,
             include_pre_nakamoto_blocks: false,
             shadow_dir_root: self.shadow_dir_root.map(PathBuf::from),
             name: self.name,

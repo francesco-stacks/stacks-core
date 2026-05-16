@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::str::FromStr;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use anyhow::{Context, Result, anyhow};
 use blockstack_lib::chainstate::stacks::{StacksTransaction, TransactionPayload};
@@ -20,8 +21,11 @@ use diesel_async::{
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use models::*;
 use schema::*;
+use serde::de::{Error as DeError, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use stacks_common::types::chainstate::StacksBlockId;
 use tokio::sync::RwLock;
@@ -66,6 +70,530 @@ pub enum CheckpointMode {
     Truncate,
     Restart,
     Passive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfilerThresholdNs(pub u64);
+
+impl FromStr for ProfilerThresholdNs {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let s = raw.trim();
+        if s.is_empty() {
+            return Err("duration cannot be empty".to_string());
+        }
+
+        let split_at = s
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(s.len());
+        let (number, unit) = s.split_at(split_at);
+        if number.is_empty() {
+            return Err(format!("duration '{raw}' is missing a number"));
+        }
+        if number.matches('.').count() > 1 {
+            return Err(format!("duration '{raw}' has too many decimal points"));
+        }
+
+        let value: f64 = number
+            .parse()
+            .map_err(|_| format!("duration '{raw}' has an invalid number"))?;
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "duration '{raw}' must be a non-negative finite value"
+            ));
+        }
+
+        let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+            "ns" | "nsec" | "nanosecond" | "nanoseconds" => 1.0,
+            "us" | "µs" | "μs" | "usec" | "microsecond" | "microseconds" => 1_000.0,
+            "ms" | "msec" | "millisecond" | "milliseconds" => 1_000_000.0,
+            "s" | "sec" | "second" | "seconds" => 1_000_000_000.0,
+            "" => {
+                return Err(format!(
+                    "duration '{raw}' is missing a unit (use ns, us, ms, or s)"
+                ));
+            }
+            other => return Err(format!("duration '{raw}' has unsupported unit '{other}'")),
+        };
+
+        let nanos = value * multiplier;
+        if nanos > u64::MAX as f64 {
+            return Err(format!("duration '{raw}' is too large"));
+        }
+
+        Ok(Self(nanos.round() as u64))
+    }
+}
+
+impl std::fmt::Display for ProfilerThresholdNs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}ns", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfilerThresholdMetric {
+    Wall,
+    SelfWall,
+    Cpu,
+    SelfCpu,
+    Wait,
+    SelfWait,
+}
+
+impl FromStr for ProfilerThresholdMetric {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw {
+            "wall" => Ok(Self::Wall),
+            "self-wall" => Ok(Self::SelfWall),
+            "cpu" => Ok(Self::Cpu),
+            "self-cpu" => Ok(Self::SelfCpu),
+            "wait" => Ok(Self::Wait),
+            "self-wait" => Ok(Self::SelfWait),
+            other => Err(format!(
+                "unsupported threshold metric '{other}' (use wall, self-wall, cpu, self-cpu, wait, or self-wait)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ProfilerThresholdMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Wall => "wall",
+            Self::SelfWall => "self-wall",
+            Self::Cpu => "cpu",
+            Self::SelfCpu => "self-cpu",
+            Self::Wait => "wait",
+            Self::SelfWait => "self-wait",
+        };
+        f.write_str(name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfilerThreshold {
+    pub metric: ProfilerThresholdMetric,
+    pub threshold: ProfilerThresholdNs,
+}
+
+impl FromStr for ProfilerThreshold {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let (metric, duration) = if let Some((metric, duration)) = raw.split_once(':') {
+            if duration.starts_with(':') {
+                return Err(format!("threshold '{raw}' has too many ':' separators"));
+            }
+            (metric.parse()?, duration)
+        } else {
+            (ProfilerThresholdMetric::Wall, raw)
+        };
+
+        Ok(Self {
+            metric,
+            threshold: duration.parse()?,
+        })
+    }
+}
+
+impl std::fmt::Display for ProfilerThreshold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.metric, self.threshold)
+    }
+}
+
+impl Serialize for ProfilerThreshold {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfilerThreshold {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ProfilerThresholdVisitor)
+    }
+}
+
+struct ProfilerThresholdVisitor;
+
+impl<'de> Visitor<'de> for ProfilerThresholdVisitor {
+    type Value = ProfilerThreshold;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a profiler threshold string, nanosecond integer, or threshold object")
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        value.parse().map_err(E::custom)
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Ok(ProfilerThreshold {
+            metric: ProfilerThresholdMetric::Wall,
+            threshold: ProfilerThresholdNs(value),
+        })
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        let value = u64::try_from(value)
+            .map_err(|_| E::custom("profiler threshold nanoseconds must be non-negative"))?;
+        self.visit_u64(value)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut metric = None;
+        let mut threshold = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "metric" => metric = Some(map.next_value()?),
+                "threshold" => threshold = Some(map.next_value()?),
+                _ => {
+                    let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+
+        Ok(ProfilerThreshold {
+            metric: metric.unwrap_or(ProfilerThresholdMetric::Wall),
+            threshold: threshold.ok_or_else(|| A::Error::missing_field("threshold"))?,
+        })
+    }
+}
+
+pub fn deserialize_profiler_thresholds<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<ProfilerThreshold>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_any(ProfilerThresholdListVisitor)
+}
+
+struct ProfilerThresholdListVisitor;
+
+impl<'de> Visitor<'de> for ProfilerThresholdListVisitor {
+    type Value = Vec<ProfilerThreshold>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a profiler threshold or a list of profiler thresholds")
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Ok(Vec::new())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Ok(Vec::new())
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        value
+            .parse()
+            .map(|threshold| vec![threshold])
+            .map_err(E::custom)
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Ok(vec![ProfilerThreshold {
+            metric: ProfilerThresholdMetric::Wall,
+            threshold: ProfilerThresholdNs(value),
+        }])
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        let value = u64::try_from(value)
+            .map_err(|_| E::custom("profiler threshold nanoseconds must be non-negative"))?;
+        self.visit_u64(value)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut thresholds = Vec::new();
+        while let Some(threshold) = seq.next_element()? {
+            thresholds.push(threshold);
+        }
+        Ok(thresholds)
+    }
+
+    fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        ProfilerThresholdVisitor
+            .visit_map(map)
+            .map(|threshold| vec![threshold])
+    }
+}
+
+impl ProfilerThreshold {
+    fn matches(&self, timing: ProfilerNodeTiming) -> bool {
+        let observed = match self.metric {
+            ProfilerThresholdMetric::Wall => timing.wall,
+            ProfilerThresholdMetric::SelfWall => timing.self_wall,
+            ProfilerThresholdMetric::Cpu => timing.cpu,
+            ProfilerThresholdMetric::SelfCpu => timing.self_cpu,
+            ProfilerThresholdMetric::Wait => timing.wait,
+            ProfilerThresholdMetric::SelfWait => timing.self_wait,
+        };
+        observed >= self.threshold.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProfilerNodeTiming {
+    wall: u64,
+    self_wall: u64,
+    cpu: u64,
+    self_cpu: u64,
+    wait: u64,
+    self_wait: u64,
+}
+
+impl ProfilerNodeTiming {
+    fn from_node(node: &stacks_profiler::ProfileStats) -> Self {
+        let children_wall = node
+            .children
+            .iter()
+            .map(|child| child.wall_time_ns)
+            .sum::<u64>();
+        let children_cpu = node
+            .children
+            .iter()
+            .map(|child| child.cpu_time_ns)
+            .sum::<u64>();
+        let self_wall = node.wall_time_ns.saturating_sub(children_wall);
+        let self_cpu = node.cpu_time_ns.saturating_sub(children_cpu);
+
+        Self {
+            wall: node.wall_time_ns,
+            self_wall,
+            cpu: node.cpu_time_ns,
+            self_cpu,
+            wait: node.wall_time_ns.saturating_sub(node.cpu_time_ns),
+            self_wait: self_wall.saturating_sub(self_cpu),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfilerSpanMode {
+    All,
+    BenchOnly,
+    Include,
+    Exclude,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfilerStoragePolicy {
+    mode: ProfilerSpanMode,
+    thresholds: Arc<[ProfilerThreshold]>,
+    patterns: Arc<GlobSet>,
+    decision_cache: Arc<StdRwLock<HashMap<(Option<&'static str>, &'static str), bool>>>,
+}
+
+impl ProfilerStoragePolicy {
+    pub fn new(
+        no_profiler: bool,
+        thresholds: &[ProfilerThreshold],
+        spans: &[String],
+        ignored_spans: &[String],
+    ) -> Result<Self> {
+        if !spans.is_empty() && !ignored_spans.is_empty() {
+            anyhow::bail!("--span and --ignore-span are mutually exclusive");
+        }
+        if no_profiler && !thresholds.is_empty() {
+            anyhow::bail!("--no-profiler and --profiler-threshold are mutually exclusive");
+        }
+        if no_profiler && (!spans.is_empty() || !ignored_spans.is_empty()) {
+            anyhow::bail!("--no-profiler cannot be combined with --span or --ignore-span");
+        }
+
+        let mode = if no_profiler {
+            ProfilerSpanMode::BenchOnly
+        } else if !spans.is_empty() {
+            ProfilerSpanMode::Include
+        } else if !ignored_spans.is_empty() {
+            ProfilerSpanMode::Exclude
+        } else {
+            ProfilerSpanMode::All
+        };
+
+        let mut builder = GlobSetBuilder::new();
+        for pattern in spans.iter().chain(ignored_spans.iter()) {
+            builder.add(
+                Glob::new(pattern)
+                    .with_context(|| format!("Invalid profiler span pattern '{pattern}'"))?,
+            );
+        }
+
+        Ok(Self {
+            mode,
+            thresholds: Arc::from(thresholds),
+            patterns: Arc::new(
+                builder
+                    .build()
+                    .context("Failed to build profiler span filter")?,
+            ),
+            decision_cache: Arc::new(StdRwLock::new(HashMap::new())),
+        })
+    }
+
+    pub fn keep_tree(&self, node: &stacks_profiler::ProfileStats) -> ProfilerKeepTree {
+        let keep_self = self.keep_node_self(node);
+        let children: Vec<Option<ProfilerKeepTree>> = node
+            .children
+            .iter()
+            .map(|child| {
+                let child_tree = self.keep_tree(child);
+                child_tree.should_insert().then_some(child_tree)
+            })
+            .collect();
+
+        ProfilerKeepTree {
+            keep_self,
+            children,
+        }
+    }
+
+    fn keep_node_self(&self, node: &stacks_profiler::ProfileStats) -> bool {
+        if is_stacks_bench_span(node.context()) {
+            return true;
+        }
+        if !self.name_policy_allows(node.context(), node.name()) {
+            return false;
+        }
+        if self.thresholds.is_empty() {
+            return true;
+        }
+        let timing = ProfilerNodeTiming::from_node(node);
+        self.thresholds
+            .iter()
+            .any(|threshold| threshold.matches(timing))
+    }
+
+    fn name_policy_allows(&self, context: Option<&'static str>, name: &'static str) -> bool {
+        if self.mode == ProfilerSpanMode::All {
+            return true;
+        }
+        if self.mode == ProfilerSpanMode::BenchOnly {
+            return false;
+        }
+
+        if let Some(&cached) = self
+            .decision_cache
+            .read()
+            .expect("poisoned lock")
+            .get(&(context, name))
+        {
+            return cached;
+        }
+
+        let matched = self.matches_pattern(context, name);
+        let allowed = match self.mode {
+            ProfilerSpanMode::All => true,
+            ProfilerSpanMode::BenchOnly => false,
+            ProfilerSpanMode::Include => matched,
+            ProfilerSpanMode::Exclude => !matched,
+        };
+
+        self.decision_cache
+            .write()
+            .expect("poisoned lock")
+            .insert((context, name), allowed);
+        allowed
+    }
+
+    fn matches_pattern(&self, context: Option<&'static str>, name: &'static str) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        if self.patterns.is_match(name) {
+            return true;
+        }
+        if let Some(context) = context {
+            let full_name = format!("{context}::{name}");
+            return self.patterns.is_match(full_name);
+        }
+        false
+    }
+}
+
+impl Default for ProfilerStoragePolicy {
+    fn default() -> Self {
+        Self::new(false, &[], &[], &[]).expect("default profiler storage policy is valid")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfilerKeepTree {
+    keep_self: bool,
+    children: Vec<Option<ProfilerKeepTree>>,
+}
+
+impl ProfilerKeepTree {
+    fn should_insert(&self) -> bool {
+        self.keep_self || self.children.iter().any(Option::is_some)
+    }
+}
+
+fn is_stacks_bench_span(context: Option<&'static str>) -> bool {
+    context
+        .is_some_and(|context| context == "stacks_bench" || context.starts_with("stacks_bench::"))
 }
 
 #[derive(Debug, QueryableByName)]
@@ -1731,13 +2259,19 @@ impl AppDb {
         Ok(())
     }
 
-    pub async fn save_block_metrics<I>(&mut self, run_id: i32, blocks: I) -> Result<()>
+    pub async fn save_block_metrics<I>(
+        &mut self,
+        run_id: i32,
+        blocks: I,
+        profiler_policy: &ProfilerStoragePolicy,
+    ) -> Result<()>
     where
         I: IntoIterator<Item = BlockMetrics> + Send,
         I::IntoIter: Send,
     {
         let span_cache = self.profiler_span_cache.clone();
         let loc_cache = self.profiler_loc_cache.clone();
+        let profiler_policy = profiler_policy.clone();
         let mut staged_kv_count = 0;
         let mut staged_clarity_costs_count = 0;
 
@@ -1849,7 +2383,13 @@ impl AppDb {
                         };
 
                         for (i, root) in metrics.profiler_roots.iter().enumerate() {
-                            let result = ctx.insert_node(dbtx, root, None, i as i32, 0, None).await?;
+                            let keep_tree = profiler_policy.keep_tree(root);
+                            if !keep_tree.should_insert() {
+                                continue;
+                            }
+                            let result = ctx
+                                .insert_node(dbtx, root, &keep_tree, None, i as i32, 0, None)
+                                .await?;
                             staged_kv_count += result.inserted_kv_records;
                             staged_clarity_costs_count += result.inserted_clarity_cost_records;
                         }
@@ -1912,12 +2452,17 @@ impl ProfilerInsertContext<'_> {
         &'b self,
         conn: &'b mut AsyncSqliteConnection,
         node: &'b stacks_profiler::ProfileStats,
+        keep_tree: &'b ProfilerKeepTree,
         parent_id: Option<i64>,
         child_index: i32,
         depth: i32,
         active_tx_id: Option<i64>,
     ) -> BoxFuture<'b, Result<InsertNodeResult>> {
         async move {
+            if !keep_tree.should_insert() {
+                return Ok(InsertNodeResult::default());
+            }
+
             let mut stacks_tx_id = active_tx_id;
 
             let mut result = InsertNodeResult::default();
@@ -1998,15 +2543,18 @@ impl ProfilerInsertContext<'_> {
                 .get_result(conn)
                 .await?;
 
-            let staged_kvs = node.records.iter().map(|r| {
+            let staged_kvs = node.records.iter().filter_map(|r| {
+                if !keep_tree.keep_self {
+                    return None;
+                }
                 let (value_type_id, value_str) = map_record_value_string(r);
-                StagedProfilerRecordKv {
+                Some(StagedProfilerRecordKv {
                     profiler_record_id: record_id,
                     key: r.key.to_string(),
                     value_type_id,
                     value: value_str,
                     count: 1,
-                }
+                })
             });
 
             let mut clarity_costs_runtime: i64 = 0;
@@ -2018,6 +2566,9 @@ impl ProfilerInsertContext<'_> {
             let mut has_clarity_costs = false;
 
             let staged_counter_kvs = node.counters.iter().filter_map(|c| {
+                if !keep_tree.keep_self {
+                    return None;
+                }
                 match c.key {
                     "CR" => {
                         has_clarity_costs = true;
@@ -2080,7 +2631,7 @@ impl ProfilerInsertContext<'_> {
                 result.inserted_kv_records += 1;
             }
 
-            if has_clarity_costs {
+            if keep_tree.keep_self && has_clarity_costs {
                 diesel::insert_into(schema::_staged_profiler_record_clarity_costs::table)
                     .values((
                         schema::_staged_profiler_record_clarity_costs::profiler_record_id
@@ -2121,10 +2672,15 @@ impl ProfilerInsertContext<'_> {
             }
 
             for (idx, child) in node.children.iter().enumerate() {
+                let Some(child_keep_tree) = keep_tree.children.get(idx).and_then(Option::as_ref)
+                else {
+                    continue;
+                };
                 result += self
                     .insert_node(
                         conn,
                         child,
+                        child_keep_tree,
                         Some(record_id),
                         idx as i32,
                         depth + 1,
@@ -2145,6 +2701,274 @@ fn map_record_value_string(r: &stacks_profiler::Record) -> (i32, String) {
         stacks_profiler::RecordValue::I64(v) => (2, v.to_string()),
         stacks_profiler::RecordValue::Str(s) => (3, s.to_string()),
         stacks_profiler::RecordValue::Bytes(b) => (4, hex::encode(b)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use stacks_profiler::{ProfileStats, SpanId};
+
+    use super::*;
+
+    static BENCH_SPAN: SpanId = SpanId {
+        name: "Segment",
+        context: Some("stacks_bench::replay"),
+        file: "stacks-bench/src/replay.rs",
+        line: 1,
+    };
+
+    static NODE_SPAN: SpanId = SpanId {
+        name: "load_contract",
+        context: Some("clarity::vm::database"),
+        file: "clarity/src/vm/database.rs",
+        line: 1,
+    };
+
+    static OTHER_NODE_SPAN: SpanId = SpanId {
+        name: "execute",
+        context: Some("clarity::vm"),
+        file: "clarity/src/vm/mod.rs",
+        line: 1,
+    };
+
+    fn stats(id: &'static SpanId, wall_time_ns: u64, children: Vec<ProfileStats>) -> ProfileStats {
+        stats_with_cpu(id, wall_time_ns, wall_time_ns, children)
+    }
+
+    fn stats_with_cpu(
+        id: &'static SpanId,
+        wall_time_ns: u64,
+        cpu_time_ns: u64,
+        children: Vec<ProfileStats>,
+    ) -> ProfileStats {
+        ProfileStats {
+            id,
+            tag: None,
+            wall_time_ns,
+            cpu_time_ns,
+            children,
+            entered_count: 1,
+            sampled_count: 1,
+            records: Vec::new(),
+            counters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn profiler_threshold_parses_units_and_decimals() {
+        assert_eq!(
+            "1000us".parse::<ProfilerThresholdNs>().unwrap().0,
+            1_000_000
+        );
+        assert_eq!("1ms".parse::<ProfilerThresholdNs>().unwrap().0, 1_000_000);
+        assert_eq!(
+            "1.3s".parse::<ProfilerThresholdNs>().unwrap().0,
+            1_300_000_000
+        );
+        assert!("10".parse::<ProfilerThresholdNs>().is_err());
+        assert!("abcms".parse::<ProfilerThresholdNs>().is_err());
+    }
+
+    #[test]
+    fn profiler_threshold_parses_metric_prefixes() {
+        let threshold = "self-cpu:1ms".parse::<ProfilerThreshold>().unwrap();
+        assert_eq!(threshold.metric, ProfilerThresholdMetric::SelfCpu);
+        assert_eq!(threshold.threshold.0, 1_000_000);
+
+        let threshold = "1ms".parse::<ProfilerThreshold>().unwrap();
+        assert_eq!(threshold.metric, ProfilerThresholdMetric::Wall);
+        assert_eq!(threshold.threshold.0, 1_000_000);
+
+        assert!("unknown:1ms".parse::<ProfilerThreshold>().is_err());
+        assert!("wall::1ms".parse::<ProfilerThreshold>().is_err());
+    }
+
+    #[test]
+    fn profiler_threshold_deserializes_legacy_and_current_shapes() {
+        assert_eq!(
+            serde_json::from_str::<Vec<ProfilerThreshold>>("[1000000]").unwrap(),
+            vec![ProfilerThreshold {
+                metric: ProfilerThresholdMetric::Wall,
+                threshold: ProfilerThresholdNs(1_000_000),
+            }]
+        );
+        assert_eq!(
+            serde_json::from_str::<ProfilerThreshold>("\"self-wait:1ms\"").unwrap(),
+            ProfilerThreshold {
+                metric: ProfilerThresholdMetric::SelfWait,
+                threshold: ProfilerThresholdNs(1_000_000),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ProfilerThreshold>(
+                r#"{"metric":"self-cpu","threshold":1000000}"#
+            )
+            .unwrap(),
+            ProfilerThreshold {
+                metric: ProfilerThresholdMetric::SelfCpu,
+                threshold: ProfilerThresholdNs(1_000_000),
+            }
+        );
+    }
+
+    #[test]
+    fn profiler_policy_always_keeps_bench_spans() {
+        let policy =
+            ProfilerStoragePolicy::new(true, &[], &[], &[]).expect("valid bench-only policy");
+        let bench = stats(&BENCH_SPAN, 1, Vec::new());
+        let node = stats(&NODE_SPAN, 10_000_000, Vec::new());
+
+        let bench_tree = policy.keep_tree(&bench);
+        assert!(bench_tree.keep_self);
+        assert!(bench_tree.should_insert());
+        assert!(!policy.keep_tree(&node).should_insert());
+    }
+
+    #[test]
+    fn profiler_policy_combines_globs_and_threshold() {
+        let policy = ProfilerStoragePolicy::new(
+            false,
+            &[ProfilerThreshold {
+                metric: ProfilerThresholdMetric::Wall,
+                threshold: ProfilerThresholdNs(1_000_000),
+            }],
+            &["*load*".to_string()],
+            &[],
+        )
+        .expect("valid include policy");
+
+        assert!(
+            policy
+                .keep_tree(&stats(&NODE_SPAN, 1_000_000, Vec::new()))
+                .keep_self
+        );
+        assert!(
+            !policy
+                .keep_tree(&stats(&NODE_SPAN, 999_999, Vec::new()))
+                .should_insert()
+        );
+        assert!(
+            !policy
+                .keep_tree(&stats(&OTHER_NODE_SPAN, 2_000_000, Vec::new()))
+                .should_insert()
+        );
+    }
+
+    #[test]
+    fn profiler_policy_ors_multiple_threshold_metrics() {
+        let policy = ProfilerStoragePolicy::new(
+            false,
+            &[
+                ProfilerThreshold {
+                    metric: ProfilerThresholdMetric::SelfCpu,
+                    threshold: ProfilerThresholdNs(1_000_000),
+                },
+                ProfilerThreshold {
+                    metric: ProfilerThresholdMetric::Wait,
+                    threshold: ProfilerThresholdNs(2_000_000),
+                },
+            ],
+            &[],
+            &[],
+        )
+        .expect("valid threshold policy");
+
+        assert!(
+            policy
+                .keep_tree(&stats_with_cpu(&NODE_SPAN, 3_000_000, 500_000, Vec::new()))
+                .keep_self
+        );
+        assert!(
+            policy
+                .keep_tree(&stats_with_cpu(
+                    &NODE_SPAN,
+                    1_500_000,
+                    1_000_000,
+                    Vec::new()
+                ))
+                .keep_self
+        );
+        assert!(
+            !policy
+                .keep_tree(&stats_with_cpu(&NODE_SPAN, 1_499_999, 999_999, Vec::new()))
+                .should_insert()
+        );
+    }
+
+    #[test]
+    fn profiler_policy_uses_self_wall_and_self_wait_thresholds() {
+        let child = stats_with_cpu(&OTHER_NODE_SPAN, 8_000_000, 7_000_000, Vec::new());
+        let parent = stats_with_cpu(&NODE_SPAN, 10_000_000, 7_500_000, vec![child.clone()]);
+
+        let self_wall_policy = ProfilerStoragePolicy::new(
+            false,
+            &[ProfilerThreshold {
+                metric: ProfilerThresholdMetric::SelfWall,
+                threshold: ProfilerThresholdNs(2_000_000),
+            }],
+            &[],
+            &[],
+        )
+        .expect("valid self-wall policy");
+        assert!(self_wall_policy.keep_tree(&parent).keep_self);
+
+        let self_wait_policy = ProfilerStoragePolicy::new(
+            false,
+            &[ProfilerThreshold {
+                metric: ProfilerThresholdMetric::SelfWait,
+                threshold: ProfilerThresholdNs(1_500_000),
+            }],
+            &[],
+            &[],
+        )
+        .expect("valid self-wait policy");
+        assert!(self_wait_policy.keep_tree(&parent).keep_self);
+
+        let too_high_policy = ProfilerStoragePolicy::new(
+            false,
+            &[ProfilerThreshold {
+                metric: ProfilerThresholdMetric::SelfWait,
+                threshold: ProfilerThresholdNs(1_500_001),
+            }],
+            &[],
+            &[],
+        )
+        .expect("valid self-wait policy");
+        assert!(!too_high_policy.keep_tree(&parent).keep_self);
+    }
+
+    #[test]
+    fn profiler_policy_excludes_matching_globs() {
+        let policy =
+            ProfilerStoragePolicy::new(false, &[], &[], &["clarity::vm::database::*".to_string()])
+                .expect("valid exclude policy");
+
+        assert!(
+            !policy
+                .keep_tree(&stats(&NODE_SPAN, 1_000_000, Vec::new()))
+                .should_insert()
+        );
+        assert!(
+            policy
+                .keep_tree(&stats(&OTHER_NODE_SPAN, 1_000_000, Vec::new()))
+                .keep_self
+        );
+    }
+
+    #[test]
+    fn profiler_policy_keeps_structural_ancestors_for_matching_children() {
+        let policy = ProfilerStoragePolicy::new(false, &[], &["*load_contract".to_string()], &[])
+            .expect("valid include policy");
+        let root = stats(
+            &OTHER_NODE_SPAN,
+            2_000_000,
+            vec![stats(&NODE_SPAN, 1_000_000, Vec::new())],
+        );
+
+        let keep_tree = policy.keep_tree(&root);
+        assert!(!keep_tree.keep_self);
+        assert!(keep_tree.should_insert());
+        assert!(keep_tree.children[0].as_ref().unwrap().keep_self);
     }
 }
 

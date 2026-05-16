@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use stacks_bench::db::app::{ProfilerThreshold, deserialize_profiler_thresholds};
 use stacks_bench::{Network, StacksBlockRef};
 use tokio::sync::mpsc;
 
@@ -141,6 +142,62 @@ pub struct RunArgs {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     contract: Vec<ContractArg>,
 
+    /// Store only stacks-bench generated profiler spans (`Segment`,
+    /// `Transaction`, etc.). Node/Clarity profiler spans and their key-value
+    /// records are omitted from persistence, but block and transaction metrics
+    /// are still recorded.
+    #[arg(
+        long = "bench-spans-only",
+        alias = "no-profiler",
+        default_value_t = false,
+        conflicts_with_all = ["profiler_threshold", "span", "ignore_span"],
+    )]
+    #[serde(default)]
+    no_profiler: bool,
+
+    /// Persist non-stacks-bench profiler spans only when a timing metric
+    /// reaches this threshold. Bare durations use inclusive wall time. Prefix
+    /// with `wall:`, `self-wall:`, `cpu:`, `self-cpu:`, `wait:`, or
+    /// `self-wait:` to select another metric. May be passed multiple times;
+    /// thresholds are OR-combined.
+    #[arg(
+        long = "profiler-threshold",
+        action = clap::ArgAction::Append,
+        value_name = "METRIC:DURATION",
+    )]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_profiler_thresholds",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    profiler_threshold: Vec<ProfilerThreshold>,
+
+    /// Persist only non-stacks-bench profiler spans matching these glob
+    /// patterns. Patterns match both the span name and `module::path::name`.
+    /// May be passed multiple times. Mutually exclusive with `--ignore-span`.
+    #[arg(
+        long = "span",
+        num_args = 1..,
+        action = clap::ArgAction::Append,
+        value_name = "GLOB",
+        conflicts_with_all = ["ignore_span", "no_profiler"],
+    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    span: Vec<String>,
+
+    /// Omit non-stacks-bench profiler spans matching these glob patterns.
+    /// Patterns match both the span name and `module::path::name`. May be
+    /// passed multiple times. Mutually exclusive with `--span`.
+    #[arg(
+        long = "ignore-span",
+        num_args = 1..,
+        action = clap::ArgAction::Append,
+        value_name = "GLOB",
+        conflicts_with_all = ["span", "no_profiler"],
+    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ignore_span: Vec<String>,
+
     /// Disable capturing of profiler key-value records generated via `record!` and `counter!`
     /// macros. This can provide a slight performance benefit and reduce storage if you do not need
     /// them.
@@ -219,6 +276,10 @@ impl From<&RunArgs> for BenchRunParams {
             warmup: args.warmup,
             filter: args.filter.as_ref().map(FilterKind::from),
             contract: normalize_contract_args(args.contract.clone()),
+            no_profiler: args.no_profiler,
+            profiler_threshold: args.profiler_threshold.clone(),
+            span: args.span.clone(),
+            ignore_span: args.ignore_span.clone(),
             no_profiler_kv: args.no_profiler_kv,
             include_pre_nakamoto_blocks: args.include_pre_nakamoto_blocks,
             shadow_dir_root: args.shadow_dir_root.clone(),

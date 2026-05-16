@@ -27,6 +27,7 @@ stacks-profiler.workspace = true
 tempfile.workspace = true
 reflink-copy.workspace = true
 ignore.workspace = true
+globset.workspace = true
 # Console/CLI
 clap.workspace = true
 cliclack.workspace = true

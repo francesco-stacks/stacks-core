@@ -4782,6 +4782,7 @@ dependencies = [
  "diesel_migrations",
  "erased-serde",
  "futures",
+ "globset",
  "hex",
  "home",
  "ignore",

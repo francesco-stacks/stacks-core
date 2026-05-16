@@ -11,8 +11,10 @@ use stacks_bench::bench_events::{self, BenchEvent, BenchEventSender};
 use stacks_bench::blocks::{BackwardsBlockStream, BlockRef};
 use stacks_bench::context::{BenchContext, BenchEnv};
 use stacks_bench::db::DbOpenForRead;
-use stacks_bench::db::app::AppDb;
 use stacks_bench::db::app::models::BenchmarkRun;
+use stacks_bench::db::app::{
+    AppDb, ProfilerStoragePolicy, ProfilerThreshold, deserialize_profiler_thresholds,
+};
 use stacks_bench::db::node::{ChainStateDb, NakamotoDb};
 use stacks_bench::filter::{ContractMatcher, TxFilter};
 use stacks_bench::indexer::{ChainIndexPlan, ChainstateIndexer, ResolvedRange};
@@ -68,6 +70,27 @@ pub struct BenchRunParams {
     /// already normalized via `normalize_contract_args` at construction time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contract: Vec<ContractArg>,
+    /// Persist only stacks-bench generated profiler spans (Segment,
+    /// Transaction, etc.). Node/Clarity profiler spans are still collected by
+    /// the underlying profiler, but are pruned before database insertion.
+    #[serde(default)]
+    pub no_profiler: bool,
+    /// Threshold predicates for non-stacks-bench profiler spans. Empty = no
+    /// timing threshold. Predicates are OR-combined after the span name policy.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_profiler_thresholds",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub profiler_threshold: Vec<ProfilerThreshold>,
+    /// Opt-in profiler span glob patterns. Mutually exclusive with
+    /// `ignore_span`. Stacks-bench spans are always persisted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub span: Vec<String>,
+    /// Opt-out profiler span glob patterns. Mutually exclusive with `span`.
+    /// Stacks-bench spans are always persisted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_span: Vec<String>,
     pub no_profiler_kv: bool,
     pub include_pre_nakamoto_blocks: bool,
     /// Override the parent directory under which the shadow tempdir is
@@ -908,6 +931,12 @@ async fn execute_replay_plan(
     let mut last_storage_delta: i64 = 0;
 
     let mut accumulator = MetricsAccumulator::default();
+    let profiler_policy = ProfilerStoragePolicy::new(
+        params.no_profiler,
+        &params.profiler_threshold,
+        &params.span,
+        &params.ignore_span,
+    )?;
     // Per-target accumulators and measured counters, indexed by
     // `entry.target_index`. Empty for range mode (plan.targets is empty); the
     // run-level `accumulator` covers that case alone.
@@ -943,7 +972,7 @@ async fn execute_replay_plan(
         let is_warmup = entry.is_warmup;
         Profiler::clear();
 
-        if !is_warmup && !params.no_profiler_kv {
+        if !is_warmup && !params.no_profiler && !params.no_profiler_kv {
             Profiler::enable_record();
         }
 
@@ -1017,7 +1046,7 @@ async fn execute_replay_plan(
 
         if let Some(batch) = calibration.observe(metrics_vec) {
             app_db
-                .save_block_metrics(run_model.id, batch.into_iter())
+                .save_block_metrics(run_model.id, batch.into_iter(), &profiler_policy)
                 .await?;
         }
     }
@@ -1034,7 +1063,7 @@ async fn execute_replay_plan(
             },
         );
         app_db
-            .save_block_metrics(run_model.id, remaining.into_iter())
+            .save_block_metrics(run_model.id, remaining.into_iter(), &profiler_policy)
             .await?;
     }
 
@@ -1131,6 +1160,15 @@ pub async fn run_benchmark(
 fn validate_run_params(params: &BenchRunParams) -> Result<()> {
     if !params.txid.is_empty() && !params.block.is_empty() {
         bail!("--txid and --block are mutually exclusive");
+    }
+    if params.no_profiler && !params.profiler_threshold.is_empty() {
+        bail!("--no-profiler and --profiler-threshold are mutually exclusive");
+    }
+    if params.no_profiler && (!params.span.is_empty() || !params.ignore_span.is_empty()) {
+        bail!("--no-profiler cannot be combined with --span or --ignore-span");
+    }
+    if !params.span.is_empty() && !params.ignore_span.is_empty() {
+        bail!("--span and --ignore-span are mutually exclusive");
     }
 
     // `--contract` is a stricter form of `--filter contract-call` and targets
