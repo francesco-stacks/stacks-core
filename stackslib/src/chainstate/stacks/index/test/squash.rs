@@ -2221,7 +2221,7 @@ fn test_squashed_marf_proof_at_extended_height() {
         // squashed range differ (the squash trie has a different internal
         // structure).  The squashed root-to-block map accounts for this
         // by computing per-height trie hashes from the squash trie root node hash.
-        let trusted = squashed.trusted_squash_hashes();
+        let trusted = squashed.trusted_squash_node_hashes();
         let squashed_ok = squashed_proof.verify(
             &path,
             &marf_value,
@@ -2288,7 +2288,7 @@ fn test_squashed_marf_proof_across_many_extended_heights() {
         .read_root_to_block_table()
         .unwrap();
 
-    let trusted = squashed.trusted_squash_hashes();
+    let trusted = squashed.trusted_squash_node_hashes();
 
     // At each extended height, prove a key from the squashed range (k2,
     // inserted at height 1) and a key from the extended range.
@@ -2412,7 +2412,7 @@ fn test_squashed_proof_rejected_without_trusted_hash() {
     );
 
     // With the correct trusted anchor set, it should pass.
-    let trusted = squashed.trusted_squash_hashes();
+    let trusted = squashed.trusted_squash_node_hashes();
     assert!(
         !trusted.is_empty(),
         "Squashed MARF should have trusted hash anchors"
@@ -2545,7 +2545,7 @@ fn test_squashed_marf_get_with_proof_public_api() {
         .borrow_storage_backend()
         .read_root_to_block_table()
         .unwrap();
-    let trusted = squashed.trusted_squash_hashes();
+    let trusted = squashed.trusted_squash_node_hashes();
     assert!(
         proof.verify(
             &path,

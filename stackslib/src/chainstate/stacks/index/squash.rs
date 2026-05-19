@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! MARF squashing: offline snapshot creation and validation.
+//! MARF squashing: offline snapshot creation.
 //!
 //! A squashed MARF contains only the canonical state at a given
 //! height H plus the metadata needed for ancestor hash lookups and
@@ -145,16 +145,13 @@ fn fmt_duration(d: Duration) -> String {
 fn apply_offline_squash_pragmas(conn: &rusqlite::Connection) -> Result<(), Error> {
     conn.pragma_update(None, "journal_mode", "OFF")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
-    conn.pragma_update(None, "temp_store", "MEMORY")?;
-    conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
     Ok(())
 }
 
 /// Restore SQLite defaults after [`apply_offline_squash_pragmas`].
 fn restore_default_squash_pragmas(conn: &rusqlite::Connection) -> Result<(), Error> {
-    conn.pragma_update(None, "locking_mode", "NORMAL")?;
-    conn.pragma_update(None, "journal_mode", "DELETE")?;
-    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
 }
 
@@ -472,36 +469,23 @@ fn verify_blob_root_matches_marf<T: MarfTrieId>(
 }
 
 /// Read blob headers in storage order for the later in-memory chain walk.
+///
+/// Falls back to per-row reads through SQLite `blob_open` when the source
+/// MARF stores blobs inside the SQLite database.
 fn prefetch_blob_headers<T: MarfTrieId>(
     conn: &mut TrieStorageConnection<T>,
     block_entries: &mut [(u32, T, u64)],
     label: &str,
 ) -> Result<HashMap<T, (T, TrieHash)>, Error> {
     let start = Instant::now();
-    // Later steps do not need SQL order, so sort in place for sequential reads.
     block_entries.sort_unstable_by_key(|(block_id, _, off)| (*off, *block_id));
     info!(
         "[{label}] [2/8] Pre-reading {} blob headers (sorted by offset)...",
         block_entries.len()
     );
 
-    let mut headers: HashMap<T, (T, TrieHash)> = HashMap::with_capacity(block_entries.len());
-    let mut last_log = Instant::now();
-    let total = block_entries.len();
-    for (i, (block_id, block_hash, _offset)) in block_entries.iter().enumerate() {
-        // Decode per row even when squashed placeholders share an offset.
-        let header: (T, TrieHash) = conn.read_parent_and_root_hash(*block_id)?;
-        headers.insert(block_hash.clone(), header);
-        if last_log.elapsed().as_secs() >= 30 {
-            info!(
-                "[{label}] [2/8] Pre-read {}/{} headers in {}",
-                i + 1,
-                total,
-                fmt_duration(start.elapsed())
-            );
-            last_log = Instant::now();
-        }
-    }
+    let headers = conn.bulk_read_blob_headers_sorted(block_entries)?;
+
     info!(
         "[{label}] [2/8] Pre-read {} headers in {}",
         headers.len(),
@@ -531,6 +515,7 @@ fn collect_per_height_metadata<T: MarfTrieId>(
     debug_assert!(walk_floor <= height);
 
     // Pre-read in offset order.
+    block_entries.sort_unstable_by_key(|(block_id, _, off)| (*off, *block_id));
     let headers = prefetch_blob_headers(conn, block_entries, label)?;
     log_rss(label, "after [2/8] prefetch (headers held)");
 
@@ -1222,6 +1207,19 @@ impl<T: MarfTrieId> MARF<T> {
 
                 // Internal children descend immediately to preserve DFS preorder.
                 if !child_is_leaf {
+                    // Async-prefetch each non-empty grandchild's page so the
+                    // foreground reads a few iterations later land warm.
+                    for ptr in child_ptrs_vec.iter() {
+                        if ptr.id() == TrieNodeID::Empty as u8 {
+                            continue;
+                        }
+                        let (target_block_id, target_in_block_ptr) = if is_backptr(ptr.id()) {
+                            (ptr.back_block(), ptr.from_backptr().ptr())
+                        } else {
+                            (child_block_id, ptr.ptr())
+                        };
+                        source.prefetch_node(target_block_id, target_in_block_ptr);
+                    }
                     descend_frame = Some(DfsFrame {
                         origin_block_id: child_block_id,
                         child_ptrs: child_ptrs_vec,
