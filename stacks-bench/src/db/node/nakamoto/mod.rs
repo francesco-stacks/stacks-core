@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use stacks_common::types::chainstate::BlockHeaderHash;
 
 use crate::db::{DbOpen, SqliteDbHandle};
 
@@ -60,6 +61,24 @@ impl<Mode> NakamotoDb<Mode> {
             .await
             .optional()
             .with_context(|| format!("Failed to query nakamoto_staging_blocks for id {id}"))
+    }
+
+    pub async fn get_nakamoto_blocks_by_hash(
+        &self,
+        hash: &BlockHeaderHash,
+    ) -> Result<Vec<models::NakamotoStagingBlock>> {
+        use self::schema::nakamoto_staging_blocks;
+
+        let hash_str = hash.to_string();
+        let mut conn = self.handle.get_conn().await?;
+
+        nakamoto_staging_blocks::table
+            .filter(nakamoto_staging_blocks::block_hash.eq(&hash_str))
+            .load(&mut conn)
+            .await
+            .with_context(|| {
+                format!("Failed to query nakamoto_staging_blocks for block hash {hash}")
+            })
     }
 
     pub async fn get_min_block_height(&self) -> Result<Option<u64>> {

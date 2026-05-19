@@ -8,7 +8,7 @@ use futures::StreamExt;
 use stacks_common::types::chainstate::StacksBlockId;
 use tokio::sync::mpsc;
 
-use crate::blocks::{BlockRef, ChainCache as _};
+use crate::blocks::{BlockHeaderProvider, BlockRef, ChainCache as _};
 use crate::context::BenchEnv;
 use crate::db::app::{AppDb, CheckpointMode, ForeignKeyMode, SynchronizationMode};
 use crate::{Network, StacksBlockHeader, StacksBlockLoader, StacksEpoch};
@@ -17,12 +17,30 @@ pub struct ChainIndexPlan {
     pub anchor_tip: BlockRef,
     pub start_height: u64,
     pub end_height: u64,
+    pub expected_start_ids: Vec<StacksBlockId>,
+    pub expected_end_ids: Vec<StacksBlockId>,
 }
 
 pub struct ResolvedRange {
     pub anchor_tip: BlockRef,
     pub start: BlockRef,
     pub end: BlockRef,
+}
+
+fn format_expected_ids(ids: &[StacksBlockId]) -> String {
+    const MAX_DISPLAY: usize = 4;
+
+    let shown = ids
+        .iter()
+        .take(MAX_DISPLAY)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ids.len() > MAX_DISPLAY {
+        format!("{shown}, ... ({} total)", ids.len())
+    } else {
+        shown
+    }
 }
 
 /// Discrete events emitted by the indexer for UI rendering.
@@ -174,6 +192,34 @@ impl<'a> ChainstateIndexer<'a> {
         })
     }
 
+    fn verify_resolved_range(
+        resolved: &ResolvedRange,
+        expected_start_ids: &[StacksBlockId],
+        expected_end_ids: &[StacksBlockId],
+    ) -> Result<()> {
+        if !expected_start_ids.is_empty() && !expected_start_ids.contains(&resolved.start.id) {
+            return Err(anyhow!(
+                "start block is not on the canonical history of the selected tip \
+                 (resolved canonical block at height {} is {}, expected one of {})",
+                resolved.start.height,
+                resolved.start.id,
+                format_expected_ids(expected_start_ids)
+            ));
+        }
+
+        if !expected_end_ids.is_empty() && !expected_end_ids.contains(&resolved.end.id) {
+            return Err(anyhow!(
+                "end block is not on the canonical history of the selected tip \
+                 (resolved canonical block at height {} is {}, expected one of {})",
+                resolved.end.height,
+                resolved.end.id,
+                format_expected_ids(expected_end_ids)
+            ));
+        }
+
+        Ok(())
+    }
+
     async fn resolve_range_ids_via_node_walk(
         &mut self,
         anchor_tip: BlockRef,
@@ -228,6 +274,8 @@ impl<'a> ChainstateIndexer<'a> {
         epochs: &[StacksEpoch],
         plan: ChainIndexPlan,
     ) -> Result<(ResolvedRange, Vec<StacksBlockId>)> {
+        let expected_start_ids = plan.expected_start_ids.clone();
+        let expected_end_ids = plan.expected_end_ids.clone();
         let index_start_height = if plan.start_height > 0 {
             plan.start_height - 1
         } else {
@@ -298,6 +346,7 @@ impl<'a> ChainstateIndexer<'a> {
                         plan.end_height,
                     )
                     .await?;
+                Self::verify_resolved_range(&resolved, &expected_start_ids, &expected_end_ids)?;
 
                 self.send_event(IndexerEvent::AlreadyCached);
                 self.send_event(IndexerEvent::Finished);
@@ -313,6 +362,7 @@ impl<'a> ChainstateIndexer<'a> {
                     plan.end_height,
                 )
                 .await?;
+            Self::verify_resolved_range(&resolved, &expected_start_ids, &expected_end_ids)?;
 
             let mut ids = self
                 .app_db
@@ -337,6 +387,7 @@ impl<'a> ChainstateIndexer<'a> {
         let resolved = self
             .run_indexing_pipeline(plan.anchor_tip.clone(), index_start_height, plan.end_height)
             .await?;
+        Self::verify_resolved_range(&resolved, &expected_start_ids, &expected_end_ids)?;
 
         if self.is_interrupted() {
             self.send_event(IndexerEvent::Interrupted);
@@ -360,6 +411,181 @@ impl<'a> ChainstateIndexer<'a> {
         if plan.start_height > 0 && !ids.is_empty() {
             ids.remove(0);
         }
+
+        self.send_event(IndexerEvent::Finished);
+        Ok((resolved, ids))
+    }
+
+    /// Fast-path indexing for a single-block window when the caller already
+    /// knows the exact block id. Walks `parent_block_id` from `target_id`
+    /// back through the chainstate to populate `[start-1, start, end]`
+    /// (3 blocks, or fewer near genesis) without ever walking from the
+    /// anchor tip.
+    ///
+    /// `--block <hash>` and `--txid` resolve to a known id up front; the
+    /// canonical-tip walk that the range pipeline does is wasted work in
+    /// those modes. Costs drop from O(tip_height - target_height) parent
+    /// dereferences to O(window_size) = ~2.
+    ///
+    /// # Anchor-tip canonicality is not verified
+    ///
+    /// Unlike [`Self::index_chainstate_range`], this method does **not**
+    /// verify that `target_id` lies on the canonical history of `anchor_tip`.
+    /// Parent links inside chainstate are followed unconditionally, so a
+    /// caller that passes the id of a forked-off block will benchmark that
+    /// fork block rather than the canonical block at the same height. This
+    /// is intentional: a hash-form `--block <block_hash>` (or `--txid`)
+    /// names a specific block, so "specific block means specific block."
+    ///
+    /// Callers that have multiple candidate ids (rare cross-fork `block_hash`
+    /// collisions) must fall back to [`Self::index_chainstate_range`] so the
+    /// canonical walk can disambiguate.
+    pub async fn index_targeted_block_window(
+        &mut self,
+        network: Network,
+        chain_id: u32,
+        epochs: &[StacksEpoch],
+        plan: ChainIndexPlan,
+        target_id: StacksBlockId,
+    ) -> Result<(ResolvedRange, Vec<StacksBlockId>)> {
+        if plan.end_height < plan.start_height {
+            return Err(anyhow!(
+                "targeted indexing: end_height ({}) below start_height ({})",
+                plan.end_height,
+                plan.start_height
+            ));
+        }
+
+        let index_start_height = if plan.start_height > 0 {
+            plan.start_height - 1
+        } else {
+            plan.start_height
+        };
+        let expected_indexed_count = (plan.end_height - index_start_height + 1) as usize;
+
+        let (_chainstate_model, _) = self
+            .app_db
+            .get_or_create_chainstate(network, chain_id, &plan.anchor_tip, epochs)
+            .await?;
+
+        // Cache short-circuit: if the [start-1, target] chain is already
+        // staged under target_id, skip all node-DB reads.
+        let cached = self
+            .app_db
+            .get_indexed_chain_block_ids(&target_id, index_start_height, plan.end_height)
+            .await?;
+        if cached.len() == expected_indexed_count {
+            // Cached ids are in ascending height order; the entry at index
+            // (start_height - index_start_height) is the parent we report
+            // as `resolved.start`. The leading helper (if any) is then
+            // dropped from the returned id list.
+            let start_offset = (plan.start_height - index_start_height) as usize;
+            let start_id = cached.get(start_offset).cloned().ok_or_else(|| {
+                anyhow!("targeted indexing: cached id list shorter than expected")
+            })?;
+            let mut ids = cached;
+            if plan.start_height > 0 {
+                ids.remove(0);
+            }
+            let resolved = ResolvedRange {
+                anchor_tip: plan.anchor_tip,
+                start: BlockRef {
+                    id: start_id,
+                    height: plan.start_height,
+                },
+                end: BlockRef {
+                    id: target_id,
+                    height: plan.end_height,
+                },
+            };
+            self.send_event(IndexerEvent::AlreadyCached);
+            self.send_event(IndexerEvent::Finished);
+            return Ok((resolved, ids));
+        }
+
+        self.send_event(IndexerEvent::IndexIncomplete {
+            found: cached.len(),
+            expected: expected_indexed_count,
+        });
+
+        // Walk parent_block_id from target back through chainstate.
+        let chainstate_db = self.env.open_chainstate_db_for_read().await?;
+        let mut nakamoto_db = self.env.open_nakamoto_db_for_read().await?;
+        let min_naka_height = nakamoto_db
+            .get_min_block_height()
+            .await?
+            .unwrap_or(u64::MAX);
+        let blocks_dir = self.env.chainstate_dir.blocks_dir();
+
+        let mut headers: Vec<StacksBlockHeader> = Vec::with_capacity(expected_indexed_count);
+        let mut headers_with_txs: Vec<(StacksBlockHeader, Vec<StacksTransaction>)> =
+            Vec::with_capacity(expected_indexed_count);
+
+        let mut current_id = target_id.clone();
+        for _ in 0..expected_indexed_count {
+            if self.is_interrupted() {
+                self.send_event(IndexerEvent::Interrupted);
+                self.send_event(IndexerEvent::Finished);
+                return Err(anyhow!("Indexing interrupted"));
+            }
+
+            let header = chainstate_db
+                .get_header(&current_id)
+                .await?
+                .ok_or_else(|| anyhow!("targeted indexing: header not found for {current_id}"))?;
+            let next_parent = header.parent_id.clone();
+
+            let mut loader = StacksBlockLoader::new(&blocks_dir, &mut nakamoto_db, min_naka_height);
+            let block = loader.load_block(&header).await.with_context(|| {
+                format!("Failed to load transactions for block {}", header.height)
+            })?;
+            let txs = block.into_transactions_vec();
+
+            headers.push(header.clone());
+            headers_with_txs.push((header, txs));
+
+            current_id = next_parent;
+        }
+
+        // Walked tip-first; persist in ascending-height order.
+        headers.reverse();
+        headers_with_txs.reverse();
+
+        self.app_db.stage_blocks(&headers).await?;
+        self.app_db.stage_transactions(headers_with_txs).await?;
+        self.app_db.stage_indexed_blocks(&headers).await?;
+        self.app_db.merge_staging().await?;
+
+        self.send_event(IndexerEvent::CheckpointStarted);
+        self.app_db.checkpoint(CheckpointMode::Truncate).await?;
+        self.send_event(IndexerEvent::CheckpointComplete);
+
+        // headers is ascending-height; the entry at offset
+        // (start_height - index_start_height) is the parent we report as
+        // `resolved.start`. The leading helper (if any) is dropped from
+        // the returned id list.
+        let start_offset = (plan.start_height - index_start_height) as usize;
+        let start_id = headers
+            .get(start_offset)
+            .map(|h| h.id.clone())
+            .ok_or_else(|| anyhow!("targeted indexing: loaded headers shorter than expected"))?;
+
+        let mut ids: Vec<StacksBlockId> = headers.iter().map(|h| h.id.clone()).collect();
+        if plan.start_height > 0 && !ids.is_empty() {
+            ids.remove(0);
+        }
+
+        let resolved = ResolvedRange {
+            anchor_tip: plan.anchor_tip,
+            start: BlockRef {
+                id: start_id,
+                height: plan.start_height,
+            },
+            end: BlockRef {
+                id: target_id,
+                height: plan.end_height,
+            },
+        };
 
         self.send_event(IndexerEvent::Finished);
         Ok((resolved, ids))

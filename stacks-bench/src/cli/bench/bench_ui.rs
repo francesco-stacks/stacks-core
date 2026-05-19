@@ -41,9 +41,11 @@ struct BenchRenderer {
 
     // Baseline phase
     baseline_multi: Option<cliclack::MultiProgress>,
-    baseline_warmup_pb: Option<cliclack::ProgressBar>,
-    baseline_round_pb: Option<cliclack::ProgressBar>,
-    baseline_measured_blocks: u64,
+    baseline_pb: Option<cliclack::ProgressBar>,
+    baseline_checkpoint_pb: Option<cliclack::ProgressBar>,
+    /// Most-recent convergence delta, surfaced in the progress bar label so
+    /// users can see the rolling-window stabilization in real time.
+    baseline_last_convergence_pct: Option<f64>,
 
     // Replay phase
     replay_multi: Option<cliclack::MultiProgress>,
@@ -147,88 +149,61 @@ impl BenchRenderer {
 
             // --- Baseline ---
             BenchEvent::BaselineStarted {
-                warmup_blocks,
-                measured_blocks,
+                segment_size,
+                max_segments,
+                ..
             } => {
                 let multi =
                     cliclack::multi_progress("Calculating block processing overhead baseline");
 
-                if warmup_blocks > 0 {
-                    let pb = multi.add(
-                        cliclack::progress_bar(warmup_blocks as u64)
-                            .with_template(PROGRESS_BAR_TEMPLATE),
-                    );
-                    pb.start("Warming up");
-                    self.baseline_warmup_pb = Some(pb);
-                }
-
-                let pb = multi.add(
-                    cliclack::progress_bar(measured_blocks.into())
-                        .with_template(PROGRESS_BAR_TEMPLATE),
-                );
-                self.baseline_round_pb = Some(pb);
-                self.baseline_measured_blocks = measured_blocks.into();
+                let max_blocks = u64::from(segment_size) * u64::from(max_segments);
+                let pb = multi
+                    .add(cliclack::progress_bar(max_blocks).with_template(PROGRESS_BAR_TEMPLATE));
+                pb.start("Sampling empty blocks (auto-stops on convergence)");
+                self.baseline_pb = Some(pb);
+                self.baseline_last_convergence_pct = None;
                 self.baseline_multi = Some(multi);
             }
-            BenchEvent::BaselineWarmupProgress { completed, .. } => {
-                if let Some(ref pb) = self.baseline_warmup_pb {
-                    pb.set_position(completed as u64);
-                }
-            }
-            BenchEvent::BaselineWarmupComplete { duration, .. } => {
-                if let Some(pb) = self.baseline_warmup_pb.take() {
-                    pb.stop(fmt_success!(
-                        "Warmup complete ({:.2}s)",
-                        duration.as_secs_f32()
-                    ));
-                }
-            }
-            BenchEvent::BaselineRoundProgress {
-                completed,
-                total,
-                round,
+            BenchEvent::BaselineProgress {
+                blocks_completed, ..
             } => {
-                if let Some(ref pb) = self.baseline_round_pb {
-                    if completed == 1 {
-                        pb.start(format!("Measuring baseline (round {round})..."));
-                    }
-                    pb.set_position(completed as u64);
-
-                    // If this round is done, stop and create a new PB for the next round
-                    if completed >= total {
-                        // Don't stop here; BaselineRoundComplete handles that
-                    }
+                if let Some(ref pb) = self.baseline_pb {
+                    pb.set_position(blocks_completed as u64);
                 }
             }
-            BenchEvent::BaselineRoundComplete { round, duration } => {
-                if let Some(pb) = self.baseline_round_pb.take() {
-                    pb.stop(fmt_success!(
-                        "Baseline round {} finished ({:.2}s)",
-                        round,
-                        duration.as_secs_f32()
-                    ));
+            BenchEvent::BaselineSegmentComplete {
+                segment_index,
+                convergence_pct,
+                ..
+            } => {
+                if let Some(pct) = convergence_pct {
+                    self.baseline_last_convergence_pct = Some(pct);
                 }
-                // Create a new progress bar for the next round if baseline_multi is still active
-                if round < 2 {
-                    if let Some(ref multi) = self.baseline_multi {
-                        let pb = multi.add(
-                            cliclack::progress_bar(self.baseline_measured_blocks)
-                                .with_template(PROGRESS_BAR_TEMPLATE),
-                        );
-                        self.baseline_round_pb = Some(pb);
-                    }
+                if let Some(ref pb) = self.baseline_pb {
+                    let msg = match self.baseline_last_convergence_pct {
+                        Some(pct) => format!(
+                            "Sampling — segment {segment_index}, rolling \u{0394} {:.2}%",
+                            pct * 100.0
+                        ),
+                        None => format!(
+                            "Sampling — segment {segment_index} (collecting convergence window)"
+                        ),
+                    };
+                    pb.set_message(msg);
                 }
             }
             BenchEvent::BaselineCheckpointStarted => {
+                if let Some(pb) = self.baseline_pb.take() {
+                    pb.stop(fmt_success!("Baseline sampling complete"));
+                }
                 if let Some(ref multi) = self.baseline_multi {
                     let spinner = multi.add(cliclack::spinner());
                     spinner.start("Checkpointing chainstate and Clarity DBs...");
-                    // Reuse baseline_round_pb slot for the checkpoint spinner
-                    self.baseline_round_pb = Some(spinner);
+                    self.baseline_checkpoint_pb = Some(spinner);
                 }
             }
             BenchEvent::BaselineCheckpointComplete { duration } => {
-                if let Some(pb) = self.baseline_round_pb.take() {
+                if let Some(pb) = self.baseline_checkpoint_pb.take() {
                     pb.stop(fmt_success!(
                         "Checkpointing complete ({:.2}s)",
                         duration.as_secs_f32()
@@ -238,10 +213,24 @@ impl BenchRenderer {
                     multi.stop();
                 }
             }
-            BenchEvent::BaselineComplete { round1, round2 } => {
+            BenchEvent::BaselineComplete {
+                baseline,
+                converged,
+                segments_used,
+                measurement_window,
+                total_blocks,
+                duration,
+            } => {
                 cliclack::note(
-                    "Block Processing Overhead Baselines",
-                    format_baseline_note(&round1, &round2),
+                    "Block Processing Overhead Baseline",
+                    format_baseline_note(
+                        &baseline,
+                        converged,
+                        segments_used,
+                        measurement_window,
+                        total_blocks,
+                        duration,
+                    ),
                 )?;
             }
 
@@ -428,51 +417,39 @@ impl BenchRenderer {
 }
 
 fn format_baseline_note(
-    round1: &BlockProcessingBaseline,
-    round2: &BlockProcessingBaseline,
+    baseline: &BlockProcessingBaseline,
+    converged: bool,
+    segments_used: u32,
+    measurement_window: u32,
+    total_blocks: u32,
+    duration: Duration,
 ) -> String {
     let mut table = Table::new()
         .col("Phase", Align::Left)
-        .col("Round 1", Align::Right)
-        .col("Round 2", Align::Right)
         .col("Average", Align::Right);
 
-    let row = |label: &str, r1: Duration, r2: Duration| {
-        vec![
-            label.into(),
-            format!("{r1:.2?}"),
-            format!("{r2:.2?}"),
-            format!("{:.2?}", (r1 + r2) / 2),
-        ]
-    };
+    let row = |label: &str, v: Duration| vec![label.into(), format!("{v:.2?}")];
 
-    table.row(row(
-        "Setup",
-        round1.avg_setup_duration,
-        round2.avg_setup_duration,
-    ));
-    table.row(row(
-        "Finalize",
-        round1.avg_finalize_duration,
-        round2.avg_finalize_duration,
-    ));
+    table.row(row("Setup", baseline.avg_setup_duration));
+    table.row(row("Finalize", baseline.avg_finalize_duration));
     table.row(row(
         "Clarity commit",
-        round1.avg_clarity_state_commit_duration,
-        round2.avg_clarity_state_commit_duration,
+        baseline.avg_clarity_state_commit_duration,
     ));
-    table.row(row(
-        "Advance tip",
-        round1.avg_advance_tip_duration,
-        round2.avg_advance_tip_duration,
-    ));
-    table.row(row(
-        "Index commit",
-        round1.avg_index_commit_duration,
-        round2.avg_index_commit_duration,
-    ));
+    table.row(row("Advance tip", baseline.avg_advance_tip_duration));
+    table.row(row("Index commit", baseline.avg_index_commit_duration));
 
-    table.to_string()
+    let status = if converged {
+        format!("converged after {segments_used} segments")
+    } else {
+        format!("max segments reached ({segments_used}) without convergence")
+    };
+    format!(
+        "{}\n\n{status}\n{total_blocks} blocks sampled in {:.2}s, last {} segments averaged",
+        table,
+        duration.as_secs_f32(),
+        measurement_window,
+    )
 }
 
 fn print_benchmark_summary(s: &MetricsSummary) -> Result<()> {

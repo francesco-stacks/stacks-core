@@ -62,31 +62,44 @@ pub enum BenchEvent {
     },
 
     // --- Baseline phase ---
-    /// Overhead baseline measurement started.
+    /// Overhead baseline measurement started. The baseline runs empty blocks
+    /// in fixed-size segments and stops once the rolling average over the last
+    /// `convergence_window` segments stabilizes within `convergence_threshold`,
+    /// or after `max_segments` is reached.
     BaselineStarted {
-        warmup_blocks: usize,
-        measured_blocks: u32,
+        segment_size: u32,
+        min_segments: u32,
+        max_segments: u32,
+        convergence_window: u32,
+        convergence_threshold: f64,
     },
-    /// Baseline warmup progress.
-    BaselineWarmupProgress { completed: u32, total: u32 },
-    /// Baseline warmup complete.
-    BaselineWarmupComplete { duration: Duration },
-    /// Baseline round progress.
-    BaselineRoundProgress {
-        round: u8,
-        completed: u32,
-        total: u32,
+    /// Per-block progress within the baseline run.
+    BaselineProgress {
+        blocks_completed: u32,
+        max_blocks: u32,
     },
-    /// Baseline round complete.
-    BaselineRoundComplete { round: u8, duration: Duration },
-    /// Checkpointing chainstate DBs during baseline.
+    /// One segment of `segment_size` blocks finished; carries the segment's
+    /// per-phase averages and, once enough segments have accumulated, the
+    /// rolling-window average and the relative change vs. the prior window
+    /// (used by the UI to surface convergence in real time).
+    BaselineSegmentComplete {
+        segment_index: u32,
+        segment_average: BlockProcessingBaseline,
+        rolling_window_average: Option<BlockProcessingBaseline>,
+        convergence_pct: Option<f64>,
+    },
+    /// Checkpointing chainstate DBs after the baseline phase.
     BaselineCheckpointStarted,
     /// Checkpointing complete.
     BaselineCheckpointComplete { duration: Duration },
     /// Full baseline measurement complete with results.
     BaselineComplete {
-        round1: BlockProcessingBaseline,
-        round2: BlockProcessingBaseline,
+        baseline: BlockProcessingBaseline,
+        converged: bool,
+        segments_used: u32,
+        measurement_window: u32,
+        total_blocks: u32,
+        duration: Duration,
     },
 
     // --- Replay phase ---

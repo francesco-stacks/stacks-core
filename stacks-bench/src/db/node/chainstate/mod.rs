@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
-use clarity::types::chainstate::StacksBlockId;
+use clarity::types::chainstate::{BlockHeaderHash, StacksBlockId};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use futures::Stream;
@@ -100,6 +100,33 @@ impl<Mode: Send + Sync + 'static> ChainStateDb<Mode> {
             .optional()
             .with_context(|| {
                 format!("Failed to query block header for block with index hash '{index_hash_hex}'")
+            })
+    }
+
+    /// Finds pre-Nakamoto block headers by their Stacks block hash.
+    pub async fn get_block_headers_by_hash(
+        &self,
+        block_hash: &BlockHeaderHash,
+    ) -> Result<Vec<models::BlockHeader>> {
+        use self::schema::block_headers;
+        let block_hash_hex = block_hash.to_hex();
+        let mut conn = self.handle.get_conn().await?;
+
+        block_headers::table
+            .select((
+                block_headers::index_block_hash,
+                block_headers::block_hash,
+                block_headers::parent_block_id,
+                block_headers::block_height,
+                block_headers::consensus_hash,
+                block_headers::burn_header_hash,
+                block_headers::burn_header_height,
+            ))
+            .filter(block_headers::block_hash.eq(&block_hash_hex))
+            .load::<models::BlockHeader>(&mut conn)
+            .await
+            .with_context(|| {
+                format!("Failed to query block header for block hash '{block_hash_hex}'")
             })
     }
 

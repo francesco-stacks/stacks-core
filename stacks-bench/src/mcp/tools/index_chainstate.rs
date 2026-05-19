@@ -23,11 +23,11 @@ pub struct IndexChainstateParams {
     /// `chainstate` folder).
     pub source_dir: String,
 
-    /// Stacks block (height or hex block id) to start at, inclusive.
+    /// Stacks block (height, index_block_hash, or canonical block_hash) to start at, inclusive.
     #[serde(default)]
     pub start_at: Option<String>,
 
-    /// Stacks block (height or hex block id) to end at, inclusive.
+    /// Stacks block (height, index_block_hash, or canonical block_hash) to end at, inclusive.
     #[serde(default)]
     pub end_at: Option<String>,
 
@@ -35,7 +35,7 @@ pub struct IndexChainstateParams {
     #[serde(default)]
     pub count: Option<u32>,
 
-    /// Tip block (height or hex block id) to anchor canonical history
+    /// Tip block (height, index_block_hash, or canonical block_hash) to anchor canonical history
     /// resolution. Defaults to the node's current canonical tip.
     #[serde(default)]
     pub tip: Option<String>,

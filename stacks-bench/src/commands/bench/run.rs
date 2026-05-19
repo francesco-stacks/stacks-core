@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use blockstack_lib::burnchains::Txid;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use stacks_bench::baseline::run_convergent_baseline;
 use stacks_bench::bench_events::{self, BenchEvent, BenchEventSender};
 use stacks_bench::blocks::{BackwardsBlockStream, BlockRef};
 use stacks_bench::context::{BenchContext, BenchEnv};
@@ -33,8 +34,6 @@ use crate::commands::common::{
     run_cleanup_with_events, setup_bench_env, setup_bench_env_and_plan,
 };
 
-const BASELINE_MEASURED_BLOCKS: u32 = 1000;
-
 /// Non-clap parameter struct for benchmark runs. CLI converts from `RunArgs`
 /// via `From`; MCP constructs directly from tool parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,9 +53,9 @@ pub struct BenchRunParams {
     /// txid mode (each tx replayed independently from its own parent block).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub txid: Vec<TxIdArg>,
-    /// Block refs (height or hex block id) to benchmark. Empty = range/txid
-    /// mode; one or more = block mode (each block replayed independently from
-    /// its own parent block). Mutually exclusive with `txid`.
+    /// Block refs (height, index_block_hash, or canonical block_hash) to benchmark.
+    /// Empty = range/txid mode; one or more = block mode (each block replayed
+    /// independently from its own parent block). Mutually exclusive with `txid`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub block: Vec<StacksBlockRef>,
     pub repetitions: u32,
@@ -202,20 +201,21 @@ struct TxTarget {
     scan: TxidScanResult,
 }
 
-/// A `--block` ref after height resolution but before indexer canonicalization.
-/// Carries the expected canonical block id for Id-form inputs so non-canonical
-/// (forked-off) ids can be rejected once the indexer reveals the canonical
-/// block at the resolved height.
-struct ResolvedBlockRef {
+/// A `--block` ref after height/hash resolution but before indexer
+/// canonicalization. Carries the expected canonical block id for hash-form
+/// inputs so non-canonical (forked-off) ids can be rejected once the indexer
+/// reveals the canonical block at the resolved height.
+struct ResolvedBlockTarget {
     /// Original textual form of the user's `--block` argument, for error
     /// messages.
     ref_text: String,
     /// Canonical block height to index up to.
     height: u64,
-    /// Block id the user explicitly asked for (`StacksBlockRef::Id`). `None`
-    /// for height-form inputs, since the canonical block at that height under
-    /// `--tip` is unambiguous.
-    expected_id: Option<StacksBlockId>,
+    /// Candidate block ids the user explicitly asked for as an index hash or
+    /// that were resolved from a canonical block hash. Empty for height-form
+    /// inputs, since the canonical block at that height under `--tip` is
+    /// unambiguous.
+    expected_ids: Vec<StacksBlockId>,
 }
 
 /// The resolved target for a benchmark run, produced after the indexer
@@ -276,10 +276,6 @@ struct ScheduledBlock {
 struct ReplayPlan {
     /// Ordered replay schedule — each entry is one block replay iteration.
     schedule: Vec<ScheduledBlock>,
-    /// Per-machine overhead baseline warmup blocks. Always `params.warmup` —
-    /// deliberately not scaled by target count, since the baseline measures
-    /// machine overhead, not target-specific work.
-    baseline_warmup_blocks: usize,
     /// Total warmup iterations across all targets in the schedule. For range
     /// mode this equals `params.warmup`; for multi-target txid mode it is
     /// `params.warmup * targets.len()`.
@@ -349,148 +345,6 @@ async fn scan_for_txid(
     }
 }
 
-fn avg_baseline(
-    a: &stacks_bench::metrics::BlockProcessingBaseline,
-    b: &stacks_bench::metrics::BlockProcessingBaseline,
-) -> stacks_bench::metrics::BlockProcessingBaseline {
-    stacks_bench::metrics::BlockProcessingBaseline {
-        avg_setup_duration: (a.avg_setup_duration + b.avg_setup_duration) / 2,
-        avg_finalize_duration: (a.avg_finalize_duration + b.avg_finalize_duration) / 2,
-        avg_clarity_state_commit_duration: (a.avg_clarity_state_commit_duration
-            + b.avg_clarity_state_commit_duration)
-            / 2,
-        avg_advance_tip_duration: (a.avg_advance_tip_duration + b.avg_advance_tip_duration) / 2,
-        avg_index_commit_duration: (a.avg_index_commit_duration + b.avg_index_commit_duration) / 2,
-    }
-}
-
-fn run_overhead_baselines(
-    warmup: usize,
-    chainstate: &mut blockstack_lib::chainstate::stacks::db::StacksChainState,
-    burnchain: &blockstack_lib::burnchains::Burnchain,
-    start_parent: &stacks_common::types::chainstate::StacksBlockId,
-    interrupted: &Arc<AtomicBool>,
-    ev: &BenchEventSender,
-) -> anyhow::Result<(
-    stacks_bench::metrics::BlockProcessingBaseline,
-    stacks_bench::metrics::BlockProcessingBaseline,
-)> {
-    let mut timer;
-    let is_interrupted = || interrupted.load(Ordering::Relaxed);
-
-    bench_events::emit(
-        ev,
-        BenchEvent::BaselineStarted {
-            warmup_blocks: warmup,
-            measured_blocks: BASELINE_MEASURED_BLOCKS,
-        },
-    );
-
-    if warmup > 0 {
-        timer = Instant::now();
-        let ev_ref = ev.clone();
-        let warmup_total = warmup as u32;
-        stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
-            chainstate,
-            burnchain,
-            start_parent,
-            warmup_total,
-            |completed, _| {
-                bench_events::emit(
-                    &ev_ref,
-                    BenchEvent::BaselineWarmupProgress {
-                        completed,
-                        total: warmup_total,
-                    },
-                );
-                !is_interrupted()
-            },
-        )?;
-        if is_interrupted() {
-            return Ok(Default::default());
-        }
-        bench_events::emit(
-            ev,
-            BenchEvent::BaselineWarmupComplete {
-                duration: timer.elapsed(),
-            },
-        );
-    }
-
-    timer = Instant::now();
-    let ev1 = ev.clone();
-    let round1 = stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
-        chainstate,
-        burnchain,
-        start_parent,
-        BASELINE_MEASURED_BLOCKS,
-        |completed, _| {
-            bench_events::emit(
-                &ev1,
-                BenchEvent::BaselineRoundProgress {
-                    round: 1,
-                    completed,
-                    total: BASELINE_MEASURED_BLOCKS,
-                },
-            );
-            !is_interrupted()
-        },
-    )?;
-    if is_interrupted() {
-        return Ok(Default::default());
-    }
-    bench_events::emit(
-        ev,
-        BenchEvent::BaselineRoundComplete {
-            round: 1,
-            duration: timer.elapsed(),
-        },
-    );
-
-    timer = Instant::now();
-    let ev2 = ev.clone();
-    let round2 = stacks_bench::replay::replay_nakamoto_empty_chain_baseline(
-        chainstate,
-        burnchain,
-        start_parent,
-        BASELINE_MEASURED_BLOCKS,
-        |completed, _| {
-            bench_events::emit(
-                &ev2,
-                BenchEvent::BaselineRoundProgress {
-                    round: 2,
-                    completed,
-                    total: BASELINE_MEASURED_BLOCKS,
-                },
-            );
-            !is_interrupted()
-        },
-    )?;
-    if is_interrupted() {
-        return Ok(Default::default());
-    }
-    bench_events::emit(
-        ev,
-        BenchEvent::BaselineRoundComplete {
-            round: 2,
-            duration: timer.elapsed(),
-        },
-    );
-
-    // Checkpoint the chainstate/clarity dbs
-    bench_events::emit(ev, BenchEvent::BaselineCheckpointStarted);
-    timer = Instant::now();
-    chainstate.checkpoint_sqlite_dbs()?;
-    bench_events::emit(
-        ev,
-        BenchEvent::BaselineCheckpointComplete {
-            duration: timer.elapsed(),
-        },
-    );
-
-    Ok((round1, round2))
-}
-
 /// Create a shadow directory, emitting lifecycle events.
 fn create_shadow_dir_with_events(
     source_dir: &Path,
@@ -537,6 +391,38 @@ async fn run_indexer_pipeline(
         .index_chainstate_range(env.network, env.chain_id, &env.epochs, plan)
         .await;
     drop(indexer); // Close event channel so UI task can exit on error
+    idx_ui_fut.await??;
+    index_result
+}
+
+/// Targeted variant of [`run_indexer_pipeline`] for callers that already know
+/// the exact canonical block id (`--block <hash>` with a single candidate, or
+/// `--txid` after the chain scan). Skips the canonical-tip chain walk —
+/// orders of magnitude faster than [`run_indexer_pipeline`] for blocks far
+/// below the anchor tip.
+async fn run_indexer_pipeline_targeted(
+    app_db: &mut AppDb,
+    env: &BenchEnv,
+    plan: ChainIndexPlan,
+    target_id: StacksBlockId,
+    interrupted: &Arc<AtomicBool>,
+    indexer_ui: &IndexerUiSpawner,
+) -> Result<(ResolvedRange, Vec<StacksBlockId>)> {
+    let tip_height = plan.anchor_tip.height;
+    let idx_start = plan.start_height;
+    let idx_end = plan.end_height;
+
+    let (idx_event_tx, idx_event_rx) = mpsc::unbounded_channel();
+    let mut indexer = ChainstateIndexer::new(app_db, env)
+        .with_events(idx_event_tx)
+        .with_interrupted(interrupted.clone());
+
+    let idx_ui_fut = indexer_ui(idx_event_rx, idx_start, idx_end, tip_height);
+
+    let index_result = indexer
+        .index_targeted_block_window(env.network, env.chain_id, &env.epochs, plan, target_id)
+        .await;
+    drop(indexer);
     idx_ui_fut.await??;
     index_result
 }
@@ -724,7 +610,6 @@ fn build_replay_plan(params: &BenchRunParams, target: ResolvedTarget) -> Result<
 
             Ok(ReplayPlan {
                 schedule,
-                baseline_warmup_blocks: warmup_per_target,
                 total_warmup_entries: warmup_per_target * target_count,
                 total_measured_entries: measured_per_target * target_count,
                 targets: descriptors,
@@ -777,7 +662,6 @@ fn build_replay_plan(params: &BenchRunParams, target: ResolvedTarget) -> Result<
 
             Ok(ReplayPlan {
                 schedule,
-                baseline_warmup_blocks: warmup_per_target,
                 total_warmup_entries: warmup_per_target * target_count,
                 total_measured_entries: measured_per_target * target_count,
                 targets: descriptors,
@@ -841,7 +725,6 @@ fn build_replay_plan(params: &BenchRunParams, target: ResolvedTarget) -> Result<
             // empty and execute_replay_plan suppresses RunResult.targets).
             Ok(ReplayPlan {
                 schedule,
-                baseline_warmup_blocks: warmup,
                 total_warmup_entries: warmup,
                 total_measured_entries: measured,
                 targets: Vec::new(),
@@ -870,11 +753,11 @@ async fn execute_replay_plan(
 
     let (mut chainstate, burnchain) = bench_context.open_stacks_chainstate()?;
 
-    // --- Overhead baselines ---
-    // Baseline measures per-machine overhead and is deliberately NOT scaled
-    // by target count in multi-target modes.
-    let (bl1, bl2) = run_overhead_baselines(
-        plan.baseline_warmup_blocks,
+    // --- Overhead baseline ---
+    // Empty-block samples are collected in fixed-size segments and averaged
+    // once the rolling mean stabilizes. The result is per-machine overhead
+    // and is deliberately NOT scaled by target count in multi-target modes.
+    let baseline_outcome = run_convergent_baseline(
         &mut chainstate,
         &burnchain,
         &bench_context.end_block().id,
@@ -906,19 +789,22 @@ async fn execute_replay_plan(
     bench_events::emit(
         ev,
         BenchEvent::BaselineComplete {
-            round1: bl1.clone(),
-            round2: bl2.clone(),
+            baseline: baseline_outcome.baseline.clone(),
+            converged: baseline_outcome.converged,
+            segments_used: baseline_outcome.segments_used,
+            measurement_window: baseline_outcome.measurement_window,
+            total_blocks: baseline_outcome.total_blocks,
+            duration: baseline_outcome.duration,
         },
     );
 
-    let averaged = avg_baseline(&bl1, &bl2);
     app_db
         .save_block_processing_baseline(
             run_model.id,
             &bench_context.end_block().id,
-            plan.baseline_warmup_blocks as u32,
-            BASELINE_MEASURED_BLOCKS,
-            &averaged,
+            baseline_outcome.discarded_blocks(),
+            baseline_outcome.measured_blocks(),
+            &baseline_outcome.baseline,
         )
         .await?;
 
@@ -1375,12 +1261,21 @@ async fn run_benchmark_txids(
             anchor_tip: anchor_tip.clone(),
             start_height: index_start,
             end_height: target_height,
+            expected_start_ids: Vec::new(),
+            expected_end_ids: vec![scan_result.block_header.id.clone()],
         };
 
-        // Drive a fresh indexer UI session per target window so progress
-        // remains attributable to each target.
-        let (_resolved, _block_ids) =
-            run_indexer_pipeline(app_db, &env, index_plan, &interrupted, indexer_ui).await?;
+        // The txid scan already resolved the exact canonical id; use the
+        // targeted pipeline so we don't walk the chain from the anchor tip.
+        let (_resolved, _block_ids) = run_indexer_pipeline_targeted(
+            app_db,
+            &env,
+            index_plan,
+            scan_result.block_header.id.clone(),
+            &interrupted,
+            indexer_ui,
+        )
+        .await?;
 
         let block_ref = BlockRef {
             id: scan_result.block_header.id.clone(),
@@ -1446,23 +1341,29 @@ async fn run_benchmark_blocks(
 
     // Resolve each --block ref to a canonical height under the anchor tip.
     // The indexer pipeline below produces the canonical block at that height
-    // and persists the [parent, target] window in the app DB. For Id-form
+    // and persists the [parent, target] window in the app DB. For hash-form
     // refs we also remember the expected canonical id so we can detect
     // non-canonical (forked-off) inputs after the pipeline resolves them.
     let chainstate_dir = stacks_bench::paths::ChainStateDir::from_node_root(shadow_dir.path());
     let chainstate_db =
         stacks_bench::db::node::ChainStateDb::open_for_read(chainstate_dir.index_db_path()).await?;
-    let mut resolved_targets: Vec<ResolvedBlockRef> = Vec::with_capacity(params.block.len());
+    let nakamoto_db = if chainstate_dir.nakamoto_db_path().exists() {
+        Some(
+            stacks_bench::db::node::NakamotoDb::open_for_read(chainstate_dir.nakamoto_db_path())
+                .await?,
+        )
+    } else {
+        None
+    };
+    let mut resolved_targets: Vec<ResolvedBlockTarget> = Vec::with_capacity(params.block.len());
     for r in &params.block {
-        let h = crate::commands::common::resolve_ref_height(&chainstate_db, r, "block").await?;
-        let expected_id = match r {
-            StacksBlockRef::Id(id) => Some(id.clone()),
-            StacksBlockRef::Height(_) => None,
-        };
-        resolved_targets.push(ResolvedBlockRef {
+        let resolved =
+            crate::commands::common::resolve_ref(&chainstate_db, nakamoto_db.as_ref(), r, "block")
+                .await?;
+        resolved_targets.push(ResolvedBlockTarget {
             ref_text: r.to_string(),
-            height: h,
-            expected_id,
+            height: resolved.height,
+            expected_ids: resolved.expected_ids,
         });
     }
     drop(chainstate_db);
@@ -1487,7 +1388,7 @@ async fn run_benchmark_blocks(
     // surfaces in the post-run `targets` summary.
     let (target_block, target_block_height) = if params.block.len() == 1 {
         match &params.block[0] {
-            StacksBlockRef::Id(id) => (Some(id.to_string()), None),
+            StacksBlockRef::Hash(hash) => (Some(hash.to_string()), None),
             StacksBlockRef::Height(h) => (None, Some(*h)),
         }
     } else {
@@ -1521,28 +1422,27 @@ async fn run_benchmark_blocks(
             anchor_tip: anchor_tip.clone(),
             start_height: index_start,
             end_height: target_height,
+            expected_start_ids: Vec::new(),
+            expected_end_ids: target.expected_ids.clone(),
         };
 
-        let (resolved, _block_ids) =
-            run_indexer_pipeline(app_db, &env, index_plan, &interrupted, indexer_ui).await?;
-
-        // For Id-form refs, the user named a specific block. After the
-        // indexer resolves canonical history under --tip, verify that the
-        // canonical block at this height matches what was asked for —
-        // otherwise the input names a block that exists in the DB but is
-        // not on the selected tip's canonical chain.
-        if let Some(expected) = &target.expected_id
-            && expected != &resolved.end.id
-        {
-            bail!(
-                "--block {} is not on the canonical history of the selected tip \
-                 (resolved canonical block at height {} is {}, not {})",
-                target.ref_text,
-                resolved.end.height,
-                resolved.end.id,
-                expected
-            );
-        }
+        // Single candidate id → use the targeted pipeline (no canonical-tip
+        // walk). Multi-candidate (rare cross-fork block_hash collisions) and
+        // height-form refs fall back to the range pipeline so the canonical
+        // walk can disambiguate.
+        let (resolved, _block_ids) = if target.expected_ids.len() == 1 {
+            run_indexer_pipeline_targeted(
+                app_db,
+                &env,
+                index_plan,
+                target.expected_ids[0].clone(),
+                &interrupted,
+                indexer_ui,
+            )
+            .await?
+        } else {
+            run_indexer_pipeline(app_db, &env, index_plan, &interrupted, indexer_ui).await?
+        };
 
         let block_ref = resolved.end.clone();
         match &highest_block {

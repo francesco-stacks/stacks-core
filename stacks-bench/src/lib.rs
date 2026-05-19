@@ -17,6 +17,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 use crate::db::ReadOnly;
 use crate::db::node::NakamotoDb;
 
+pub mod baseline;
 pub mod bench_events;
 pub mod blocks;
 pub mod context;
@@ -102,7 +103,7 @@ impl ResolveEpochFromHeight for [StacksEpoch] {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StacksBlockRef {
-    Id(StacksBlockId),
+    Hash(BlockHeaderHash),
     Height(u64),
 }
 
@@ -111,10 +112,13 @@ impl FromStr for StacksBlockRef {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Ok(height) = s.parse::<u64>() {
             Ok(Self::Height(height))
-        } else if let Ok(block_id) = StacksBlockId::from_hex(s) {
-            Ok(Self::Id(block_id))
+        } else if let Ok(hash) = BlockHeaderHash::from_hex(s) {
+            Ok(Self::Hash(hash))
         } else {
-            bail!("invalid block identifier: {s} (expected u64 height or hex block hash)")
+            bail!(
+                "invalid block identifier: {s} \
+                 (expected u64 height, hex index_block_hash, or hex block_hash)"
+            )
         }
     }
 }
@@ -122,27 +126,8 @@ impl FromStr for StacksBlockRef {
 impl std::fmt::Display for StacksBlockRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StacksBlockRef::Id(block_id) => write!(f, "{block_id}"),
+            StacksBlockRef::Hash(hash) => write!(f, "{hash}"),
             StacksBlockRef::Height(h) => write!(f, "{h}"),
-        }
-    }
-}
-
-impl StacksBlockRef {
-    pub fn resolve_block_height(&self, chainstate: &StacksChainState) -> Result<u64> {
-        match self {
-            StacksBlockRef::Height(h) => Ok(*h),
-            StacksBlockRef::Id(block_id) => {
-                let (consensus_hash, header_hash) = chainstate
-                    .get_block_header_hashes(block_id)
-                    .with_context(|| format!("lookup header hashes for {block_id}"))?
-                    .ok_or_else(|| anyhow!("missing header hashes for {block_id}"))?;
-
-                chainstate
-                    .get_stacks_block_height(&consensus_hash, &header_hash)
-                    .with_context(|| format!("lookup height for {block_id}"))?
-                    .ok_or_else(|| anyhow!("missing height for {block_id}"))
-            }
         }
     }
 }

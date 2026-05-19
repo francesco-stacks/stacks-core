@@ -29,21 +29,21 @@ pub struct RunArgs {
     #[arg(long = "source", short = 's')]
     source_dir: PathBuf,
 
-    /// The Stacks block (height or hex block id) to start at, inclusive. Cannot be used with the
-    /// `txid` or `block` flags.
+    /// The Stacks block (height, index_block_hash, or canonical block_hash) to start at,
+    /// inclusive. Cannot be used with the `txid` or `block` flags.
     #[arg(long, conflicts_with_all = ["txid", "block"], default_value = "1")]
     #[serde(skip_serializing_if = "Option::is_none")]
     start_at: Option<StacksBlockRef>,
 
-    /// The Stacks block (height or hex block id) to end at, inclusive. Cannot be used with the
-    /// `txid`, `block`, or `count` flags.
+    /// The Stacks block (height, index_block_hash, or canonical block_hash) to end at,
+    /// inclusive. Cannot be used with the `txid`, `block`, or `count` flags.
     #[arg(long, conflicts_with_all = ["txid", "block", "block_count"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     end_at: Option<StacksBlockRef>,
 
-    /// The tip block (height or hex block id) to use as the anchor for resolving canonical history.
-    /// Defaults to the node's current canonical tip. Useful for benchmarking in forks: provide the
-    /// fork's tip hash here.
+    /// The tip block (height, index_block_hash, or canonical block_hash) to use as the anchor for
+    /// resolving canonical history. Defaults to the node's current canonical tip. Useful for
+    /// benchmarking in forks: provide the fork's tip hash here.
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     tip: Option<StacksBlockRef>,
@@ -76,9 +76,10 @@ pub struct RunArgs {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     txid: Vec<TxIdArg>,
 
-    /// A specific Stacks block (height or hex block id) to benchmark. May be passed multiple
-    /// times to benchmark several blocks in a single run; each block is replayed `--repetitions`
-    /// times from its own parent block. Resolved against `--tip` for canonical history.
+    /// A specific Stacks block (height, index_block_hash, or canonical block_hash) to benchmark.
+    /// May be passed multiple times to benchmark several blocks in a single run; each block is
+    /// replayed `--repetitions` times from its own parent block. Resolved against `--tip` for
+    /// canonical history.
     /// Cannot be combined with `--start-at`, `--end-at`, `--count`, `--filter`, `--contract`,
     /// or `--txid`.
     #[arg(
@@ -110,6 +111,8 @@ pub struct RunArgs {
     calibration: usize,
 
     /// Number of blocks to process as warmup before starting measurements.
+    /// Applies to the replay phase only; the overhead baseline is self-tuning
+    /// (sampled empty blocks until the rolling mean stabilizes).
     ///
     /// In block-range mode, this is the number of warmup blocks (the earliest
     /// selected blocks).

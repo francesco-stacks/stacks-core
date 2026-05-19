@@ -18,13 +18,13 @@ pub struct IndexArgs {
     #[arg(long = "source", short = 's')]
     source_dir: PathBuf,
 
-    /// The Stacks block (height or hex block id) to start at, inclusive.
+    /// The Stacks block (height, index_block_hash, or canonical block_hash) to start at, inclusive.
     #[arg(long, default_value = "1")]
     #[serde(skip_serializing_if = "Option::is_none")]
     start_at: Option<StacksBlockRef>,
 
-    /// The Stacks block (height or hex block id) to end at, inclusive. Cannot
-    /// be used with the `count` flag.
+    /// The Stacks block (height, index_block_hash, or canonical block_hash) to end at, inclusive.
+    /// Cannot be used with the `count` flag.
     #[arg(long, conflicts_with_all = &["block_count"])]
     #[serde(skip_serializing_if = "Option::is_none")]
     end_at: Option<StacksBlockRef>,
@@ -34,7 +34,8 @@ pub struct IndexArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     block_count: Option<u32>,
 
-    /// The tip block (height or hex block id) to use as the anchor for resolving canonical history.
+    /// The tip block (height, index_block_hash, or canonical block_hash) to use as the anchor for
+    /// resolving canonical history.
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     tip: Option<StacksBlockRef>,

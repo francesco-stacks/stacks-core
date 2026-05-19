@@ -26,14 +26,14 @@ pub struct RunBenchmarkParams {
     /// `chainstate` folder).
     pub source_dir: String,
 
-    /// Stacks block (height or hex block id) to start at, inclusive.
+    /// Stacks block (height, index_block_hash, or canonical block_hash) to start at, inclusive.
     /// Defaults to block 1 if omitted. Not allowed when `txid` or `block` is
     /// non-empty.
     #[serde(default)]
     pub start_at: Option<String>,
 
-    /// Stacks block (height or hex block id) to end at, inclusive. Not
-    /// allowed when `txid` or `block` is non-empty.
+    /// Stacks block (height, index_block_hash, or canonical block_hash) to end at, inclusive.
+    /// Not allowed when `txid` or `block` is non-empty.
     #[serde(default)]
     pub end_at: Option<String>,
 
@@ -49,10 +49,9 @@ pub struct RunBenchmarkParams {
     #[serde(default)]
     pub txid: Vec<String>,
 
-    /// Stacks blocks (height or hex block id) to benchmark. When non-empty,
-    /// `start_at`, `end_at`, `count`, `filter`, and `txid` must be omitted.
-    /// Each block is replayed `repetitions` times from its own parent block.
-    /// Mutually exclusive with `txid`.
+    /// Stacks blocks (height, index_block_hash, or canonical block_hash) to benchmark. When
+    /// non-empty, `start_at`, `end_at`, `count`, `filter`, and `txid` must be omitted. Each block
+    /// is replayed `repetitions` times from its own parent block. Mutually exclusive with `txid`.
     #[serde(default)]
     pub block: Vec<String>,
 
@@ -117,7 +116,7 @@ pub struct RunBenchmarkParams {
     #[serde(default)]
     pub network: Option<String>,
 
-    /// Tip block (height or hex block id) to anchor canonical history
+    /// Tip block (height, index_block_hash, or canonical block_hash) to anchor canonical history
     /// resolution. Defaults to the node's current canonical tip.
     #[serde(default)]
     pub tip: Option<String>,
@@ -367,6 +366,9 @@ pub(super) async fn forward_bench_events(
     // Debounce: only send high-frequency progress events when the whole-
     // percent value changes (at most ~100 notifications per phase).
     let mut last_sent_pct: i32 = -1;
+    // Most-recent baseline progress, reused when emitting segment-status
+    // notifications so they don't reset clients' progress bars to 0%.
+    let mut baseline_progress: Option<(u32, u32)> = None;
 
     while let Some(event) = rx.recv().await {
         let notification = match &event {
@@ -389,31 +391,82 @@ pub(super) async fn forward_bench_events(
                 )),
             )),
             BenchEvent::BaselineStarted {
-                warmup_blocks,
-                measured_blocks,
+                segment_size,
+                max_segments,
+                ..
             } => {
                 last_sent_pct = -1;
+                let max_blocks = *segment_size * *max_segments;
+                baseline_progress = Some((0, max_blocks));
                 Some(progress(
                     &token,
                     0.0,
-                    None,
+                    Some(max_blocks as f64),
                     Some(&format!(
-                        "Measuring baseline overhead (warmup: {warmup_blocks}, measured: {measured_blocks})"
+                        "Measuring baseline overhead (≤{max_blocks} blocks; stops on convergence)"
                     )),
                 ))
             }
-            BenchEvent::BaselineRoundProgress {
-                round,
-                completed,
-                total,
-            } => debounced(&mut last_sent_pct, *completed as f64, *total as f64, || {
-                progress(
-                    &token,
-                    *completed as f64,
-                    Some(*total as f64),
-                    Some(&format!("Baseline round {round}")),
+            BenchEvent::BaselineProgress {
+                blocks_completed,
+                max_blocks,
+            } => {
+                baseline_progress = Some((*blocks_completed, *max_blocks));
+                debounced(
+                    &mut last_sent_pct,
+                    *blocks_completed as f64,
+                    *max_blocks as f64,
+                    || {
+                        progress(
+                            &token,
+                            *blocks_completed as f64,
+                            Some(*max_blocks as f64),
+                            Some("Baseline sampling"),
+                        )
+                    },
                 )
-            }),
+            }
+            BenchEvent::BaselineSegmentComplete {
+                segment_index,
+                convergence_pct,
+                ..
+            } => {
+                let msg = match convergence_pct {
+                    Some(pct) => format!(
+                        "Baseline segment {segment_index}, rolling Δ {:.2}%",
+                        pct * 100.0
+                    ),
+                    None => format!("Baseline segment {segment_index}"),
+                };
+                let (completed, total) = baseline_progress.unwrap_or((0, 0));
+                Some(progress(
+                    &token,
+                    completed as f64,
+                    Some(total as f64),
+                    Some(&msg),
+                ))
+            }
+            BenchEvent::BaselineComplete {
+                converged,
+                segments_used,
+                total_blocks,
+                ..
+            } => {
+                last_sent_pct = -1;
+                let status = if *converged {
+                    "converged"
+                } else {
+                    "max segments"
+                };
+                Some(progress(
+                    &token,
+                    *total_blocks as f64,
+                    Some(*total_blocks as f64),
+                    Some(&format!(
+                        "Baseline {status} after {segments_used} segments ({total_blocks} blocks)"
+                    )),
+                ))
+            }
             BenchEvent::ReplayStarted {
                 total_blocks,
                 warmup_blocks,

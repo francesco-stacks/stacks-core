@@ -15,7 +15,7 @@ use clarity::vm::costs::ExecutionCost;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 
 use crate::context::BenchContext;
-use crate::metrics::{BlockMetrics, BlockProcessingBaseline, TransactionMetrics};
+use crate::metrics::{BlockMetrics, TransactionMetrics};
 use crate::{BlockEra, ResolveEpochFromHeight, StacksBlockHeader};
 
 #[derive(Debug, Clone)]
@@ -30,7 +30,6 @@ pub enum ReplayMode {
     /// suffix transactions after the target are executed.
     SingleTx(crate::filter::TxFilter),
 }
-
 impl std::fmt::Display for ReplayMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -294,7 +293,7 @@ fn replay_nakamoto_by_segments<F>(
     burnchain: &Burnchain,
     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
     segments: &[TxSegment],
-    #[allow(unused_variables)] repetition: u32,
+    repetition: u32,
     mut on_segment: Option<&mut F>,
 ) -> Result<Vec<BlockMetrics>>
 where
@@ -458,10 +457,16 @@ where
         }
     }
 
-    // Validate state root for full-block replay (single segment covering all txs). Multi-segment
-    // replays commit intermediate state under synthetic block IDs, which alters the MARF trie
-    // structure and invalidates root comparison.
-    if segments.len() == 1 && segments[0].range == (0..block.txs.len()) {
+    // Validate state root only for canonical-equivalent replays — i.e. a
+    // single segment covering every transaction in the block, executed at
+    // `repetition == 0`. Two cases break the comparison even though Clarity
+    // execution is bit-identical:
+    //   * Multi-segment replays commit intermediate state under synthetic
+    //     block IDs, altering the MARF trie structure.
+    //   * `repetition > 0` synthesizes a shifted timestamp (see
+    //     `execute_segment`) to avoid header-table collisions, which changes
+    //     the block hash and therefore the MARF entries committed under it.
+    if repetition == 0 && segments.len() == 1 && segments[0].range == (0..block.txs.len()) {
         if let Some(replayed_root) = last_state_index_root {
             if replayed_root != block.header.state_index_root {
                 let tenure_tx = block.get_tenure_tx_payload();
@@ -811,157 +816,5 @@ fn execute_segment(
         segment_total_clarity_cost,
         segment_tx_metrics,
         state_index_root: mined_state_index_root,
-    })
-}
-
-pub fn replay_nakamoto_empty_chain_baseline<F>(
-    chainstate: &mut StacksChainState,
-    burnchain: &Burnchain,
-    start_parent_block_id: &StacksBlockId,
-    n_blocks: u32,
-    mut on_progress: F,
-) -> anyhow::Result<BlockProcessingBaseline>
-where
-    F: FnMut(u32, u32) -> bool,
-{
-    if n_blocks == 0 {
-        return Ok(BlockProcessingBaseline::default());
-    }
-
-    let mut cur_parent_info =
-        NakamotoChainState::get_block_header(chainstate.db(), start_parent_block_id)?
-            .ok_or_else(|| anyhow::anyhow!("Parent header not found: {start_parent_block_id}"))?;
-
-    // We only read from sortdb in this benchmark.
-    let sortdb = burnchain
-        .open_sortition_db(false)
-        .with_context(|| "open sortition db (readonly) for baseline")?;
-
-    let mut total_setup_duration = Duration::ZERO;
-    let mut total_finalize_duration = Duration::ZERO;
-    let mut total_clarity_state_commit_duration = Duration::ZERO;
-    let mut total_advance_chain_tip_duration = Duration::ZERO;
-    let mut total_index_commit_duration = Duration::ZERO;
-
-    for i in 0..n_blocks {
-        let setup_start = Instant::now();
-
-        // Empty baseline blocks extend the parent's current tenure. In Nakamoto
-        // terms the block header consensus hash is the tenure/election consensus
-        // hash, not the parent's current burn view; the burn view may be a
-        // no-sortition burn block and therefore have no winning block commit.
-        let tenure_id_consensus_hash = cur_parent_info.consensus_hash.clone();
-
-        let baseline_sn =
-            SortitionDB::get_block_snapshot_consensus(sortdb.conn(), &tenure_id_consensus_hash)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "baseline: missing sortition snapshot for tenure consensus hash \
-                         {tenure_id_consensus_hash} (iter {i})"
-                    )
-                })?;
-
-        let burn_dbconn = sortdb.index_handle(&baseline_sn.sortition_id);
-
-        let mut builder = NakamotoBlockBuilder::new(
-            &cur_parent_info,
-            &tenure_id_consensus_hash,
-            0,
-            None,
-            None,
-            0,
-            None,
-            None,
-            None,
-            DEFAULT_MAX_TENURE_BYTES,
-        )?;
-
-        let mut miner_tenure_info = builder.load_tenure_info(
-            chainstate,
-            &burn_dbconn,
-            MinerTenureInfoCause::NoTenureChange,
-        )?;
-        let burn_chain_height = miner_tenure_info.burn_tip_height;
-
-        let mut clarity_tx = builder.tenure_begin(&burn_dbconn, &mut miner_tenure_info)?;
-        let starting_cost = clarity_tx.cost_so_far();
-
-        total_setup_duration += setup_start.elapsed();
-
-        let finalize_start = Instant::now();
-        let mined_block = builder.mine_nakamoto_block(&mut clarity_tx, burn_chain_height);
-        total_finalize_duration += finalize_start.elapsed();
-
-        let total_tenure_cost = clarity_tx.cost_so_far();
-        let mut block_execution_cost = clarity_tx.cost_so_far();
-        block_execution_cost.sub(&starting_cost)?;
-
-        let clarity_commit_start = Instant::now();
-        clarity_tx.commit_to_block(
-            &mined_block.header.consensus_hash,
-            &mined_block.header.block_hash(),
-        );
-        total_clarity_state_commit_duration += clarity_commit_start.elapsed();
-
-        let advance_tip_start = Instant::now();
-
-        let burn_view =
-            NakamotoChainState::get_block_burn_view(&sortdb, &mined_block, &cur_parent_info)?;
-
-        let sn = SortitionDB::get_block_snapshot_consensus(
-            sortdb.conn(),
-            &mined_block.header.consensus_hash,
-        )?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "baseline: snapshot not found for mined header CH {} (iter {i})",
-                mined_block.header.consensus_hash
-            )
-        })?;
-
-        let new_tip_info = NakamotoChainState::advance_tip(
-            &mut miner_tenure_info.chainstate_tx.tx,
-            &cur_parent_info.anchored_header,
-            &cur_parent_info.consensus_hash,
-            &mined_block,
-            None,
-            &sn.burn_header_hash,
-            sn.block_height as u32,
-            sn.burn_header_timestamp,
-            None,
-            None,
-            &block_execution_cost,
-            &total_tenure_cost,
-            builder.get_bytes_so_far(),
-            false,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            false,
-            0,
-            0,
-            &burn_view,
-        )?;
-
-        total_advance_chain_tip_duration += advance_tip_start.elapsed();
-
-        let index_commit_start = Instant::now();
-        miner_tenure_info.chainstate_tx.commit()?;
-        total_index_commit_duration += index_commit_start.elapsed();
-
-        cur_parent_info = new_tip_info;
-
-        if !on_progress(i + 1, n_blocks) {
-            break;
-        }
-    }
-
-    Ok(BlockProcessingBaseline {
-        avg_setup_duration: total_setup_duration / n_blocks,
-        avg_finalize_duration: total_finalize_duration / n_blocks,
-        avg_clarity_state_commit_duration: total_clarity_state_commit_duration / n_blocks,
-        avg_advance_tip_duration: total_advance_chain_tip_duration / n_blocks,
-        avg_index_commit_duration: total_index_commit_duration / n_blocks,
     })
 }

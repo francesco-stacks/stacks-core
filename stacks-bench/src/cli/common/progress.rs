@@ -84,7 +84,14 @@ async fn run_pipeline_progress(
     end_height: u64,
     tip_height: u64,
 ) -> Result<()> {
-    let total_blocks = end_height - start_height + 1;
+    // Include the indexer's hidden "start - 1" helper block in the visible
+    // count. The indexer always stages `[start - 1, start, end]` (or the
+    // genesis-clamped equivalent) so that the AppDb's recursive parent-chain
+    // query has a valid anchor below `start`. Counting only `[start, end]`
+    // makes the cache check report "0/3" while the progress bar fills to
+    // "Indexed 2 blocks" — same work, two different numbers.
+    let index_start_height = start_height.saturating_sub(1);
+    let total_blocks = end_height - index_start_height + 1;
     let walk_distance = tip_height.saturating_sub(end_height);
     let has_walk_phase = walk_distance > 0;
 
