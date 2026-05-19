@@ -111,6 +111,13 @@ pub struct RunBenchmarkParams {
     #[serde(default)]
     pub no_profiler_kv: bool,
 
+    /// Track per-block storage growth in the shadow directory. Off by
+    /// default; opt in for runs where per-block disk attribution matters.
+    /// When off, every persisted `total_storage_delta` row is `0` and the
+    /// post-run cumulative storage-growth summary is suppressed.
+    #[serde(default)]
+    pub storage_deltas: bool,
+
     /// Network name (e.g. `"mainnet"`, `"testnet"`). Inferred from the
     /// chainstate if omitted.
     #[serde(default)]
@@ -284,6 +291,7 @@ impl RunBenchmarkParams {
             ignore_span: self.ignore_span,
             no_profiler_kv: self.no_profiler_kv,
             include_pre_nakamoto_blocks: false,
+            storage_deltas: self.storage_deltas,
             shadow_dir_root: self.shadow_dir_root.map(PathBuf::from),
             name: self.name,
         })

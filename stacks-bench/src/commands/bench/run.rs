@@ -34,6 +34,12 @@ use crate::commands::common::{
     run_cleanup_with_events, setup_bench_env, setup_bench_env_and_plan,
 };
 
+/// During warmup we suppress the per-block WAL checkpoint, since the metrics
+/// are discarded anyway. To prevent the WAL from growing unboundedly across
+/// long warmups (and producing a multi-second stall at the warmup→measured
+/// boundary), run an interleaved checkpoint every N warmup blocks.
+const WARMUP_CHECKPOINT_INTERVAL: usize = 100;
+
 /// Non-clap parameter struct for benchmark runs. CLI converts from `RunArgs`
 /// via `From`; MCP constructs directly from tool parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +98,12 @@ pub struct BenchRunParams {
     pub ignore_span: Vec<String>,
     pub no_profiler_kv: bool,
     pub include_pre_nakamoto_blocks: bool,
+    /// Track per-block storage growth in the shadow directory. Off by
+    /// default; opt in for runs where per-block disk attribution matters.
+    /// When off, every `stacks_block_stats.total_storage_delta` row is `0`
+    /// and the post-run cumulative `StorageSummary` event is suppressed.
+    #[serde(default)]
+    pub storage_deltas: bool,
     /// Override the parent directory under which the shadow tempdir is
     /// created. Useful for sandboxed environments where the default
     /// (`source_dir.parent()`) is not writable. The shadow tempdir is still
@@ -485,6 +497,15 @@ struct ReplayOutcome {
     /// `None` for range mode and single-`--txid` (preserves legacy shape).
     target_summaries: Option<Vec<TargetSummary>>,
     total_checkpoint_duration: Duration,
+    total_storage_delta_duration: Duration,
+    total_block_load_duration: Duration,
+    total_metrics_flush_duration: Duration,
+    /// Wall time of the warmup phase, from the start of the replay loop
+    /// through (and including) the warmup→measured boundary checkpoint.
+    /// Zero when `--warmup 0`. Bucketed separately so warmup wall time
+    /// doesn't get mis-attributed to "Benchmarking Overhead".
+    warmup_duration: Duration,
+    storage_deltas: bool,
     was_interrupted: bool,
 }
 
@@ -515,6 +536,7 @@ async fn finalize_run(
     let summary = outcome.accumulator.summary();
 
     let overhead = duration
+        .saturating_sub(outcome.warmup_duration)
         .saturating_sub(summary.duration)
         .saturating_sub(outcome.total_checkpoint_duration);
 
@@ -525,9 +547,13 @@ async fn finalize_run(
             warmup_blocks: outcome.warmup_blocks,
             measured_blocks: outcome.completed_measured,
             total_duration: duration,
+            warmup_duration: outcome.warmup_duration,
             replay_duration: summary.duration,
             checkpoint_duration: outcome.total_checkpoint_duration,
             overhead,
+            storage_delta_duration: outcome.total_storage_delta_duration,
+            block_load_duration: outcome.total_block_load_duration,
+            metrics_flush_duration: outcome.total_metrics_flush_duration,
             interrupted: outcome.was_interrupted,
         },
     );
@@ -537,11 +563,13 @@ async fn finalize_run(
         BenchEvent::BenchmarkSummary(outcome.accumulator.summary()),
     );
 
-    // Give the OS a moment to sync metadata
-    std::thread::sleep(Duration::from_millis(100));
+    if outcome.storage_deltas {
+        // Give the OS a moment to sync metadata
+        std::thread::sleep(Duration::from_millis(100));
 
-    let storage_delta_report = shadow_dir.calculate_storage_delta()?;
-    bench_events::emit(ev, BenchEvent::StorageSummary(storage_delta_report));
+        let storage_delta_report = shadow_dir.calculate_storage_delta()?;
+        bench_events::emit(ev, BenchEvent::StorageSummary(storage_delta_report));
+    }
 
     run_cleanup_with_events(app_db.clone(), shadow_dir, ev).await?;
 
@@ -672,9 +700,10 @@ fn build_replay_plan(params: &BenchRunParams, target: ResolvedTarget) -> Result<
         }
         ResolvedTarget::BlockRange { block_ids, filter } => {
             let warmup = params.warmup;
-            if warmup > block_ids.len() {
+            if warmup >= block_ids.len() {
                 bail!(
-                    "--warmup ({}) cannot exceed selected block count ({})",
+                    "--warmup ({}) must be strictly less than the selected block count ({}); \
+                     otherwise the run would contain no measured blocks",
                     warmup,
                     block_ids.len()
                 );
@@ -808,12 +837,26 @@ async fn execute_replay_plan(
         )
         .await?;
 
-    shadow_dir.calculate_storage_delta()?; // Reset storage delta baseline
+    if params.storage_deltas {
+        shadow_dir.calculate_storage_delta()?; // Reset storage delta baseline
+    }
+
+    // Open the sortition DB once and reuse it across every replay iteration.
+    // Previously `replay_nakamoto_by_segments` opened a fresh handle per
+    // block; at 25-50k blocks that's a meaningful per-block sqlite/MARF
+    // setup cost. The handle is read-only from replay's perspective (it
+    // only queries snapshots / burn views).
+    let sortdb = burnchain
+        .open_sortition_db(true)
+        .with_context(|| "open sortition db for replay loop")?;
 
     let mut calibration = CalibrationState::new(plan.needs_calibration, params.calibration);
     let mut completed_measured: usize = 0;
     let mut warmup_done: usize = 0;
     let mut total_clarity_db_checkpoint_duration = Duration::ZERO;
+    let mut total_storage_delta_duration = Duration::ZERO;
+    let mut total_block_load_duration = Duration::ZERO;
+    let mut total_metrics_flush_duration = Duration::ZERO;
     let mut last_storage_delta: i64 = 0;
 
     let mut accumulator = MetricsAccumulator::default();
@@ -842,6 +885,7 @@ async fn execute_replay_plan(
 
     // --- Replay loop ---
     let mut warmup_complete_emitted = false;
+    let mut warmup_duration = Duration::ZERO;
     let start = Instant::now();
     for entry in plan.schedule.iter() {
         if interrupted.load(Ordering::Relaxed) {
@@ -856,21 +900,65 @@ async fn execute_replay_plan(
         }
 
         let is_warmup = entry.is_warmup;
-        Profiler::clear();
 
-        if !is_warmup && !params.no_profiler && !params.no_profiler_kv {
-            Profiler::enable_record();
+        // Warmup → measured boundary: warmup repetitions ran with
+        // `sample_metrics=false`, which skipped the per-block WAL checkpoint
+        // and the storage-delta callback. Flush WAL once now so the first
+        // measured block doesn't have to absorb warmup's accumulated dirty
+        // pages, and reset the storage-delta baseline so per-block deltas
+        // start from a clean reference. The total wall time of the warmup
+        // phase (including periodic and boundary checkpoints) is bucketed
+        // under `warmup_duration` so it doesn't fall into "Overhead".
+        if !is_warmup && plan.total_warmup_entries > 0 && !warmup_complete_emitted {
+            chainstate.checkpoint_sqlite_dbs()?;
+            if params.storage_deltas {
+                let storage_report = shadow_dir.calculate_storage_delta()?;
+                last_storage_delta = storage_report.net_growth_bytes;
+            }
+            warmup_duration = start.elapsed();
+            warmup_complete_emitted = true;
+            bench_events::emit(
+                ev,
+                BenchEvent::ReplayWarmupComplete {
+                    warmup_blocks: plan.total_warmup_entries,
+                    duration: warmup_duration,
+                },
+            );
         }
 
+        if !is_warmup {
+            Profiler::clear();
+            if !params.no_profiler && !params.no_profiler_kv {
+                Profiler::enable_record();
+            }
+        }
+
+        let block_load_start = Instant::now();
         let block = app_db.get_block(&entry.block_id).await?;
+        // Only attribute block-load time to the overhead bucket for measured
+        // iterations; warmup block-loads are already accounted for in
+        // `warmup_duration`. Counting them here too would cause the UI's
+        // "Other" sub-line to underflow into a `saturating_sub` (showing 0
+        // when the real value is small but positive).
+        if !is_warmup {
+            total_block_load_duration += block_load_start.elapsed();
+        }
 
+        let storage_deltas = params.storage_deltas;
         let mut on_segment = |_: &SegmentReplayInfo, m: Option<&mut BlockMetrics>| -> Result<()> {
-            let storage_report = shadow_dir.calculate_storage_delta()?;
-            let current_delta = storage_report.net_growth_bytes;
-            let delta_since_last = current_delta - last_storage_delta;
-            last_storage_delta = current_delta;
+            let delta_since_last = if storage_deltas {
+                let storage_delta_start = Instant::now();
+                let storage_report = shadow_dir.calculate_storage_delta()?;
+                total_storage_delta_duration += storage_delta_start.elapsed();
+                let current_delta = storage_report.net_growth_bytes;
+                let delta = current_delta - last_storage_delta;
+                last_storage_delta = current_delta;
+                delta
+            } else {
+                0
+            };
 
-            if !is_warmup && let Some(m) = m {
+            if let Some(m) = m {
                 m.total_storage_delta = delta_since_last;
                 total_clarity_db_checkpoint_duration += m.clarity_db_checkpoint_duration;
             }
@@ -880,15 +968,26 @@ async fn execute_replay_plan(
         let maybe_metrics_vec = stacks_bench::replay::replay_block(
             &mut bench_context,
             &mut chainstate,
-            &burnchain,
+            &sortdb,
             &entry.replay_mode,
             &block,
             entry.repetition,
-            Some(&mut on_segment),
+            !is_warmup,
+            if is_warmup {
+                None
+            } else {
+                Some(&mut on_segment)
+            },
         )?;
 
         if is_warmup {
             warmup_done += 1;
+            // Periodic WAL flush during warmup. Without this, --warmup 5000
+            // (or larger) accumulates a huge WAL and produces a multi-second
+            // stall at the boundary checkpoint above.
+            if warmup_done % WARMUP_CHECKPOINT_INTERVAL == 0 {
+                chainstate.checkpoint_sqlite_dbs()?;
+            }
             bench_events::emit(
                 ev,
                 BenchEvent::ReplayWarmupProgress {
@@ -900,17 +999,6 @@ async fn execute_replay_plan(
         }
 
         completed_measured += 1;
-
-        if !warmup_complete_emitted && plan.total_warmup_entries > 0 {
-            bench_events::emit(
-                ev,
-                BenchEvent::ReplayWarmupComplete {
-                    warmup_blocks: plan.total_warmup_entries,
-                    duration: start.elapsed(),
-                },
-            );
-            warmup_complete_emitted = true;
-        }
 
         bench_events::emit(
             ev,
@@ -931,10 +1019,28 @@ async fn execute_replay_plan(
         }
 
         if let Some(batch) = calibration.observe(metrics_vec) {
+            let flush_start = Instant::now();
             app_db
                 .save_block_metrics(run_model.id, batch.into_iter(), &profiler_policy)
                 .await?;
+            total_metrics_flush_duration += flush_start.elapsed();
         }
+    }
+
+    // If the loop ended without ever reaching a measured iteration (e.g.
+    // Ctrl-C during warmup, or a future config where every entry is warmup)
+    // the warmup→measured boundary detection never fired. Finalize the
+    // warmup timing and emit `ReplayWarmupComplete` here so the summary's
+    // "Warmup Replay" line still reflects the work that was done.
+    if !warmup_complete_emitted && warmup_done > 0 {
+        warmup_duration = start.elapsed();
+        bench_events::emit(
+            ev,
+            BenchEvent::ReplayWarmupComplete {
+                warmup_blocks: plan.total_warmup_entries,
+                duration: warmup_duration,
+            },
+        );
     }
 
     // Flush remaining metrics. On interruption, skip the last-chance model
@@ -948,9 +1054,11 @@ async fn execute_replay_plan(
                 count: remaining.len(),
             },
         );
+        let flush_start = Instant::now();
         app_db
             .save_block_metrics(run_model.id, remaining.into_iter(), &profiler_policy)
             .await?;
+        total_metrics_flush_duration += flush_start.elapsed();
     }
 
     // Build per-target summaries when the plan has more than one logical
@@ -995,6 +1103,11 @@ async fn execute_replay_plan(
             accumulator,
             target_summaries,
             total_checkpoint_duration: total_clarity_db_checkpoint_duration,
+            total_storage_delta_duration,
+            total_block_load_duration,
+            total_metrics_flush_duration,
+            warmup_duration,
+            storage_deltas: params.storage_deltas,
             was_interrupted: interrupted.load(Ordering::Relaxed),
         },
         shadow_dir,

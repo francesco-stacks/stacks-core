@@ -325,9 +325,13 @@ impl BenchRenderer {
                 warmup_blocks,
                 measured_blocks,
                 total_duration,
+                warmup_duration,
                 replay_duration,
                 checkpoint_duration,
                 overhead,
+                storage_delta_duration,
+                block_load_duration,
+                metrics_flush_duration,
                 interrupted,
             } => {
                 let mut table = Table::new()
@@ -341,6 +345,12 @@ impl BenchRenderer {
                     "Total Duration".into(),
                     format!("{total_duration:.2?}"),
                 ]);
+                if warmup_blocks > 0 {
+                    table.row(vec![
+                        "Warmup Replay".into(),
+                        format!("{warmup_duration:.2?}"),
+                    ]);
+                }
                 table.row(vec![
                     "Block Replay".into(),
                     format!("{replay_duration:.2?}"),
@@ -353,6 +363,27 @@ impl BenchRenderer {
                     "Benchmarking Overhead".into(),
                     format!("{overhead:.2?}"),
                 ]);
+                // Sub-breakdown of the overhead bucket. "Other" captures
+                // everything left after subtracting the three measured
+                // pieces (profiler clear/take, BlockMetrics construction,
+                // loop scaffolding, event channel sends).
+                let other_overhead = overhead
+                    .saturating_sub(storage_delta_duration)
+                    .saturating_sub(block_load_duration)
+                    .saturating_sub(metrics_flush_duration);
+                table.row(vec![
+                    "  Storage Delta".into(),
+                    format!("{storage_delta_duration:.2?}"),
+                ]);
+                table.row(vec![
+                    "  Block Load".into(),
+                    format!("{block_load_duration:.2?}"),
+                ]);
+                table.row(vec![
+                    "  Metrics Flush".into(),
+                    format!("{metrics_flush_duration:.2?}"),
+                ]);
+                table.row(vec!["  Other".into(), format!("{other_overhead:.2?}")]);
                 if interrupted {
                     let planned = total_blocks - warmup_blocks;
                     table.row(vec![

@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use blockstack_lib::burnchains::{Burnchain, Txid};
+use blockstack_lib::burnchains::Txid;
 use blockstack_lib::chainstate::burn::db::sortdb::{SortitionDB, get_ancestor_sort_id};
 use blockstack_lib::chainstate::nakamoto::NakamotoChainState;
 use blockstack_lib::chainstate::nakamoto::miner::{MinerTenureInfoCause, NakamotoBlockBuilder};
@@ -180,13 +180,20 @@ fn compute_synthetic_id(
 /// Re-execute all transactions in a block to measure execution performance.
 ///
 /// Segmented mode returns 0..N measurement units (one per recorded segment).
+///
+/// `sample_metrics = false` short-circuits all per-block instrumentation that
+/// is only useful for measured-block accounting: profiler spans, per-phase
+/// `Instant` timing, `BlockMetrics` construction, and the per-segment
+/// `checkpoint_sqlite_dbs()` call. Pass `false` for warmup repetitions, which
+/// run the block for cache/state-warming purposes and discard the metrics.
 pub fn replay_block<F>(
     context: &mut BenchContext,
     chainstate: &mut StacksChainState,
-    burnchain: &Burnchain,
+    sortdb: &SortitionDB,
     mode: &ReplayMode,
     block_header: &StacksBlockHeader,
     repetition: u32,
+    sample_metrics: bool,
     on_segment: Option<&mut F>,
 ) -> Result<Option<Vec<BlockMetrics>>>
 where
@@ -213,10 +220,11 @@ where
 
                     let seg_metrics = replay_nakamoto_by_segments(
                         chainstate,
-                        burnchain,
+                        sortdb,
                         &naka_block,
                         &segments,
                         repetition,
+                        sample_metrics,
                         on_segment,
                     )?;
 
@@ -240,10 +248,11 @@ where
                     // uses Profiler::clear() / take_results() per recorded segment.
                     let seg_metrics = replay_nakamoto_by_segments(
                         chainstate,
-                        burnchain,
+                        sortdb,
                         &naka_block,
                         &segments,
                         repetition,
+                        sample_metrics,
                         on_segment,
                     )?;
 
@@ -263,10 +272,11 @@ where
 
                     let seg_metrics = replay_nakamoto_by_segments(
                         chainstate,
-                        burnchain,
+                        sortdb,
                         &naka_block,
                         &segments,
                         repetition,
+                        sample_metrics,
                         on_segment,
                     )?;
 
@@ -290,10 +300,11 @@ where
 
 fn replay_nakamoto_by_segments<F>(
     chainstate: &mut StacksChainState,
-    burnchain: &Burnchain,
+    sortdb: &SortitionDB,
     block: &blockstack_lib::chainstate::nakamoto::NakamotoBlock,
     segments: &[TxSegment],
     repetition: u32,
+    sample_metrics: bool,
     mut on_segment: Option<&mut F>,
 ) -> Result<Vec<BlockMetrics>>
 where
@@ -309,9 +320,6 @@ where
     let parent_info = NakamotoChainState::get_block_header(chainstate.db(), &parent_block_id)?
         .ok_or_else(|| anyhow!("Parent header not found"))?;
 
-    // Reuse one sortdb handle across all segments
-    let sortdb = burnchain.open_sortition_db(true)?;
-
     // Keep track of the current parent header info across segments
     let mut cur_parent_info = parent_info.clone();
 
@@ -323,22 +331,30 @@ where
             continue;
         }
 
+        // Effective sampling combines per-segment intent with the run-level
+        // `sample_metrics` flag. Warmup repetitions pass `sample_metrics=false`
+        // to bypass profiler spans, per-phase `Instant` timing, BlockMetrics
+        // construction, and the per-segment checkpoint.
+        let measure = sample_metrics && seg.sampled;
+
         // Get segment size and transactions
         let segment_txs = &block.txs[seg.range.clone()];
 
-        // Suppress profiler recording for unmeasured segments.
-        let _suppression = if !seg.sampled {
+        // Suppress profiler recording for unmeasured segments inside a sampled
+        // run. When `sample_metrics=false`, the surrounding code skips all
+        // profiler calls anyway so suppression is moot.
+        let _suppression = if sample_metrics && !seg.sampled {
             Some(stacks_profiler::Profiler::begin_suppression())
         } else {
             None
         };
 
         // For measured segments, start a fresh profiler tree for this segment.
-        if seg.sampled {
+        if measure {
             stacks_profiler::Profiler::clear();
         }
 
-        let _segment_root = if seg.sampled {
+        let _segment_root = if measure {
             stacks_profiler::span!("Segment", seg_ix)
         } else {
             None
@@ -347,13 +363,9 @@ where
         // -------------------------------------------------------------------
         // PHASE 1: SETUP
         // -------------------------------------------------------------------
-        let setup_start = if seg.sampled {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        let setup_start = if measure { Some(Instant::now()) } else { None };
 
-        let _setup_guard = if seg.sampled {
+        let _setup_guard = if measure {
             stacks_profiler::span!("Segment: Setup", seg_ix)
         } else {
             None
@@ -380,7 +392,7 @@ where
 
         let exec_result = execute_segment(
             chainstate,
-            &sortdb,
+            sortdb,
             &cur_parent_info,
             block,
             seg,
@@ -390,6 +402,7 @@ where
             segment_cause,
             setup_start,
             repetition,
+            measure,
         )
         .with_context(|| {
             format!("Failed to replay segment {seg_ix} from origin block {origin_id}")
@@ -400,16 +413,23 @@ where
         last_state_index_root = Some(exec_result.state_index_root);
 
         // Grab all profiler roots for this segment.
-        let segment_profiler_roots = if seg.sampled {
+        let segment_profiler_roots = if measure {
             stacks_profiler::Profiler::take_results()
         } else {
             vec![]
         };
 
-        // Checkpoint the Clarity state db to ensure writes are flushed from the WAL.
-        let checkpoint_start = Instant::now();
-        chainstate.checkpoint_sqlite_dbs()?;
-        let clarity_db_checkpoint_duration = checkpoint_start.elapsed();
+        // Checkpoint the Clarity state db to ensure writes are flushed from
+        // the WAL. Skipped during warmup (`sample_metrics=false`): the caller
+        // runs one checkpoint at the warmup→measured boundary so the first
+        // measured block doesn't have to absorb warmup's accumulated WAL.
+        let clarity_db_checkpoint_duration = if sample_metrics {
+            let checkpoint_start = Instant::now();
+            chainstate.checkpoint_sqlite_dbs()?;
+            checkpoint_start.elapsed()
+        } else {
+            Duration::ZERO
+        };
 
         // Advance parent for the next segment so burn_view inheritance works
         cur_parent_info = exec_result.new_tip_info;
@@ -423,7 +443,7 @@ where
             sampled: seg.sampled,
         };
 
-        if seg.sampled {
+        if measure {
             let synthetic_id = compute_synthetic_id(&origin_id, seg_ix, &seg.range, repetition);
 
             let mut m = BlockMetrics::new_default(origin_id.clone(), synthetic_id.clone());
@@ -512,6 +532,7 @@ fn execute_segment(
     segment_cause: MinerTenureInfoCause,
     setup_start: Option<Instant>,
     repetition: u32,
+    measure: bool,
 ) -> Result<SegmentExecResult> {
     // Vary the timestamp per repetition so each synthetic block gets a
     // unique block hash.  This prevents MARF key / header-table collisions
@@ -605,13 +626,9 @@ fn execute_segment(
     let setup_duration = setup_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
 
     // ---------------- TRANSACTION EXECUTION ----------------
-    let exec_start = if seg.sampled {
-        Some(Instant::now())
-    } else {
-        None
-    };
+    let exec_start = if measure { Some(Instant::now()) } else { None };
 
-    let _exec_guard = if seg.sampled {
+    let _exec_guard = if measure {
         stacks_profiler::span!("Segment: Tx Execution", seg_ix)
     } else {
         None
@@ -627,15 +644,11 @@ fn execute_segment(
         let tx = &block.txs[i];
         let tx_len = tx.tx_len();
 
-        let tx_start = if seg.sampled {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        let tx_start = if measure { Some(Instant::now()) } else { None };
 
         let rel_i = i - seg.range.start;
 
-        let _tx_guard = if seg.sampled {
+        let _tx_guard = if measure {
             stacks_profiler::span!("Transaction", rel_i)
         } else {
             None
@@ -666,7 +679,7 @@ fn execute_segment(
             }
         };
 
-        if seg.sampled {
+        if measure {
             let cost = success.receipt.execution_cost.clone();
             segment_total_clarity_cost.add(&cost)?;
             segment_tx_metrics.push((tx.txid(), dur, cost));
@@ -678,11 +691,7 @@ fn execute_segment(
     let execution_duration = exec_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
 
     // ---------------- COMMIT ----------------
-    let commit_start = if seg.sampled {
-        Some(Instant::now())
-    } else {
-        None
-    };
+    let commit_start = if measure { Some(Instant::now()) } else { None };
 
     let total_tenure_cost = clarity_tx.cost_so_far();
     let mut block_execution_cost = clarity_tx.cost_so_far();
@@ -690,7 +699,7 @@ fn execute_segment(
 
     let segment_block_size = builder.get_bytes_so_far();
 
-    let _finalize_guard = if seg.sampled {
+    let _finalize_guard = if measure {
         stacks_profiler::span!("Segment: Finalize (merkle+seal)", seg_ix)
     } else {
         None
@@ -704,7 +713,7 @@ fn execute_segment(
 
     drop(_finalize_guard);
 
-    let _clarity_commit_guard = if seg.sampled {
+    let _clarity_commit_guard = if measure {
         stacks_profiler::span!("Segment: Clarity State Commit", seg_ix)
     } else {
         None
@@ -761,7 +770,7 @@ fn execute_segment(
         None
     };
 
-    let _advance_chain_tip_guard = if seg.sampled {
+    let _advance_chain_tip_guard = if measure {
         stacks_profiler::span!("Segment: Advance Chain Tip", seg_ix)
     } else {
         None
@@ -794,7 +803,7 @@ fn execute_segment(
 
     drop(_advance_chain_tip_guard);
 
-    let _index_commit_guard = if seg.sampled {
+    let _index_commit_guard = if measure {
         stacks_profiler::span!("Segment: Index Commit", seg_ix)
     } else {
         None

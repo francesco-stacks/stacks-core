@@ -158,6 +158,16 @@ pub struct RunArgs {
     #[serde(default)]
     no_profiler: bool,
 
+    /// Track per-block storage growth in the shadow directory and persist
+    /// the deltas in `stacks_block_stats.total_storage_delta`, plus emit a
+    /// cumulative storage-growth summary at the end of the run. Off by
+    /// default because `calculate_storage_delta()` does a filesystem walk
+    /// per block and is a meaningful overhead at scale (25-50k+ blocks).
+    /// When off, persisted `total_storage_delta` rows are stored as `0`.
+    #[arg(long = "storage-deltas", default_value_t = false)]
+    #[serde(default)]
+    storage_deltas: bool,
+
     /// Persist non-stacks-bench profiler spans only when a timing metric
     /// reaches this threshold. Bare durations use inclusive wall time. Prefix
     /// with `wall:`, `self-wall:`, `cpu:`, `self-cpu:`, `wait:`, or
@@ -285,6 +295,7 @@ impl From<&RunArgs> for BenchRunParams {
             ignore_span: args.ignore_span.clone(),
             no_profiler_kv: args.no_profiler_kv,
             include_pre_nakamoto_blocks: args.include_pre_nakamoto_blocks,
+            storage_deltas: args.storage_deltas,
             shadow_dir_root: args.shadow_dir_root.clone(),
             name: args.name.clone(),
         }

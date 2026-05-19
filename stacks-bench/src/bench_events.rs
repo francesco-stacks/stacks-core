@@ -137,9 +137,30 @@ pub enum BenchEvent {
         warmup_blocks: usize,
         measured_blocks: usize,
         total_duration: Duration,
+        /// Wall time of the warmup phase, including periodic warmup
+        /// checkpoints and the warmup→measured boundary checkpoint. Zero
+        /// when `--warmup 0`. Bucketed separately so warmup wall time
+        /// doesn't get mis-attributed to "Benchmarking Overhead".
+        warmup_duration: Duration,
         replay_duration: Duration,
         checkpoint_duration: Duration,
+        /// Total benchmarking overhead, computed as
+        /// `total_duration - warmup_duration - replay_duration - checkpoint_duration`.
+        /// Further broken down by [`Self::ReplaySummary::storage_delta_duration`],
+        /// [`Self::ReplaySummary::block_load_duration`], and
+        /// [`Self::ReplaySummary::metrics_flush_duration`]. Whatever's left
+        /// after subtracting those three is "other" overhead (profiler ops,
+        /// loop scaffolding, event channel sends, etc.).
         overhead: Duration,
+        /// Cumulative time spent in per-segment `calculate_storage_delta()`
+        /// (filesystem walk over the shadow dir).
+        storage_delta_duration: Duration,
+        /// Cumulative time spent in `AppDb::get_block` (per-block load from
+        /// the indexed AppDb).
+        block_load_duration: Duration,
+        /// Cumulative time spent in `AppDb::save_block_metrics` calls
+        /// (batched persistence of measured-block metrics).
+        metrics_flush_duration: Duration,
         interrupted: bool,
     },
     /// Benchmark metrics summary computed.
