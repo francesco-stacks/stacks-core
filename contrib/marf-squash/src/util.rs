@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use stacks_common::types::StacksEpochId;
-use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
+use stacks_common::types::chainstate::{ConsensusHash, SortitionId, StacksBlockId};
 use stacks_common::util::hash::to_hex;
 use stackslib::burnchains::PoxConstants;
 use stackslib::chainstate::burn::db::sortdb::SortitionDB;
@@ -471,99 +471,54 @@ pub fn build_pox_constants(mainnet: bool, config_path: Option<&Path>) -> PoxCons
     }
 }
 
-/// Read first_burn_height from the sortition DB.
-pub fn read_first_burn_height(sortition_db_path: &str) -> u64 {
-    let conn = rusqlite::Connection::open_with_flags(
-        sortition_db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to open sortition DB: {e}");
-        std::process::exit(1);
-    });
-    conn.query_row(
-        "SELECT MIN(block_height) FROM snapshots WHERE pox_valid = 1",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to read first burn height from sortition DB: {e}");
-        std::process::exit(1);
-    }) as u64
+/// Canonical Stacks and sortition MARF boundaries that must be squashed together.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct CanonicalSquashTargets {
+    pub tenure_consensus_hash: ConsensusHash,
+    pub stacks_height: u32,
+    pub stacks_tip: StacksBlockId,
+    /// Bitcoin height for the tenure tip's `burn_view`.
+    pub tenure_end_burn_height: u64,
+    /// Sortition MARF height for `tenure_end_burn_height`.
+    pub sortition_marf_height: u32,
+    pub sortition_canonical_tip: SortitionId,
+    /// Sortition id that must resolve at `sortition_marf_height`.
+    pub sortition_boundary_id: SortitionId,
+    pub first_burn_height: u64,
 }
 
-/// Convert a Bitcoin block height to the sortition MARF height.
-/// sortition_marf_height = bitcoin_height - first_burn_height
-pub fn bitcoin_height_to_sortition_marf_height(
-    sortition_db_path: &str,
-    bitcoin_height: u64,
-) -> u32 {
-    let first_burn_height = read_first_burn_height(sortition_db_path);
-    if bitcoin_height < first_burn_height {
-        eprintln!("Bitcoin height {bitcoin_height} is below first burn height {first_burn_height}");
-        std::process::exit(1);
-    }
-    (bitcoin_height - first_burn_height) as u32
-}
-
-/// Return the canonical sortition tip `SortitionId` from a sortition DB.
-///
-/// `MARF::squash_to_path` and `MARF::validate_squashed_at_height` need an
-/// explicit tip that lives on the canonical burn-chain fork; using the
-/// highest-`block_id` row (the default in `get_latest_confirmed_block_hash`)
-/// can pick a non-canonical fork on a sortition DB with reorgs.
-pub fn read_canonical_sortition_tip(
-    sortition_db_dir: &str,
-    pox_constants: PoxConstants,
-) -> Result<SortitionId, String> {
-    let sortition_db = SortitionDB::open(sortition_db_dir, false, pox_constants, None)
-        .map_err(|e| format!("Failed to open sortition DB at '{sortition_db_dir}': {e}"))?;
-    SortitionDB::get_canonical_burn_chain_tip(sortition_db.conn())
-        .map(|snapshot| snapshot.sortition_id)
-        .map_err(|e| format!("Failed to read canonical burn-chain tip: {e}"))
-}
-
-/// Find the highest canonical Stacks block in the tenure that started at
-/// `bitcoin_height`.
-///
-/// Validates that the Bitcoin height is a canonical tenure start (sortition=true)
-/// by walking the canonical burn chain from the tip. Uses the existing
-/// `NakamotoChainState::find_highest_known_block_header_in_tenure_by_block_height`
-/// helper for burn_view-aware canonical selection.
-///
-/// Returns the (Stacks block height, canonical `StacksBlockId`) at the end of
-/// the tenure. The block id is the explicit tip that `MARF::squash_to_path`
-/// and `MARF::validate_squashed_at_height` require to walk the canonical fork,
-/// rather than letting the engine pick the highest-`block_id` row (which can
-/// pick a non-canonical fork).
-pub fn find_tenure_end_stacks_height(
+/// Resolve squash targets, widening the sortition boundary for tenure-extend burn views.
+pub fn resolve_canonical_squash_targets(
     chainstate_root: &str,
     sortition_db_dir: &str,
-    bitcoin_height: u64,
+    tenure_start_bitcoin_height: u64,
     mainnet: bool,
     chain_id: u32,
     pox_constants: PoxConstants,
-) -> Result<(u32, StacksBlockId), String> {
-    // Open the DBs with the correct APIs.
+) -> Result<CanonicalSquashTargets, String> {
+    let bitcoin_height = tenure_start_bitcoin_height;
+
     let (chainstate, _) = StacksChainState::open(mainnet, chain_id, chainstate_root, None)
         .map_err(|e| format!("Failed to open chainstate at '{chainstate_root}': {e}"))?;
 
     let sortition_db = SortitionDB::open(sortition_db_dir, false, pox_constants, None)
         .map_err(|e| format!("Failed to open sortition DB at '{sortition_db_dir}': {e}"))?;
 
-    // Walk the canonical burn chain to find the snapshot at this height.
+    let first_burn_height = sortition_db.first_block_height;
+
     let canonical_tip = SortitionDB::get_canonical_burn_chain_tip(sortition_db.conn())
         .map_err(|e| format!("Failed to get canonical burn tip: {e}"))?;
 
     let ic = sortition_db.index_handle_at_tip();
-    let snapshot =
+    let start_snapshot =
         SortitionDB::get_ancestor_snapshot(&ic, bitcoin_height, &canonical_tip.sortition_id)
             .map_err(|e| {
                 format!("Failed to get ancestor snapshot at burn height {bitcoin_height}: {e}")
             })?
             .ok_or_else(|| format!("No canonical sortition at Bitcoin height {bitcoin_height}"))?;
 
-    if !snapshot.sortition {
+    if !start_snapshot.sortition {
         // Find nearby tenure starts for a helpful error message.
         let mut nearby = Vec::new();
         let search_radius = 10u64;
@@ -598,18 +553,164 @@ pub fn find_tenure_end_stacks_height(
         ));
     }
 
-    // Use the existing NakamotoChainState helper for burn_view-aware selection.
-    let header = NakamotoChainState::find_highest_known_block_header_in_tenure_by_block_height(
+    let tenure_ch = start_snapshot.consensus_hash.clone();
+
+    let end_header = NakamotoChainState::find_highest_known_block_header_in_tenure_by_block_height(
         &chainstate,
         &sortition_db,
         bitcoin_height,
     )
     .map_err(|e| format!("Failed to find tenure end at burn height {bitcoin_height}: {e}"))?
     .ok_or_else(|| {
-        format!("No Nakamoto blocks found at Bitcoin height {bitcoin_height}. This may predate Nakamoto activation.")
+        format!(
+            "No Nakamoto blocks found at Bitcoin height {bitcoin_height}. \
+             This may predate Nakamoto activation."
+        )
     })?;
 
-    Ok((header.stacks_block_height as u32, header.index_block_hash()))
+    if end_header.consensus_hash != tenure_ch {
+        return Err(format!(
+            "Tenure CH mismatch: tenure-start sortition has CH {tenure_ch}, but \
+             highest known block in tenure has CH {}. Likely a re-org between \
+             the start sortition and the block headers table.",
+            end_header.consensus_hash
+        ));
+    }
+
+    let stacks_height: u32 = end_header.stacks_block_height.try_into().map_err(|_| {
+        format!(
+            "Tenure tip Stacks height {} does not fit in u32",
+            end_header.stacks_block_height
+        )
+    })?;
+    let stacks_tip = end_header.index_block_hash();
+
+    let header_burn_view = end_header.burn_view.clone().ok_or_else(|| {
+        format!(
+            "Nakamoto tenure tip {stacks_tip} (height {stacks_height}) has no \
+             burn_view set. Squash requires a Nakamoto block header with a \
+             burn_view."
+        )
+    })?;
+
+    let burn_view_snapshot =
+        SortitionDB::get_block_snapshot_consensus(sortition_db.conn(), &header_burn_view)
+            .map_err(|e| format!("Failed to load snapshot for burn_view {header_burn_view}: {e}"))?
+            .ok_or_else(|| {
+                format!("No snapshot found for tenure tip's burn_view {header_burn_view}")
+            })?;
+
+    let canonical_at_height = SortitionDB::get_ancestor_snapshot(
+        &ic,
+        burn_view_snapshot.block_height,
+        &canonical_tip.sortition_id,
+    )
+    .map_err(|e| {
+        format!(
+            "Failed to get canonical ancestor at burn height {}: {e}",
+            burn_view_snapshot.block_height
+        )
+    })?
+    .ok_or_else(|| {
+        format!(
+            "No canonical sortition at burn height {} (burn_view {header_burn_view})",
+            burn_view_snapshot.block_height
+        )
+    })?;
+
+    if canonical_at_height.sortition_id != burn_view_snapshot.sortition_id {
+        return Err(format!(
+            "Tenure tip's burn_view {header_burn_view} points at sortition_id \
+             {} (burn height {}), which is not on the canonical burn-chain \
+             fork. Cowardly refusing to squash a tenure that landed on an \
+             orphan burn fork.",
+            burn_view_snapshot.sortition_id, burn_view_snapshot.block_height
+        ));
+    }
+
+    let tenure_end_burn_height = burn_view_snapshot.block_height;
+    if tenure_end_burn_height < bitcoin_height {
+        return Err(format!(
+            "Tenure end burn height {tenure_end_burn_height} is earlier than \
+             tenure-start burn height {bitcoin_height}. Refusing to squash."
+        ));
+    }
+    if tenure_end_burn_height < first_burn_height {
+        return Err(format!(
+            "Tenure end burn height {tenure_end_burn_height} is below the \
+             sortition DB's first_burn_height {first_burn_height}"
+        ));
+    }
+
+    let sortition_marf_height: u32 = (tenure_end_burn_height - first_burn_height)
+        .try_into()
+        .map_err(|_| {
+            format!(
+                "Sortition MARF height {} does not fit in u32",
+                tenure_end_burn_height - first_burn_height
+            )
+        })?;
+
+    let sortition_boundary_id = burn_view_snapshot.sortition_id.clone();
+    let sortition_canonical_tip = canonical_tip.sortition_id.clone();
+
+    // The boundary snapshot must resolve back to the same canonical Stacks tip.
+    let runtime_tip = SortitionDB::get_canonical_nakamoto_tip_hash_and_height_and_burn_view(
+        sortition_db.conn(),
+        &burn_view_snapshot,
+    )
+    .map_err(|e| {
+        format!(
+            "Failed to resolve runtime canonical Nakamoto tip from boundary \
+             snapshot {sortition_boundary_id}: {e}"
+        )
+    })?
+    .ok_or_else(|| {
+        format!(
+            "Runtime canonical Nakamoto tip resolution returned None from \
+             boundary snapshot {sortition_boundary_id}"
+        )
+    })?;
+
+    let (runtime_ch, runtime_burn_view, runtime_bhh, runtime_height) = runtime_tip;
+    let runtime_block_id = StacksBlockId::new(&runtime_ch, &runtime_bhh);
+    if runtime_block_id != stacks_tip {
+        return Err(format!(
+            "Runtime canonical tip reconstruction mismatch: boundary snapshot \
+             {sortition_boundary_id} resolves to StacksBlockId {runtime_block_id} \
+             at height {runtime_height}, but the tenure tip header is \
+             StacksBlockId {stacks_tip} at height {stacks_height}. The squash \
+             boundary would leave the destination internally inconsistent."
+        ));
+    }
+    if runtime_height != end_header.stacks_block_height {
+        return Err(format!(
+            "Runtime canonical tip height mismatch: boundary snapshot resolves \
+             to height {runtime_height} but tenure tip is at height \
+             {stacks_height}"
+        ));
+    }
+    // The block id can match even when the burn-view mapping is corrupt.
+    if runtime_burn_view != header_burn_view {
+        return Err(format!(
+            "Runtime canonical tip burn_view mismatch: boundary snapshot \
+             resolves to burn_view {runtime_burn_view} but the tenure tip's \
+             burn_view is {header_burn_view}. The sortition DB's \
+             `stacks_chain_tips_by_burn_view` row for sortition \
+             {sortition_boundary_id} is internally inconsistent."
+        ));
+    }
+
+    Ok(CanonicalSquashTargets {
+        tenure_consensus_hash: tenure_ch,
+        stacks_height,
+        stacks_tip,
+        tenure_end_burn_height,
+        sortition_marf_height,
+        sortition_canonical_tip,
+        sortition_boundary_id,
+        first_burn_height,
+    })
 }
 
 /// Apply PoX overrides from a node config TOML file to the given PoxConstants.

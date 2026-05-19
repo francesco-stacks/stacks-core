@@ -9,11 +9,10 @@ use crate::ops::{
     validate_block_data, validate_one,
 };
 use crate::util::{
-    bitcoin_height_to_sortition_marf_height, build_pox_constants, chainstate_paths,
-    enforce_minimum_tenure_height, ensure_flag_requires, ensure_targets_selected,
-    find_tenure_end_stacks_height, read_canonical_sortition_tip, read_db_config,
-    read_first_burn_height, selected_targets, sortition_open_opts_for_path, squash_marf_open_opts,
-    target_out_paths, target_out_paths_sortition, warn_if_in_prepare_phase,
+    build_pox_constants, chainstate_paths, enforce_minimum_tenure_height, ensure_flag_requires,
+    ensure_targets_selected, read_db_config, resolve_canonical_squash_targets, selected_targets,
+    sortition_open_opts_for_path, squash_marf_open_opts, target_out_paths,
+    target_out_paths_sortition, warn_if_in_prepare_phase,
 };
 use crate::verify::verify_gss;
 
@@ -72,8 +71,7 @@ pub fn run_squash(args: SquashArgs) {
         .parent()
         .expect("cannot derive sortition dir from sortition db path");
 
-    // Find the Stacks height at the end of this tenure and its canonical tip.
-    let (stacks_height, stacks_tip) = find_tenure_end_stacks_height(
+    let targets = resolve_canonical_squash_targets(
         chainstate_root.to_str().unwrap(),
         sortition_db_dir.to_str().unwrap(),
         bitcoin_height,
@@ -86,26 +84,21 @@ pub fn run_squash(args: SquashArgs) {
         std::process::exit(1);
     });
 
+    let stacks_height = targets.stacks_height;
+    let stacks_tip = targets.stacks_tip.clone();
+    let sortition_marf_height = targets.sortition_marf_height;
+    let sortition_tip = targets.sortition_canonical_tip.clone();
+    let first_burn_height = targets.first_burn_height;
+
     eprintln!(
         "Squash at tenure start Bitcoin height {bitcoin_height}, \
-         Stacks tenure end height {stacks_height}, canonical Stacks tip {stacks_tip}"
+         Stacks tenure end height {stacks_height}, canonical Stacks tip {stacks_tip} \
+         (tenure end Bitcoin height {}, sortition MARF height {})",
+        targets.tenure_end_burn_height, sortition_marf_height
     );
 
     // Prepare-phase warning.
-    let first_burn_height = read_first_burn_height(paths.sortition.db.to_str().unwrap());
     warn_if_in_prepare_phase(bitcoin_height, &pox, first_burn_height);
-
-    // Sortition MARF height and canonical sortition tip.
-    let sortition_marf_height = bitcoin_height_to_sortition_marf_height(
-        paths.sortition.db.to_str().unwrap(),
-        bitcoin_height,
-    );
-    let sortition_tip =
-        read_canonical_sortition_tip(sortition_db_dir.to_str().unwrap(), pox.clone())
-            .unwrap_or_else(|e: String| {
-                eprintln!("{e}");
-                std::process::exit(1);
-            });
 
     let mut clarity_out = None;
     let mut index_out = None;
@@ -434,7 +427,7 @@ pub fn run_validate(args: ValidateArgs) {
         .parent()
         .expect("cannot derive sortition dir");
 
-    let (stacks_height, stacks_tip) = find_tenure_end_stacks_height(
+    let targets = resolve_canonical_squash_targets(
         chainstate_root.to_str().unwrap(),
         sortition_db_dir.to_str().unwrap(),
         bitcoin_height,
@@ -447,18 +440,11 @@ pub fn run_validate(args: ValidateArgs) {
         std::process::exit(1);
     });
 
-    let sortition_marf_height = bitcoin_height_to_sortition_marf_height(
-        source_paths.sortition.db.to_str().unwrap(),
-        bitcoin_height,
-    );
-    let sortition_tip =
-        read_canonical_sortition_tip(sortition_db_dir.to_str().unwrap(), pox.clone())
-            .unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1);
-            });
-
-    let first_burn_height = read_first_burn_height(source_paths.sortition.db.to_str().unwrap());
+    let stacks_height = targets.stacks_height;
+    let stacks_tip = targets.stacks_tip.clone();
+    let sortition_marf_height = targets.sortition_marf_height;
+    let sortition_tip = targets.sortition_canonical_tip.clone();
+    let first_burn_height = targets.first_burn_height;
 
     let mut all_valid = true;
 
