@@ -104,6 +104,16 @@ pub struct BenchRunParams {
     /// and the post-run cumulative `StorageSummary` event is suppressed.
     #[serde(default)]
     pub storage_deltas: bool,
+    /// **DESTRUCTIVE.** Skip the reflink/CoW copy of the source chainstate
+    /// and run the bench directly against `source_dir`. Writes during the
+    /// bench will mutate the source data permanently. Intended only for
+    /// ephemeral-VM setups where the host has already CoW-copied the disk
+    /// image attached to the VM, so an in-VM copy would add a redundant
+    /// CoW layer. Mutually exclusive with `storage_deltas` (passthrough
+    /// has no base directory to compute deltas against). Not persisted
+    /// across reruns — `bench rerun` always defaults this back to `false`.
+    #[serde(skip)]
+    pub dangerous_no_chainstate_copy: bool,
     /// Override the parent directory under which the shadow tempdir is
     /// created. Useful for sandboxed environments where the default
     /// (`source_dir.parent()`) is not writable. The shadow tempdir is still
@@ -357,13 +367,27 @@ async fn scan_for_txid(
     }
 }
 
-/// Create a shadow directory, emitting lifecycle events.
+/// Create a shadow directory, emitting lifecycle events. When `passthrough`
+/// is `true`, skip the CoW copy entirely and operate directly on
+/// `source_dir` — see [`ShadowDir::passthrough`] for the destructive
+/// semantics. Emits [`BenchEvent::ChainstatePassthroughEnabled`] instead of
+/// the normal `ShadowDir{Started,Complete}` pair in that case.
 fn create_shadow_dir_with_events(
     source_dir: &Path,
     include_pre_nakamoto: bool,
     shadow_dir_root: Option<&Path>,
+    passthrough: bool,
     ev: &BenchEventSender,
 ) -> Result<ShadowDir> {
+    if passthrough {
+        bench_events::emit(
+            ev,
+            BenchEvent::ChainstatePassthroughEnabled {
+                source: source_dir.display().to_string(),
+            },
+        );
+        return ShadowDir::passthrough(source_dir);
+    }
     bench_events::emit(ev, BenchEvent::ShadowDirStarted);
     let timer = Instant::now();
     let shadow_dir = create_shadow_dir(source_dir, include_pre_nakamoto, shadow_dir_root)?;
@@ -1142,6 +1166,7 @@ pub async fn run_benchmark(
         &params.source_dir,
         params.include_pre_nakamoto_blocks,
         params.shadow_dir_root.as_deref(),
+        params.dangerous_no_chainstate_copy,
         &ev,
     )?;
 
@@ -1168,6 +1193,18 @@ fn validate_run_params(params: &BenchRunParams) -> Result<()> {
     }
     if !params.span.is_empty() && !params.ignore_span.is_empty() {
         bail!("--span and --ignore-span are mutually exclusive");
+    }
+    if params.dangerous_no_chainstate_copy && params.storage_deltas {
+        bail!(
+            "--dangerous-no-chainstate-copy and --storage-deltas are mutually exclusive: \
+             passthrough mode has no base directory to compute per-block storage deltas against"
+        );
+    }
+    if params.dangerous_no_chainstate_copy && params.shadow_dir_root.is_some() {
+        bail!(
+            "--dangerous-no-chainstate-copy and --shadow-dir-root are mutually exclusive: \
+             passthrough mode does not create a shadow directory, so the parent override has no effect"
+        );
     }
 
     // `--contract` is a stricter form of `--filter contract-call` and targets
@@ -1235,7 +1272,11 @@ async fn run_benchmark_range(
             network: env.network.to_string(),
             epochs: env.epochs.iter().map(|e| e.to_string()).collect(),
             source_dir: shadow_dir.source().display().to_string(),
-            shadow_dir: shadow_dir.path().display().to_string(),
+            shadow_dir: if shadow_dir.is_passthrough() {
+                "<skipped - no copy>".to_string()
+            } else {
+                shadow_dir.path().display().to_string()
+            },
             target_txid: None,
             target_block: None,
             target_block_height: None,
@@ -1305,7 +1346,11 @@ async fn run_benchmark_txids(
             network: env.network.to_string(),
             epochs: env.epochs.iter().map(|e| e.to_string()).collect(),
             source_dir: shadow_dir.source().display().to_string(),
-            shadow_dir: shadow_dir.path().display().to_string(),
+            shadow_dir: if shadow_dir.is_passthrough() {
+                "<skipped - no copy>".to_string()
+            } else {
+                shadow_dir.path().display().to_string()
+            },
             target_txid: txid_summary,
             target_block: None,
             target_block_height: None,
@@ -1515,7 +1560,11 @@ async fn run_benchmark_blocks(
             network: env.network.to_string(),
             epochs: env.epochs.iter().map(|e| e.to_string()).collect(),
             source_dir: shadow_dir.source().display().to_string(),
-            shadow_dir: shadow_dir.path().display().to_string(),
+            shadow_dir: if shadow_dir.is_passthrough() {
+                "<skipped - no copy>".to_string()
+            } else {
+                shadow_dir.path().display().to_string()
+            },
             target_txid: None,
             target_block,
             target_block_height,

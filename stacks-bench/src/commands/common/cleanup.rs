@@ -10,8 +10,18 @@ pub async fn run_cleanup_with_events(
     shadow_dir: ShadowDir,
     ev: &BenchEventSender,
 ) -> Result<()> {
-    bench_events::emit(ev, BenchEvent::CleanupStarted);
+    let is_passthrough = shadow_dir.is_passthrough();
+    bench_events::emit(
+        ev,
+        BenchEvent::CleanupStarted {
+            passthrough: is_passthrough,
+        },
+    );
 
+    // In passthrough mode there's no temp dir to remove — dropping the
+    // ShadowDir is a no-op, and emitting `CleanupShadowDirComplete` would be
+    // misleading ("Shadow directory removed" against the user's actual
+    // chainstate). Just drop synchronously and skip the event.
     let shadow_start = Instant::now();
     let shadow_handle = tokio::task::spawn_blocking(move || drop(shadow_dir));
 
@@ -43,12 +53,14 @@ pub async fn run_cleanup_with_events(
     });
 
     let _ = shadow_handle.await;
-    bench_events::emit(
-        ev,
-        BenchEvent::CleanupShadowDirComplete {
-            duration: shadow_start.elapsed(),
-        },
-    );
+    if !is_passthrough {
+        bench_events::emit(
+            ev,
+            BenchEvent::CleanupShadowDirComplete {
+                duration: shadow_start.elapsed(),
+            },
+        );
+    }
 
     // Best-effort: don't fail the run if cleanup fails
     let _ = db_handle.await;

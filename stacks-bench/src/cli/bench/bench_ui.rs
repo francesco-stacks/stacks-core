@@ -105,6 +105,13 @@ impl BenchRenderer {
                     ));
                 }
             }
+            BenchEvent::ChainstatePassthroughEnabled { source } => {
+                cliclack::log::warning(format!(
+                    "DESTRUCTIVE: --dangerous-no-chainstate-copy is enabled. \
+                     Running directly against {source}; writes during the bench will mutate \
+                     the source chainstate permanently."
+                ))?;
+            }
 
             // --- Environment ---
             BenchEvent::EnvironmentReady {
@@ -401,14 +408,18 @@ impl BenchRenderer {
             }
 
             // --- Cleanup ---
-            BenchEvent::CleanupStarted => {
+            BenchEvent::CleanupStarted { passthrough } => {
                 let multi = cliclack::multi_progress("Cleaning up");
-                // Pre-create spinners for parallel cleanup tasks
-                let shadow_spinner = multi.add(cliclack::spinner());
-                shadow_spinner.start("Removing shadow directory...");
+                // In passthrough mode there's no shadow dir to remove, so
+                // skip its spinner — the matching `CleanupShadowDirComplete`
+                // event never fires.
+                if !passthrough {
+                    let shadow_spinner = multi.add(cliclack::spinner());
+                    shadow_spinner.start("Removing shadow directory...");
+                    self.cleanup_shadow_spinner = Some(shadow_spinner);
+                }
                 let db_spinner = multi.add(cliclack::spinner());
                 db_spinner.start("Checkpointing database...");
-                self.cleanup_shadow_spinner = Some(shadow_spinner);
                 self.cleanup_db_spinner = Some(db_spinner);
                 self.cleanup_multi = Some(multi);
             }

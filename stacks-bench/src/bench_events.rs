@@ -43,6 +43,11 @@ pub enum BenchEvent {
     ShadowDirStarted,
     /// Shadow directory created successfully.
     ShadowDirComplete { duration: Duration },
+    /// `--dangerous-no-chainstate-copy` was enabled: no CoW copy was taken
+    /// and the bench is running directly against the source chainstate.
+    /// UI should render a prominent warning since writes will mutate the
+    /// source data permanently.
+    ChainstatePassthroughEnabled { source: String },
 
     /// Environment resolved and ready.
     EnvironmentReady {
@@ -169,8 +174,10 @@ pub enum BenchEvent {
     StorageSummary(ShadowDirDeltaReport),
 
     // --- Cleanup phase ---
-    /// Cleanup started (shadow dir removal + DB checkpoint/vacuum).
-    CleanupStarted,
+    /// Cleanup started (shadow dir removal + DB checkpoint/vacuum). In
+    /// passthrough mode (`--dangerous-no-chainstate-copy`) there is no
+    /// shadow dir to remove, so UIs should skip the corresponding spinner.
+    CleanupStarted { passthrough: bool },
     /// Shadow directory removed.
     CleanupShadowDirComplete { duration: Duration },
     /// DB checkpoint + vacuum complete.

@@ -168,6 +168,18 @@ pub struct RunArgs {
     #[serde(default)]
     storage_deltas: bool,
 
+    /// **DESTRUCTIVE.** Skip the reflink/CoW copy of the source chainstate
+    /// and run the bench directly against `--source`. Writes during the
+    /// bench will mutate the source data permanently. Intended for
+    /// ephemeral-VM setups where the host has already CoW-copied the disk
+    /// image attached to the VM, so an in-VM copy would add a redundant
+    /// CoW layer. Mutually exclusive with `--storage-deltas`. Not
+    /// persisted in the run record — `bench rerun` always defaults this
+    /// back to `false`.
+    #[arg(long = "dangerous-no-chainstate-copy", default_value_t = false)]
+    #[serde(skip)]
+    dangerous_no_chainstate_copy: bool,
+
     /// Persist non-stacks-bench profiler spans only when a timing metric
     /// reaches this threshold. Bare durations use inclusive wall time. Prefix
     /// with `wall:`, `self-wall:`, `cpu:`, `self-cpu:`, `wait:`, or
@@ -296,6 +308,7 @@ impl From<&RunArgs> for BenchRunParams {
             no_profiler_kv: args.no_profiler_kv,
             include_pre_nakamoto_blocks: args.include_pre_nakamoto_blocks,
             storage_deltas: args.storage_deltas,
+            dangerous_no_chainstate_copy: args.dangerous_no_chainstate_copy,
             shadow_dir_root: args.shadow_dir_root.clone(),
             name: args.name.clone(),
         }

@@ -22,7 +22,10 @@ pub struct ShadowDirDeltaReport {
 
 #[derive(Debug)]
 pub struct ShadowDir {
-    _tmp: TempDir,
+    /// `None` in passthrough mode (no CoW copy was taken; `root == source`).
+    /// `Some(TempDir)` in normal mode, where dropping the temp dir deletes
+    /// the CoW copy on cleanup.
+    _tmp: Option<TempDir>,
     source: PathBuf,
     root: PathBuf,
     watched_files: Vec<PathBuf>,
@@ -38,6 +41,37 @@ impl ShadowDir {
     /// Prefix for temporary shadow directories.
     const TMP_PREFIX: &'static str = "stacks-bench-";
 
+    /// Construct a passthrough `ShadowDir` that operates **directly on the
+    /// source chainstate without taking a CoW copy**. Writes during a bench
+    /// run will mutate the source data permanently — intended only for
+    /// ephemeral-VM setups where the host has already CoW-copied the disk
+    /// image attached to the VM, so an additional in-VM copy would add a
+    /// redundant CoW layer.
+    ///
+    /// In passthrough mode, [`Self::calculate_storage_delta`] fails (there's
+    /// no base to compare against), [`Self::is_passthrough`] returns `true`,
+    /// and dropping the `ShadowDir` is a no-op (the source dir is left
+    /// intact).
+    pub fn passthrough<P: AsRef<Path>>(source: P) -> Result<Self> {
+        let source = source.as_ref();
+        let canonical = source.canonicalize().with_context(|| {
+            format!(
+                "Failed to canonicalize source dir {} for passthrough",
+                source.display()
+            )
+        })?;
+        Ok(Self {
+            _tmp: None,
+            source: canonical.clone(),
+            root: canonical,
+            watched_files: Vec::new(),
+        })
+    }
+
+    pub fn is_passthrough(&self) -> bool {
+        self._tmp.is_none()
+    }
+
     pub fn path(&self) -> &Path {
         &self.root
     }
@@ -51,14 +85,21 @@ impl ShadowDir {
     }
 
     /// Keep the temp directory instead of deleting it on drop, consuming this
-    /// [`ShadowDir`] and returning its path.
-    pub fn keep(self) -> PathBuf {
-        self._tmp.keep()
+    /// [`ShadowDir`] and returning its path. Returns `None` in passthrough
+    /// mode (there is no temp dir to keep).
+    pub fn keep(self) -> Option<PathBuf> {
+        self._tmp.map(|t| t.keep())
     }
 
     /// Calculates the storage delta between a base directory and a shadow directory.
     /// Returns a detailed report.
     pub fn calculate_storage_delta(&self) -> Result<ShadowDirDeltaReport> {
+        if self.is_passthrough() {
+            bail!(
+                "storage-delta is not supported in passthrough mode \
+                 (`--dangerous-no-chainstate-copy`); there is no base directory to compare against"
+            );
+        }
         let base_root = &self.source;
         let shadow_root = &self.root;
         let mut net_growth: i64 = 0;
@@ -378,7 +419,7 @@ impl ShadowDirBuilder {
         }
 
         Ok(ShadowDir {
-            _tmp: tmp,
+            _tmp: Some(tmp),
             root,
             source,
             watched_files: self.watch_files,

@@ -118,6 +118,16 @@ pub struct RunBenchmarkParams {
     #[serde(default)]
     pub storage_deltas: bool,
 
+    /// **DESTRUCTIVE.** Skip the reflink/CoW copy of the source chainstate
+    /// and run the bench directly against `source_dir`. Writes during the
+    /// bench will mutate the source data permanently. Intended only for
+    /// ephemeral-VM setups where the host has already CoW-copied the disk
+    /// image attached to the VM, so an in-VM copy would add a redundant
+    /// CoW layer. Mutually exclusive with `storage_deltas`. Not persisted
+    /// across reruns.
+    #[serde(default)]
+    pub dangerous_no_chainstate_copy: bool,
+
     /// Network name (e.g. `"mainnet"`, `"testnet"`). Inferred from the
     /// chainstate if omitted.
     #[serde(default)]
@@ -292,6 +302,7 @@ impl RunBenchmarkParams {
             no_profiler_kv: self.no_profiler_kv,
             include_pre_nakamoto_blocks: false,
             storage_deltas: self.storage_deltas,
+            dangerous_no_chainstate_copy: self.dangerous_no_chainstate_copy,
             shadow_dir_root: self.shadow_dir_root.map(PathBuf::from),
             name: self.name,
         })
@@ -396,6 +407,15 @@ pub(super) async fn forward_bench_events(
                 Some(&format!(
                     "Shadow directory ready ({:.1}s)",
                     duration.as_secs_f64()
+                )),
+            )),
+            BenchEvent::ChainstatePassthroughEnabled { source } => Some(progress(
+                &token,
+                0.0,
+                None,
+                Some(&format!(
+                    "DESTRUCTIVE: --dangerous-no-chainstate-copy enabled; \
+                     running directly against {source}"
                 )),
             )),
             BenchEvent::BaselineStarted {
@@ -518,7 +538,9 @@ pub(super) async fn forward_bench_events(
                     Some(&format!("Replay complete ({:.1}s)", duration.as_secs_f64())),
                 ))
             }
-            BenchEvent::CleanupStarted => Some(progress(&token, 0.0, None, Some("Cleaning up..."))),
+            BenchEvent::CleanupStarted { .. } => {
+                Some(progress(&token, 0.0, None, Some("Cleaning up...")))
+            }
             BenchEvent::CleanupComplete => {
                 Some(progress(&token, 0.0, None, Some("Cleanup complete")))
             }
