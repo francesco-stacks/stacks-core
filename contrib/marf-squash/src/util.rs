@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use stacks_common::types::StacksEpochId;
-use stacks_common::types::chainstate::{ConsensusHash, SortitionId, StacksBlockId};
+use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 use stacks_common::util::hash::to_hex;
 use stackslib::burnchains::PoxConstants;
 use stackslib::chainstate::burn::db::sortdb::SortitionDB;
@@ -44,10 +44,11 @@ const MAINNET_MIN_TENURE_HEIGHT: u64 = 943_331;
 /// * non-mainnet: the minimum is `epoch_3.4_start_height - 1`, derived
 ///   from the node config TOML.
 pub fn enforce_minimum_tenure_height(
-    bitcoin_height: u64,
+    bitcoin_height: u32,
     mainnet: bool,
     config_path: Option<&Path>,
 ) {
+    let bitcoin_height = u64::from(bitcoin_height);
     let min = if mainnet {
         MAINNET_MIN_TENURE_HEIGHT
     } else {
@@ -485,31 +486,27 @@ pub fn build_pox_constants(mainnet: bool, config_path: Option<&Path>) -> PoxCons
 
 /// Canonical Stacks and sortition MARF boundaries that must be squashed together.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CanonicalSquashTargets {
-    pub tenure_consensus_hash: ConsensusHash,
     pub stacks_height: u32,
     pub stacks_tip: StacksBlockId,
-    /// Bitcoin height for the tenure tip's `burn_view`.
-    pub tenure_end_burn_height: u64,
-    /// Sortition MARF height for `tenure_end_burn_height`.
+    /// Resolved Bitcoin height of the squash boundary (the tenure tip's `burn_view`).
+    pub squash_bitcoin_height: u32,
+    /// Sortition MARF height for `squash_bitcoin_height`.
     pub sortition_marf_height: u32,
     pub sortition_canonical_tip: SortitionId,
-    /// Sortition id that must resolve at `sortition_marf_height`.
-    pub sortition_boundary_id: SortitionId,
-    pub first_burn_height: u64,
+    pub first_bitcoin_height: u32,
 }
 
 /// Resolve squash targets, widening the sortition boundary for tenure-extend burn views.
 pub fn resolve_canonical_squash_targets(
     chainstate_root: &str,
     sortition_db_dir: &str,
-    tenure_start_bitcoin_height: u64,
+    tenure_start_bitcoin_height: u32,
     mainnet: bool,
     chain_id: u32,
     pox_constants: PoxConstants,
 ) -> Result<CanonicalSquashTargets, String> {
-    let bitcoin_height = tenure_start_bitcoin_height;
+    let start_height = u64::from(tenure_start_bitcoin_height);
 
     let (chainstate, _) = StacksChainState::open(mainnet, chain_id, chainstate_root, None)
         .map_err(|e| format!("Failed to open chainstate at '{chainstate_root}': {e}"))?;
@@ -517,27 +514,32 @@ pub fn resolve_canonical_squash_targets(
     let sortition_db = SortitionDB::open(sortition_db_dir, false, pox_constants, None)
         .map_err(|e| format!("Failed to open sortition DB at '{sortition_db_dir}': {e}"))?;
 
-    let first_burn_height = sortition_db.first_block_height;
+    let first_bitcoin_height: u32 = sortition_db.first_block_height.try_into().map_err(|_| {
+        format!(
+            "Sortition first_block_height {} does not fit in u32",
+            sortition_db.first_block_height
+        )
+    })?;
 
     let canonical_tip = SortitionDB::get_canonical_burn_chain_tip(sortition_db.conn())
         .map_err(|e| format!("Failed to get canonical burn tip: {e}"))?;
 
     let ic = sortition_db.index_handle_at_tip();
     let start_snapshot =
-        SortitionDB::get_ancestor_snapshot(&ic, bitcoin_height, &canonical_tip.sortition_id)
+        SortitionDB::get_ancestor_snapshot(&ic, start_height, &canonical_tip.sortition_id)
             .map_err(|e| {
-                format!("Failed to get ancestor snapshot at burn height {bitcoin_height}: {e}")
+                format!("Failed to get ancestor snapshot at Bitcoin height {start_height}: {e}")
             })?
-            .ok_or_else(|| format!("No canonical sortition at Bitcoin height {bitcoin_height}"))?;
+            .ok_or_else(|| format!("No canonical sortition at Bitcoin height {start_height}"))?;
 
     if !start_snapshot.sortition {
         // Find nearby tenure starts for a helpful error message.
         let mut nearby = Vec::new();
         let search_radius = 10u64;
-        let search_start = bitcoin_height.saturating_sub(search_radius);
-        let search_end = bitcoin_height.saturating_add(search_radius);
+        let search_start = start_height.saturating_sub(search_radius);
+        let search_end = start_height.saturating_add(search_radius);
         for h in search_start..=search_end {
-            if h == bitcoin_height {
+            if h == start_height {
                 continue;
             }
             if let Ok(Some(s)) =
@@ -560,7 +562,7 @@ pub fn resolve_canonical_squash_targets(
             )
         };
         return Err(format!(
-            "Bitcoin height {bitcoin_height} did not start a Nakamoto tenure \
+            "Bitcoin height {start_height} did not start a Nakamoto tenure \
              (sortition=false).{nearby_str}"
         ));
     }
@@ -570,12 +572,12 @@ pub fn resolve_canonical_squash_targets(
     let end_header = NakamotoChainState::find_highest_known_block_header_in_tenure_by_block_height(
         &chainstate,
         &sortition_db,
-        bitcoin_height,
+        start_height,
     )
-    .map_err(|e| format!("Failed to find tenure end at burn height {bitcoin_height}: {e}"))?
+    .map_err(|e| format!("Failed to find tenure end at Bitcoin height {start_height}: {e}"))?
     .ok_or_else(|| {
         format!(
-            "No Nakamoto blocks found at Bitcoin height {bitcoin_height}. \
+            "No Nakamoto blocks found at Bitcoin height {start_height}. \
              This may predate Nakamoto activation."
         )
     })?;
@@ -619,13 +621,13 @@ pub fn resolve_canonical_squash_targets(
     )
     .map_err(|e| {
         format!(
-            "Failed to get canonical ancestor at burn height {}: {e}",
+            "Failed to get canonical ancestor at Bitcoin height {}: {e}",
             burn_view_snapshot.block_height
         )
     })?
     .ok_or_else(|| {
         format!(
-            "No canonical sortition at burn height {} (burn_view {header_burn_view})",
+            "No canonical sortition at Bitcoin height {} (burn_view {header_burn_view})",
             burn_view_snapshot.block_height
         )
     })?;
@@ -633,37 +635,35 @@ pub fn resolve_canonical_squash_targets(
     if canonical_at_height.sortition_id != burn_view_snapshot.sortition_id {
         return Err(format!(
             "Tenure tip's burn_view {header_burn_view} points at sortition_id \
-             {} (burn height {}), which is not on the canonical burn-chain \
+             {} (Bitcoin height {}), which is not on the canonical burn-chain \
              fork. Cowardly refusing to squash a tenure that landed on an \
              orphan burn fork.",
             burn_view_snapshot.sortition_id, burn_view_snapshot.block_height
         ));
     }
 
-    let tenure_end_burn_height = burn_view_snapshot.block_height;
-    if tenure_end_burn_height < bitcoin_height {
+    let squash_bitcoin_height: u32 = burn_view_snapshot.block_height.try_into().map_err(|_| {
+        format!(
+            "Tenure end Bitcoin height {} does not fit in u32",
+            burn_view_snapshot.block_height
+        )
+    })?;
+    if squash_bitcoin_height < tenure_start_bitcoin_height {
         return Err(format!(
-            "Tenure end burn height {tenure_end_burn_height} is earlier than \
-             tenure-start burn height {bitcoin_height}. Refusing to squash."
+            "Tenure end Bitcoin height {squash_bitcoin_height} is earlier than \
+             tenure-start Bitcoin height {tenure_start_bitcoin_height}. Refusing to squash."
         ));
     }
-    if tenure_end_burn_height < first_burn_height {
+    if squash_bitcoin_height < first_bitcoin_height {
         return Err(format!(
-            "Tenure end burn height {tenure_end_burn_height} is below the \
-             sortition DB's first_burn_height {first_burn_height}"
+            "Tenure end Bitcoin height {squash_bitcoin_height} is below the \
+             sortition DB's first_bitcoin_height {first_bitcoin_height}"
         ));
     }
 
-    let sortition_marf_height: u32 = (tenure_end_burn_height - first_burn_height)
-        .try_into()
-        .map_err(|_| {
-            format!(
-                "Sortition MARF height {} does not fit in u32",
-                tenure_end_burn_height - first_burn_height
-            )
-        })?;
+    let sortition_marf_height = squash_bitcoin_height - first_bitcoin_height;
 
-    let sortition_boundary_id = burn_view_snapshot.sortition_id.clone();
+    let sortition_boundary_id = &burn_view_snapshot.sortition_id;
     let sortition_canonical_tip = canonical_tip.sortition_id.clone();
 
     // The boundary snapshot must resolve back to the same canonical Stacks tip.
@@ -714,14 +714,12 @@ pub fn resolve_canonical_squash_targets(
     }
 
     Ok(CanonicalSquashTargets {
-        tenure_consensus_hash: tenure_ch,
         stacks_height,
         stacks_tip,
-        tenure_end_burn_height,
+        squash_bitcoin_height,
         sortition_marf_height,
         sortition_canonical_tip,
-        sortition_boundary_id,
-        first_burn_height,
+        first_bitcoin_height,
     })
 }
 
@@ -766,12 +764,18 @@ pub fn apply_config_overrides(config_path: &Path, pox: &mut PoxConstants) {
 /// The cycle number is derived from the burn height directly using Nakamoto
 /// prepare-phase semantics: if inside the prepare phase, the corresponding
 /// cycle is the one being prepared for (i.e., the next cycle).
-pub fn warn_if_in_prepare_phase(bitcoin_height: u64, pox: &PoxConstants, first_burn_height: u64) {
-    if pox.is_in_naka_prepare_phase(first_burn_height, bitcoin_height) {
+pub fn warn_if_in_prepare_phase(
+    bitcoin_height: u32,
+    pox: &PoxConstants,
+    first_bitcoin_height: u32,
+) {
+    let bitcoin_height = u64::from(bitcoin_height);
+    let first_bitcoin_height = u64::from(first_bitcoin_height);
+    if pox.is_in_naka_prepare_phase(first_bitcoin_height, bitcoin_height) {
         // Derive the cycle being prepared for using the same Nakamoto-specific
         // semantics. In Nakamoto prepare phase (which excludes the mod-0 block),
         // the corresponding cycle is always current_cycle + 1.
-        let current_cycle = pox.block_height_to_reward_cycle(first_burn_height, bitcoin_height);
+        let current_cycle = pox.block_height_to_reward_cycle(first_bitcoin_height, bitcoin_height);
         if let Some(cycle) = current_cycle {
             let preparing_for = cycle + 1;
             eprintln!(

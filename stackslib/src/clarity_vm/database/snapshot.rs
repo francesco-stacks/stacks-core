@@ -212,12 +212,11 @@ fn resolve_required_contracts(
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
     let mut marf = MARF::<StacksBlockId>::from_path(src_db_path, open_opts)?;
     for contract_id in contract_ids.iter() {
-        let contract = QualifiedContractIdentifier::parse(contract_id)
-            .map_err(|e| {
-                Error::CorruptionError(format!(
-                    "Failed to parse contract identifier '{contract_id}': {e:?}"
-                ))
-            })?;
+        let contract = QualifiedContractIdentifier::parse(contract_id).map_err(|e| {
+            Error::CorruptionError(format!(
+                "Failed to parse contract identifier '{contract_id}': {e:?}"
+            ))
+        })?;
         let key = make_contract_hash_key(&contract);
         if marf.get(squashed_tip, &key)?.is_some() {
             required_contract_ids.insert(contract_id.clone());
@@ -313,12 +312,11 @@ pub fn validate_clarity_side_tables(
 
         for contract_id in sample_contract_ids.iter() {
             sample_contracts_checked += 1;
-            let contract = QualifiedContractIdentifier::parse(contract_id)
-                .map_err(|e| {
-                    Error::CorruptionError(format!(
-                        "Failed to parse contract identifier '{contract_id}': {e:?}"
-                    ))
-                })?;
+            let contract = QualifiedContractIdentifier::parse(contract_id).map_err(|e| {
+                Error::CorruptionError(format!(
+                    "Failed to parse contract identifier '{contract_id}': {e:?}"
+                ))
+            })?;
             let key = make_contract_hash_key(&contract);
             let trie_value = marf.get(&tip, &key)?;
             let Some(trie_value) = trie_value else {
@@ -374,12 +372,11 @@ pub fn validate_clarity_side_tables(
         let mut marf = MARF::<StacksBlockId>::from_path(dst_db_path, open_opts)?;
         let tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(marf.sqlite_conn())?;
         for contract_id in all_contract_ids_ordered.iter() {
-            let contract = QualifiedContractIdentifier::parse(contract_id)
-                .map_err(|e| {
-                    Error::CorruptionError(format!(
-                        "Failed to parse contract identifier '{contract_id}': {e:?}"
-                    ))
-                })?;
+            let contract = QualifiedContractIdentifier::parse(contract_id).map_err(|e| {
+                Error::CorruptionError(format!(
+                    "Failed to parse contract identifier '{contract_id}': {e:?}"
+                ))
+            })?;
             let key = make_contract_hash_key(&contract);
             if marf.get(&tip, &key)?.is_some() {
                 required_contract_ids.insert(contract_id.clone());

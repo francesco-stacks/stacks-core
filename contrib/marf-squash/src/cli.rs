@@ -38,7 +38,7 @@ pub struct SquashArgs {
     /// The snapshot includes the complete tenure: all Stacks blocks produced
     /// by the miner who won this sortition. Epoch 3.x (Nakamoto) only.
     #[arg(long, value_name = "HEIGHT")]
-    pub tenure_start_bitcoin_height: u64,
+    pub tenure_start_bitcoin_height: u32,
     /// Squash the Clarity MARF (chainstate/vm/clarity/marf.sqlite).
     #[arg(long)]
     pub clarity: bool,
@@ -83,7 +83,7 @@ pub struct ValidateArgs {
     pub squashed_chainstate: PathBuf,
     /// Bitcoin block height where the Nakamoto tenure started.
     #[arg(long, value_name = "HEIGHT")]
-    pub tenure_start_bitcoin_height: u64,
+    pub tenure_start_bitcoin_height: u32,
     /// Validate the Clarity MARF.
     #[arg(long)]
     pub clarity: bool,
@@ -127,7 +127,7 @@ pub struct VerifyArgs {
 #[derive(Deserialize)]
 pub struct CheckpointFile {
     pub stacks_height: u32,
-    pub bitcoin_height: u64,
+    pub bitcoin_height: u32,
     pub clarity_squash_root_node_hash: String,
     pub index_squash_root_node_hash: String,
     pub sortition_squash_root_node_hash: String,
@@ -161,7 +161,7 @@ pub struct SquashManifest {
 pub struct SnapshotSection {
     pub version: u32,
     pub stacks_height: u32,
-    pub bitcoin_height: u64,
+    pub bitcoin_height: u32,
     pub block_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitcoin_block_hash: Option<String>,

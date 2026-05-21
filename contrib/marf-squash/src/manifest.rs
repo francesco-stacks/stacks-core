@@ -4,6 +4,7 @@ use std::path::Path;
 
 use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, MarfConnection};
+use stackslib::chainstate::stacks::index::storage::SquashBoundary;
 use stackslib::chainstate::stacks::index::{MarfTrieId, trie_sql};
 
 use crate::cli::{
@@ -15,12 +16,19 @@ use crate::util::{
     squash_marf_open_opts,
 };
 
+/// Squash metadata read from a just-squashed MARF DB.
+pub struct ReadSquashMetadata<T: MarfTrieId> {
+    pub tip: T,
+    pub archival_root_hash: String,
+    pub squash_root_node_hash: String,
+    pub boundary: SquashBoundary,
+}
+
 /// Read squash metadata from a just-squashed MARF DB.
-/// Returns (tip, archival_root_hash, squash_root_node_hash, height).
 pub fn read_squash_metadata<T: MarfTrieId + std::fmt::Display>(
     db_path: &str,
     open_opts: MARFOpenOpts,
-) -> (T, String, Option<String>, u32) {
+) -> ReadSquashMetadata<T> {
     let marf = MARF::<T>::from_path(db_path, open_opts).unwrap_or_else(|e| {
         eprintln!("Failed to open squashed MARF for manifest: {e:?}");
         std::process::exit(1);
@@ -29,21 +37,20 @@ pub fn read_squash_metadata<T: MarfTrieId + std::fmt::Display>(
         eprintln!("Failed to read latest block hash: {e:?}");
         std::process::exit(1);
     });
-    let squash_info = trie_sql::read_squash_info(marf.sqlite_conn()).unwrap_or_else(|e| {
-        eprintln!("Failed to read squash info: {e:?}");
-        std::process::exit(1);
-    });
-    match squash_info {
-        Some((archival_hash, squash_hash, height)) => (
-            tip,
-            format!("0x{archival_hash}"),
-            squash_hash.map(|h| format!("0x{h}")),
-            height,
-        ),
-        None => {
+    let info = trie_sql::read_squash_info(marf.sqlite_conn())
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read squash info: {e:?}");
+            std::process::exit(1);
+        })
+        .unwrap_or_else(|| {
             eprintln!("No squash info found in DB");
             std::process::exit(1);
-        }
+        });
+    ReadSquashMetadata {
+        tip,
+        archival_root_hash: format!("0x{}", info.archival_marf_root_hash),
+        squash_root_node_hash: format!("0x{}", info.squash_root_node_hash),
+        boundary: info.boundary,
     }
 }
 
@@ -51,6 +58,25 @@ pub fn read_squash_metadata<T: MarfTrieId + std::fmt::Display>(
 fn insert_expected_rel(base: &Path, abs_path: &Path, set: &mut HashSet<String>) {
     if let Ok(rel) = abs_path.strip_prefix(base) {
         set.insert(rel.to_string_lossy().replace('\\', "/"));
+    }
+}
+
+/// Assert that a squashed DB stores the boundary the caller expected.
+/// Exits on mismatch.
+fn assert_manifest_boundary(label: &str, actual: SquashBoundary, expected: SquashBoundary) {
+    if actual.marf_height != expected.marf_height {
+        eprintln!(
+            "Manifest error: {label} squash MARF height {} != expected {}",
+            actual.marf_height, expected.marf_height
+        );
+        std::process::exit(1);
+    }
+    if actual.bitcoin_height != expected.bitcoin_height {
+        eprintln!(
+            "Manifest error: {label} squash Bitcoin height {} != expected {}",
+            actual.bitcoin_height, expected.bitcoin_height
+        );
+        std::process::exit(1);
     }
 }
 
@@ -101,44 +127,44 @@ pub fn generate_manifest(
     index_out: &TargetPaths,
     sortition_out: (&TargetPaths, u32),
     stacks_height: u32,
-    bitcoin_height: u64,
+    bitcoin_height: u32,
     blocks_section: BlocksSection,
     copied_block_rel_paths: &[String],
 ) {
-    let (i_tip, i_archival, i_squash, i_height) = read_squash_metadata::<StacksBlockId>(
+    let stacks_boundary = SquashBoundary {
+        marf_height: stacks_height,
+        bitcoin_height,
+    };
+
+    let index_meta = read_squash_metadata::<StacksBlockId>(
         index_out.db.to_str().unwrap(),
         squash_marf_open_opts(),
     );
+    assert_manifest_boundary("Index", index_meta.boundary, stacks_boundary);
 
-    if i_height != stacks_height {
-        eprintln!("Manifest error: Index squash height {i_height} != requested {stacks_height}");
-        std::process::exit(1);
-    }
-
-    let (c_tip, c_archival, c_squash, c_h) = read_squash_metadata::<StacksBlockId>(
+    let clarity_meta = read_squash_metadata::<StacksBlockId>(
         clarity_out.db.to_str().unwrap(),
         squash_marf_open_opts(),
     );
-    if c_h != stacks_height {
-        eprintln!("Manifest error: Clarity squash height {c_h} != requested {stacks_height}");
-        std::process::exit(1);
-    }
-    if c_tip != i_tip {
-        eprintln!("Manifest error: Clarity tip {c_tip} != Index tip {i_tip}");
+    assert_manifest_boundary("Clarity", clarity_meta.boundary, stacks_boundary);
+    if clarity_meta.tip != index_meta.tip {
+        eprintln!(
+            "Manifest error: Clarity tip {} != Index tip {}",
+            clarity_meta.tip, index_meta.tip
+        );
         std::process::exit(1);
     }
 
     let (sortition_paths, sortition_marf_height) = sortition_out;
-    let (_s_tip, s_archival, s_squash, s_h) = read_squash_metadata::<SortitionId>(
+    let sortition_meta = read_squash_metadata::<SortitionId>(
         sortition_paths.db.to_str().unwrap(),
         sortition_open_opts_for_path(&sortition_paths.db),
     );
-    if s_h != sortition_marf_height {
-        eprintln!(
-            "Manifest error: Sortition squash height {s_h} != requested {sortition_marf_height}"
-        );
-        std::process::exit(1);
-    }
+    let sortition_boundary = SquashBoundary {
+        marf_height: sortition_marf_height,
+        bitcoin_height,
+    };
+    assert_manifest_boundary("Sortition", sortition_meta.boundary, sortition_boundary);
 
     // Read db_config from the squashed index DB.
     let (chain_id, mainnet) = {
@@ -257,21 +283,21 @@ pub fn generate_manifest(
             version: 1,
             stacks_height,
             bitcoin_height,
-            block_hash: format!("0x{i_tip}"),
+            block_hash: format!("0x{}", index_meta.tip),
             bitcoin_block_hash: Some(bitcoin_block_hash),
             timestamp,
             chain_id,
             mainnet,
         },
         roots: RootsSection {
-            clarity_archival_marf_root_hash: Some(c_archival),
-            index_archival_marf_root_hash: i_archival,
-            sortition_archival_marf_root_hash: Some(s_archival),
+            clarity_archival_marf_root_hash: Some(clarity_meta.archival_root_hash),
+            index_archival_marf_root_hash: index_meta.archival_root_hash,
+            sortition_archival_marf_root_hash: Some(sortition_meta.archival_root_hash),
         },
         squash_roots: SquashRootsSection {
-            clarity_squash_root_node_hash: c_squash,
-            index_squash_root_node_hash: i_squash,
-            sortition_squash_root_node_hash: s_squash,
+            clarity_squash_root_node_hash: Some(clarity_meta.squash_root_node_hash),
+            index_squash_root_node_hash: Some(index_meta.squash_root_node_hash),
+            sortition_squash_root_node_hash: Some(sortition_meta.squash_root_node_hash),
         },
         blocks: Some(blocks_section),
         checksums: Some(ChecksumsSection {

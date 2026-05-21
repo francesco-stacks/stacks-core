@@ -1,6 +1,7 @@
 use stackslib::chainstate::stacks::db::snapshot::{
     copy_confirmed_epoch2_microblocks, copy_epoch2_block_files, copy_nakamoto_staging_blocks,
 };
+use stackslib::chainstate::stacks::index::storage::SquashBoundary;
 
 use crate::cli::{BlocksSection, SquashArgs, ValidateArgs, VerifyArgs};
 use crate::manifest::generate_manifest;
@@ -47,14 +48,14 @@ pub fn run_squash(args: SquashArgs) {
     let (do_clarity, do_index, do_sortition) =
         selected_targets(args.clarity, args.index, args.sortition, args.all);
 
-    let bitcoin_height = args.tenure_start_bitcoin_height;
+    let tenure_start_bitcoin_height = args.tenure_start_bitcoin_height;
 
     // Read network config.
     let (mainnet, chain_id) = read_db_config(&paths.index.db);
     let pox = build_pox_constants(mainnet, args.config.as_deref());
 
     // A squashed snapshot is only usable from epoch 3.4 onwards.
-    enforce_minimum_tenure_height(bitcoin_height, mainnet, args.config.as_deref());
+    enforce_minimum_tenure_height(tenure_start_bitcoin_height, mainnet, args.config.as_deref());
 
     // Derive chainstate root: paths.index.db = ".../chainstate/vm/index.sqlite"
     let chainstate_root = paths
@@ -74,7 +75,7 @@ pub fn run_squash(args: SquashArgs) {
     let targets = resolve_canonical_squash_targets(
         chainstate_root.to_str().unwrap(),
         sortition_db_dir.to_str().unwrap(),
-        bitcoin_height,
+        tenure_start_bitcoin_height,
         mainnet,
         chain_id,
         pox.clone(),
@@ -88,17 +89,27 @@ pub fn run_squash(args: SquashArgs) {
     let stacks_tip = targets.stacks_tip.clone();
     let sortition_marf_height = targets.sortition_marf_height;
     let sortition_tip = targets.sortition_canonical_tip.clone();
-    let first_burn_height = targets.first_burn_height;
+    let first_bitcoin_height = targets.first_bitcoin_height;
+    // Resolved squash boundary (tenure end). Written into `marf_squash_info`
+    // so the runtime's reward-cycle gate can compare against it without IO.
+    let squash_bitcoin_height = targets.squash_bitcoin_height;
+    let stacks_boundary = SquashBoundary {
+        marf_height: stacks_height,
+        bitcoin_height: squash_bitcoin_height,
+    };
+    let sortition_boundary = SquashBoundary {
+        marf_height: sortition_marf_height,
+        bitcoin_height: squash_bitcoin_height,
+    };
 
     eprintln!(
-        "Squash at tenure start Bitcoin height {bitcoin_height}, \
+        "Squash at tenure start Bitcoin height {tenure_start_bitcoin_height}, \
          Stacks tenure end height {stacks_height}, canonical Stacks tip {stacks_tip} \
-         (tenure end Bitcoin height {}, sortition MARF height {})",
-        targets.tenure_end_burn_height, sortition_marf_height
+         (squash Bitcoin height {squash_bitcoin_height}, sortition MARF height {sortition_marf_height})"
     );
 
     // Prepare-phase warning.
-    warn_if_in_prepare_phase(bitcoin_height, &pox, first_burn_height);
+    warn_if_in_prepare_phase(tenure_start_bitcoin_height, &pox, first_bitcoin_height);
 
     let mut clarity_out = None;
     let mut index_out = None;
@@ -113,7 +124,7 @@ pub fn run_squash(args: SquashArgs) {
             &paths.clarity,
             &out,
             &stacks_tip,
-            stacks_height,
+            stacks_boundary,
             SideTableMode::Clarity,
             squash_marf_open_opts(),
         );
@@ -127,10 +138,10 @@ pub fn run_squash(args: SquashArgs) {
             &paths.index,
             &out,
             &stacks_tip,
-            stacks_height,
+            stacks_boundary,
             SideTableMode::Index {
-                first_burn_height,
-                reward_cycle_len: pox.reward_cycle_length as u64,
+                first_bitcoin_height,
+                reward_cycle_len: pox.reward_cycle_length,
             },
             squash_marf_open_opts(),
         );
@@ -144,7 +155,7 @@ pub fn run_squash(args: SquashArgs) {
             &paths.sortition,
             &out,
             &sortition_tip,
-            sortition_marf_height,
+            sortition_boundary,
             SideTableMode::Sortition,
             sortition_open_opts_for_path(&paths.sortition.db),
         );
@@ -283,7 +294,7 @@ pub fn run_squash(args: SquashArgs) {
             &squashed_sort,
             &src_hdr,
             &dst_hdr,
-            bitcoin_height as u32,
+            squash_bitcoin_height,
         );
     }
 
@@ -299,7 +310,7 @@ pub fn run_squash(args: SquashArgs) {
                 &paths.clarity,
                 clarity_out.as_ref().unwrap(),
                 &stacks_tip,
-                stacks_height,
+                stacks_boundary,
                 args.full,
                 SideTableMode::Clarity,
                 squash_marf_open_opts(),
@@ -313,11 +324,11 @@ pub fn run_squash(args: SquashArgs) {
                 &paths.index,
                 index_out.as_ref().unwrap(),
                 &stacks_tip,
-                stacks_height,
+                stacks_boundary,
                 args.full,
                 SideTableMode::Index {
-                    first_burn_height,
-                    reward_cycle_len: pox.reward_cycle_length as u64,
+                    first_bitcoin_height,
+                    reward_cycle_len: pox.reward_cycle_length,
                 },
                 squash_marf_open_opts(),
             )
@@ -325,19 +336,18 @@ pub fn run_squash(args: SquashArgs) {
             all_valid = false;
         }
 
-        if do_sortition {
-            let (_, marf_height) = sortition_out.as_ref().unwrap();
-            if !validate_one(
+        if do_sortition
+            && !validate_one(
                 &paths.sortition,
                 &sortition_out.as_ref().unwrap().0,
                 &sortition_tip,
-                *marf_height,
+                sortition_boundary,
                 args.full,
                 SideTableMode::Sortition,
                 sortition_open_opts_for_path(&paths.sortition.db),
-            ) {
-                all_valid = false;
-            }
+            )
+        {
+            all_valid = false;
         }
 
         if do_blocks {
@@ -363,7 +373,7 @@ pub fn run_squash(args: SquashArgs) {
                 &squashed_sort,
                 &src_hdr,
                 &dst_hdr,
-                bitcoin_height as u32,
+                squash_bitcoin_height,
             )
         {
             all_valid = false;
@@ -384,7 +394,7 @@ pub fn run_squash(args: SquashArgs) {
             index_out.as_ref().unwrap(),
             (&sort_paths, sort_height),
             stacks_height,
-            bitcoin_height,
+            squash_bitcoin_height,
             blocks_stats.unwrap(),
             &copied_block_rel_paths,
         );
@@ -406,14 +416,14 @@ pub fn run_validate(args: ValidateArgs) {
     let (do_clarity, do_index, do_sortition) =
         selected_targets(args.clarity, args.index, args.sortition, args.all);
 
-    let bitcoin_height = args.tenure_start_bitcoin_height;
+    let tenure_start_bitcoin_height = args.tenure_start_bitcoin_height;
 
     // Resolve the same way as run_squash.
     let (mainnet, chain_id) = read_db_config(&source_paths.index.db);
     let pox = build_pox_constants(mainnet, args.config.as_deref());
 
     // A squashed snapshot is only usable from epoch 3.4 onwards.
-    enforce_minimum_tenure_height(bitcoin_height, mainnet, args.config.as_deref());
+    enforce_minimum_tenure_height(tenure_start_bitcoin_height, mainnet, args.config.as_deref());
 
     let chainstate_root = source_paths
         .index
@@ -430,7 +440,7 @@ pub fn run_validate(args: ValidateArgs) {
     let targets = resolve_canonical_squash_targets(
         chainstate_root.to_str().unwrap(),
         sortition_db_dir.to_str().unwrap(),
-        bitcoin_height,
+        tenure_start_bitcoin_height,
         mainnet,
         chain_id,
         pox.clone(),
@@ -444,7 +454,16 @@ pub fn run_validate(args: ValidateArgs) {
     let stacks_tip = targets.stacks_tip.clone();
     let sortition_marf_height = targets.sortition_marf_height;
     let sortition_tip = targets.sortition_canonical_tip.clone();
-    let first_burn_height = targets.first_burn_height;
+    let first_bitcoin_height = targets.first_bitcoin_height;
+    let squash_bitcoin_height = targets.squash_bitcoin_height;
+    let stacks_boundary = SquashBoundary {
+        marf_height: stacks_height,
+        bitcoin_height: squash_bitcoin_height,
+    };
+    let sortition_boundary = SquashBoundary {
+        marf_height: sortition_marf_height,
+        bitcoin_height: squash_bitcoin_height,
+    };
 
     let mut all_valid = true;
 
@@ -453,7 +472,7 @@ pub fn run_validate(args: ValidateArgs) {
             &source_paths.clarity,
             &squashed_paths.clarity,
             &stacks_tip,
-            stacks_height,
+            stacks_boundary,
             args.full,
             SideTableMode::Clarity,
             squash_marf_open_opts(),
@@ -467,11 +486,11 @@ pub fn run_validate(args: ValidateArgs) {
             &source_paths.index,
             &squashed_paths.index,
             &stacks_tip,
-            stacks_height,
+            stacks_boundary,
             args.full,
             SideTableMode::Index {
-                first_burn_height,
-                reward_cycle_len: pox.reward_cycle_length as u64,
+                first_bitcoin_height,
+                reward_cycle_len: pox.reward_cycle_length,
             },
             squash_marf_open_opts(),
         )
@@ -484,7 +503,7 @@ pub fn run_validate(args: ValidateArgs) {
             &source_paths.sortition,
             &squashed_paths.sortition,
             &sortition_tip,
-            sortition_marf_height,
+            sortition_boundary,
             args.full,
             SideTableMode::Sortition,
             sortition_open_opts_for_path(&source_paths.sortition.db),
@@ -521,8 +540,6 @@ pub fn run_validate(args: ValidateArgs) {
     let do_bitcoin_aux = args.bitcoin || args.all;
     ensure_flag_requires("bitcoin", do_bitcoin_aux, "sortition", do_sortition);
     if do_bitcoin_aux {
-        let btc_height = bitcoin_height as u32;
-
         let src_bc_db = args.source_chainstate.join("burnchain/burnchain.sqlite");
         let dst_bc_db = args.squashed_chainstate.join("burnchain/burnchain.sqlite");
         let squashed_sort = args
@@ -537,7 +554,7 @@ pub fn run_validate(args: ValidateArgs) {
             &squashed_sort,
             &src_hdr,
             &dst_hdr,
-            btc_height,
+            squash_bitcoin_height,
         ) {
             all_valid = false;
         }

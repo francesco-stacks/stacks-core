@@ -330,6 +330,64 @@ fn test_squash_info_sql_squash_root_asserted() {
     );
 }
 
+/// Guards against validation passing with a wrong stored Bitcoin boundary.
+#[test]
+fn test_validate_detects_wrong_squash_bitcoin_height() {
+    let dir = tempdir().unwrap();
+    let src_db_path = dir.path().join("index.sqlite");
+    let (_, blocks, _) = setup_marf(src_db_path.to_str().unwrap(), 2, 1);
+
+    let (dst_db_path, _) = squash_helper(
+        src_db_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        1,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let tip = blocks.last().unwrap();
+
+    let stored_boundary = SquashBoundary {
+        marf_height: 1,
+        bitcoin_height: 1,
+    };
+    let stats = MARF::validate_squashed_at_height(
+        src_db_path.to_str().unwrap(),
+        dst_db_path.to_str().unwrap(),
+        open_opts.clone(),
+        tip,
+        stored_boundary,
+        false,
+    )
+    .unwrap();
+    assert!(stats.squash_marf_height_matches);
+    assert!(stats.squash_bitcoin_height_matches);
+    assert!(
+        stats.is_valid(),
+        "validation should pass with correct boundary"
+    );
+
+    let wrong_bitcoin = SquashBoundary {
+        marf_height: 1,
+        bitcoin_height: 42,
+    };
+    let stats = MARF::validate_squashed_at_height(
+        src_db_path.to_str().unwrap(),
+        dst_db_path.to_str().unwrap(),
+        open_opts,
+        tip,
+        wrong_bitcoin,
+        false,
+    )
+    .unwrap();
+    assert!(stats.squash_marf_height_matches);
+    assert!(!stats.squash_bitcoin_height_matches);
+    assert!(
+        !stats.is_valid(),
+        "validation must reject a stored bitcoin_height that disagrees with the expected boundary"
+    );
+}
+
 #[test]
 fn test_large_marf_squash_extend_root_hash_matches_archival() {
     // Squash a 10-block MARF at height 8, then extend both the archival

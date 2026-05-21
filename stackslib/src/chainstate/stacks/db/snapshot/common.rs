@@ -464,10 +464,7 @@ mod tests {
     #[case::unix_absolute("/tmp/marf-squash/index.sqlite", "/tmp/marf-squash/index.sqlite")]
     #[case::windows_drive_letter("C:/Users/test/index.sqlite", "C:/Users/test/index.sqlite")]
     #[case::unreserved_chars_pass_through("/abc-DEF_123.~", "/abc-DEF_123.~")]
-    #[case::space_and_uri_structurals(
-        "/tmp/has space/file?x#y",
-        "/tmp/has%20space/file%3Fx%23y"
-    )]
+    #[case::space_and_uri_structurals("/tmp/has space/file?x#y", "/tmp/has%20space/file%3Fx%23y")]
     #[case::percent_literal_encoded("/tmp/100%/x", "/tmp/100%25/x")]
     // `é` is U+00E9 = 0xC3 0xA9 in UTF-8; non-ASCII bytes always encode.
     #[case::non_ascii_as_utf8_bytes("/tmp/café", "/tmp/caf%C3%A9")]

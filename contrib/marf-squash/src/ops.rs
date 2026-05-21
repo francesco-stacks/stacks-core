@@ -9,6 +9,7 @@ use stackslib::chainstate::stacks::db::snapshot::{
 };
 use stackslib::chainstate::stacks::index::MarfTrieId;
 use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, SquashValidationStats};
+use stackslib::chainstate::stacks::index::storage::SquashBoundary;
 use stackslib::clarity_vm::database::snapshot::{
     copy_clarity_side_tables, validate_clarity_side_tables,
 };
@@ -20,8 +21,8 @@ use crate::util::{die_with_cleanup, ensure_blobs_match};
 pub enum SideTableMode {
     Clarity,
     Index {
-        first_burn_height: u64,
-        reward_cycle_len: u64,
+        first_bitcoin_height: u32,
+        reward_cycle_len: u32,
     },
     Sortition,
 }
@@ -42,7 +43,7 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
     source: &TargetPaths,
     out: &TargetPaths,
     tip: &T,
-    height: u32,
+    boundary: SquashBoundary,
     side_table_mode: SideTableMode,
     open_opts: MARFOpenOpts,
 ) {
@@ -65,7 +66,7 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
         out.db.to_str().unwrap(),
         open_opts,
         tip,
-        height,
+        boundary,
         label,
     ) {
         Ok(stats) => stats,
@@ -96,15 +97,15 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
             }
         }
         SideTableMode::Index {
-            first_burn_height,
+            first_bitcoin_height,
             reward_cycle_len,
         } => {
             println!("Copying index side tables...");
             match copy_index_side_tables(
                 source.db.to_str().unwrap(),
                 out.db.to_str().unwrap(),
-                *first_burn_height,
-                *reward_cycle_len,
+                u64::from(*first_bitcoin_height),
+                u64::from(*reward_cycle_len),
             ) {
                 Ok(st) => {
                     println!(
@@ -170,7 +171,10 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
         (savings as f64 / original_total as f64) * 100.0
     };
 
-    println!("Squash complete ({label}) at height {height}");
+    println!(
+        "Squash complete ({label}) at marf_height {} (bitcoin_height {})",
+        boundary.marf_height, boundary.bitcoin_height,
+    );
     println!("Node count: {}", stats.node_count);
     println!(
         "Original: db={original_db_size} bytes, blobs={original_blobs_size} bytes, total={original_total} bytes"
@@ -190,7 +194,7 @@ pub fn validate_one<T: MarfTrieId>(
     source: &TargetPaths,
     squashed: &TargetPaths,
     tip: &T,
-    height: u32,
+    boundary: SquashBoundary,
     full: bool,
     side_table_mode: SideTableMode,
     open_opts: MARFOpenOpts,
@@ -208,7 +212,7 @@ pub fn validate_one<T: MarfTrieId>(
             .unwrap(),
         open_opts,
         tip,
-        height,
+        boundary,
         full,
     );
     println!("Validation results for {label}:");
@@ -254,15 +258,15 @@ pub fn validate_one<T: MarfTrieId>(
     };
 
     let index_side_valid = if let SideTableMode::Index {
-        first_burn_height,
+        first_bitcoin_height,
         reward_cycle_len,
     } = &side_table_mode
     {
         match validate_index_side_tables(
             source.db.to_str().unwrap(),
             squashed.db.to_str().unwrap(),
-            *first_burn_height,
-            *reward_cycle_len,
+            u64::from(*first_bitcoin_height),
+            u64::from(*reward_cycle_len),
         ) {
             Ok(v) => {
                 print_index_side_table_validation(&v);
@@ -306,7 +310,7 @@ fn validate_or_exit<T: MarfTrieId>(
     squashed_blobs: &str,
     open_opts: MARFOpenOpts,
     tip: &T,
-    height: u32,
+    boundary: SquashBoundary,
     full_leaf_scan: bool,
 ) -> SquashValidationStats {
     if let Some(blobs) = source_blobs {
@@ -319,7 +323,7 @@ fn validate_or_exit<T: MarfTrieId>(
         squashed_db,
         open_opts,
         tip,
-        height,
+        boundary,
         full_leaf_scan,
     ) {
         Ok(stats) => stats,
@@ -334,6 +338,14 @@ fn print_validation(stats: &SquashValidationStats) {
     println!("Validation:");
     println!("Archival root present: {}", stats.archival_root_present);
     println!("Archival root matches: {}", stats.archival_root_matches);
+    println!(
+        "Squash MARF height matches: {}",
+        stats.squash_marf_height_matches
+    );
+    println!(
+        "Squash Bitcoin height matches: {}",
+        stats.squash_bitcoin_height_matches
+    );
     println!(
         "Squash node hash present: {}",
         stats.squash_node_hash_present
@@ -540,7 +552,7 @@ pub fn validate_bitcoin_aux_files(
     squashed_sort: &Path,
     src_hdr: &Path,
     dst_hdr: &Path,
-    burn_height: u32,
+    bitcoin_height: u32,
 ) -> bool {
     println!("Validating Bitcoin auxiliary files...");
     let mut valid = true;
@@ -549,7 +561,7 @@ pub fn validate_bitcoin_aux_files(
         src_bc_db.to_str().unwrap(),
         dst_bc_db.to_str().unwrap(),
         squashed_sort.to_str().unwrap(),
-        burn_height,
+        bitcoin_height,
     ) {
         Ok(v) => {
             println!("  bc_block_headers_match: {}", v.block_headers_match);
@@ -576,7 +588,7 @@ pub fn validate_bitcoin_aux_files(
     match validate_spv_headers(
         src_hdr.to_str().unwrap(),
         dst_hdr.to_str().unwrap(),
-        burn_height,
+        bitcoin_height,
     ) {
         Ok(v) => {
             println!("  spv_headers_match: {}", v.headers_match);
@@ -604,14 +616,14 @@ pub fn copy_bitcoin_aux_files(
     squashed_sort: &Path,
     src_hdr: &Path,
     dst_hdr: &Path,
-    burn_height: u32,
+    bitcoin_height: u32,
 ) {
     println!("Copying burnchain.sqlite (canonical only)...");
     match copy_burnchain_db(
         src_bc_db.to_str().unwrap(),
         dst_bc_db.to_str().unwrap(),
         squashed_sort.to_str().unwrap(),
-        burn_height,
+        bitcoin_height,
     ) {
         Ok(bc_stats) => {
             println!(
@@ -629,11 +641,11 @@ pub fn copy_bitcoin_aux_files(
         ),
     }
 
-    println!("Copying headers.sqlite (SPV, up to burn height {burn_height})...");
+    println!("Copying headers.sqlite (SPV, up to Bitcoin height {bitcoin_height})...");
     match copy_spv_headers(
         src_hdr.to_str().unwrap(),
         dst_hdr.to_str().unwrap(),
-        burn_height,
+        bitcoin_height,
     ) {
         Ok(spv_stats) => {
             println!(

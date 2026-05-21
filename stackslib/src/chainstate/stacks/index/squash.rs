@@ -361,8 +361,7 @@ pub struct SquashStats {
 ///   this column to filter canonical rows; root-hash equality alone does not
 ///   prove the block-hash column is correct).
 /// - No extra `marf_squashed_blocks` rows above the squash height.
-/// - Squash metadata (`marf_squash_info`) is present and correct, including
-///   the stored squash height (runtime uses it for historical-read guards).
+/// - Squash metadata (`marf_squash_info`) matches the expected boundary and root hashes.
 /// - All historical `marf_data` entries share the tip block's blob offset.
 ///
 /// When `full_leaf_scan` is enabled, the validator additionally walks every
@@ -376,10 +375,14 @@ pub struct SquashValidationStats {
     /// Whether the stored archival root hash at the squash height
     /// matches the source MARF's root hash at that height.
     pub archival_root_matches: bool,
-    /// Whether the `marf_squash_info.squash_height` column matches the
-    /// `height` the caller validated at (runtime reads this column for
+    /// Whether the `marf_squash_info.marf_height` column matches the
+    /// MARF height the caller validated at (runtime reads this column for
     /// `HistoricalReadInSquashedRange` decisions).
-    pub squash_height_matches: bool,
+    pub squash_marf_height_matches: bool,
+    /// Whether the `marf_squash_info.bitcoin_height` column matches the
+    /// Bitcoin height the caller validated at (the runtime reward-cycle gate
+    /// reads this column).
+    pub squash_bitcoin_height_matches: bool,
     /// Per-height root hashes missing from the SQL table.
     pub root_hash_missing: u64,
     /// Per-height root hashes with mismatched values.
@@ -422,7 +425,8 @@ impl SquashValidationStats {
     pub fn is_valid(&self) -> bool {
         let fast_valid = self.archival_root_present
             && self.archival_root_matches
-            && self.squash_height_matches
+            && self.squash_marf_height_matches
+            && self.squash_bitcoin_height_matches
             && self.squash_node_hash_present
             && self.squash_node_hash_matches
             && self.root_hash_missing == 0
@@ -1371,9 +1375,10 @@ impl<T: MarfTrieId> MARF<T> {
         squashed_path: &str,
         open_opts: MARFOpenOpts,
         source_tip: &T,
-        height: u32,
+        boundary: SquashBoundary,
         full_leaf_scan: bool,
     ) -> Result<SquashValidationStats, Error> {
+        let height = boundary.marf_height;
         let mut src_open_opts = open_opts.clone();
         src_open_opts.external_blobs = Path::new(&format!("{src_path}.blobs")).exists();
 
@@ -1404,7 +1409,8 @@ impl<T: MarfTrieId> MARF<T> {
         let mut stats = SquashValidationStats {
             archival_root_present: false,
             archival_root_matches: false,
-            squash_height_matches: false,
+            squash_marf_height_matches: false,
+            squash_bitcoin_height_matches: false,
             root_hash_missing: 0,
             root_hash_mismatches: 0,
             block_hash_missing: 0,
@@ -1537,37 +1543,31 @@ impl<T: MarfTrieId> MARF<T> {
             None => src.get_root_hash_at(&source_block_at_height)?,
         };
 
-        // Check 2: Squash metadata in SQL. We compare three things:
-        //
-        // - `archival_marf_root_hash` against the source MARF root hash at the
-        //   squash height (the canonical state the squash is supposed to
-        //   represent).
-        // - `squash_height` against the height the caller asked us to
-        //   validate at - the runtime uses this column to decide which
-        //   blocks fall in the historical-read range, so a wrong stored
-        //   height passes root validation but misbehaves at runtime.
-        // - `squash_root_node_hash` against a fresh DFS-recomputed hash of
-        //   the committed squash blob (Check 2b below).
-        let sql_squash_info = trie_sql::read_squash_info(squashed.sqlite_conn())?;
-        let stored_squash_node_hash = match sql_squash_info {
-            Some((archival_marf_root_hash, squash_root_node_hash, stored_height)) => {
+        // Check 2: SQL squash metadata. Root equality alone does not validate
+        // the stored boundary values consumed by runtime guards; the squash
+        // root is rederived from the committed blob below.
+        let stored_squash_node_hash = match trie_sql::read_squash_info(squashed.sqlite_conn())? {
+            Some(info) => {
                 stats.archival_root_present = true;
-                stats.archival_root_matches = archival_marf_root_hash == expected_squash_root;
-                stats.squash_height_matches = stored_height == height;
-                squash_root_node_hash
+                stats.archival_root_matches = info.archival_marf_root_hash == expected_squash_root;
+                stats.squash_marf_height_matches =
+                    info.boundary.marf_height == boundary.marf_height;
+                stats.squash_bitcoin_height_matches =
+                    info.boundary.bitcoin_height == boundary.bitcoin_height;
+                Some(info.squash_root_node_hash)
             }
             None => {
                 stats.archival_root_present = false;
                 stats.archival_root_matches = false;
-                stats.squash_height_matches = false;
+                stats.squash_marf_height_matches = false;
+                stats.squash_bitcoin_height_matches = false;
                 None
             }
         };
 
         // Check 2b: Validate squash_root_node_hash by recomputing from blob
-        let empty_hash = TrieHash::from_data(&[]);
         match stored_squash_node_hash {
-            Some(stored_hash) if stored_hash != empty_hash => {
+            Some(stored_hash) => {
                 stats.squash_node_hash_present = true;
                 let start_node_hash = Instant::now();
                 info!("Validate: recomputing squash_root_node_hash from blob (DFS walk)...");
@@ -1580,7 +1580,7 @@ impl<T: MarfTrieId> MARF<T> {
                     fmt_duration(start_node_hash.elapsed())
                 );
             }
-            _ => {
+            None => {
                 stats.squash_node_hash_present = false;
                 stats.squash_node_hash_matches = false;
             }

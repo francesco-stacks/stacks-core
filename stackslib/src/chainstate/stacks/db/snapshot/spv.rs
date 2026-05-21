@@ -18,9 +18,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OpenFlags};
 
-use super::common::{
-    clone_schemas_from_source, full_row_except_match, with_offline_write_session,
-};
+use super::common::{clone_schemas_from_source, full_row_except_match, with_offline_write_session};
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all headers.sqlite versions.
