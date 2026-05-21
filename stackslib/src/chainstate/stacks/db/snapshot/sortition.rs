@@ -13,13 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::HashSet;
+
 use rusqlite::{params, Connection};
 use stacks_common::types::chainstate::SortitionId;
 
 use super::common::{
-    check_optional_table_match, clone_optional_schemas_from_source, clone_schemas_from_source,
-    collect_leaf_value_hashes, copy_canonical_fork_storage, execute_copy_specs,
-    full_row_except_match, table_exists, TableCopySpec,
+    clone_schemas_from_source, collect_canonical_leaf_hashes, copy_canonical_fork_storage,
+    execute_copy_specs, full_row_except_match, with_offline_write_session, TableCopySpec,
 };
 use crate::chainstate::stacks::index::Error;
 
@@ -40,11 +41,6 @@ const REQUIRED_TABLES: &[&str] = &[
     "vote_for_aggregate_key",
     "preprocessed_reward_sets",
     "epochs",
-];
-
-/// Optional sortition tables (may not exist in all source DBs).
-const OPTIONAL_TABLES: &[&str] = &[
-    "snapshot_burn_distributions", // test-only (#[cfg(test)])
 ];
 
 /// Row-count statistics returned by [`copy_sortition_side_tables`].
@@ -96,7 +92,6 @@ pub struct SortitionSideTableValidation {
     pub epochs_match: bool,
     pub db_config_match: bool,
     pub fork_storage_match: bool,
-    pub snapshot_burn_distributions_match: Option<bool>,
 }
 
 impl SortitionSideTableValidation {
@@ -119,7 +114,6 @@ impl SortitionSideTableValidation {
             && self.epochs_match
             && self.db_config_match
             && self.fork_storage_match
-            && self.snapshot_burn_distributions_match.unwrap_or(true)
     }
 }
 
@@ -127,12 +121,35 @@ impl SortitionSideTableValidation {
 fn populate_canonical_sortitions(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch("CREATE TEMP TABLE canonical_sortitions (sortition_id TEXT PRIMARY KEY)")
         .map_err(Error::SQLError)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO canonical_sortitions (sortition_id) \
-         SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
-        [],
-    )
-    .map_err(Error::SQLError)?;
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO canonical_sortitions (sortition_id) \
+             SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
+            [],
+        )
+        .map_err(Error::SQLError)?;
+    if inserted == 0 {
+        return Err(Error::CorruptionError(
+            "marf_squashed_blocks is empty; post-squash dst must have at least one canonical sortition"
+                .into(),
+        ));
+    }
+    // Source-completeness: every canonical sortition must exist in
+    // src.snapshots. A canonical sortition_id missing from src is
+    // corruption. The squash claimed a sortition that src doesn't have.
+    let orphans: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM canonical_sortitions \
+             WHERE sortition_id NOT IN (SELECT sortition_id FROM src.snapshots)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    if orphans > 0 {
+        return Err(Error::CorruptionError(format!(
+            "{orphans} canonical sortition(s) in marf_squashed_blocks are absent from src.snapshots"
+        )));
+    }
 
     conn.execute_batch(
         "CREATE TEMP TABLE canonical_burn_hashes (burn_header_hash TEXT PRIMARY KEY)",
@@ -243,45 +260,18 @@ pub fn copy_sortition_side_tables(
     src_path: &str,
     dst_path: &str,
 ) -> Result<SortitionSideTableStats, Error> {
-    let conn = Connection::open(dst_path).map_err(Error::SQLError)?;
+    // Walk the squashed trie before opening dst R/W.
+    let leaf_hashes = collect_canonical_leaf_hashes::<SortitionId>(dst_path)?;
 
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
-        .map_err(Error::SQLError)?;
-
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(Error::SQLError)?;
-
-    if let Err(e) = clone_schemas_from_source(&conn, REQUIRED_TABLES) {
-        let _ = conn.execute_batch("ROLLBACK");
-        let _ = conn.execute_batch("DETACH DATABASE src");
-        return Err(e);
-    }
-    if let Err(e) = clone_optional_schemas_from_source(&conn, OPTIONAL_TABLES) {
-        let _ = conn.execute_batch("ROLLBACK");
-        let _ = conn.execute_batch("DETACH DATABASE src");
-        return Err(e);
-    }
-
-    let result = copy_sortition_tables_inner(&conn, dst_path);
-
-    match result {
-        Ok(stats) => {
-            conn.execute_batch("COMMIT").map_err(Error::SQLError)?;
-            conn.execute_batch("DETACH DATABASE src")
-                .map_err(Error::SQLError)?;
-            Ok(stats)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            let _ = conn.execute_batch("DETACH DATABASE src");
-            Err(e)
-        }
-    }
+    with_offline_write_session(dst_path, &[("src", src_path)], "", |conn| {
+        clone_schemas_from_source(conn, REQUIRED_TABLES)?;
+        copy_sortition_tables_inner(conn, &leaf_hashes)
+    })
 }
 
 fn copy_sortition_tables_inner(
     conn: &Connection,
-    dst_path: &str,
+    leaf_hashes: &HashSet<String>,
 ) -> Result<SortitionSideTableStats, Error> {
     // Copy db_config verbatim.
     let db_config_rows = conn
@@ -291,10 +281,10 @@ fn copy_sortition_tables_inner(
         )
         .map_err(Error::SQLError)? as u64;
 
-    // Copy only canonical __fork_storage rows - the squashed MARF trie
+    // Copy only canonical __fork_storage rows. The squashed MARF trie
     // leaves reference these by value_hash. Non-canonical fork entries
     // are excluded.
-    let fork_storage_rows = copy_canonical_fork_storage::<SortitionId>(conn, dst_path)?;
+    let fork_storage_rows = copy_canonical_fork_storage(conn, leaf_hashes)?;
 
     // Build canonical sortition set from squash metadata.
     populate_canonical_sortitions(conn)?;
@@ -302,27 +292,6 @@ fn copy_sortition_tables_inner(
     // Execute descriptor-driven copies.
     let specs = sortition_copy_specs();
     let results = execute_copy_specs(conn, &specs)?;
-
-    // Optional tables: copy if present in source.
-    for (table, filter) in [(
-        "snapshot_burn_distributions",
-        " WHERE sortition_id IN (SELECT sortition_id FROM canonical_sortitions)",
-    )] {
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM src.sqlite_master WHERE type='table' AND name=?1",
-                params![table],
-                |row| row.get(0),
-            )
-            .map_err(Error::SQLError)?;
-        if exists {
-            conn.execute(
-                &format!("INSERT INTO {table} SELECT * FROM src.{table}{filter}"),
-                [],
-            )
-            .map_err(Error::SQLError)?;
-        }
-    }
 
     conn.execute_batch("DROP TABLE IF EXISTS canonical_sortitions")
         .map_err(Error::SQLError)?;
@@ -510,65 +479,30 @@ pub fn validate_sortition_side_tables(
         "SELECT * FROM src.db_config",
     );
 
-    // __fork_storage: canonical-only copy. Validate against the canonical
-    // filtered source set (same leaf-hash filter used by copy_canonical_fork_storage).
+    // __fork_storage: canonical-only copy.
+    // Validate against the canonical filtered source set.
     let fork_storage_match = {
-        let dst_has = table_exists(&conn, "", "__fork_storage");
-        let src_has = table_exists(&conn, "src", "__fork_storage");
-        match (dst_has, src_has) {
-            (false, false) => true,
-            (true, true) => {
-                let has_marf_data = table_exists(&conn, "", "marf_data");
-
-                if has_marf_data {
-                    let (_tip, leaf_hashes) = collect_leaf_value_hashes::<SortitionId>(dst_path)?;
-
-                    conn.execute_batch(
-                        "CREATE TEMP TABLE val_fork_leaf_values (value_hash TEXT PRIMARY KEY)",
-                    )
-                    .map_err(Error::SQLError)?;
-
-                    {
-                        let mut stmt = conn
-                            .prepare(
-                                "INSERT OR IGNORE INTO val_fork_leaf_values (value_hash) VALUES (?1)",
-                            )
-                            .map_err(Error::SQLError)?;
-                        for hash in &leaf_hashes {
-                            stmt.execute([hash]).map_err(Error::SQLError)?;
-                        }
-                    }
-
-                    let ok = full_row_except_match(
-                        &conn,
-                        "SELECT * FROM __fork_storage",
-                        "SELECT f.* FROM src.__fork_storage f \
-                         INNER JOIN val_fork_leaf_values lv ON f.value_hash = lv.value_hash",
-                    );
-
-                    conn.execute_batch("DROP TABLE IF EXISTS val_fork_leaf_values")
-                        .map_err(Error::SQLError)?;
-
-                    ok
-                } else {
-                    // fixture fallback, matching copy_canonical_fork_storage()
-                    full_row_except_match(
-                        &conn,
-                        "SELECT * FROM __fork_storage",
-                        "SELECT * FROM src.__fork_storage",
-                    )
-                }
+        let leaf_hashes = collect_canonical_leaf_hashes::<SortitionId>(dst_path)?;
+        conn.execute_batch("CREATE TEMP TABLE val_fork_leaf_values (value_hash TEXT PRIMARY KEY)")
+            .map_err(Error::SQLError)?;
+        {
+            let mut stmt = conn
+                .prepare("INSERT INTO val_fork_leaf_values (value_hash) VALUES (?1)")
+                .map_err(Error::SQLError)?;
+            for hash in &leaf_hashes {
+                stmt.execute([hash]).map_err(Error::SQLError)?;
             }
-            _ => false,
         }
+        let ok = full_row_except_match(
+            &conn,
+            "SELECT * FROM __fork_storage",
+            "SELECT f.* FROM src.__fork_storage f \
+             INNER JOIN val_fork_leaf_values lv ON f.value_hash = lv.value_hash",
+        );
+        conn.execute_batch("DROP TABLE IF EXISTS val_fork_leaf_values")
+            .map_err(Error::SQLError)?;
+        ok
     };
-
-    // Optional tables
-    let snapshot_burn_distributions_match = check_optional_table_match(
-        &conn,
-        "snapshot_burn_distributions",
-        Some("WHERE sortition_id IN (SELECT sortition_id FROM canonical_sortitions)"),
-    );
 
     let _ = conn.execute_batch("DROP TABLE IF EXISTS canonical_sortitions");
     let _ = conn.execute_batch("DROP TABLE IF EXISTS canonical_burn_hashes");
@@ -594,6 +528,5 @@ pub fn validate_sortition_side_tables(
         epochs_match,
         db_config_match,
         fork_storage_match,
-        snapshot_burn_distributions_match,
     })
 }

@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OpenFlags};
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 
-use super::common::{clone_schemas_from_source, full_row_except_match};
+use super::common::{
+    clone_schemas_from_source, full_row_except_match, with_indexes_dropped,
+    with_offline_write_session,
+};
 use crate::chainstate::stacks::db::blocks::index_block_hash_to_rel_path;
 use crate::chainstate::stacks::index::Error;
 use crate::core::EMPTY_MICROBLOCK_PARENT_HASH;
@@ -177,7 +180,8 @@ fn derive_confirmed_microblock_set(
 
         if hashes.is_empty() {
             warn!(
-                "No confirmed microblocks found for parent {parent_ch}/{parent_bh} (tip {parent_mblock_hash}, seq {parent_mblock_seq}), skipping stream"
+                "[microblocks] no confirmed microblocks found for parent {parent_ch}/{parent_bh} \
+                 (tip {parent_mblock_hash}, seq {parent_mblock_seq}), skipping stream"
             );
             stats.streams_skipped += 1;
             continue;
@@ -234,64 +238,54 @@ pub fn copy_confirmed_epoch2_microblocks(
     src_index_path: &str,
     dst_index_path: &str,
 ) -> Result<Epoch2MicroblockCopyStats, Error> {
-    let conn = Connection::open_with_flags(
-        dst_index_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(Error::SQLError)?;
+    with_offline_write_session(dst_index_path, &[("src", src_index_path)], "", |conn| {
+        let (selected_hashes, selected_parents, mut stats) = derive_confirmed_microblock_set(conn)?;
 
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_index_path])
-        .map_err(Error::SQLError)?;
+        if !selected_hashes.is_empty() {
+            populate_microblock_temp_tables(
+                conn,
+                &selected_hashes,
+                &selected_parents,
+                "selected_microblocks",
+                "selected_parents",
+            )?;
 
-    let (selected_hashes, selected_parents, mut stats) = derive_confirmed_microblock_set(&conn)?;
+            stats.microblock_rows_copied = conn
+                .execute(
+                    "INSERT INTO staging_microblocks \
+                     SELECT s.* FROM src.staging_microblocks s \
+                     WHERE s.microblock_hash IN (SELECT hash FROM temp.selected_microblocks) \
+                       AND s.index_block_hash IN (SELECT ibh FROM temp.selected_parents) \
+                       AND s.orphaned = 0",
+                    [],
+                )
+                .map_err(Error::SQLError)? as u64;
 
-    if !selected_hashes.is_empty() {
-        populate_microblock_temp_tables(
-            &conn,
-            &selected_hashes,
-            &selected_parents,
-            "selected_microblocks",
-            "selected_parents",
-        )?;
-
-        stats.microblock_rows_copied = conn
-            .execute(
-                "INSERT INTO staging_microblocks \
-                 SELECT s.* FROM src.staging_microblocks s \
-                 WHERE s.microblock_hash IN (SELECT hash FROM temp.selected_microblocks) \
-                   AND s.index_block_hash IN (SELECT ibh FROM temp.selected_parents) \
-                   AND s.orphaned = 0",
+            conn.execute(
+                "INSERT INTO staging_microblocks_data \
+                 SELECT s.* FROM src.staging_microblocks_data s \
+                 WHERE s.block_hash IN (SELECT hash FROM temp.selected_microblocks)",
                 [],
-            )
-            .map_err(Error::SQLError)? as u64;
-
-        conn.execute(
-            "INSERT INTO staging_microblocks_data \
-             SELECT s.* FROM src.staging_microblocks_data s \
-             WHERE s.block_hash IN (SELECT hash FROM temp.selected_microblocks)",
-            [],
-        )
-        .map_err(Error::SQLError)?;
-
-        stats.microblock_bytes_copied = conn
-            .query_row(
-                "SELECT COALESCE(SUM(LENGTH(block_data)), 0) FROM staging_microblocks_data",
-                [],
-                |row| row.get(0),
             )
             .map_err(Error::SQLError)?;
 
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS temp.selected_microblocks; \
-             DROP TABLE IF EXISTS temp.selected_parents;",
-        )
-        .map_err(Error::SQLError)?;
-    }
+            stats.microblock_bytes_copied = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(LENGTH(block_data)), 0) FROM staging_microblocks_data",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Error::SQLError)?;
 
-    conn.execute_batch("DETACH DATABASE src")
-        .map_err(Error::SQLError)?;
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS temp.selected_microblocks; \
+                 DROP TABLE IF EXISTS temp.selected_parents;",
+            )
+            .map_err(Error::SQLError)?;
+        }
 
-    Ok(stats)
+        Ok(stats)
+    })
 }
 
 /// Copy canonical epoch 2.x block flat files.
@@ -365,7 +359,7 @@ pub fn copy_epoch2_block_files(
 
         if stats.files_copied % 1000 == 0 {
             info!(
-                "Copied {} epoch 2.x block files ({} bytes)...",
+                "[blocks] copied {} epoch 2.x block files ({} bytes)...",
                 stats.files_copied, stats.total_bytes
             );
         }
@@ -375,56 +369,49 @@ pub fn copy_epoch2_block_files(
 }
 
 /// Create and populate `nakamoto.sqlite` with canonical `nakamoto_staging_blocks` rows.
+/// The INSERT runs with `synchronous = OFF` and secondary indexes dropped + rebuilt.
 pub fn copy_nakamoto_staging_blocks(
     src_nakamoto_path: &str,
     dst_nakamoto_path: &str,
     squashed_index_path: &str,
 ) -> Result<NakamotoBlockCopyStats, Error> {
-    let conn = Connection::open_with_flags(
+    with_offline_write_session(
         dst_nakamoto_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        &[("src", src_nakamoto_path), ("idx", squashed_index_path)],
+        "",
+        |conn| {
+            clone_schemas_from_source(conn, &["nakamoto_staging_blocks", "db_version"])?;
+
+            conn.execute("INSERT INTO db_version SELECT * FROM src.db_version", [])
+                .map_err(Error::SQLError)?;
+
+            with_indexes_dropped(conn, "nakamoto_staging_blocks", |conn| {
+                conn.execute(
+                    "INSERT INTO nakamoto_staging_blocks \
+                     SELECT s.* FROM src.nakamoto_staging_blocks s \
+                     INNER JOIN idx.nakamoto_block_headers nh \
+                       ON s.index_block_hash = nh.index_block_hash",
+                    [],
+                )
+                .map_err(Error::SQLError)?;
+                Ok(())
+            })?;
+
+            let stats: NakamotoBlockCopyStats = conn
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM nakamoto_staging_blocks",
+                    [],
+                    |row| {
+                        Ok(NakamotoBlockCopyStats {
+                            rows_copied: row.get::<_, i64>(0)? as u64,
+                            total_blob_bytes: row.get::<_, i64>(1)? as u64,
+                        })
+                    },
+                )
+                .map_err(Error::SQLError)?;
+            Ok(stats)
+        },
     )
-    .map_err(Error::SQLError)?;
-
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_nakamoto_path])
-        .map_err(Error::SQLError)?;
-
-    clone_schemas_from_source(&conn, &["nakamoto_staging_blocks", "db_version"])?;
-
-    conn.execute("INSERT INTO db_version SELECT * FROM src.db_version", [])
-        .map_err(Error::SQLError)?;
-
-    conn.execute("ATTACH DATABASE ?1 AS idx", params![squashed_index_path])
-        .map_err(Error::SQLError)?;
-
-    conn.execute(
-        "INSERT INTO nakamoto_staging_blocks \
-         SELECT s.* FROM src.nakamoto_staging_blocks s \
-         INNER JOIN idx.nakamoto_block_headers nh \
-           ON s.index_block_hash = nh.index_block_hash",
-        [],
-    )
-    .map_err(Error::SQLError)?;
-
-    let stats: NakamotoBlockCopyStats = conn
-        .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM nakamoto_staging_blocks",
-            [],
-            |row| {
-                Ok(NakamotoBlockCopyStats {
-                    rows_copied: row.get::<_, i64>(0)? as u64,
-                    total_blob_bytes: row.get::<_, i64>(1)? as u64,
-                })
-            },
-        )
-        .map_err(Error::SQLError)?;
-
-    conn.execute_batch("DETACH DATABASE idx; DETACH DATABASE src")
-        .map_err(Error::SQLError)?;
-
-    Ok(stats)
 }
 
 /// Validate confirmed microblock streams.

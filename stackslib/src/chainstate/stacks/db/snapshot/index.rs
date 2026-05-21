@@ -13,15 +13,16 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use stacks_common::types::chainstate::StacksBlockId;
 
 use super::common::{
-    checkpoint_destination_wal, clone_schemas_from_source, collect_leaf_value_hashes,
-    copy_canonical_fork_storage, dst_subset_of_src, execute_copy_specs, full_row_except_match,
-    table_exists, TableCopySpec,
+    clone_schemas_from_source, collect_canonical_leaf_hashes, copy_canonical_fork_storage,
+    dst_subset_of_src, execute_copy_specs, full_row_except_match, with_offline_write_session,
+    TableCopySpec,
 };
 use crate::burnchains::PoxConstants;
 use crate::chainstate::stacks::index::Error;
@@ -117,22 +118,88 @@ impl IndexSideTableValidation {
 fn populate_canonical_blocks(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch("CREATE TEMP TABLE canonical_blocks (index_block_hash TEXT PRIMARY KEY)")
         .map_err(Error::SQLError)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO canonical_blocks (index_block_hash) \
-         SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
-        [],
-    )
-    .map_err(Error::SQLError)?;
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO canonical_blocks (index_block_hash) \
+             SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
+            [],
+        )
+        .map_err(Error::SQLError)?;
+    if inserted == 0 {
+        return Err(Error::CorruptionError(
+            "marf_squashed_blocks is empty; post-squash dst must have at least one canonical block"
+                .into(),
+        ));
+    }
+    // Source-completeness: every canonical block must exist in src as an
+    // epoch-2 or Nakamoto header. A canonical ID not in src is corruption.
+    // The squash claimed a block that the source doesn't have.
+    let orphans: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM canonical_blocks \
+             WHERE index_block_hash NOT IN (SELECT index_block_hash FROM src.block_headers) \
+               AND index_block_hash NOT IN (SELECT index_block_hash FROM src.nakamoto_block_headers)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    if orphans > 0 {
+        return Err(Error::CorruptionError(format!(
+            "{orphans} canonical block(s) in marf_squashed_blocks are absent from \
+             src.block_headers and src.nakamoto_block_headers"
+        )));
+    }
     Ok(())
 }
 
-/// Derive the maximum reward cycle from the canonical squashed tip's burn height.
+/// Scope of `signer_stats` rows the squashed dst should retain.
+#[derive(Debug, Clone, Copy)]
+pub enum RewardCycleScope {
+    /// Post-Nakamoto state with a canonical tip: keep `signer_stats`
+    /// rows where `reward_cycle <= cycle`.
+    Through(u64),
+    /// Pre-Nakamoto state: `src.nakamoto_block_headers` is empty, so
+    /// `src.signer_stats` must also be empty (asserted at derivation).
+    /// No rows to copy.
+    PreNakamoto,
+}
+
+/// Determine the `signer_stats` cutoff. Three real states:
+/// - Post-Nakamoto with canonical tip → `Through(cycle)`.
+/// - Pre-Nakamoto (no `nakamoto_block_headers` in src) → `PreNakamoto`,
+///   after asserting `src.signer_stats` is empty (it would be otherwise
+///   unfilterable).
+/// - `nakamoto_block_headers` non-empty but no canonical join match →
+///   `CorruptionError` (squashed canonical set absent from src).
 fn derive_max_reward_cycle(
     conn: &Connection,
     first_burn_height: u64,
     reward_cycle_len: u64,
-) -> Result<Option<u64>, Error> {
-    let tip_burn_height: Option<u64> = conn
+) -> Result<RewardCycleScope, Error> {
+    let src_has_nakamoto: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM src.nakamoto_block_headers",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    if !src_has_nakamoto {
+        let signer_stats_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM src.signer_stats", [], |row| {
+                row.get(0)
+            })
+            .map_err(Error::SQLError)?;
+        if signer_stats_count > 0 {
+            return Err(Error::CorruptionError(format!(
+                "pre-Nakamoto src (no nakamoto_block_headers) has {signer_stats_count} \
+                 signer_stats rows; expected empty"
+            )));
+        }
+        info!("[index] derive_max_reward_cycle: pre-Nakamoto (signer_stats empty)");
+        return Ok(RewardCycleScope::PreNakamoto);
+    }
+
+    let tip_burn_height: u64 = conn
         .query_row(
             "SELECT nh.burn_header_height \
              FROM marf_squashed_blocks mh \
@@ -144,26 +211,28 @@ fn derive_max_reward_cycle(
         )
         .optional()
         .map_err(Error::SQLError)?
-        .map(|h| h as u64);
-
-    match tip_burn_height {
-        Some(tbh) => {
-            let cycle = PoxConstants::static_block_height_to_reward_cycle(
-                tbh,
-                first_burn_height,
-                reward_cycle_len,
+        .map(|h| h as u64)
+        .ok_or_else(|| {
+            Error::CorruptionError(
+                "src.nakamoto_block_headers has rows but none match marf_squashed_blocks; \
+                 squashed canonical set is absent from src"
+                    .into(),
             )
-            .ok_or_else(|| {
-                Error::CorruptionError(format!(
-                    "cannot derive reward cycle: tip_burn_height={tbh}, \
-                     first_burn_height={first_burn_height}, reward_cycle_len={reward_cycle_len}"
-                ))
-            })?;
-            info!("  derive_max_reward_cycle: {cycle} (tip_burn_height={tbh})");
-            Ok(Some(cycle))
-        }
-        None => Ok(None),
-    }
+        })?;
+
+    let cycle = PoxConstants::static_block_height_to_reward_cycle(
+        tip_burn_height,
+        first_burn_height,
+        reward_cycle_len,
+    )
+    .ok_or_else(|| {
+        Error::CorruptionError(format!(
+            "cannot derive reward cycle: tip_burn_height={tip_burn_height}, \
+             first_burn_height={first_burn_height}, reward_cycle_len={reward_cycle_len}"
+        ))
+    })?;
+    info!("[index] derive_max_reward_cycle: {cycle} (tip_burn_height={tip_burn_height})");
+    Ok(RewardCycleScope::Through(cycle))
 }
 
 /// Build the copy specs for descriptor-driven index tables.
@@ -229,41 +298,17 @@ pub fn copy_index_side_tables(
     first_burn_height: u64,
     reward_cycle_len: u64,
 ) -> Result<IndexSideTableStats, Error> {
-    let conn = Connection::open(dst_path).map_err(Error::SQLError)?;
+    let leaf_hashes = collect_canonical_leaf_hashes::<StacksBlockId>(dst_path)?;
 
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
-        .map_err(Error::SQLError)?;
-
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(Error::SQLError)?;
-
-    if let Err(e) = clone_schemas_from_source(&conn, REQUIRED_TABLES) {
-        let _ = conn.execute_batch("ROLLBACK");
-        let _ = conn.execute_batch("DETACH DATABASE src");
-        return Err(e);
-    }
-
-    let result = copy_tables_inner(&conn, dst_path, first_burn_height, reward_cycle_len);
-
-    match result {
-        Ok(stats) => {
-            conn.execute_batch("COMMIT").map_err(Error::SQLError)?;
-            conn.execute_batch("DETACH DATABASE src")
-                .map_err(Error::SQLError)?;
-            checkpoint_destination_wal(&conn)?;
-            Ok(stats)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            let _ = conn.execute_batch("DETACH DATABASE src");
-            Err(e)
-        }
-    }
+    with_offline_write_session(dst_path, &[("src", src_path)], "", |conn| {
+        clone_schemas_from_source(conn, REQUIRED_TABLES)?;
+        copy_tables_inner(conn, &leaf_hashes, first_burn_height, reward_cycle_len)
+    })
 }
 
 fn copy_tables_inner(
     conn: &Connection,
-    dst_path: &str,
+    leaf_hashes: &HashSet<String>,
     first_burn_height: u64,
     reward_cycle_len: u64,
 ) -> Result<IndexSideTableStats, Error> {
@@ -276,18 +321,18 @@ fn copy_tables_inner(
         [],
     )
     .map_err(Error::SQLError)?;
-    info!("  copy_side_tables: db_config done in {:?}", t.elapsed());
+    info!("[index] db_config done in {:?}", t.elapsed());
 
-    // Copy only canonical __fork_storage rows - the squashed MARF trie
+    // Copy only canonical __fork_storage rows. The squashed MARF trie
     // leaves reference these by value_hash. Non-canonical fork entries
     // are excluded.
-    let fork_storage_rows = copy_canonical_fork_storage::<StacksBlockId>(conn, dst_path)?;
+    let fork_storage_rows = copy_canonical_fork_storage(conn, leaf_hashes)?;
 
     // Build canonical block set from squash metadata.
     let t = Instant::now();
     populate_canonical_blocks(conn)?;
     info!(
-        "  copy_side_tables: canonical_blocks temp table built in {:?}",
+        "[index] canonical_blocks temp table built in {:?}",
         t.elapsed()
     );
 
@@ -304,26 +349,23 @@ fn copy_tables_inner(
     };
 
     // Custom: signer_stats filtered by derived reward cycle.
-    let max_reward_cycle = derive_max_reward_cycle(conn, first_burn_height, reward_cycle_len)?;
+    let signer_stats_scope = derive_max_reward_cycle(conn, first_burn_height, reward_cycle_len)?;
 
     let t = Instant::now();
-    let signer_stats_rows = match max_reward_cycle {
-        Some(cycle) => conn
+    let signer_stats_rows = match signer_stats_scope {
+        RewardCycleScope::Through(cycle) => conn
             .execute(
                 "INSERT INTO signer_stats SELECT * FROM src.signer_stats \
                  WHERE reward_cycle <= ?1",
                 params![cycle as i64],
             )
             .map_err(Error::SQLError)? as u64,
-        None => conn
-            .execute(
-                "INSERT INTO signer_stats SELECT * FROM src.signer_stats",
-                [],
-            )
-            .map_err(Error::SQLError)? as u64,
+        // Pre-Nakamoto: `derive_max_reward_cycle` already verified
+        // `src.signer_stats` is empty; nothing to copy.
+        RewardCycleScope::PreNakamoto => 0,
     };
     info!(
-        "  copy_side_tables: signer_stats ({signer_stats_rows} rows) in {:?}",
+        "[index] signer_stats ({signer_stats_rows} rows) in {:?}",
         t.elapsed()
     );
 
@@ -340,17 +382,14 @@ fn copy_tables_inner(
         )
         .map_err(Error::SQLError)? as u64;
     info!(
-        "  copy_side_tables: staging_blocks ({staging_blocks_rows} rows) in {:?}",
+        "[index] staging_blocks ({staging_blocks_rows} rows) in {:?}",
         t.elapsed()
     );
 
     conn.execute_batch("DROP TABLE IF EXISTS canonical_blocks")
         .map_err(Error::SQLError)?;
 
-    info!(
-        "  copy_side_tables: all tables done in {:?}",
-        total_start.elapsed()
-    );
+    info!("[index] all tables done in {:?}", total_start.elapsed());
 
     Ok(IndexSideTableStats {
         block_headers_rows: get("block_headers"),
@@ -417,57 +456,29 @@ pub fn validate_index_side_tables(
             .unwrap_or(1)
             == 0;
 
-    // __fork_storage: canonical-only copy. Validate against the canonical
-    // filtered source set (same leaf-hash filter used by copy_canonical_fork_storage).
+    // __fork_storage: canonical-only copy.
+    // Validate against the canonical filtered source set
     let fork_storage_match = {
-        let dst_has = table_exists(&conn, "", "__fork_storage");
-        let src_has = table_exists(&conn, "src", "__fork_storage");
-        match (dst_has, src_has) {
-            (false, false) => true,
-            (true, true) => {
-                let has_marf_data = table_exists(&conn, "", "marf_data");
-
-                if has_marf_data {
-                    let (_tip, leaf_hashes) = collect_leaf_value_hashes::<StacksBlockId>(dst_path)?;
-
-                    conn.execute_batch(
-                        "CREATE TEMP TABLE val_fork_leaf_values (value_hash TEXT PRIMARY KEY)",
-                    )
-                    .map_err(Error::SQLError)?;
-
-                    {
-                        let mut stmt = conn
-                            .prepare(
-                                "INSERT OR IGNORE INTO val_fork_leaf_values (value_hash) VALUES (?1)",
-                            )
-                            .map_err(Error::SQLError)?;
-                        for hash in &leaf_hashes {
-                            stmt.execute([hash]).map_err(Error::SQLError)?;
-                        }
-                    }
-
-                    let ok = full_row_except_match(
-                        &conn,
-                        "SELECT * FROM __fork_storage",
-                        "SELECT f.* FROM src.__fork_storage f \
-                         INNER JOIN val_fork_leaf_values lv ON f.value_hash = lv.value_hash",
-                    );
-
-                    conn.execute_batch("DROP TABLE IF EXISTS val_fork_leaf_values")
-                        .map_err(Error::SQLError)?;
-
-                    ok
-                } else {
-                    // fixture fallback, matching copy_canonical_fork_storage()
-                    full_row_except_match(
-                        &conn,
-                        "SELECT * FROM __fork_storage",
-                        "SELECT * FROM src.__fork_storage",
-                    )
-                }
+        let leaf_hashes = collect_canonical_leaf_hashes::<StacksBlockId>(dst_path)?;
+        conn.execute_batch("CREATE TEMP TABLE val_fork_leaf_values (value_hash TEXT PRIMARY KEY)")
+            .map_err(Error::SQLError)?;
+        {
+            let mut stmt = conn
+                .prepare("INSERT INTO val_fork_leaf_values (value_hash) VALUES (?1)")
+                .map_err(Error::SQLError)?;
+            for hash in &leaf_hashes {
+                stmt.execute([hash]).map_err(Error::SQLError)?;
             }
-            _ => false,
         }
+        let ok = full_row_except_match(
+            &conn,
+            "SELECT * FROM __fork_storage",
+            "SELECT f.* FROM src.__fork_storage f \
+             INNER JOIN val_fork_leaf_values lv ON f.value_hash = lv.value_hash",
+        );
+        conn.execute_batch("DROP TABLE IF EXISTS val_fork_leaf_values")
+            .map_err(Error::SQLError)?;
+        ok
     };
 
     // Build canonical block set.
@@ -617,38 +628,45 @@ pub fn validate_index_side_tables(
         &format!("SELECT * FROM src.nakamoto_reward_sets WHERE index_block_hash IN ({cb})"),
     );
 
-    let max_reward_cycle = derive_max_reward_cycle(&conn, first_burn_height, reward_cycle_len)?;
+    let signer_stats_scope = derive_max_reward_cycle(&conn, first_burn_height, reward_cycle_len)?;
 
     // signer_stats is a non-consensus counter table whose only writer uses
     // INSERT ... ON CONFLICT DO UPDATE SET blocks_signed = blocks_signed + 1.
     // After the snapshot the source keeps incrementing, so we check:
     //   1. every (public_key, reward_cycle) key in dst exists in filtered src
     //   2. dst.blocks_signed <= src.blocks_signed
-    let signer_stats_match = {
-        let cycle_filter = match max_reward_cycle {
-            Some(cycle) => format!(" WHERE reward_cycle <= {cycle}"),
-            None => String::new(),
-        };
-        // No fabricated keys.
-        let keys_ok = dst_subset_of_src(
-            &conn,
-            "SELECT public_key, reward_cycle FROM signer_stats",
-            &format!("SELECT public_key, reward_cycle FROM src.signer_stats{cycle_filter}"),
-        );
-        // No inflated counters.
-        let counters_ok: i64 = conn
-            .query_row(
+    // Pre-Nakamoto: src.signer_stats verified empty by `derive_max_reward_cycle`,
+    // so we only check that dst is also empty.
+    let signer_stats_match = match signer_stats_scope {
+        RewardCycleScope::PreNakamoto => conn
+            .query_row("SELECT COUNT(*) FROM signer_stats", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|c| c == 0)
+            .unwrap_or(false),
+        RewardCycleScope::Through(cycle) => {
+            // No fabricated keys.
+            let keys_ok = dst_subset_of_src(
+                &conn,
+                "SELECT public_key, reward_cycle FROM signer_stats",
                 &format!(
+                    "SELECT public_key, reward_cycle FROM src.signer_stats \
+                     WHERE reward_cycle <= {cycle}"
+                ),
+            );
+            // No inflated counters.
+            let counters_ok: i64 = conn
+                .query_row(
                     "SELECT COUNT(*) FROM signer_stats d \
                      JOIN src.signer_stats s \
                        ON d.public_key = s.public_key AND d.reward_cycle = s.reward_cycle \
-                     WHERE d.blocks_signed > s.blocks_signed"
-                ),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(1);
-        keys_ok && counters_ok == 0
+                     WHERE d.blocks_signed > s.blocks_signed",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(1);
+            keys_ok && counters_ok == 0
+        }
     };
 
     // matured_rewards is a non-consensus cache populated as new blocks

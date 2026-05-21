@@ -19,19 +19,12 @@ use std::path::Path;
 use rusqlite::{params, Connection, OpenFlags};
 
 use super::common::{
-    clone_optional_schemas_from_source, clone_schemas_from_source, full_row_except_match,
-    table_exists,
+    clone_schemas_from_source, full_row_except_match, with_offline_write_session,
 };
-use crate::chainstate::stacks::db::snapshot::common::checkpoint_destination_wal;
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all headers.sqlite versions.
-const REQUIRED_TABLES: &[&str] = &["headers", "db_config"];
-
-/// Tables present only in SPV schema v2+ (may be absent in very old DBs).
-const OPTIONAL_TABLES: &[&str] = &[
-    "chain_work", // Added in SPV_SCHEMA_2
-];
+const REQUIRED_TABLES: &[&str] = &["headers", "db_config", "chain_work"];
 
 /// Bitcoin difficulty chunk size (2016 blocks per difficulty interval).
 const DIFFICULTY_CHUNK_SIZE: u32 = 2016;
@@ -77,35 +70,9 @@ pub fn copy_spv_headers(
         fs::create_dir_all(parent).map_err(Error::IOError)?;
     }
 
-    let conn = Connection::open(dst_path).map_err(Error::SQLError)?;
-
-    // Match the journal mode used by stacks-node (WAL) so the database can be
-    // opened later without needing write access to switch modes.
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(Error::SQLError)?;
-
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
-        .map_err(Error::SQLError)?;
-
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(Error::SQLError)?;
-
-    let result = copy_spv_headers_inner(&conn, burn_height);
-
-    match result {
-        Ok(stats) => {
-            conn.execute_batch("COMMIT").map_err(Error::SQLError)?;
-            conn.execute_batch("DETACH DATABASE src")
-                .map_err(Error::SQLError)?;
-            checkpoint_destination_wal(&conn)?;
-            Ok(stats)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            let _ = conn.execute_batch("DETACH DATABASE src");
-            Err(e)
-        }
-    }
+    with_offline_write_session(dst_path, &[("src", src_path)], "", |conn| {
+        copy_spv_headers_inner(conn, burn_height)
+    })
 }
 
 fn copy_spv_headers_inner(
@@ -113,8 +80,6 @@ fn copy_spv_headers_inner(
     burn_height: u32,
 ) -> Result<SpvHeadersCopyStats, Error> {
     clone_schemas_from_source(conn, REQUIRED_TABLES)?;
-    let optional_present = clone_optional_schemas_from_source(conn, OPTIONAL_TABLES)?;
-    let has_chain_work = optional_present.contains(&"chain_work".to_string());
 
     conn.execute("INSERT INTO db_config SELECT * FROM src.db_config", [])
         .map_err(Error::SQLError)?;
@@ -127,16 +92,13 @@ fn copy_spv_headers_inner(
         .map_err(Error::SQLError)? as u64;
 
     // Copy chain_work for complete intervals only.
-    let chain_work_rows = if has_chain_work {
-        conn.execute(
+    let chain_work_rows = conn
+        .execute(
             "INSERT INTO chain_work SELECT * FROM src.chain_work \
              WHERE (interval + 1) * ?1 - 1 <= ?2",
             params![DIFFICULTY_CHUNK_SIZE, burn_height],
         )
-        .map_err(Error::SQLError)? as u64
-    } else {
-        0
-    };
+        .map_err(Error::SQLError)? as u64;
 
     Ok(SpvHeadersCopyStats {
         headers_rows,
@@ -178,21 +140,14 @@ pub fn validate_spv_headers(
         &format!("SELECT * FROM src.headers WHERE height <= {burn_height}"),
     );
 
-    let has_src_cw = table_exists(&conn, "src", "chain_work");
-    let has_dst_cw = table_exists(&conn, "", "chain_work");
-
-    let chain_work_match = match (has_src_cw, has_dst_cw) {
-        (false, false) => true,
-        (true, true) => full_row_except_match(
-            &conn,
-            "SELECT * FROM chain_work",
-            &format!(
-                "SELECT * FROM src.chain_work \
+    let chain_work_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM chain_work",
+        &format!(
+            "SELECT * FROM src.chain_work \
                  WHERE (interval + 1) * {DIFFICULTY_CHUNK_SIZE} - 1 <= {burn_height}"
-            ),
         ),
-        _ => false,
-    };
+    );
 
     // No headers above burn_height in destination.
     let extra_above: i64 = conn

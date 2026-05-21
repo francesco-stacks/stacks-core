@@ -16,7 +16,8 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use rusqlite::{params, Connection};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use rusqlite::{params, Connection, OptionalExtension};
 use stacks_common::util::hash::to_hex;
 
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
@@ -35,9 +36,11 @@ pub struct TableCopySpec {
     pub source_sql: String,
 }
 
-/// Clone table and index schemas from the source DB (via `sqlite_master`) into the
-/// destination connection. This avoids duplicating any CREATE TABLE / ALTER TABLE /
-/// CREATE INDEX statements and is always in sync with whatever migration version the
+/// Clone table and index schemas from the source DB (via `sqlite_master`)
+/// into the destination connection. **Strict**: every requested table
+/// must exist in `src`, otherwise returns `CorruptionError`. This
+/// avoids duplicating CREATE TABLE / ALTER TABLE / CREATE INDEX
+/// statements and stays in sync with whatever migration version the
 /// source is at.
 ///
 /// Expects the source DB to be ATTACHed as `src`.
@@ -45,22 +48,27 @@ pub fn clone_schemas_from_source(conn: &Connection, tables: &[&str]) -> Result<(
     let mut stmts: Vec<String> = Vec::new();
 
     for table in tables {
-        let sql: Option<String> = conn
+        let create_sql: String = conn
             .query_row(
                 "SELECT sql FROM src.sqlite_master WHERE type='table' AND name=?1",
                 params![table],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()
+            .map_err(Error::SQLError)?
+            .ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "src is missing required table `{table}`; expected on any chainstate \
+                     that ran the matching migration"
+                ))
+            })?;
 
-        if let Some(create_sql) = sql {
-            let safe_sql = if create_sql.contains("IF NOT EXISTS") {
-                create_sql
-            } else {
-                create_sql.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
-            };
-            stmts.push(safe_sql);
-        }
+        let safe_sql = if create_sql.contains("IF NOT EXISTS") {
+            create_sql
+        } else {
+            create_sql.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
+        };
+        stmts.push(safe_sql);
 
         let mut idx_stmt = conn
             .prepare("SELECT sql FROM src.sqlite_master WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL")
@@ -84,29 +92,6 @@ pub fn clone_schemas_from_source(conn: &Connection, tables: &[&str]) -> Result<(
     }
 
     Ok(())
-}
-
-/// Clone schemas only for tables that exist in the source DB.
-/// Returns the list of tables that were actually cloned.
-pub fn clone_optional_schemas_from_source(
-    conn: &Connection,
-    tables: &[&str],
-) -> Result<Vec<String>, Error> {
-    let mut present = Vec::new();
-    for table in tables {
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM src.sqlite_master WHERE type='table' AND name=?1",
-                params![table],
-                |row| row.get(0),
-            )
-            .map_err(Error::SQLError)?;
-        if exists {
-            clone_schemas_from_source(conn, &[table])?;
-            present.push(table.to_string());
-        }
-    }
-    Ok(present)
 }
 
 /// Check if a table exists in the given schema prefix (empty for main, "src" for attached).
@@ -159,7 +144,11 @@ pub fn dst_subset_of_src(conn: &Connection, dst_sql: &str, src_sql: &str) -> boo
     extra_in_dst == 0
 }
 
-/// Execute a slice of copy specs inside the current transaction.
+/// Execute copy specs inside the current transaction, dropping each
+/// table's secondary indexes around the bulk INSERT and rebuilding
+/// them once at the end (one rebuild vs N per-row B-tree updates).
+/// `sqlite_autoindex_*` have `sql IS NULL` and are skipped.
+///
 /// Returns a vec of (table_name, rows_copied).
 pub fn execute_copy_specs(
     conn: &Connection,
@@ -167,46 +156,64 @@ pub fn execute_copy_specs(
 ) -> Result<Vec<(&'static str, u64)>, Error> {
     let mut results = Vec::with_capacity(specs.len());
     for spec in specs {
-        let t = Instant::now();
+        let t_total = Instant::now();
+
+        let t_drop = Instant::now();
+        let saved_indexes = collect_user_indexes(conn, spec.table)?;
+        for (name, _) in &saved_indexes {
+            conn.execute(&format!("DROP INDEX IF EXISTS \"{name}\""), [])
+                .map_err(Error::SQLError)?;
+        }
+        let drop_elapsed = t_drop.elapsed();
+
+        let t_insert = Instant::now();
         let sql = format!("INSERT INTO {} {}", spec.table, spec.source_sql);
         let rows = conn.execute(&sql, []).map_err(Error::SQLError)? as u64;
+        let insert_elapsed = t_insert.elapsed();
+
+        let t_rebuild = Instant::now();
+        for (_, create_sql) in &saved_indexes {
+            conn.execute(create_sql, []).map_err(Error::SQLError)?;
+        }
+        let rebuild_elapsed = t_rebuild.elapsed();
+
         info!(
-            "  copy: {} ({} rows) in {:?}",
+            "[copy] {} ({} rows) in {:?} (insert {:?}, drop {} idx {:?}, rebuild {:?})",
             spec.table,
             rows,
-            t.elapsed()
+            t_total.elapsed(),
+            insert_elapsed,
+            saved_indexes.len(),
+            drop_elapsed,
+            rebuild_elapsed,
         );
         results.push((spec.table, rows));
     }
     Ok(results)
 }
 
-/// Check an optional table's match status.
-/// Returns None if absent in both, Some(false) if present in one but not other,
-/// Some(true/false) from full-row EXCEPT if present in both.
-pub fn check_optional_table_match(
+/// Collect every user-defined index on `main.table` along with its
+/// CREATE statement so the caller can drop and later rebuild them.
+/// Excludes `sqlite_autoindex_*` (those have `sql IS NULL` and are
+/// recreated implicitly with the table).
+pub(crate) fn collect_user_indexes(
     conn: &Connection,
     table: &str,
-    src_filter: Option<&str>,
-) -> Option<bool> {
-    let in_dst = table_exists(conn, "", table);
-    let in_src = table_exists(conn, "src", table);
-
-    match (in_dst, in_src) {
-        (false, false) => None,
-        (true, false) | (false, true) => Some(false),
-        (true, true) => {
-            let src_sql = match src_filter {
-                Some(filter) => format!("SELECT * FROM src.{table} {filter}"),
-                None => format!("SELECT * FROM src.{table}"),
-            };
-            Some(full_row_except_match(
-                conn,
-                &format!("SELECT * FROM {table}"),
-                &src_sql,
-            ))
-        }
-    }
+) -> Result<Vec<(String, String)>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL",
+        )
+        .map_err(Error::SQLError)?;
+    let rows = stmt
+        .query_map(params![table], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(Error::SQLError)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Error::SQLError)?;
+    Ok(rows)
 }
 
 /// Collect the hex-encoded `MARFValue` of every leaf in the squashed trie.
@@ -224,10 +231,10 @@ pub fn collect_leaf_value_hashes<T: MarfTrieId>(
     let mut marf = MARF::<T>::from_storage(storage);
     let tip = trie_sql::get_latest_confirmed_block_hash::<T>(marf.sqlite_conn())?;
 
-    let mut hashes = HashSet::new();
+    let mut hashes: HashSet<String> = HashSet::new();
     marf.with_conn(|conn| {
         MARF::for_each_leaf(conn, &tip, |_hash, value| {
-            hashes.insert(to_hex(&value.to_vec()));
+            hashes.insert(to_hex(&value.0));
             Ok(())
         })
     })?;
@@ -235,109 +242,236 @@ pub fn collect_leaf_value_hashes<T: MarfTrieId>(
     Ok((tip, hashes))
 }
 
-/// Copy only the `__fork_storage` rows that are referenced by leaf nodes
-/// in the squashed MARF trie. Non-canonical entries from forks are excluded.
+/// Walk the squashed MARF at `dst_path` read-only and return the
+/// canonical leaf value hashes for `copy_canonical_fork_storage`.
 ///
-/// Opens the squashed MARF read-only and walks the trie via `for_each_leaf`
-/// to collect canonical leaf value hashes, then copies only the matching
-/// `__fork_storage` rows from the source.
-///
-/// Falls back to a full copy if `marf_data` is absent (e.g. in test
-/// fixtures that don't go through `squash_to_path`).
-///
-/// Returns the number of rows copied.
-pub fn copy_canonical_fork_storage<T: MarfTrieId>(
-    conn: &Connection,
+/// Returns an empty set when dst has no `marf_data` (practically
+/// only in tests, but this makes them easier).
+pub fn collect_canonical_leaf_hashes<T: MarfTrieId>(
     dst_path: &str,
-) -> Result<u64, Error> {
-    // Check if the source even has __fork_storage (test fixtures may not).
-    let src_has_table: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM src.sqlite_master WHERE type='table' AND name='__fork_storage'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-
-    if !src_has_table {
-        info!("  copy_canonical_fork_storage: source has no __fork_storage, skipping");
-        return Ok(0);
-    }
-
-    // Ensure the destination table exists (clone schema from source).
-    clone_schemas_from_source(conn, &["__fork_storage"])?;
-
-    // If marf_data doesn't exist, fall back to full copy.
-    let has_marf_data: bool = conn
+) -> Result<HashSet<String>, Error> {
+    let probe = Connection::open_with_flags(
+        dst_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(Error::SQLError)?;
+    let has_marf_data: bool = probe
         .query_row(
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='marf_data'",
             [],
             |row| row.get(0),
         )
         .unwrap_or(false);
-
+    drop(probe);
     if !has_marf_data {
-        let rows = conn
-            .execute(
-                "INSERT OR REPLACE INTO __fork_storage SELECT * FROM src.__fork_storage",
-                [],
-            )
-            .map_err(Error::SQLError)? as u64;
-        info!("  copy_canonical_fork_storage: no marf_data table, full copy ({rows} rows)");
-        return Ok(rows);
+        return Ok(HashSet::new());
     }
 
     let t = Instant::now();
-
     let (_tip, leaf_hashes) = collect_leaf_value_hashes::<T>(dst_path)?;
-    let insert_count = leaf_hashes.len() as u64;
-
-    // Build a temp table of canonical leaf value hashes.
-    conn.execute_batch("CREATE TEMP TABLE __squash_leaf_values (value_hash TEXT PRIMARY KEY)")
-        .map_err(Error::SQLError)?;
-
-    {
-        let mut stmt = conn
-            .prepare("INSERT OR IGNORE INTO __squash_leaf_values (value_hash) VALUES (?1)")
-            .map_err(Error::SQLError)?;
-        for hash in &leaf_hashes {
-            stmt.execute(params![hash]).map_err(Error::SQLError)?;
-        }
-    }
-    drop(leaf_hashes);
-
     info!(
-        "  copy_canonical_fork_storage: extracted {insert_count} leaf hashes in {:?}",
+        "[fork_storage] collected {} leaf hashes in {:?}",
+        leaf_hashes.len(),
         t.elapsed()
     );
+    Ok(leaf_hashes)
+}
 
-    // Copy only the referenced rows.
-    let t2 = Instant::now();
-    let rows = conn
-        .execute(
-            "INSERT OR REPLACE INTO __fork_storage \
-             SELECT f.* FROM src.__fork_storage f \
-             INNER JOIN __squash_leaf_values lv ON f.value_hash = lv.value_hash",
+/// Copy canonical `__fork_storage` rows from `src` into `main`. i.e.
+/// only the rows whose `value_hash` is referenced by a leaf in the
+/// squashed MARF.
+///
+/// An empty `leaf_hashes` results in zero rows copied. the strict
+/// `clone_schemas_from_source` ensures the schema is still cloned.
+pub fn copy_canonical_fork_storage(
+    conn: &Connection,
+    leaf_hashes: &HashSet<String>,
+) -> Result<u64, Error> {
+    let src_has_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM src.sqlite_master WHERE type='table' AND name='__fork_storage'",
             [],
+            |row| row.get(0),
         )
-        .map_err(Error::SQLError)? as u64;
-
-    conn.execute_batch("DROP TABLE IF EXISTS __squash_leaf_values")
         .map_err(Error::SQLError)?;
 
+    if !src_has_table {
+        return Err(Error::CorruptionError(
+            "src has no __fork_storage; expected on any chainstate that ran the MARF migration"
+                .into(),
+        ));
+    }
+
+    clone_schemas_from_source(conn, &["__fork_storage"])?;
+
+    // `get_ref` borrows the key bytes from SQLite's row buffer; we only
+    // allocate `value` when the row passes the canonical-leaf check.
+    let t = Instant::now();
+    let mut select = conn
+        .prepare("SELECT value_hash, value FROM src.__fork_storage")
+        .map_err(Error::SQLError)?;
+    let mut insert = conn
+        .prepare("INSERT OR REPLACE INTO __fork_storage (value_hash, value) VALUES (?1, ?2)")
+        .map_err(Error::SQLError)?;
+    let mut rows: u64 = 0;
+    let mut scanned: u64 = 0;
+    let mut rows_iter = select.query([]).map_err(Error::SQLError)?;
+    while let Some(row) = rows_iter.next().map_err(Error::SQLError)? {
+        scanned += 1;
+        let key_ref = row.get_ref(0).map_err(Error::SQLError)?;
+        let key_str = key_ref.as_str().map_err(|e| {
+            Error::CorruptionError(format!("src.__fork_storage.value_hash is not TEXT: {e:?}"))
+        })?;
+        if leaf_hashes.contains(key_str) {
+            let value: String = row.get(1).map_err(Error::SQLError)?;
+            insert
+                .execute(params![key_str, &value])
+                .map_err(Error::SQLError)?;
+            rows += 1;
+        }
+    }
     info!(
-        "  copy_canonical_fork_storage: copied {rows} rows (from {insert_count} leaves) in {:?}",
-        t2.elapsed()
+        "[fork_storage] stream-filter src.__fork_storage: scanned {scanned}, \
+         copied {rows} rows in {:?}",
+        t.elapsed()
     );
 
     Ok(rows)
 }
 
-pub fn checkpoint_destination_wal(conn: &Connection) -> Result<(), Error> {
-    let _: (i64, i64, i64) = conn
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
+/// Chars to percent-encode inside a SQLite `file:<path>?mode=ro` URI.
+/// Encodes URI-structural chars and parser-hostile bytes; leaves `/`
+/// and `:` intact so absolute Unix paths and Windows drive letters
+/// round-trip cleanly. Non-ASCII bytes are encoded by
+/// `utf8_percent_encode` regardless of the set.
+const SQLITE_URI_PATH_RESERVED: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+fn percent_encode_path(path: &str) -> String {
+    utf8_percent_encode(path, SQLITE_URI_PATH_RESERVED).to_string()
+}
+
+/// Open `dst_path` (created if missing), ATTACH each source read-only
+/// via `file:<path>?mode=ro` URI, run `body` inside `BEGIN IMMEDIATE`,
+/// then `COMMIT`, `DETACH`, and restore `journal_mode = WAL` so
+/// downstream readers (`marf_sqlite_open`) keep working.
+///
+/// Body runs with an aggressive offline pragma profile
+/// (`journal_mode = OFF`, `synchronous = OFF`, `locking_mode =
+/// EXCLUSIVE`, `temp_store = MEMORY`, 4 GiB mmap, 256 MiB cache), all
+/// `main.`-scoped. Read-only ATTACH keeps `BEGIN IMMEDIATE` from
+/// locking the source files, so a live node sharing them is not blocked.
+///
+/// On error, propagate without rollback - the caller discards
+/// `dst_path` (marf-squash restarts on any failure).
+///
+/// `pre_begin_pragmas` runs before ATTACH/BEGIN - use it for pragmas
+/// SQLite ignores mid-transaction (e.g. `foreign_keys`).
+///
+/// `alias` is interpolated into SQL; pass only trusted fixed
+/// identifiers (current callers use literals).
+pub fn with_offline_write_session<F, T>(
+    dst_path: &str,
+    attachments: &[(&'static str, &str)],
+    pre_begin_pragmas: &str,
+    body: F,
+) -> Result<T, Error>
+where
+    F: FnOnce(&Connection) -> Result<T, Error>,
+{
+    let conn = Connection::open(dst_path).map_err(Error::SQLError)?;
+    // `main.`-scoped so the aggressive profile applies only to dst.
+    // Safe given the offline + wipe-on-failure precondition (no
+    // rollback recovery needed).
+    conn.execute_batch(
+        "PRAGMA main.journal_mode = OFF; \
+         PRAGMA main.synchronous = OFF; \
+         PRAGMA main.mmap_size = 4294967296; \
+         PRAGMA main.temp_store = MEMORY; \
+         PRAGMA main.locking_mode = EXCLUSIVE; \
+         PRAGMA main.cache_size = -262144;",
+    )
+    .map_err(Error::SQLError)?;
+    if !pre_begin_pragmas.is_empty() {
+        conn.execute_batch(pre_begin_pragmas)
+            .map_err(Error::SQLError)?;
+    }
+
+    for (alias, path) in attachments {
+        let uri = format!("file:{}?mode=ro", percent_encode_path(path));
+        conn.execute(&format!("ATTACH DATABASE ?1 AS {alias}"), params![uri])
+            .map_err(Error::SQLError)?;
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(Error::SQLError)?;
-    Ok(())
+
+    let value = body(&conn)?;
+
+    conn.execute_batch("COMMIT").map_err(Error::SQLError)?;
+    for (alias, _) in attachments.iter().rev() {
+        conn.execute_batch(&format!("DETACH DATABASE {alias}"))
+            .map_err(Error::SQLError)?;
+    }
+    // Restore WAL on disk so downstream readonly openers (which
+    // force-set WAL via marf_sqlite_open) don't fail SQLITE_READONLY.
+    conn.execute_batch("PRAGMA main.journal_mode = WAL;")
+        .map_err(Error::SQLError)?;
+    Ok(value)
+}
+
+/// Drop user-defined indexes on `main.table` while `body` bulk-loads
+/// it, then recreate them on `Ok` (one rebuild vs N per-row B-tree
+/// updates). On `Err`, indexes are not recreated . marf-squash
+/// discards dst on failure, so the half-state is never observed.
+pub fn with_indexes_dropped<F, T>(conn: &Connection, table: &str, body: F) -> Result<T, Error>
+where
+    F: FnOnce(&Connection) -> Result<T, Error>,
+{
+    let saved = collect_user_indexes(conn, table)?;
+    for (name, _) in &saved {
+        conn.execute(&format!("DROP INDEX IF EXISTS \"{name}\""), [])
+            .map_err(Error::SQLError)?;
+    }
+    let value = body(conn)?;
+    for (_, create_sql) in &saved {
+        conn.execute(create_sql, []).map_err(Error::SQLError)?;
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::percent_encode_path;
+
+    #[rstest]
+    #[case::unix_absolute("/tmp/marf-squash/index.sqlite", "/tmp/marf-squash/index.sqlite")]
+    #[case::windows_drive_letter("C:/Users/test/index.sqlite", "C:/Users/test/index.sqlite")]
+    #[case::unreserved_chars_pass_through("/abc-DEF_123.~", "/abc-DEF_123.~")]
+    #[case::space_and_uri_structurals(
+        "/tmp/has space/file?x#y",
+        "/tmp/has%20space/file%3Fx%23y"
+    )]
+    #[case::percent_literal_encoded("/tmp/100%/x", "/tmp/100%25/x")]
+    // `é` is U+00E9 = 0xC3 0xA9 in UTF-8; non-ASCII bytes always encode.
+    #[case::non_ascii_as_utf8_bytes("/tmp/café", "/tmp/caf%C3%A9")]
+    fn percent_encode_path_cases(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(percent_encode_path(input), expected);
+    }
 }

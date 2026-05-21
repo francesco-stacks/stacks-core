@@ -149,6 +149,11 @@ fn apply_offline_squash_pragmas(conn: &rusqlite::Connection) -> Result<(), Error
 }
 
 /// Restore SQLite defaults after [`apply_offline_squash_pragmas`].
+///
+/// `journal_mode` must end at `WAL`: the side-table copy phase opens the
+/// squashed DB readonly via `marf_sqlite_open`, which forces
+/// `PRAGMA journal_mode = WAL` on every connection. That pragma fails
+/// `SQLITE_READONLY` unless the DB header is already WAL.
 fn restore_default_squash_pragmas(conn: &rusqlite::Connection) -> Result<(), Error> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;

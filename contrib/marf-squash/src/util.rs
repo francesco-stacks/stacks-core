@@ -17,6 +17,18 @@ use stackslib::config::{Config, ConfigFile};
 
 use crate::cli::{ChainstatePaths, GSS_MANIFEST, SQLITE_SIDECAR_EXTENSIONS, TargetPaths};
 
+/// Print `msg`, best-effort delete each path, then `exit(1)`. Needed
+/// because the offline-write helper runs with `journal_mode = OFF`:
+/// any mid-flight error leaves dst in an undefined state, so a clean
+/// re-run requires deleting it.
+pub fn die_with_cleanup(msg: &str, paths: &[&Path]) -> ! {
+    eprintln!("{msg}");
+    for p in paths {
+        let _ = fs::remove_file(p);
+    }
+    std::process::exit(1);
+}
+
 /// On mainnet, Bitcoin height 943332 was a fast-block (no Stacks tenure
 /// started there), so the last tenure that belongs entirely to epoch 3.3
 /// is at height 943331. This is the minimum acceptable value for

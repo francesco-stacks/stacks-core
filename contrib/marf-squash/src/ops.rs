@@ -14,7 +14,7 @@ use stackslib::clarity_vm::database::snapshot::{
 };
 
 use crate::cli::TargetPaths;
-use crate::util::ensure_blobs_match;
+use crate::util::{die_with_cleanup, ensure_blobs_match};
 
 #[derive(Clone)]
 pub enum SideTableMode {
@@ -75,6 +75,13 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
         }
     };
 
+    let die = |msg: String| -> ! {
+        match out.blobs.as_ref() {
+            Some(blobs) => die_with_cleanup(&msg, &[&out.db, blobs]),
+            None => die_with_cleanup(&msg, &[&out.db]),
+        }
+    };
+
     match &side_table_mode {
         SideTableMode::Clarity => {
             println!("Copying Clarity side tables...");
@@ -85,15 +92,7 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
                         st.data_table_rows, st.metadata_table_rows
                     );
                 }
-                Err(e) => {
-                    eprintln!("Failed to copy Clarity side tables: {e:?}");
-                    eprintln!("Cleaning up output files...");
-                    let _ = fs::remove_file(&out.db);
-                    if let Some(ref blobs) = out.blobs {
-                        let _ = fs::remove_file(blobs);
-                    }
-                    std::process::exit(1);
-                }
+                Err(e) => die(format!("Failed to copy Clarity side tables: {e:?}")),
             }
         }
         SideTableMode::Index {
@@ -124,15 +123,7 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
                         st.fork_storage_rows
                     );
                 }
-                Err(e) => {
-                    eprintln!("Failed to copy index side tables: {e:?}");
-                    eprintln!("Cleaning up output files...");
-                    let _ = fs::remove_file(&out.db);
-                    if let Some(ref blobs) = out.blobs {
-                        let _ = fs::remove_file(blobs);
-                    }
-                    std::process::exit(1);
-                }
+                Err(e) => die(format!("Failed to copy index side tables: {e:?}")),
             }
         }
         SideTableMode::Sortition => {
@@ -149,12 +140,7 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
                         st.fork_storage_rows
                     );
                 }
-                Err(e) => {
-                    eprintln!("Failed to copy sortition side tables: {e:?}");
-                    eprintln!("Cleaning up output files...");
-                    let _ = fs::remove_file(&out.db);
-                    std::process::exit(1);
-                }
+                Err(e) => die(format!("Failed to copy sortition side tables: {e:?}")),
             }
         }
     }
@@ -454,9 +440,6 @@ fn print_sortition_side_table_validation(v: &SortitionSideTableValidation) {
     );
     println!("  epochs_match: {}", v.epochs_match);
     println!("  db_config_match: {}", v.db_config_match);
-    if let Some(m) = v.snapshot_burn_distributions_match {
-        println!("  snapshot_burn_distributions_match: {m}");
-    }
     println!("  Sortition side-table valid: {}", v.is_valid());
 }
 
@@ -580,7 +563,6 @@ pub fn validate_bitcoin_aux_files(
             println!("  bc_db_config_match: {}", v.db_config_match);
             println!("  bc_no_extra_headers: {}", v.no_extra_headers);
             println!("  bc_canonical_complete: {}", v.canonical_complete);
-            println!("  bc_affirmation_maps_match: {}", v.affirmation_maps_match);
             if !v.is_valid() {
                 valid = false;
             }
@@ -633,19 +615,18 @@ pub fn copy_bitcoin_aux_files(
     ) {
         Ok(bc_stats) => {
             println!(
-                "  block_headers={}, block_ops={}, commit_metadata={}, anchor_blocks={}, overrides={}, affirmation_maps={}",
+                "  block_headers={}, block_ops={}, commit_metadata={}, anchor_blocks={}, overrides={}",
                 bc_stats.block_headers_rows,
                 bc_stats.block_ops_rows,
                 bc_stats.block_commit_metadata_rows,
                 bc_stats.anchor_blocks_rows,
                 bc_stats.overrides_rows,
-                bc_stats.affirmation_maps_rows
             );
         }
-        Err(e) => {
-            eprintln!("Failed to copy burnchain.sqlite: {e:?}");
-            std::process::exit(1);
-        }
+        Err(e) => die_with_cleanup(
+            &format!("Failed to copy burnchain.sqlite: {e:?}"),
+            &[dst_bc_db],
+        ),
     }
 
     println!("Copying headers.sqlite (SPV, up to burn height {burn_height})...");
@@ -660,9 +641,6 @@ pub fn copy_bitcoin_aux_files(
                 spv_stats.headers_rows, spv_stats.chain_work_rows
             );
         }
-        Err(e) => {
-            eprintln!("Failed to copy headers.sqlite: {e:?}");
-            std::process::exit(1);
-        }
+        Err(e) => die_with_cleanup(&format!("Failed to copy headers.sqlite: {e:?}"), &[dst_hdr]),
     };
 }

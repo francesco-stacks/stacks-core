@@ -9,10 +9,10 @@ use crate::ops::{
     validate_block_data, validate_one,
 };
 use crate::util::{
-    build_pox_constants, chainstate_paths, enforce_minimum_tenure_height, ensure_flag_requires,
-    ensure_targets_selected, read_db_config, resolve_canonical_squash_targets, selected_targets,
-    sortition_open_opts_for_path, squash_marf_open_opts, target_out_paths,
-    target_out_paths_sortition, warn_if_in_prepare_phase,
+    build_pox_constants, chainstate_paths, die_with_cleanup, enforce_minimum_tenure_height,
+    ensure_flag_requires, ensure_targets_selected, read_db_config,
+    resolve_canonical_squash_targets, selected_targets, sortition_open_opts_for_path,
+    squash_marf_open_opts, target_out_paths, target_out_paths_sortition, warn_if_in_prepare_phase,
 };
 use crate::verify::verify_gss;
 
@@ -194,10 +194,10 @@ pub fn run_squash(args: SquashArgs) {
                 );
                 st
             }
-            Err(e) => {
-                eprintln!("Failed to copy microblock streams: {e:?}");
-                std::process::exit(1);
-            }
+            Err(e) => die_with_cleanup(
+                &format!("Failed to copy microblock streams: {e:?}"),
+                &[&i_out.db],
+            ),
         };
 
         // 2. Copy epoch 2.x block files.
@@ -241,10 +241,10 @@ pub fn run_squash(args: SquashArgs) {
                 );
                 st
             }
-            Err(e) => {
-                eprintln!("Failed to copy nakamoto staging blocks: {e:?}");
-                std::process::exit(1);
-            }
+            Err(e) => die_with_cleanup(
+                &format!("Failed to copy nakamoto staging blocks: {e:?}"),
+                &[dst_nakamoto.as_path(), &i_out.db],
+            ),
         };
 
         blocks_stats = Some(BlocksSection {

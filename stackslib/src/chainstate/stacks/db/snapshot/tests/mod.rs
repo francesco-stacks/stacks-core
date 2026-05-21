@@ -81,6 +81,17 @@ fn create_source_db(path: &std::path::Path) -> Connection {
         conn.execute_batch(cmd).unwrap();
     }
 
+    // Tests skip the MARF migration; create `__fork_storage` empty so
+    // `copy_canonical_fork_storage`'s strict src-has-table check passes.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS __fork_storage (
+            value_hash TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY(value_hash)
+        );",
+    )
+    .unwrap();
+
     conn
 }
 
@@ -645,6 +656,16 @@ fn create_sortition_source_db(path: &std::path::Path) -> Connection {
         [],
     )
     .unwrap();
+    // Same reason as `create_source_db`: satisfy the strict
+    // src-has-table check in `copy_canonical_fork_storage`.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS __fork_storage (
+            value_hash TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY(value_hash)
+        );",
+    )
+    .unwrap();
     conn
 }
 
@@ -1026,8 +1047,7 @@ fn test_sortition_burn_header_hash_filtering() {
 }
 
 #[test]
-fn test_sortition_validate_detects_fabricated_canonical_set() {
-    // Destination claims a sortition_id that doesn't exist in source snapshots.
+fn test_sortition_copy_rejects_fabricated_canonical_set() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src_sort.sqlite");
     let conn = create_sortition_source_db(&src_path);
@@ -1040,86 +1060,15 @@ fn test_sortition_validate_detects_fabricated_canonical_set() {
     let dst_path = dir.path().join("dst_sort.sqlite");
     create_sortition_dest_db(&dst_path, &["sort_0", "sort_fake"]);
 
-    let _stats =
-        copy_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap()).unwrap();
-
-    let validation =
-        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
-            .unwrap();
-
-    assert!(
-        !validation.canonical_set_in_source,
-        "fabricated sortition_id should be detected"
-    );
-    assert!(!validation.is_valid(), "validation must fail");
-}
-
-#[test]
-fn test_sortition_optional_table_asymmetry() {
-    // Source has snapshot_burn_distributions but destination doesn't
-    // (e.g., table was created in source but clone_optional_schemas
-    // somehow didn't create it in destination). Validation should
-    // report Some(false).
-    let dir = tempdir().unwrap();
-    let src_path = dir.path().join("src_sort.sqlite");
-    let conn = create_sortition_source_db(&src_path);
-
-    // Add the optional table to source.
-    conn.execute_batch(
-        "CREATE TABLE snapshot_burn_distributions (
-                sortition_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL
-            )",
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO snapshot_burn_distributions (sortition_id, data) \
-             VALUES (?1, 'dist_data')",
-        params![hex_id("sort_0")],
-    )
-    .unwrap();
-
-    insert_snapshot(&conn, "sort_0", "bhh_0", 0);
-    insert_epoch(&conn, 0, 1);
-    drop(conn);
-
-    let dst_path = dir.path().join("dst_sort.sqlite");
-    create_sortition_dest_db(&dst_path, &["sort_0"]);
-
-    // Do the copy - this should copy snapshot_burn_distributions.
-    let _stats =
-        copy_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap()).unwrap();
-
-    // Validation should pass with the table present in both.
-    let validation =
-        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
-            .unwrap();
-    assert_eq!(
-        validation.snapshot_burn_distributions_match,
-        Some(true),
-        "should match when present in both"
-    );
-    assert!(validation.is_valid(), "should pass: {validation:?}");
-
-    // Now drop the table from destination to simulate asymmetry.
-    {
-        let conn = Connection::open(&dst_path).unwrap();
-        conn.execute_batch("DROP TABLE snapshot_burn_distributions")
-            .unwrap();
+    let err = copy_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+        .expect_err("copy must reject fabricated canonical sortition");
+    match err {
+        Error::CorruptionError(msg) => assert!(
+            msg.contains("canonical sortition") && msg.contains("absent from src.snapshots"),
+            "unexpected corruption message: {msg}"
+        ),
+        other => panic!("expected CorruptionError, got {other:?}"),
     }
-
-    let validation =
-        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
-            .unwrap();
-    assert_eq!(
-        validation.snapshot_burn_distributions_match,
-        Some(false),
-        "should detect table present in source but not dest"
-    );
-    assert!(
-        !validation.is_valid(),
-        "asymmetric optional table must fail"
-    );
 }
 
 #[test]
@@ -1407,11 +1356,16 @@ fn test_epoch2_block_file_missing_source_is_error() {
 fn test_all_required_tables_exist() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
-    let _conn = create_source_db(&src_path);
-    drop(_conn);
+    let conn = create_source_db(&src_path);
+    // Source-completeness: the canonical block listed in dst must also
+    // exist in src.block_headers. Insert a matching row.
+    insert_block_header(&conn, 0, "1");
+    drop(conn);
 
     let dst_path = dir.path().join("dst.sqlite");
-    create_dest_db_with_canonical_blocks(&dst_path, &[]);
+    // Use one canonical block so `marf_squashed_blocks` isn't empty;
+    // this test asserts schema presence, not canonical-set semantics.
+    create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
 
     copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1).unwrap();
 
@@ -2142,7 +2096,7 @@ use crate::burnchains::db::{
     BURNCHAIN_DB_INDEXES, BURNCHAIN_DB_MIGRATION_V2_TO_V3, BURNCHAIN_DB_SCHEMA_2,
 };
 
-/// Create a v3 burnchain.sqlite source (no affirmation_maps).
+/// Create a burnchain.sqlite source.
 /// Replays the real schema: SCHEMA_2 then MIGRATION_V2_TO_V3, plus indexes.
 fn create_burnchain_db_v3(path: &std::path::Path) -> Connection {
     let conn = Connection::open(path).unwrap();
@@ -2155,19 +2109,6 @@ fn create_burnchain_db_v3(path: &std::path::Path) -> Connection {
     conn.execute_batch(BURNCHAIN_DB_MIGRATION_V2_TO_V3).unwrap();
     conn.execute("UPDATE db_config SET version = '3'", [])
         .unwrap();
-    conn
-}
-
-/// Create a v2 burnchain.sqlite source (with affirmation_maps).
-/// Uses the real v2 schema plus indexes; does NOT apply the v3 migration.
-fn create_burnchain_db_v2(path: &std::path::Path) -> Connection {
-    let conn = Connection::open(path).unwrap();
-    conn.execute_batch(BURNCHAIN_DB_SCHEMA_2).unwrap();
-    conn.execute("INSERT INTO db_config (version) VALUES ('2')", [])
-        .unwrap();
-    for idx in BURNCHAIN_DB_INDEXES {
-        conn.execute_batch(idx).unwrap();
-    }
     conn
 }
 
@@ -2280,7 +2221,6 @@ fn test_burnchain_db_copy_and_validate() {
     assert_eq!(stats.block_headers_rows, 3); // 3 canonical
     assert_eq!(stats.block_ops_rows, 1); // only hash_1's op
     assert_eq!(stats.block_commit_metadata_rows, 1); // only canonical
-    assert_eq!(stats.affirmation_maps_rows, 0); // v3
 
     let v = super::burnchain::validate_burnchain_db(
         src_path.to_str().unwrap(),
@@ -2516,107 +2456,6 @@ fn test_burnchain_db_missing_source_is_error() {
     );
     // Should error because the source file does not exist.
     assert!(result.is_err());
-}
-
-#[test]
-fn test_burnchain_db_affirmation_maps_preserved_v2() {
-    let dir = tempdir().unwrap();
-    let src_path = dir.path().join("src.sqlite");
-    let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
-
-    create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1")]);
-
-    let src = create_burnchain_db_v2(&src_path);
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
-        [],
-    )
-    .unwrap();
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, 'h1', 'h0', 0, 0)",
-        [],
-    )
-    .unwrap();
-    // Affirmation map id=1 (id=0 already inserted by schema).
-    src.execute(
-        "INSERT INTO affirmation_maps (affirmation_id, weight, affirmation_map) VALUES (1, 1, 'p')",
-        [],
-    )
-    .unwrap();
-    // Affirmation map id=2 (not referenced by any canonical commit).
-    src.execute(
-            "INSERT INTO affirmation_maps (affirmation_id, weight, affirmation_map) VALUES (2, 2, 'pp')",
-            [],
-        )
-        .unwrap();
-    // Canonical commit referencing affirmation_id=1.
-    src.execute(
-            "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, affirmation_id, anchor_block, anchor_block_descendant) \
-             VALUES ('h1', 'tx1', 1, 0, 1, NULL, NULL)",
-            [],
-        )
-        .unwrap();
-    drop(src);
-
-    let stats = super::burnchain::copy_burnchain_db(
-        src_path.to_str().unwrap(),
-        dst_path.to_str().unwrap(),
-        sort_path.to_str().unwrap(),
-        1,
-    )
-    .unwrap();
-
-    // Only affirmation_id=1 referenced by canonical commit.
-    assert_eq!(stats.affirmation_maps_rows, 1);
-
-    let v = super::burnchain::validate_burnchain_db(
-        src_path.to_str().unwrap(),
-        dst_path.to_str().unwrap(),
-        sort_path.to_str().unwrap(),
-        1,
-    )
-    .unwrap();
-    assert!(v.is_valid(), "v2 validation failed: {v:?}");
-    assert!(v.affirmation_maps_match);
-}
-
-#[test]
-fn test_burnchain_db_v3_no_affirmation_maps() {
-    let dir = tempdir().unwrap();
-    let src_path = dir.path().join("src.sqlite");
-    let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
-
-    create_squashed_sortition(&sort_path, &[(0, "h0")]);
-
-    let src = create_burnchain_db_v3(&src_path);
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
-        [],
-    )
-    .unwrap();
-    drop(src);
-
-    let stats = super::burnchain::copy_burnchain_db(
-        src_path.to_str().unwrap(),
-        dst_path.to_str().unwrap(),
-        sort_path.to_str().unwrap(),
-        0,
-    )
-    .unwrap();
-
-    assert_eq!(stats.affirmation_maps_rows, 0);
-
-    let v = super::burnchain::validate_burnchain_db(
-        src_path.to_str().unwrap(),
-        dst_path.to_str().unwrap(),
-        sort_path.to_str().unwrap(),
-        0,
-    )
-    .unwrap();
-    assert!(v.is_valid(), "v3 validation failed: {v:?}");
-    assert!(v.affirmation_maps_match); // both absent = true
 }
 
 #[test]

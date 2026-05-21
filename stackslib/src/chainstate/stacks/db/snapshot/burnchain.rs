@@ -18,14 +18,10 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OpenFlags};
 
-use super::common::{
-    clone_optional_schemas_from_source, clone_schemas_from_source, full_row_except_match,
-    table_exists,
-};
-use crate::chainstate::stacks::db::snapshot::common::checkpoint_destination_wal;
+use super::common::{clone_schemas_from_source, full_row_except_match, with_offline_write_session};
 use crate::chainstate::stacks::index::Error;
 
-/// Tables required in all burnchain.sqlite versions (v2 and v3).
+/// Tables required in all burnchain.sqlite versions.
 const REQUIRED_TABLES: &[&str] = &[
     "burnchain_db_block_headers",
     "burnchain_db_block_ops",
@@ -33,11 +29,6 @@ const REQUIRED_TABLES: &[&str] = &[
     "anchor_blocks",
     "overrides",
     "db_config",
-];
-
-/// Tables present only in v2 (dropped by BURNCHAIN_DB_MIGRATION_V2_TO_V3).
-const OPTIONAL_TABLES: &[&str] = &[
-    "affirmation_maps", // v2 only; v3 drops it and removes FK from block_commit_metadata
 ];
 
 /// Row-count statistics returned by [`copy_burnchain_db`].
@@ -48,7 +39,6 @@ pub struct BurnchainDbCopyStats {
     pub block_commit_metadata_rows: u64,
     pub anchor_blocks_rows: u64,
     pub overrides_rows: u64,
-    pub affirmation_maps_rows: u64, // 0 if v3 (table absent)
 }
 
 /// Validation result for a copied burnchain.sqlite.
@@ -62,7 +52,6 @@ pub struct BurnchainDbValidation {
     pub db_config_match: bool,
     pub no_extra_headers: bool,
     pub canonical_complete: bool,
-    pub affirmation_maps_match: bool,
 }
 
 impl BurnchainDbValidation {
@@ -75,7 +64,6 @@ impl BurnchainDbValidation {
             && self.db_config_match
             && self.no_extra_headers
             && self.canonical_complete
-            && self.affirmation_maps_match
     }
 }
 
@@ -103,7 +91,6 @@ fn populate_canonical_burn_hashes(conn: &Connection) -> Result<(), Error> {
 /// 2. Canonical block_commit_metadata
 /// 3. anchor_blocks derived from copied commit metadata
 /// 4. overrides derived from copied anchor blocks
-/// 5. affirmation_maps derived from copied commit metadata (v2 only)
 pub fn copy_burnchain_db(
     src_burnchain_db_path: &str,
     dst_burnchain_db_path: &str,
@@ -125,47 +112,16 @@ pub fn copy_burnchain_db(
         fs::create_dir_all(parent).map_err(Error::IOError)?;
     }
 
-    let conn = Connection::open(dst_burnchain_db_path).map_err(Error::SQLError)?;
-
-    // Match the journal mode used by stacks-node (WAL) so the database can be
-    // opened later without needing write access to switch modes.
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(Error::SQLError)?;
-
-    // Disable FK enforcement during bulk copy.
-    conn.execute_batch("PRAGMA foreign_keys = OFF")
-        .map_err(Error::SQLError)?;
-
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_burnchain_db_path])
-        .map_err(Error::SQLError)?;
-    conn.execute(
-        "ATTACH DATABASE ?1 AS sort",
-        params![squashed_sortition_path],
+    with_offline_write_session(
+        dst_burnchain_db_path,
+        &[
+            ("src", src_burnchain_db_path),
+            ("sort", squashed_sortition_path),
+        ],
+        // FK off must run before BEGIN IMMEDIATE; per-connection only.
+        "PRAGMA foreign_keys = OFF;",
+        |conn| copy_burnchain_db_inner(conn, expected_burn_height),
     )
-    .map_err(Error::SQLError)?;
-
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(Error::SQLError)?;
-
-    let result = copy_burnchain_db_inner(&conn, expected_burn_height);
-
-    match result {
-        Ok(stats) => {
-            conn.execute_batch("COMMIT").map_err(Error::SQLError)?;
-            conn.execute_batch("DETACH DATABASE sort")
-                .map_err(Error::SQLError)?;
-            conn.execute_batch("DETACH DATABASE src")
-                .map_err(Error::SQLError)?;
-            checkpoint_destination_wal(&conn)?;
-            Ok(stats)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            let _ = conn.execute_batch("DETACH DATABASE sort");
-            let _ = conn.execute_batch("DETACH DATABASE src");
-            Err(e)
-        }
-    }
 }
 
 fn copy_burnchain_db_inner(
@@ -173,8 +129,6 @@ fn copy_burnchain_db_inner(
     expected_burn_height: u32,
 ) -> Result<BurnchainDbCopyStats, Error> {
     clone_schemas_from_source(conn, REQUIRED_TABLES)?;
-    let optional_present = clone_optional_schemas_from_source(conn, OPTIONAL_TABLES)?;
-    let has_affirmation_maps = optional_present.contains(&"affirmation_maps".to_string());
 
     // Copy db_config verbatim.
     conn.execute("INSERT INTO db_config SELECT * FROM src.db_config", [])
@@ -266,28 +220,12 @@ fn copy_burnchain_db_inner(
         )
         .map_err(Error::SQLError)? as u64;
 
-    // 5. affirmation_maps derived from copied commit metadata (v2 only)
-    let affirmation_maps_rows = if has_affirmation_maps {
-        conn.execute(
-            "INSERT INTO affirmation_maps \
-             SELECT * FROM src.affirmation_maps \
-             WHERE affirmation_id IN ( \
-                 SELECT DISTINCT affirmation_id FROM block_commit_metadata \
-             )",
-            [],
-        )
-        .map_err(Error::SQLError)? as u64
-    } else {
-        0
-    };
-
     Ok(BurnchainDbCopyStats {
         block_headers_rows,
         block_ops_rows,
         block_commit_metadata_rows,
         anchor_blocks_rows,
         overrides_rows,
-        affirmation_maps_rows,
     })
 }
 
@@ -393,23 +331,6 @@ pub fn validate_burnchain_db(
         .unwrap_or(1);
     let no_extra_headers = extra_non_canonical == 0;
 
-    // affirmation_maps: check if present in both or absent in both.
-    let has_src = table_exists(&conn, "src", "affirmation_maps");
-    let has_dst = table_exists(&conn, "", "affirmation_maps");
-
-    let affirmation_maps_match = match (has_src, has_dst) {
-        (false, false) => true,
-        (true, true) => full_row_except_match(
-            &conn,
-            "SELECT * FROM affirmation_maps",
-            "SELECT * FROM src.affirmation_maps \
-             WHERE affirmation_id IN ( \
-                 SELECT DISTINCT affirmation_id FROM block_commit_metadata \
-             )",
-        ),
-        _ => false,
-    };
-
     conn.execute_batch("DETACH DATABASE sort")
         .map_err(Error::SQLError)?;
     conn.execute_batch("DETACH DATABASE src")
@@ -424,6 +345,5 @@ pub fn validate_burnchain_db(
         db_config_match,
         no_extra_headers,
         canonical_complete,
-        affirmation_maps_match,
     })
 }
