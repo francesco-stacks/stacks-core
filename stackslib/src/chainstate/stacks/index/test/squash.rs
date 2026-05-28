@@ -655,6 +655,210 @@ fn test_squash_historical_read_intermittent_key_rejected() {
     }
 }
 
+/// Test helper: dispatch the key-based form of `get_path_with_last_write_height`.
+fn last_write_height_by_key(
+    marf: &mut MARF<StacksBlockId>,
+    block_hash: &StacksBlockId,
+    key: &str,
+) -> Result<Option<(MARFValue, u32)>, Error> {
+    let path = TrieHash::from_key(key);
+    marf.with_conn(|c| MARF::get_path_with_last_write_height(c, block_hash, &path))
+}
+
+/// At the squash tip, a key rewritten every block has last_write_height == squash_height.
+#[test]
+fn test_last_write_height_at_squash_tip() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("index.sqlite");
+    let (_archival, blocks, _) = setup_marf(src_path.to_str().unwrap(), 64, 4);
+
+    let squash_height: u32 = 48;
+    let (squashed_path, _) = squash_helper(
+        src_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        squash_height,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    let tip_block = &blocks[squash_height as usize];
+
+    let (val, last_write_height) = last_write_height_by_key(&mut squashed, tip_block, "k1")
+        .unwrap()
+        .expect("k1 present at squash tip");
+    assert_eq!(val, MARFValue::from_value("v1_at_48"));
+    assert_eq!(last_write_height, squash_height);
+}
+
+/// A write-once key reports its single-write height regardless of squash tip.
+#[test]
+fn test_last_write_height_stable_key_below_squash_tip() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("index.sqlite");
+    // Use 4 keys per block so k4 is written at block 1 and never again.
+    let (_archival, blocks, _) = setup_marf(src_path.to_str().unwrap(), 64, 4);
+
+    let squash_height: u32 = 48;
+    let (squashed_path, _) = squash_helper(
+        src_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        squash_height,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    let tip_block = &blocks[squash_height as usize];
+
+    // `setup_marf` inserts k4 once at block height 1; never rewritten after.
+    let (val, last_write_height) = last_write_height_by_key(&mut squashed, tip_block, "k4")
+        .unwrap()
+        .expect("k4 present");
+    assert_eq!(val, MARFValue::from_value("v4_at_1"));
+    assert_eq!(
+        last_write_height, 1,
+        "stable leaf reports its single-write height"
+    );
+}
+
+/// A key rewritten every block reports `last_write_height > J` for any
+/// sub-boundary J - the fallback caller must reject in this case.
+#[test]
+fn test_last_write_height_updated_key_above_subboundary() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("index.sqlite");
+    let (_archival, blocks, _) = setup_marf(src_path.to_str().unwrap(), 64, 4);
+
+    let squash_height: u32 = 48;
+    let (squashed_path, _) = squash_helper(
+        src_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        squash_height,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    let tip_block = &blocks[squash_height as usize];
+
+    let (val, last_write_height) = last_write_height_by_key(&mut squashed, tip_block, "k1")
+        .unwrap()
+        .expect("k1 present");
+    assert_eq!(val, MARFValue::from_value("v1_at_48"));
+    assert!(
+        last_write_height > 10,
+        "k1 updates every block; last_write_height={last_write_height} must exceed any sub-boundary J < squash_height"
+    );
+}
+
+/// Absent at the squash tip implies absent at any earlier tip (MARF is append-only).
+#[test]
+fn test_last_write_height_absent_key() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("index.sqlite");
+    let (_archival, blocks, _) = setup_marf(src_path.to_str().unwrap(), 64, 4);
+
+    let squash_height: u32 = 48;
+    let (squashed_path, _) = squash_helper(
+        src_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        squash_height,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    let tip_block = &blocks[squash_height as usize];
+
+    let result = last_write_height_by_key(&mut squashed, tip_block, "never_written_key").unwrap();
+    assert!(
+        result.is_none(),
+        "absent key must return None; got {result:?}"
+    );
+}
+
+#[test]
+fn test_get_from_hash_with_squash_tip_fallback() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("index.sqlite");
+    let (_archival, blocks, _) = setup_marf(src_path.to_str().unwrap(), 64, 4);
+
+    let squash_height: u32 = 48;
+    let (squashed_path, _) = squash_helper(
+        src_path.to_str().unwrap(),
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        squash_height,
+    );
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let mut squashed = MARF::from_path(squashed_path.to_str().unwrap(), open_opts).unwrap();
+
+    let early_block = &blocks[10];
+
+    let stable_path = TrieHash::from_key("k4");
+    let stable = squashed
+        .get_from_hash_with_squash_tip_fallback(early_block, &stable_path)
+        .expect("stable key should be recovered by fallback");
+    assert_eq!(stable, Some(MARFValue::from_value("v4_at_1")));
+
+    let absent_path = TrieHash::from_key("never_written_key");
+    let absent = squashed
+        .get_from_hash_with_squash_tip_fallback(early_block, &absent_path)
+        .expect("absent key should resolve through fallback");
+    assert_eq!(absent, None);
+
+    let updated_path = TrieHash::from_key("k1");
+    match squashed.get_from_hash_with_squash_tip_fallback(early_block, &updated_path) {
+        Err(Error::HistoricalReadInSquashedRange {
+            block_height,
+            squash_height: sh,
+        }) => {
+            assert_eq!(block_height, 10);
+            assert_eq!(sh, squash_height);
+        }
+        other => panic!("updated key below boundary must still reject; got {other:?}"),
+    }
+}
+
+/// On an archival MARF the helper matches `get_by_key` plus a height.
+#[test]
+fn test_last_write_height_archival_marf() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("index.sqlite");
+    let (mut archival, blocks, _) = setup_marf(src_path.to_str().unwrap(), 16, 4);
+
+    let early_block = &blocks[3];
+    let tip = blocks.last().unwrap();
+
+    assert_eq!(
+        archival.get_squashed_block_hash_at_height(3).unwrap(),
+        None,
+        "archival MARF should not report a squashed block hash"
+    );
+
+    let from_get = archival.get(early_block, "k1").unwrap();
+    let from_helper = last_write_height_by_key(&mut archival, early_block, "k1").unwrap();
+
+    assert_eq!(
+        from_get.map(|v| v),
+        from_helper.as_ref().map(|(v, _)| v.clone()),
+        "value matches between get and helper"
+    );
+
+    // Tip lookup should return the latest value too.
+    let (tip_val, tip_height) = last_write_height_by_key(&mut archival, tip, "k1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(tip_val, MARFValue::from_value("v1_at_15"));
+    assert_eq!(tip_height, 15);
+}
+
 /// Extend a squashed MARF through enough blocks to exercise deep backpointer
 /// chains and node promotions, then verify hash equality with the archival.
 /// Uses 256 blocks, 32 keys/block at squash height 192 (leaving 64 extension blocks).

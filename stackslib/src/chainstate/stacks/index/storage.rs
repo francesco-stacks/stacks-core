@@ -2582,6 +2582,9 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         };
 
         if block_height < squash_height {
+            error!(
+                "Historical read disallowed for block {block_hash}, height {block_height}: below squash height {squash_height}"
+            );
             return Err(Error::HistoricalReadInSquashedRange {
                 block_height,
                 squash_height,

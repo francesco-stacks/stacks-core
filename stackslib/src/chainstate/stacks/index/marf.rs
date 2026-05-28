@@ -200,9 +200,81 @@ pub trait MarfConnection<T: MarfTrieId> {
         self.with_conn(|c| MARF::get_by_key(c, block_hash, key))
     }
 
+    /// Resolve a squashed block's `block_hash` from its `last_write_height` via the
+    /// `marf_squashed_blocks` side table. Returns `Ok(None)` if the MARF is
+    /// archival or `height` is outside the squashed range.
+    fn get_squashed_block_hash_at_height(&mut self, height: u32) -> Result<Option<T>, Error> {
+        self.with_conn(|c| {
+            crate::chainstate::stacks::index::trie_sql::read_squashed_block_hash_by_height::<T>(
+                c.sqlite_conn(),
+                height,
+            )
+        })
+    }
+
     /// Resolve a TrieHash from the MARF to a MARFValue with respect to the given block height.
     fn get_from_hash(&mut self, block_hash: &T, th: &TrieHash) -> Result<Option<MARFValue>, Error> {
         self.with_conn(|c| MARF::get_by_hash(c, block_hash, th))
+    }
+
+    /// Resolve a TrieHash, applying the squash-tip fallback when a guarded
+    /// historical read below the squash boundary would otherwise fail.
+    /// Value-only; not for proofs.
+    fn get_from_hash_with_squash_tip_fallback(
+        &mut self,
+        block_hash: &T,
+        path: &TrieHash,
+    ) -> Result<Option<MARFValue>, Error> {
+        match self.get_from_hash(block_hash, path) {
+            Ok(result) => Ok(result),
+            Err(Error::NotFoundError) => Ok(None),
+            Err(
+                original @ Error::HistoricalReadInSquashedRange {
+                    block_height,
+                    squash_height,
+                },
+            ) => {
+                let Some(squash_tip) = self.get_squashed_block_hash_at_height(squash_height)?
+                else {
+                    warn!(
+                        "Squash-tip fallback rejected for {path} off of {block_hash}: no squashed block hash at height {squash_height}; original error: {original:?}"
+                    );
+                    return Err(original);
+                };
+
+                match self
+                    .with_conn(|c| MARF::get_path_with_last_write_height(c, &squash_tip, path))
+                {
+                    Ok(Some((marf_value, last_write_height)))
+                        if last_write_height <= block_height =>
+                    {
+                        debug!(
+                            "Squash-tip fallback hit for {path}: last_write_height={last_write_height} <= block_height={block_height}"
+                        );
+                        Ok(Some(marf_value))
+                    }
+                    Ok(Some((_marf_value, last_write_height))) => {
+                        warn!(
+                            "Squash-tip fallback rejected for {path} off of {block_hash}: last_write_height={last_write_height} > block_height={block_height}, squash_height={squash_height}, squash_tip={squash_tip}; original error: {original:?}"
+                        );
+                        Err(original)
+                    }
+                    Ok(None) => {
+                        debug!(
+                            "Squash-tip fallback found no leaf for {path} at squash height {squash_height}; treating as absent"
+                        );
+                        Ok(None)
+                    }
+                    Err(fallback_err) => {
+                        error!(
+                            "Squash-tip fallback failed for {path} off of {block_hash}: {fallback_err:?}; original error: {original:?}"
+                        );
+                        Err(fallback_err)
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn get_with_proof(
@@ -1322,6 +1394,116 @@ impl<T: MarfTrieId> MARF<T> {
             })?;
 
         result.map(|option_result| option_result.map(|leaf| leaf.data))
+    }
+
+    /// Like `get_by_hash`, but also returns the `last_write_height` of the block
+    /// whose trie carries the leaf pointer at the squash tip. CONSERVATIVE upper
+    /// bound on the last semantic write - copy-forward steps (`node_child_copy`,
+    /// `add_value`'s leaf promotion) may inflate it - so `last_write_height <=
+    /// J_height` is safe (no false positives) but admits false negatives.
+    ///
+    /// Bypasses `check_historical_read_allowed` so sub-boundary reads on a squashed
+    /// MARF can succeed via the shared squash blob. Restores the previously-opened
+    /// block. NOT for proofs - see `MarfConnection::get_from_hash_with_squash_tip_fallback`.
+    pub(crate) fn get_path_with_last_write_height(
+        storage: &mut TrieStorageConnection<T>,
+        block_hash: &T,
+        path: &TrieHash,
+    ) -> Result<Option<(MARFValue, u32)>, Error> {
+        let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
+
+        let walk_result = MARF::get_path_with_last_write_height_unchecked(
+            storage, block_hash, path,
+        )
+        .or_else(|e| match e {
+            Error::NotFoundError => Ok(None),
+            _ => Err(e),
+        });
+
+        // restore
+        storage
+            .open_block_maybe_id(&cur_block_hash, cur_block_id)
+            .inspect_err(|e| {
+                warn!("Failed to re-open {cur_block_hash} {cur_block_id:?}: {e:?}");
+                warn!("Result of failed last-write-height lookup '{path}': {walk_result:?}");
+            })?;
+
+        walk_result
+    }
+
+    /// Body of `get_path_with_last_write_height` minus the storage-restore book-keeping.
+    /// Mirrors `MARF::get_path` but skips `check_historical_read_allowed` and,
+    /// after the walk reaches a leaf, derives the leaf's `last_write_height` from
+    /// `cursor.ptr().back_block()` (or the current block for inline leaves).
+    fn get_path_with_last_write_height_unchecked(
+        storage: &mut TrieStorageConnection<T>,
+        block_hash: &T,
+        path: &TrieHash,
+    ) -> Result<Option<(MARFValue, u32)>, Error> {
+        trace!("MARF::get_path_with_last_write_height_unchecked({block_hash:?}) {path:?}");
+
+        // a NotFoundError _here_ means that a block didn't exist
+        storage.open_block(block_hash).inspect_err(|_e| {
+            test_debug!("Failed to open block {block_hash:?}: {_e:?}");
+        })?;
+
+        // a NotFoundError _here_ means that the key doesn't exist in this view
+        let (cursor, node) = MARF::walk(storage, block_hash, path).inspect_err(|_e| {
+            trace!("Failed to look up key {block_hash:?} {path:?}: {_e:?}");
+        })?;
+
+        if cursor.block_hashes.len() + 1 != cursor.node_ptrs.len() {
+            return Err(Error::CorruptionError(format!(
+                "cursor invariant violated for {block_hash} {path:?}: \
+                 block_hashes.len()={}, node_ptrs.len()={}",
+                cursor.block_hashes.len(),
+                cursor.node_ptrs.len()
+            )));
+        }
+
+        if !cursor.eop() {
+            return Err(Error::CorruptionError(format!(
+                "cursor did not reach end-of-path after walk for {block_hash} {path:?}"
+            )));
+        }
+
+        match node {
+            TrieNodeType::Leaf(data) => {
+                // Find the block whose trie carries this leaf at the squash tip.
+                // The squash preserves the original local id in `back_block` even
+                // after clearing `is_backptr` (see `remap_child_ptrs`); inline
+                // leaves have back_block == 0, so fall back to the current block.
+                let leaf_ptr = cursor.ptr();
+                let leaf_block_hash: T = if leaf_ptr.back_block() != 0 {
+                    storage
+                        .get_block_from_local_id(leaf_ptr.back_block())?
+                        .clone()
+                } else {
+                    storage.get_cur_block()
+                };
+
+                // Squashed: authoritative height comes from `marf_squashed_blocks`.
+                // Archival / post-squash: fall back to the MARF height index.
+                let last_write_height = match storage.squashed_block_height(&leaf_block_hash)? {
+                    Some(h) => h,
+                    None => match MARF::get_block_height(storage, &leaf_block_hash, block_hash)? {
+                        Some(h) => h,
+                        None => {
+                            return Err(Error::CorruptionError(format!(
+                                "Leaf for key path {path:?} is in block {leaf_block_hash} \
+                                     but neither the squash side table nor the MARF height \
+                                     index resolves a height for it (tip={block_hash})"
+                            )));
+                        }
+                    },
+                };
+
+                Ok(Some((data.data, last_write_height)))
+            }
+            _ => Err(Error::CorruptionError(
+                "Path reached a non-leaf".to_string(),
+            )),
+        }
     }
 
     /// Load up a MARF value by TrieHash, given a handle to the storage connection and a tip to

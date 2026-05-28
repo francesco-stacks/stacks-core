@@ -398,6 +398,13 @@ pub struct ReadOnlyMarfStore<'a> {
     marf: &'a mut MARF<StacksBlockId>,
 }
 
+fn unexpected_marf_get_error(context: String, e: Error) -> VmInternalError {
+    error!("Unexpected MARF failure on GET ({context}): {e:?}");
+    VmInternalError::Expect(format!(
+        "ERROR: Unexpected MARF Failure on GET ({context}): {e:?}"
+    ))
+}
+
 impl ClarityMarfStore for ReadOnlyMarfStore<'_> {}
 impl ClarityMarfStore for PersistentWritableMarfStore<'_> {}
 
@@ -540,6 +547,8 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
     }
 
     /// Sets the chain tip at which queries will happen.  Used for `(at-block ..)`
+    /// Below-boundary historical Clarity reads on a squashed snapshot are RPC
+    /// degradation only - `at-block` is removed in epoch 3.4.
     fn set_block_hash(&mut self, bhh: StacksBlockId) -> Result<StacksBlockId, VmExecutionError> {
         self.marf
             .check_ancestor_block_hash(&bhh)
@@ -639,7 +648,12 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
                 Error::NotFoundError => Ok(None),
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| {
+                unexpected_marf_get_error(
+                    format!("read-only proof key={key:?} tip={}", &self.chain_tip),
+                    e,
+                )
+            })?
             .map(|(marf_value, proof)| {
                 let side_key = marf_value.to_hex();
                 let data =
@@ -664,7 +678,12 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
                 Error::NotFoundError => Ok(None),
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| {
+                unexpected_marf_get_error(
+                    format!("read-only proof path={hash} tip={}", &self.chain_tip),
+                    e,
+                )
+            })?
             .map(|(marf_value, proof)| {
                 let side_key = marf_value.to_hex();
                 let data =
@@ -680,8 +699,9 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
     }
 
     fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
+        let path = TrieHash::from_key(key);
         self.marf
-            .get(&self.chain_tip, key)
+            .get_from_hash_with_squash_tip_fallback(&self.chain_tip, &path)
             .or_else(|e| match e {
                 Error::NotFoundError => {
                     test_debug!(
@@ -701,7 +721,12 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
                     Err(e)
                 }
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| {
+                unexpected_marf_get_error(
+                    format!("read-only key={key:?} tip={}", &self.chain_tip),
+                    e,
+                )
+            })?
             .map(|marf_value| {
                 let side_key = marf_value.to_hex();
                 SqliteConnection::get(self.get_side_store(), &side_key)?.ok_or_else(|| {
@@ -718,7 +743,7 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
     fn get_data_from_path(&mut self, hash: &TrieHash) -> Result<Option<String>, VmExecutionError> {
         trace!("MarfedKV get_from_hash: {:?} tip={}", hash, &self.chain_tip);
         self.marf
-            .get_from_hash(&self.chain_tip, hash)
+            .get_from_hash_with_squash_tip_fallback(&self.chain_tip, hash)
             .or_else(|e| match e {
                 Error::NotFoundError => {
                     trace!(
@@ -730,7 +755,12 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
                 }
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| {
+                unexpected_marf_get_error(
+                    format!("read-only path={hash} tip={}", &self.chain_tip),
+                    e,
+                )
+            })?
             .map(|marf_value| {
                 let side_key = marf_value.to_hex();
                 trace!("MarfedKV get side-key for {:?}: {:?}", hash, &side_key);
@@ -844,7 +874,12 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
                 }
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| {
+                unexpected_marf_get_error(
+                    format!("writable key={key:?} tip={}", &self.chain_tip),
+                    e,
+                )
+            })?
             .map(|marf_value| {
                 let side_key = marf_value.to_hex();
                 trace!("MarfedKV get side-key for {:?}: {:?}", key, &side_key);
@@ -874,7 +909,12 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
                 }
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| {
+                unexpected_marf_get_error(
+                    format!("writable path={hash} tip={}", &self.chain_tip),
+                    e,
+                )
+            })?
             .map(|marf_value| {
                 let side_key = marf_value.to_hex();
                 trace!("MarfedKV get side-key for {:?}: {:?}", hash, &side_key);
@@ -899,7 +939,12 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
                 Error::NotFoundError => Ok(None),
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| {
+                unexpected_marf_get_error(
+                    format!("writable proof key={key:?} tip={}", &self.chain_tip),
+                    e,
+                )
+            })?
             .map(|(marf_value, proof)| {
                 let side_key = marf_value.to_hex();
                 let data =
@@ -924,7 +969,12 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
                 Error::NotFoundError => Ok(None),
                 _ => Err(e),
             })
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
+            .map_err(|e| {
+                unexpected_marf_get_error(
+                    format!("writable proof path={hash} tip={}", &self.chain_tip),
+                    e,
+                )
+            })?
             .map(|(marf_value, proof)| {
                 let side_key = marf_value.to_hex();
                 let data =
@@ -1011,9 +1061,10 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             keys.push(key);
             values.push(marf_value);
         }
-        self.marf
-            .insert_batch(&keys, values)
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure".into()).into())
+        self.marf.insert_batch(&keys, values).map_err(|e| {
+            error!("Unexpected MARF failure on PUT: {e:?}");
+            VmInternalError::Expect(format!("ERROR: Unexpected MARF Failure on PUT: {e:?}")).into()
+        })
     }
 
     fn get_contract_hash(

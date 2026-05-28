@@ -772,7 +772,7 @@ pub fn get_ancestor_block_height<T: MarfTrieId>(
 }
 
 /// Load some index data
-fn load_indexed(conn: &DBConn, marf_value: &MARFValue) -> Result<Option<String>, Error> {
+pub(crate) fn load_indexed(conn: &DBConn, marf_value: &MARFValue) -> Result<Option<String>, Error> {
     let mut stmt = conn
         .prepare("SELECT value FROM __fork_storage WHERE value_hash = ?1 LIMIT 2")
         .map_err(Error::SqliteError)?;
@@ -796,20 +796,51 @@ fn load_indexed(conn: &DBConn, marf_value: &MARFValue) -> Result<Option<String>,
     Ok(value)
 }
 
-/// Get a value from the fork index
+/// Resolve a MARFValue into its `__fork_storage` string. Panics on the
+/// "leaf present but side-table row missing" corruption case, matching the
+/// behavior of `get_indexed`.
+fn load_indexed_value<T: MarfTrieId>(
+    conn: &DBConn,
+    header_hash: &T,
+    key: &str,
+    marf_value: &MARFValue,
+) -> Result<String, Error> {
+    let value = load_indexed(conn, marf_value)?.unwrap_or_else(|| {
+        panic!(
+            "FATAL: corrupt index: key '{key}' from {header_hash} is present in the index but missing a value in the DB"
+        )
+    });
+    Ok(value)
+}
+
+/// Get a value from the fork index.
+///
+/// On a squashed MARF, a sub-boundary read at tip `J` that fires
+/// `HistoricalReadInSquashedRange` is retried at the squash tip `H`. With
+/// `U = last_write_height` of the leaf at `H`:
+/// - `U <= J_height` ⇒ value at `J` equals value at `H` (writes are append-only),
+///   return it.
+/// - `U  > J_height` ⇒ a write happened in `(J, H]`; return the original error.
+/// - leaf absent at `H` ⇒ also absent at `J`. Return `Ok(None)`.
+///
+/// Consensus-safe but NOT proof-safe; proof callers go through `MARF::get_with_proof`
+/// which keeps the historical-read guard.
 fn get_indexed<T: MarfTrieId, M: MarfConnection<T>>(
     index: &mut M,
     header_hash: &T,
     key: &str,
 ) -> Result<Option<String>, Error> {
-    match index.get(header_hash, key) {
+    let path = TrieHash::from_key(key);
+    match index.get_from_hash_with_squash_tip_fallback(header_hash, &path) {
         Ok(Some(marf_value)) => {
-            let value = load_indexed(index.sqlite_conn(), &marf_value)?
-                .unwrap_or_else(|| panic!("FATAL: corrupt index: key '{}' from {} is present in the index but missing a value in the DB", &key, &header_hash));
+            let value = load_indexed_value(index.sqlite_conn(), header_hash, key, &marf_value)?;
             Ok(Some(value))
         }
         Ok(None) => Ok(None),
         Err(MARFError::NotFoundError) => Ok(None),
+        Err(original @ MARFError::HistoricalReadInSquashedRange { .. }) => {
+            Err(Error::IndexError(original))
+        }
         Err(e) => {
             error!(
                 "Failed to fetch '{}' off of {}: {:?}",
@@ -985,7 +1016,13 @@ impl<C: Clone, T: MarfTrieId> Drop for IndexDBTx<'_, C, T> {
 mod tests {
     use std::fs;
 
+    use stacks_common::types::chainstate::StacksBlockId;
+    use tempfile::tempdir;
+
     use super::*;
+    use crate::chainstate::stacks::index::marf::MARFOpenOpts;
+    use crate::chainstate::stacks::index::storage::{SquashBoundary, TrieHashCalculationMode};
+    use crate::chainstate::stacks::index::ClarityMarfTrieId;
 
     #[test]
     fn test_pragma() {
@@ -1017,5 +1054,172 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// End-to-end regression for the `last_write_height <= J_height` comparison
+    /// in `get_indexed`: accepts strict / boundary, rejects off-by-one / updated,
+    /// and above-boundary tips go through the normal path.
+    #[test]
+    fn test_get_indexed_squash_tip_fallback_comparison() {
+        fn block_id(b: u8) -> StacksBlockId {
+            let mut bytes = [0u8; 32];
+            bytes[31] = b;
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        }
+
+        let dir = tempdir().unwrap();
+        let archival_path = dir.path().join("archival.sqlite");
+
+        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+
+        let mut marf =
+            MARF::<StacksBlockId>::from_path(archival_path.to_str().unwrap(), open_opts.clone())
+                .unwrap();
+
+        // Mirrors what `IndexDBTx::instantiate_index` does at runtime.
+        marf.sqlite_conn()
+            .execute(
+                "CREATE TABLE __fork_storage (
+                    value_hash TEXT NOT NULL PRIMARY KEY,
+                    value TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+
+        let blocks: Vec<StacksBlockId> = (0..=5).map(block_id).collect();
+
+        let insert_fork_storage =
+            |marf: &MARF<StacksBlockId>, marf_value: &MARFValue, value: &str| {
+                marf.sqlite_conn()
+                    .execute(
+                        "INSERT OR REPLACE INTO __fork_storage (value_hash, value) VALUES (?1, ?2)",
+                        rusqlite::params![to_hex(&marf_value.to_vec()), value],
+                    )
+                    .unwrap();
+            };
+
+        marf.begin(&StacksBlockId::sentinel(), &blocks[0]).unwrap();
+        let stable_mv = MARFValue::from_value("stable_v0");
+        insert_fork_storage(&marf, &stable_mv, "stable_v0");
+        let updated_mv_at_0 = MARFValue::from_value("updated_v0");
+        insert_fork_storage(&marf, &updated_mv_at_0, "updated_v0");
+        marf.insert("stable", stable_mv).unwrap();
+        marf.insert("updated", updated_mv_at_0).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+
+        // Rewrite "updated" each block; leave "stable" at v0.
+        for i in 1..=5 {
+            marf.begin(&blocks[i - 1], &blocks[i]).unwrap();
+            let v = format!("updated_v{i}");
+            let mv = MARFValue::from_value(&v);
+            insert_fork_storage(&marf, &mv, &v);
+            marf.insert("updated", mv).unwrap();
+            marf.seal().unwrap();
+            marf.commit().unwrap();
+        }
+        drop(marf);
+
+        let squash_dir = dir.path().join("squashed");
+        std::fs::create_dir_all(&squash_dir).unwrap();
+        let squashed_db_path = squash_dir.join("index.sqlite");
+        let boundary = SquashBoundary {
+            marf_height: 5,
+            bitcoin_height: 5,
+        };
+        MARF::squash_to_path(
+            archival_path.to_str().unwrap(),
+            squashed_db_path.to_str().unwrap(),
+            open_opts.clone(),
+            &blocks[5],
+            boundary,
+            "test",
+        )
+        .unwrap();
+
+        // The squash tool copies __fork_storage in production; replicate it here.
+        let squashed_conn = Connection::open(squashed_db_path.to_str().unwrap()).unwrap();
+        squashed_conn
+            .execute(
+                "CREATE TABLE __fork_storage (
+                    value_hash TEXT NOT NULL PRIMARY KEY,
+                    value TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        squashed_conn
+            .execute(
+                &format!(
+                    "ATTACH DATABASE '{}' AS arch",
+                    archival_path.to_str().unwrap()
+                ),
+                [],
+            )
+            .unwrap();
+        squashed_conn
+            .execute(
+                "INSERT INTO __fork_storage SELECT * FROM arch.__fork_storage",
+                [],
+            )
+            .unwrap();
+        squashed_conn.execute("DETACH DATABASE arch", []).unwrap();
+        drop(squashed_conn);
+
+        let squashed =
+            MARF::<StacksBlockId>::from_path(squashed_db_path.to_str().unwrap(), open_opts.clone())
+                .unwrap();
+        let conn = IndexDBConn::new(&squashed, ());
+
+        // Tip == squash tip: normal path handles it.
+        let v = conn.get_indexed(&blocks[5], "stable").unwrap();
+        assert_eq!(v, Some("stable_v0".to_string()));
+
+        // BOUNDARY: J_height == last_write_height (both 0).
+        let v = conn
+            .get_indexed(&blocks[0], "stable")
+            .expect("stable equality must accept");
+        assert_eq!(v, Some("stable_v0".to_string()));
+
+        // STRICT: J_height > last_write_height.
+        let v = conn
+            .get_indexed(&blocks[3], "stable")
+            .expect("stable strict-below must accept");
+        assert_eq!(v, Some("stable_v0".to_string()));
+
+        // Absent at H ⇒ absent at any earlier tip.
+        let v = conn
+            .get_indexed(&blocks[0], "never_written")
+            .expect("absent key should resolve through squash-tip fallback");
+        assert_eq!(v, None);
+
+        // REJECT: J_height < last_write_height (updated key, J = 0, leaf at 5).
+        match conn.get_indexed(&blocks[0], "updated") {
+            Err(Error::IndexError(MARFError::HistoricalReadInSquashedRange {
+                block_height,
+                squash_height,
+            })) => {
+                assert_eq!(block_height, 0);
+                assert_eq!(squash_height, 5);
+            }
+            other => panic!(
+                "updated key at J<last_write_height must propagate HistoricalReadInSquashedRange; got {other:?}"
+            ),
+        }
+
+        // REJECT off-by-one: J = squash-1, leaf at squash.
+        match conn.get_indexed(&blocks[4], "updated") {
+            Err(Error::IndexError(MARFError::HistoricalReadInSquashedRange {
+                block_height,
+                squash_height,
+            })) => {
+                assert_eq!(block_height, 4);
+                assert_eq!(squash_height, 5);
+            }
+            other => panic!(
+                "updated key off-by-one (J = squash-1, leaf at squash) must reject; got {other:?}"
+            ),
+        }
     }
 }
