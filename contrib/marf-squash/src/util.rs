@@ -438,7 +438,12 @@ pub fn sortition_open_opts_for_path(db_path: &Path) -> MARFOpenOpts {
 /// Read `mainnet` from the index DB's `db_config` table and derive PoX constants.
 /// Read (mainnet, chain_id) from the index DB's db_config table.
 pub fn read_db_config(index_db_path: &Path) -> (bool, u32) {
-    let conn = rusqlite::Connection::open(index_db_path).unwrap_or_else(|e| {
+    // Read-only: never touch or create files on the source chainstate.
+    let conn = rusqlite::Connection::open_with_flags(
+        index_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap_or_else(|e| {
         eprintln!(
             "Failed to open index DB '{}' for db_config: {e}",
             index_db_path.display()

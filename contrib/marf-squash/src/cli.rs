@@ -31,7 +31,10 @@ pub struct SquashArgs {
     /// Path to the chainstate folder (the parent of chainstate/ and burnchain/).
     #[arg(long, value_name = "DIR")]
     pub chainstate: PathBuf,
-    /// Output directory for the squashed MARF files.
+    /// Output directory -- the node's `working_dir`. The squash writes a
+    /// directly bootable `<out-dir>/<network>/` tree. `<network>` is `mainnet`
+    /// for a mainnet chainstate, otherwise the source chainstate's own
+    /// subdirectory name (e.g. `krypton`).
     #[arg(long = "out-dir", value_name = "DIR")]
     pub out_dir: PathBuf,
     /// Bitcoin block height where a Nakamoto tenure started (sortition=true).

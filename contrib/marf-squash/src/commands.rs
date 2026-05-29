@@ -30,6 +30,52 @@ fn sortition_tip_copy_boundary(
     }
 }
 
+/// Network subdirectories marf-squash can target. A squash requires epoch 3.4
+/// (Nakamoto), so only the persistent Nakamoto networks qualify: mainnet and
+/// the krypton testnet.
+const KNOWN_NETWORK_SUBDIRS: &[&str] = &["mainnet", "krypton"];
+
+fn is_known_network(subdir: &str) -> bool {
+    KNOWN_NETWORK_SUBDIRS.contains(&subdir)
+}
+
+/// Resolve the `working_dir/<network>/` subdirectory for the squash output.
+///
+/// Mainnet is unambiguous. For any other network the mode (`krypton`, `xenon`,
+/// ...) is not recoverable from the chainstate alone (testnet/regtest share a
+/// chain id), so mirror the source chainstate's own subdirectory name.
+fn network_subdir(mainnet: bool, chainstate: &std::path::Path) -> Result<String, String> {
+    if mainnet {
+        return Ok("mainnet".to_string());
+    }
+    let subdir = chainstate
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!(
+                "cannot derive the network subdirectory from --chainstate '{}'; \
+                 pass a path ending in the network name, e.g. /stacks/krypton",
+                chainstate.display()
+            )
+        })?;
+    if subdir == "mainnet" {
+        return Err(format!(
+            "--chainstate '{}' ends in 'mainnet' but the chainstate is not mainnet; \
+             refusing to write a 'mainnet' subdirectory for a testnet/regtest chainstate",
+            chainstate.display()
+        ));
+    }
+    if !is_known_network(&subdir) {
+        return Err(format!(
+            "'{subdir}' is not a recognized stacks-node network ({}); stacks-node would reject \
+             this mode. Point --chainstate at a path ending in the network name.",
+            KNOWN_NETWORK_SUBDIRS.join(", ")
+        ));
+    }
+    Ok(subdir)
+}
+
 pub fn run_squash(args: SquashArgs) {
     ensure_targets_selected(
         args.clarity,
@@ -40,31 +86,41 @@ pub fn run_squash(args: SquashArgs) {
         args.all,
     );
 
-    // Require --out-dir to be absent or empty. Re-running into an existing
-    // output tree can leave partial or duplicate data (e.g. nakamoto.sqlite
-    // rows inserted twice) that is difficult to diagnose.
-    if args.out_dir.exists() {
-        let is_empty = std::fs::read_dir(&args.out_dir)
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(false);
-        if !is_empty {
-            eprintln!(
-                "Error: --out-dir '{}' already exists and is not empty.\n\
-                 Remove it or choose a different path to avoid partial/duplicate output.",
-                args.out_dir.display()
-            );
-            std::process::exit(1);
-        }
-    }
-
     let paths = chainstate_paths(&args.chainstate);
     let (do_clarity, do_index, do_sortition) =
         selected_targets(args.clarity, args.index, args.sortition, args.all);
 
     let tenure_start_bitcoin_height = args.tenure_start_bitcoin_height;
 
-    // Read network config.
     let (mainnet, chain_id) = read_db_config(&paths.index.db);
+
+    let subdir = network_subdir(mainnet, &args.chainstate).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+    let out_root = args.out_dir.join(&subdir);
+
+    // Require the destination network dir to be absent or empty. Re-running into
+    // an existing tree can leave partial or duplicate data (e.g. nakamoto.sqlite
+    // rows inserted twice) that is difficult to diagnose.
+    if out_root.exists() {
+        let is_empty = std::fs::read_dir(&out_root)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        if !is_empty {
+            eprintln!(
+                "Error: output '{}' already exists and is not empty.\n\
+                 Remove it or choose a different --out-dir to avoid partial/duplicate output.",
+                out_root.display()
+            );
+            std::process::exit(1);
+        }
+    }
+    std::fs::create_dir_all(&out_root).unwrap_or_else(|e| {
+        eprintln!("Failed to create output dir {}: {e}", out_root.display());
+        std::process::exit(1);
+    });
+
     let pox = build_pox_constants(mainnet, args.config.as_deref());
 
     // A squashed snapshot is only usable from epoch 3.4 onwards.
@@ -130,7 +186,7 @@ pub fn run_squash(args: SquashArgs) {
     // Phase 1: Squash & Copy
 
     if do_clarity {
-        let out = target_out_paths(&args.out_dir, &paths.clarity.db);
+        let out = target_out_paths(&out_root, &paths.clarity.db);
         squash_and_copy_one(
             "clarity",
             &paths.clarity,
@@ -144,7 +200,7 @@ pub fn run_squash(args: SquashArgs) {
     }
 
     if do_index {
-        let out = target_out_paths(&args.out_dir, &paths.index.db);
+        let out = target_out_paths(&out_root, &paths.index.db);
         squash_and_copy_one(
             "index",
             &paths.index,
@@ -161,7 +217,7 @@ pub fn run_squash(args: SquashArgs) {
     }
 
     if do_sortition {
-        let out = target_out_paths_sortition(&args.out_dir, &paths.sortition.db);
+        let out = target_out_paths_sortition(&out_root, &paths.sortition.db);
         squash_and_copy_one(
             "sortition",
             &paths.sortition,
@@ -185,7 +241,7 @@ pub fn run_squash(args: SquashArgs) {
 
     // These variables are needed by both the copy and validation phases for blocks.
     let src_blocks_dir = args.chainstate.join("chainstate/blocks");
-    let dst_blocks_dir = args.out_dir.join("chainstate/blocks");
+    let dst_blocks_dir = out_root.join("chainstate/blocks");
     let src_nakamoto = args.chainstate.join("chainstate/blocks/nakamoto.sqlite");
     let dst_nakamoto = dst_blocks_dir.join("nakamoto.sqlite");
 
@@ -298,10 +354,10 @@ pub fn run_squash(args: SquashArgs) {
     ensure_flag_requires("bitcoin", do_bitcoin_aux, "sortition", do_sortition);
     // These variables are needed by both the copy and validation phases for bitcoin aux.
     let src_bc_db = args.chainstate.join("burnchain/burnchain.sqlite");
-    let dst_bc_db = args.out_dir.join("burnchain/burnchain.sqlite");
-    let squashed_sort = args.out_dir.join("burnchain/sortition/marf.sqlite");
+    let dst_bc_db = out_root.join("burnchain/burnchain.sqlite");
+    let squashed_sort = out_root.join("burnchain/sortition/marf.sqlite");
     let src_hdr = args.chainstate.join("headers.sqlite");
-    let dst_hdr = args.out_dir.join("headers.sqlite");
+    let dst_hdr = out_root.join("headers.sqlite");
 
     if do_bitcoin_aux {
         copy_bitcoin_aux_files(
@@ -409,7 +465,7 @@ pub fn run_squash(args: SquashArgs) {
     if do_clarity && do_index && do_sortition && do_blocks && do_bitcoin_aux {
         let (sort_paths, sort_height) = sortition_out.unwrap();
         generate_manifest(
-            &args.out_dir,
+            &out_root,
             clarity_out.as_ref().unwrap(),
             index_out.as_ref().unwrap(),
             (&sort_paths, sort_height),
@@ -419,6 +475,14 @@ pub fn run_squash(args: SquashArgs) {
             &copied_block_rel_paths,
         );
     }
+
+    eprintln!(
+        "Squash complete. Output: {}\n  \
+         - Boot: set the node's working_dir = \"{}\"\n  \
+         - Re-validate/verify: pass this output path as --squashed-chainstate / --gss-dir",
+        out_root.display(),
+        args.out_dir.display()
+    );
 }
 
 pub fn run_validate(args: ValidateArgs) {
@@ -438,7 +502,7 @@ pub fn run_validate(args: ValidateArgs) {
 
     let tenure_start_bitcoin_height = args.tenure_start_bitcoin_height;
 
-    // Resolve the same way as run_squash.
+    // Read config and PoX constants the same way as run_squash.
     let (mainnet, chain_id) = read_db_config(&source_paths.index.db);
     let pox = build_pox_constants(mainnet, args.config.as_deref());
 
@@ -603,5 +667,90 @@ pub fn run_verify(args: VerifyArgs) {
             eprintln!("Verification FAILED.");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{is_known_network, network_subdir};
+    use crate::util::target_out_paths;
+
+    #[test]
+    fn network_subdir_mainnet_is_forced() {
+        // Mainnet always boots under `mainnet/`, regardless of the source path.
+        assert_eq!(
+            network_subdir(true, Path::new("/stacks/anything")).unwrap(),
+            "mainnet"
+        );
+        assert_eq!(network_subdir(true, Path::new("/")).unwrap(), "mainnet");
+    }
+
+    #[test]
+    fn network_subdir_mirrors_testnet_path() {
+        assert_eq!(
+            network_subdir(false, Path::new("/stacks/krypton")).unwrap(),
+            "krypton"
+        );
+        // Trailing slash is stripped.
+        assert_eq!(
+            network_subdir(false, Path::new("/stacks/krypton/")).unwrap(),
+            "krypton"
+        );
+    }
+
+    #[test]
+    fn network_subdir_rejects_undeterminable_path() {
+        assert!(network_subdir(false, Path::new("/")).is_err());
+        assert!(network_subdir(false, Path::new("..")).is_err());
+    }
+
+    #[test]
+    fn network_subdir_rejects_mainnet_dir_for_non_mainnet() {
+        // A testnet/regtest chainstate can never boot as mainnet.
+        assert!(network_subdir(false, Path::new("/stacks/mainnet")).is_err());
+    }
+
+    #[test]
+    fn network_subdir_unknown_errors() {
+        assert!(network_subdir(false, Path::new("/stacks/weirdnet")).is_err());
+    }
+
+    #[test]
+    fn known_networks() {
+        assert!(is_known_network("krypton"));
+        assert!(is_known_network("mainnet"));
+        assert!(!is_known_network("weirdnet"));
+    }
+
+    #[test]
+    fn output_lands_under_network_subdir() {
+        // The layout contract: `--out-dir` is the working_dir, and the squash
+        // targets land at `<out-dir>/<network>/...`.
+        let out_dir = Path::new("/tmp/out");
+
+        // Testnet: the source subdir is mirrored.
+        let subdir = network_subdir(false, Path::new("/data/krypton")).unwrap();
+        let out_root = out_dir.join(subdir);
+        let tp = target_out_paths(
+            &out_root,
+            Path::new("/data/krypton/chainstate/vm/clarity/marf.sqlite"),
+        );
+        assert_eq!(
+            tp.db.to_str().unwrap(),
+            "/tmp/out/krypton/chainstate/vm/clarity/marf.sqlite"
+        );
+
+        // Mainnet is forced into `mainnet/` regardless of the source path.
+        let mainnet_root = out_dir.join(network_subdir(true, Path::new("/data/x")).unwrap());
+        let tp_m = target_out_paths(
+            &mainnet_root,
+            Path::new("/data/x/chainstate/vm/index.sqlite"),
+        );
+        assert_eq!(
+            tp_m.db.to_str().unwrap(),
+            "/tmp/out/mainnet/chainstate/vm/index.sqlite"
+        );
     }
 }
