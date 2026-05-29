@@ -281,25 +281,25 @@ pub fn validate_burnchain_db(
         &conn,
         "SELECT * FROM db_config",
         "SELECT * FROM src.db_config",
-    );
+    )?;
 
     let block_headers_match = full_row_except_match(
         &conn,
         "SELECT * FROM burnchain_db_block_headers",
         &format!("SELECT * FROM src.burnchain_db_block_headers WHERE block_hash IN ({bhh})"),
-    );
+    )?;
 
     let block_ops_match = full_row_except_match(
         &conn,
         "SELECT * FROM burnchain_db_block_ops",
         &format!("SELECT * FROM src.burnchain_db_block_ops WHERE block_hash IN ({bhh})"),
-    );
+    )?;
 
     let block_commit_metadata_match = full_row_except_match(
         &conn,
         "SELECT * FROM block_commit_metadata",
         &format!("SELECT * FROM src.block_commit_metadata WHERE burn_block_hash IN ({bhh})"),
-    );
+    )?;
 
     let anchor_blocks_match = full_row_except_match(
         &conn,
@@ -309,14 +309,14 @@ pub fn validate_burnchain_db(
              SELECT DISTINCT anchor_block FROM block_commit_metadata \
              WHERE anchor_block IS NOT NULL \
          )",
-    );
+    )?;
 
     let overrides_match = full_row_except_match(
         &conn,
         "SELECT * FROM overrides",
         "SELECT * FROM src.overrides \
          WHERE reward_cycle IN (SELECT reward_cycle FROM anchor_blocks)",
-    );
+    )?;
 
     // No non-canonical burn hashes in destination.
     let extra_non_canonical: i64 = conn

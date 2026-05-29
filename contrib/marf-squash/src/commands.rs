@@ -1,5 +1,6 @@
 use stackslib::chainstate::stacks::db::snapshot::{
-    copy_confirmed_epoch2_microblocks, copy_epoch2_block_files, copy_nakamoto_staging_blocks,
+    SortitionTipCopyBoundary, copy_confirmed_epoch2_microblocks, copy_epoch2_block_files,
+    copy_nakamoto_staging_blocks,
 };
 use stackslib::chainstate::stacks::index::storage::SquashBoundary;
 
@@ -16,6 +17,18 @@ use crate::util::{
     squash_marf_open_opts, target_out_paths, target_out_paths_sortition, warn_if_in_prepare_phase,
 };
 use crate::verify::verify_gss;
+
+fn sortition_tip_copy_boundary(
+    targets: &crate::util::CanonicalSquashTargets,
+) -> SortitionTipCopyBoundary {
+    SortitionTipCopyBoundary {
+        max_stacks_height: u64::from(targets.stacks_height),
+        anchor_consensus_hash: targets.stacks_tip_consensus_hash.clone(),
+        anchor_burn_view_consensus_hash: targets.stacks_tip_burn_view_consensus_hash.clone(),
+        anchor_block_hash: targets.stacks_tip_block_hash.clone(),
+        anchor_block_height: u64::from(targets.stacks_height),
+    }
+}
 
 pub fn run_squash(args: SquashArgs) {
     ensure_targets_selected(
@@ -87,11 +100,10 @@ pub fn run_squash(args: SquashArgs) {
 
     let stacks_height = targets.stacks_height;
     let stacks_tip = targets.stacks_tip.clone();
+    let stacks_tip_boundary = sortition_tip_copy_boundary(&targets);
     let sortition_marf_height = targets.sortition_marf_height;
     let sortition_tip = targets.sortition_canonical_tip.clone();
     let first_bitcoin_height = targets.first_bitcoin_height;
-    // Resolved squash boundary (tenure end). Written into `marf_squash_info`
-    // so the runtime's reward-cycle gate can compare against it without IO.
     let squash_bitcoin_height = targets.squash_bitcoin_height;
     let stacks_boundary = SquashBoundary {
         marf_height: stacks_height,
@@ -104,7 +116,7 @@ pub fn run_squash(args: SquashArgs) {
 
     eprintln!(
         "Squash at tenure start Bitcoin height {tenure_start_bitcoin_height}, \
-         Stacks tenure end height {stacks_height}, canonical Stacks tip {stacks_tip} \
+         Stacks tenure-start anchor height {stacks_height}, anchor tip {stacks_tip} \
          (squash Bitcoin height {squash_bitcoin_height}, sortition MARF height {sortition_marf_height})"
     );
 
@@ -156,7 +168,9 @@ pub fn run_squash(args: SquashArgs) {
             &out,
             &sortition_tip,
             sortition_boundary,
-            SideTableMode::Sortition,
+            SideTableMode::Sortition {
+                stacks_tip_boundary: stacks_tip_boundary.clone(),
+            },
             sortition_open_opts_for_path(&paths.sortition.db),
         );
         sortition_out = Some((out, sortition_marf_height));
@@ -240,10 +254,12 @@ pub fn run_squash(args: SquashArgs) {
             std::process::exit(1);
         }
         println!("Copying nakamoto staging blocks...");
+        let source_canonical_tip_hex = targets.source_canonical_stacks_tip.to_hex();
         let nak_stats = match copy_nakamoto_staging_blocks(
             src_nakamoto.to_str().unwrap(),
             dst_nakamoto.to_str().unwrap(),
             dst_index_path,
+            Some(source_canonical_tip_hex.as_str()),
         ) {
             Ok(st) => {
                 println!(
@@ -343,7 +359,9 @@ pub fn run_squash(args: SquashArgs) {
                 &sortition_tip,
                 sortition_boundary,
                 args.full,
-                SideTableMode::Sortition,
+                SideTableMode::Sortition {
+                    stacks_tip_boundary: stacks_tip_boundary.clone(),
+                },
                 sortition_open_opts_for_path(&paths.sortition.db),
             )
         {
@@ -354,6 +372,7 @@ pub fn run_squash(args: SquashArgs) {
             let i_out = index_out
                 .as_ref()
                 .expect("--blocks requires --index; index_out must be set");
+            let source_canonical_tip_hex = targets.source_canonical_stacks_tip.to_hex();
             if !validate_block_data(
                 paths.index.db.to_str().unwrap(),
                 i_out.db.to_str().unwrap(),
@@ -361,6 +380,7 @@ pub fn run_squash(args: SquashArgs) {
                 &dst_blocks_dir,
                 &src_nakamoto,
                 &dst_nakamoto,
+                Some(source_canonical_tip_hex.as_str()),
             ) {
                 all_valid = false;
             }
@@ -452,6 +472,7 @@ pub fn run_validate(args: ValidateArgs) {
 
     let stacks_height = targets.stacks_height;
     let stacks_tip = targets.stacks_tip.clone();
+    let stacks_tip_boundary = sortition_tip_copy_boundary(&targets);
     let sortition_marf_height = targets.sortition_marf_height;
     let sortition_tip = targets.sortition_canonical_tip.clone();
     let first_bitcoin_height = targets.first_bitcoin_height;
@@ -505,7 +526,9 @@ pub fn run_validate(args: ValidateArgs) {
             &sortition_tip,
             sortition_boundary,
             args.full,
-            SideTableMode::Sortition,
+            SideTableMode::Sortition {
+                stacks_tip_boundary: stacks_tip_boundary.clone(),
+            },
             sortition_open_opts_for_path(&source_paths.sortition.db),
         )
     {
@@ -524,6 +547,7 @@ pub fn run_validate(args: ValidateArgs) {
             .join("chainstate/blocks/nakamoto.sqlite");
         let src_blocks_dir = args.source_chainstate.join("chainstate/blocks");
         let dst_blocks_dir = args.squashed_chainstate.join("chainstate/blocks");
+        let source_canonical_tip_hex = targets.source_canonical_stacks_tip.to_hex();
         if !validate_block_data(
             source_paths.index.db.to_str().unwrap(),
             squashed_paths.index.db.to_str().unwrap(),
@@ -531,6 +555,7 @@ pub fn run_validate(args: ValidateArgs) {
             &dst_blocks_dir,
             &src_nakamoto,
             &dst_nakamoto,
+            Some(source_canonical_tip_hex.as_str()),
         ) {
             all_valid = false;
         }

@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 
 use rusqlite::{params, Connection};
-use stacks_common::types::chainstate::SortitionId;
+use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, SortitionId};
 
 use super::common::{
     clone_schemas_from_source, collect_canonical_leaf_hashes, copy_canonical_fork_storage,
@@ -64,6 +64,22 @@ pub struct SortitionSideTableStats {
     pub fork_storage_rows: u64,
 }
 
+/// Stacks-side boundary used when copying sortition tip memo tables.
+///
+/// A squash can anchor the sortition MARF at a burn view whose runtime source
+/// tip is later than the copied Stacks MARF. In that case, the memoized
+/// sortition tip must be rewritten to the copied Stacks anchor so a booting
+/// node replays the intra-tenure descendants instead of believing they are
+/// already processed.
+#[derive(Debug, Clone)]
+pub struct SortitionTipCopyBoundary {
+    pub max_stacks_height: u64,
+    pub anchor_consensus_hash: ConsensusHash,
+    pub anchor_burn_view_consensus_hash: ConsensusHash,
+    pub anchor_block_hash: BlockHeaderHash,
+    pub anchor_block_height: u64,
+}
+
 /// Validation result for sortition side tables in a squashed DB.
 ///
 /// See [`validate_sortition_side_tables`] for the trust boundary - this checks
@@ -83,6 +99,12 @@ pub struct SortitionSideTableValidation {
     pub snapshot_transition_ops_match: bool,
     pub stacks_chain_tips_match: bool,
     pub stacks_chain_tips_by_burn_view_match: bool,
+    /// No copied sortition tip memo row points past the copied Stacks MARF
+    /// boundary.
+    pub stacks_chain_tips_within_stacks_boundary: bool,
+    /// The copied burn-view tip row resolves exactly to the selected Stacks
+    /// anchor when a Stacks boundary rewrite is requested.
+    pub stacks_chain_tips_anchor_match: bool,
     pub preprocessed_reward_sets_match: bool,
     pub missed_commits_match: bool,
     pub stack_stx_match: bool,
@@ -105,6 +127,8 @@ impl SortitionSideTableValidation {
             && self.snapshot_transition_ops_match
             && self.stacks_chain_tips_match
             && self.stacks_chain_tips_by_burn_view_match
+            && self.stacks_chain_tips_within_stacks_boundary
+            && self.stacks_chain_tips_anchor_match
             && self.preprocessed_reward_sets_match
             && self.missed_commits_match
             && self.stack_stx_match
@@ -166,13 +190,161 @@ fn populate_canonical_sortitions(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_tip_boundary(boundary: Option<&SortitionTipCopyBoundary>) -> Result<(), Error> {
+    if let Some(boundary) = boundary {
+        if boundary.anchor_block_height > boundary.max_stacks_height {
+            return Err(Error::CorruptionError(format!(
+                "sortition tip rewrite anchor height {} exceeds Stacks boundary {}",
+                boundary.anchor_block_height, boundary.max_stacks_height
+            )));
+        }
+        let _ = i64::try_from(boundary.max_stacks_height).map_err(|_| {
+            Error::CorruptionError(format!(
+                "Stacks boundary height {} exceeds SQLite INTEGER range",
+                boundary.max_stacks_height
+            ))
+        })?;
+        let _ = i64::try_from(boundary.anchor_block_height).map_err(|_| {
+            Error::CorruptionError(format!(
+                "sortition tip rewrite anchor height {} exceeds SQLite INTEGER range",
+                boundary.anchor_block_height
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Build the copy/validate source SQL for a sortition Stacks-tip memo table.
+///
+/// Handles both `stacks_chain_tips` and (with `include_burn_view`)
+/// `stacks_chain_tips_by_burn_view`; the latter carries an extra
+/// `burn_view_consensus_hash` column and a correspondingly stricter anchor
+/// match. With a `boundary`, rows whose `block_height` exceeds it are rewritten
+/// down to the anchor (see [`SortitionTipCopyBoundary`]).
+fn stacks_chain_tip_memo_source_sql(
+    table: &str,
+    sid: &str,
+    include_burn_view: bool,
+    boundary: Option<&SortitionTipCopyBoundary>,
+) -> String {
+    let Some(boundary) = boundary else {
+        return format!("SELECT * FROM src.{table} WHERE sortition_id IN ({sid})");
+    };
+    let max_height = boundary.max_stacks_height;
+    let anchor_height = boundary.anchor_block_height;
+    let anchor_ch = &boundary.anchor_consensus_hash;
+    let anchor_bhh = &boundary.anchor_block_hash;
+    let anchor_burn_view_ch = &boundary.anchor_burn_view_consensus_hash;
+    let burn_view_column = if include_burn_view {
+        format!(
+            "CASE WHEN block_height > {max_height} THEN '{anchor_burn_view_ch}' \
+                  ELSE burn_view_consensus_hash END, "
+        )
+    } else {
+        String::new()
+    };
+    let anchor_match = if include_burn_view {
+        format!(
+            "(consensus_hash = '{anchor_ch}' \
+              AND burn_view_consensus_hash = '{anchor_burn_view_ch}')"
+        )
+    } else {
+        format!("consensus_hash = '{anchor_ch}'")
+    };
+    format!(
+        "SELECT sortition_id, \
+                CASE WHEN block_height > {max_height} THEN '{anchor_ch}' ELSE consensus_hash END, \
+                {burn_view_column}\
+                CASE WHEN block_height > {max_height} THEN '{anchor_bhh}' ELSE block_hash END, \
+                CASE WHEN block_height > {max_height} THEN {anchor_height} ELSE block_height END \
+         FROM src.{table} \
+         WHERE sortition_id IN ({sid}) \
+           AND (block_height <= {max_height} OR {anchor_match})"
+    )
+}
+
+fn sortition_tip_heights_within_boundary(
+    conn: &Connection,
+    boundary: Option<&SortitionTipCopyBoundary>,
+) -> Result<bool, Error> {
+    let Some(boundary) = boundary else {
+        return Ok(true);
+    };
+    let max_height = i64::try_from(boundary.max_stacks_height).map_err(|_| {
+        Error::CorruptionError(format!(
+            "Stacks boundary height {} exceeds SQLite INTEGER range",
+            boundary.max_stacks_height
+        ))
+    })?;
+    conn.query_row(
+        "SELECT COUNT(*) = 0 FROM ( \
+             SELECT block_height FROM stacks_chain_tips WHERE block_height > ?1 \
+             UNION ALL \
+             SELECT block_height FROM stacks_chain_tips_by_burn_view WHERE block_height > ?1 \
+         )",
+        params![max_height],
+        |row| row.get(0),
+    )
+    .map_err(Error::SQLError)
+}
+
+fn sortition_tip_anchor_matches_boundary(
+    conn: &Connection,
+    boundary: Option<&SortitionTipCopyBoundary>,
+) -> Result<bool, Error> {
+    let Some(boundary) = boundary else {
+        return Ok(true);
+    };
+    let anchor_height = i64::try_from(boundary.anchor_block_height).map_err(|_| {
+        Error::CorruptionError(format!(
+            "sortition tip rewrite anchor height {} exceeds SQLite INTEGER range",
+            boundary.anchor_block_height
+        ))
+    })?;
+    let anchor_ch = boundary.anchor_consensus_hash.to_string();
+    let anchor_burn_view_ch = boundary.anchor_burn_view_consensus_hash.to_string();
+    let anchor_bhh = boundary.anchor_block_hash.to_string();
+
+    let burn_view_anchor_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM stacks_chain_tips_by_burn_view \
+             WHERE consensus_hash = ?1 \
+               AND burn_view_consensus_hash = ?2 \
+               AND block_hash = ?3 \
+               AND block_height = ?4",
+            params![&anchor_ch, &anchor_burn_view_ch, &anchor_bhh, anchor_height],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    let burn_view_mismatches: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM stacks_chain_tips_by_burn_view \
+             WHERE burn_view_consensus_hash = ?1 \
+               AND (consensus_hash != ?2 OR block_hash != ?3 OR block_height != ?4)",
+            params![&anchor_burn_view_ch, &anchor_ch, &anchor_bhh, anchor_height],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    let legacy_mismatches: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM stacks_chain_tips \
+             WHERE consensus_hash = ?1 \
+               AND (block_hash != ?2 OR block_height != ?3)",
+            params![&anchor_ch, &anchor_bhh, anchor_height],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+
+    Ok(burn_view_anchor_rows > 0 && burn_view_mismatches == 0 && legacy_mismatches == 0)
+}
+
 /// Build the copy specs for sortition side tables.
 ///
 /// Tables are grouped by their filter key:
 /// - `sortition_id` filtered
 /// - `burn_header_hash` filtered
 /// - full-copy
-fn sortition_copy_specs() -> Vec<TableCopySpec> {
+fn sortition_copy_specs(boundary: Option<&SortitionTipCopyBoundary>) -> Vec<TableCopySpec> {
     let sid = "SELECT sortition_id FROM canonical_sortitions";
     let bhh = "SELECT burn_header_hash FROM canonical_burn_hashes";
 
@@ -204,14 +376,15 @@ fn sortition_copy_specs() -> Vec<TableCopySpec> {
         },
         TableCopySpec {
             table: "stacks_chain_tips",
-            source_sql: format!(
-                "SELECT * FROM src.stacks_chain_tips WHERE sortition_id IN ({sid})"
-            ),
+            source_sql: stacks_chain_tip_memo_source_sql("stacks_chain_tips", sid, false, boundary),
         },
         TableCopySpec {
             table: "stacks_chain_tips_by_burn_view",
-            source_sql: format!(
-                "SELECT * FROM src.stacks_chain_tips_by_burn_view WHERE sortition_id IN ({sid})"
+            source_sql: stacks_chain_tip_memo_source_sql(
+                "stacks_chain_tips_by_burn_view",
+                sid,
+                true,
+                boundary,
             ),
         },
         TableCopySpec {
@@ -260,18 +433,28 @@ pub fn copy_sortition_side_tables(
     src_path: &str,
     dst_path: &str,
 ) -> Result<SortitionSideTableStats, Error> {
+    copy_sortition_side_tables_with_boundary(src_path, dst_path, None)
+}
+
+pub fn copy_sortition_side_tables_with_boundary(
+    src_path: &str,
+    dst_path: &str,
+    stacks_boundary: Option<&SortitionTipCopyBoundary>,
+) -> Result<SortitionSideTableStats, Error> {
+    validate_tip_boundary(stacks_boundary)?;
     // Walk the squashed trie before opening dst R/W.
     let leaf_hashes = collect_canonical_leaf_hashes::<SortitionId>(dst_path)?;
 
     with_offline_write_session(dst_path, &[("src", src_path)], "", |conn| {
         clone_schemas_from_source(conn, REQUIRED_TABLES)?;
-        copy_sortition_tables_inner(conn, &leaf_hashes)
+        copy_sortition_tables_inner(conn, &leaf_hashes, stacks_boundary)
     })
 }
 
 fn copy_sortition_tables_inner(
     conn: &Connection,
     leaf_hashes: &HashSet<String>,
+    stacks_boundary: Option<&SortitionTipCopyBoundary>,
 ) -> Result<SortitionSideTableStats, Error> {
     // Copy db_config verbatim.
     let db_config_rows = conn
@@ -290,8 +473,13 @@ fn copy_sortition_tables_inner(
     populate_canonical_sortitions(conn)?;
 
     // Execute descriptor-driven copies.
-    let specs = sortition_copy_specs();
+    let specs = sortition_copy_specs(stacks_boundary);
     let results = execute_copy_specs(conn, &specs)?;
+    if !sortition_tip_heights_within_boundary(conn, stacks_boundary)? {
+        return Err(Error::CorruptionError(
+            "copied sortition tip row points past the Stacks MARF boundary".into(),
+        ));
+    }
 
     conn.execute_batch("DROP TABLE IF EXISTS canonical_sortitions")
         .map_err(Error::SQLError)?;
@@ -346,6 +534,15 @@ pub fn validate_sortition_side_tables(
     src_path: &str,
     dst_path: &str,
 ) -> Result<SortitionSideTableValidation, Error> {
+    validate_sortition_side_tables_with_boundary(src_path, dst_path, None)
+}
+
+pub fn validate_sortition_side_tables_with_boundary(
+    src_path: &str,
+    dst_path: &str,
+    stacks_boundary: Option<&SortitionTipCopyBoundary>,
+) -> Result<SortitionSideTableValidation, Error> {
+    validate_tip_boundary(stacks_boundary)?;
     let conn = Connection::open(dst_path).map_err(Error::SQLError)?;
     conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
         .map_err(Error::SQLError)?;
@@ -404,80 +601,89 @@ pub fn validate_sortition_side_tables(
         &conn,
         "SELECT * FROM snapshots",
         &format!("SELECT * FROM src.snapshots WHERE sortition_id IN ({sid})"),
-    );
+    )?;
     let leader_keys_match = full_row_except_match(
         &conn,
         "SELECT * FROM leader_keys",
         &format!("SELECT * FROM src.leader_keys WHERE sortition_id IN ({sid})"),
-    );
+    )?;
     let block_commits_match = full_row_except_match(
         &conn,
         "SELECT * FROM block_commits",
         &format!("SELECT * FROM src.block_commits WHERE sortition_id IN ({sid})"),
-    );
+    )?;
     let block_commit_parents_match = full_row_except_match(
         &conn,
         "SELECT * FROM block_commit_parents",
         &format!(
             "SELECT * FROM src.block_commit_parents WHERE block_commit_sortition_id IN ({sid})"
         ),
-    );
+    )?;
     let snapshot_transition_ops_match = full_row_except_match(
         &conn,
         "SELECT * FROM snapshot_transition_ops",
         &format!("SELECT * FROM src.snapshot_transition_ops WHERE sortition_id IN ({sid})"),
-    );
+    )?;
     let stacks_chain_tips_match = full_row_except_match(
         &conn,
         "SELECT * FROM stacks_chain_tips",
-        &format!("SELECT * FROM src.stacks_chain_tips WHERE sortition_id IN ({sid})"),
-    );
+        &stacks_chain_tip_memo_source_sql("stacks_chain_tips", sid, false, stacks_boundary),
+    )?;
     let stacks_chain_tips_by_burn_view_match = full_row_except_match(
         &conn,
         "SELECT * FROM stacks_chain_tips_by_burn_view",
-        &format!("SELECT * FROM src.stacks_chain_tips_by_burn_view WHERE sortition_id IN ({sid})"),
-    );
+        &stacks_chain_tip_memo_source_sql(
+            "stacks_chain_tips_by_burn_view",
+            sid,
+            true,
+            stacks_boundary,
+        ),
+    )?;
+    let stacks_chain_tips_within_stacks_boundary =
+        sortition_tip_heights_within_boundary(&conn, stacks_boundary)?;
+    let stacks_chain_tips_anchor_match =
+        sortition_tip_anchor_matches_boundary(&conn, stacks_boundary)?;
     let preprocessed_reward_sets_match = full_row_except_match(
         &conn,
         "SELECT * FROM preprocessed_reward_sets",
         &format!("SELECT * FROM src.preprocessed_reward_sets WHERE sortition_id IN ({sid})"),
-    );
+    )?;
     let missed_commits_match = full_row_except_match(
         &conn,
         "SELECT * FROM missed_commits",
         &format!("SELECT * FROM src.missed_commits WHERE intended_sortition_id IN ({sid})"),
-    );
+    )?;
 
     // burn_header_hash-filtered tables
     let stack_stx_match = full_row_except_match(
         &conn,
         "SELECT * FROM stack_stx",
         &format!("SELECT * FROM src.stack_stx WHERE burn_header_hash IN ({bhh})"),
-    );
+    )?;
     let transfer_stx_match = full_row_except_match(
         &conn,
         "SELECT * FROM transfer_stx",
         &format!("SELECT * FROM src.transfer_stx WHERE burn_header_hash IN ({bhh})"),
-    );
+    )?;
     let delegate_stx_match = full_row_except_match(
         &conn,
         "SELECT * FROM delegate_stx",
         &format!("SELECT * FROM src.delegate_stx WHERE burn_header_hash IN ({bhh})"),
-    );
+    )?;
     let vote_for_aggregate_key_match = full_row_except_match(
         &conn,
         "SELECT * FROM vote_for_aggregate_key",
         &format!("SELECT * FROM src.vote_for_aggregate_key WHERE burn_header_hash IN ({bhh})"),
-    );
+    )?;
 
     // Full-copy tables
     let epochs_match =
-        full_row_except_match(&conn, "SELECT * FROM epochs", "SELECT * FROM src.epochs");
+        full_row_except_match(&conn, "SELECT * FROM epochs", "SELECT * FROM src.epochs")?;
     let db_config_match = full_row_except_match(
         &conn,
         "SELECT * FROM db_config",
         "SELECT * FROM src.db_config",
-    );
+    )?;
 
     // __fork_storage: canonical-only copy.
     // Validate against the canonical filtered source set.
@@ -498,7 +704,7 @@ pub fn validate_sortition_side_tables(
             "SELECT * FROM __fork_storage",
             "SELECT f.* FROM src.__fork_storage f \
              INNER JOIN val_fork_leaf_values lv ON f.value_hash = lv.value_hash",
-        );
+        )?;
         conn.execute_batch("DROP TABLE IF EXISTS val_fork_leaf_values")
             .map_err(Error::SQLError)?;
         ok
@@ -519,6 +725,8 @@ pub fn validate_sortition_side_tables(
         snapshot_transition_ops_match,
         stacks_chain_tips_match,
         stacks_chain_tips_by_burn_view_match,
+        stacks_chain_tips_within_stacks_boundary,
+        stacks_chain_tips_anchor_match,
         preprocessed_reward_sets_match,
         missed_commits_match,
         stack_stx_match,

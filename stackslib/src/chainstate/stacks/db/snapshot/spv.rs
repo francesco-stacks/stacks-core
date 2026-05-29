@@ -130,13 +130,13 @@ pub fn validate_spv_headers(
         &conn,
         "SELECT * FROM db_config",
         "SELECT * FROM src.db_config",
-    );
+    )?;
 
     let headers_match = full_row_except_match(
         &conn,
         "SELECT * FROM headers",
         &format!("SELECT * FROM src.headers WHERE height <= {burn_height}"),
-    );
+    )?;
 
     let chain_work_match = full_row_except_match(
         &conn,
@@ -145,7 +145,7 @@ pub fn validate_spv_headers(
             "SELECT * FROM src.chain_work \
                  WHERE (interval + 1) * {DIFFICULTY_CHUNK_SIZE} - 1 <= {burn_height}"
         ),
-    );
+    )?;
 
     // No headers above burn_height in destination.
     let extra_above: i64 = conn

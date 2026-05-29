@@ -2,10 +2,11 @@ use std::fs;
 use std::path::Path;
 
 use stackslib::chainstate::stacks::db::snapshot::{
-    IndexSideTableValidation, SortitionSideTableValidation, copy_burnchain_db,
-    copy_index_side_tables, copy_sortition_side_tables, copy_spv_headers, validate_burnchain_db,
-    validate_epoch2_block_files, validate_index_side_tables, validate_microblock_streams,
-    validate_nakamoto_staging_blocks, validate_sortition_side_tables, validate_spv_headers,
+    IndexSideTableValidation, SortitionSideTableValidation, SortitionTipCopyBoundary,
+    copy_burnchain_db, copy_index_side_tables, copy_sortition_side_tables_with_boundary,
+    copy_spv_headers, validate_burnchain_db, validate_epoch2_block_files,
+    validate_index_side_tables, validate_microblock_streams, validate_nakamoto_staging_blocks,
+    validate_sortition_side_tables_with_boundary, validate_spv_headers,
 };
 use stackslib::chainstate::stacks::index::MarfTrieId;
 use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, SquashValidationStats};
@@ -24,7 +25,9 @@ pub enum SideTableMode {
         first_bitcoin_height: u32,
         reward_cycle_len: u32,
     },
-    Sortition,
+    Sortition {
+        stacks_tip_boundary: SortitionTipCopyBoundary,
+    },
 }
 
 impl SideTableMode {
@@ -32,7 +35,7 @@ impl SideTableMode {
         match self {
             SideTableMode::Clarity => "clarity",
             SideTableMode::Index { .. } => "index",
-            SideTableMode::Sortition => "sortition",
+            SideTableMode::Sortition { .. } => "sortition",
         }
     }
 }
@@ -127,10 +130,15 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
                 Err(e) => die(format!("Failed to copy index side tables: {e:?}")),
             }
         }
-        SideTableMode::Sortition => {
+        SideTableMode::Sortition {
+            stacks_tip_boundary,
+        } => {
             println!("Copying sortition side tables...");
-            match copy_sortition_side_tables(source.db.to_str().unwrap(), out.db.to_str().unwrap())
-            {
+            match copy_sortition_side_tables_with_boundary(
+                source.db.to_str().unwrap(),
+                out.db.to_str().unwrap(),
+                Some(stacks_tip_boundary),
+            ) {
                 Ok(st) => {
                     println!(
                         "Sortition side-table copy complete: snapshots={}, leader_keys={}, block_commits={}, epochs={}, fork_storage={}",
@@ -281,10 +289,14 @@ pub fn validate_one<T: MarfTrieId>(
         true
     };
 
-    let sortition_side_valid = if matches!(side_table_mode, SideTableMode::Sortition) {
-        match validate_sortition_side_tables(
+    let sortition_side_valid = if let SideTableMode::Sortition {
+        stacks_tip_boundary,
+    } = &side_table_mode
+    {
+        match validate_sortition_side_tables_with_boundary(
             source.db.to_str().unwrap(),
             squashed.db.to_str().unwrap(),
+            Some(stacks_tip_boundary),
         ) {
             Ok(v) => {
                 print_sortition_side_table_validation(&v);
@@ -439,6 +451,14 @@ fn print_sortition_side_table_validation(v: &SortitionSideTableValidation) {
         v.stacks_chain_tips_by_burn_view_match
     );
     println!(
+        "  stacks_chain_tips_within_stacks_boundary: {}",
+        v.stacks_chain_tips_within_stacks_boundary
+    );
+    println!(
+        "  stacks_chain_tips_anchor_match: {}",
+        v.stacks_chain_tips_anchor_match
+    );
+    println!(
         "  preprocessed_reward_sets_match: {}",
         v.preprocessed_reward_sets_match
     );
@@ -464,6 +484,7 @@ pub fn validate_block_data(
     dst_blocks_dir: &Path,
     src_nakamoto: &Path,
     dst_nakamoto: &Path,
+    source_canonical_tip: Option<&str>,
 ) -> bool {
     println!("Validating block data...");
     let mut valid = true;
@@ -503,10 +524,12 @@ pub fn validate_block_data(
             src_nakamoto.to_str().unwrap(),
             dst_nakamoto.to_str().unwrap(),
             dst_index,
+            source_canonical_tip,
         ) {
             Ok(v) => {
                 println!("  nakamoto_metadata_match: {}", v.metadata_match);
                 println!("  nakamoto_no_extra_blocks: {}", v.no_extra_blocks);
+                println!("  nakamoto_no_dangling_parents: {}", v.no_dangling_parents);
                 println!("  nakamoto_blob_bytes_match: {}", v.blob_bytes_match);
                 println!("  nakamoto_db_version_match: {}", v.db_version_match);
                 println!("  nakamoto_schema_match: {}", v.schema_match);

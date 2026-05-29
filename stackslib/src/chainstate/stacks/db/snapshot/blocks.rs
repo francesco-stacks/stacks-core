@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 
 use super::common::{
@@ -74,6 +74,7 @@ impl MicroblockValidation {
 pub struct NakamotoBlockValidation {
     pub metadata_match: bool,
     pub no_extra_blocks: bool,
+    pub no_dangling_parents: bool,
     pub blob_bytes_match: bool,
     pub db_version_match: bool,
     pub schema_match: bool,
@@ -83,6 +84,7 @@ impl NakamotoBlockValidation {
     pub fn is_valid(&self) -> bool {
         self.metadata_match
             && self.no_extra_blocks
+            && self.no_dangling_parents
             && self.blob_bytes_match
             && self.db_version_match
             && self.schema_match
@@ -101,6 +103,177 @@ impl Epoch2BlockFileValidation {
     pub fn is_valid(&self) -> bool {
         self.all_files_present && self.no_extra_files && self.all_bytes_match
     }
+}
+
+fn squashed_index_marf_height(conn: &Connection) -> Result<Option<i64>, Error> {
+    let has_squash_info: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM idx.sqlite_master \
+             WHERE type = 'table' AND name = 'marf_squash_info'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    if !has_squash_info {
+        return Ok(None);
+    }
+
+    conn.query_row(
+        "SELECT marf_height FROM idx.marf_squash_info LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Error::SQLError)
+}
+
+const NAKAMOTO_STAGING_BLOCK_COLUMNS: &str = "\
+    block_hash, consensus_hash, parent_block_id, is_tenure_start, \
+    burn_attachable, processed, orphaned, height, index_block_hash, \
+    processed_time, obtain_method, signing_weight, data";
+
+const NAKAMOTO_STAGING_BLOCK_METADATA_COLUMNS: &str = "\
+    block_hash, consensus_hash, parent_block_id, is_tenure_start, \
+    burn_attachable, processed, orphaned, height, index_block_hash, \
+    processed_time, obtain_method, signing_weight";
+
+fn nakamoto_staging_blocks_index_canonical_predicate(source_alias: &str) -> String {
+    format!(
+        "{source_alias}.index_block_hash IN (SELECT index_block_hash FROM idx.nakamoto_block_headers)"
+    )
+}
+
+/// Predicate selecting the staging rows the squash retains.
+///
+/// - Non-squash (`squashed == false`): every non-orphan canonical block, i.e.
+///   one present in the squashed index headers.
+/// - Squash (`squashed == true`): the canonical blocks at/below the boundary
+///   (the index headers) plus the canonical descendant chain strictly above it,
+///   materialized in the temp table `replay_chain` by
+///   [`build_replay_chain_temp_table`]. Side forks and orphans are excluded.
+fn nakamoto_staging_blocks_membership_predicate(source_alias: &str, squashed: bool) -> String {
+    let canonical_by_index = nakamoto_staging_blocks_index_canonical_predicate(source_alias);
+    if !squashed {
+        return format!("{source_alias}.orphaned = 0 AND {canonical_by_index}");
+    }
+    format!(
+        "{source_alias}.orphaned = 0 \
+         AND ( \
+           {canonical_by_index} \
+           OR {source_alias}.index_block_hash IN (SELECT index_block_hash FROM replay_chain) \
+         )"
+    )
+}
+
+fn nakamoto_staging_blocks_source_select(
+    source_alias: &str,
+    squashed: bool,
+    include_data: bool,
+) -> String {
+    let data_column = if include_data {
+        format!(", {source_alias}.data")
+    } else {
+        String::new()
+    };
+    // Post-boundary replay-chain members are reset to unprocessed so the booted
+    // node replays them.
+    let (processed_expr, processed_time_expr) = if squashed {
+        let replay = format!(
+            "{source_alias}.index_block_hash IN (SELECT index_block_hash FROM replay_chain)"
+        );
+        (
+            format!("CASE WHEN {replay} THEN 0 ELSE {source_alias}.processed END"),
+            format!("CASE WHEN {replay} THEN 0 ELSE {source_alias}.processed_time END"),
+        )
+    } else {
+        (
+            format!("{source_alias}.processed"),
+            format!("{source_alias}.processed_time"),
+        )
+    };
+
+    format!(
+        "SELECT {source_alias}.block_hash, \
+                {source_alias}.consensus_hash, \
+                {source_alias}.parent_block_id, \
+                {source_alias}.is_tenure_start, \
+                {source_alias}.burn_attachable, \
+                {processed_expr}, \
+                {source_alias}.orphaned, \
+                {source_alias}.height, \
+                {source_alias}.index_block_hash, \
+                {processed_time_expr}, \
+                {source_alias}.obtain_method, \
+                {source_alias}.signing_weight \
+                {data_column} \
+         FROM src.nakamoto_staging_blocks {source_alias}"
+    )
+}
+
+/// Materialize the canonical replay chain into the temp table `replay_chain`.
+///
+/// Walks `parent_block_id` from the source canonical Stacks tip back toward the
+/// anchor, retaining only blocks strictly above `squash_stacks_height`. Because
+/// parent links are unique, this is *exactly* the set of post-boundary
+/// canonical descendants a booted node must replay: competing processed forks
+/// (which are not ancestors of the canonical tip) and orphans are excluded by
+/// construction. Requires the source DB attached as `src`.
+fn build_replay_chain_temp_table(
+    conn: &Connection,
+    squash_stacks_height: i64,
+    source_canonical_tip: &str,
+) -> Result<(), Error> {
+    // Fail fast on a tip that can't anchor a replay chain (missing, orphaned, or
+    // not above the boundary): it would otherwise yield an empty `replay_chain`
+    // that still validates. A valid-but-wrong tip is trusted from the CLI's
+    // authoritative canonical-tip computation.
+    let tip_height: Option<i64> = conn
+        .query_row(
+            "SELECT height FROM src.nakamoto_staging_blocks \
+             WHERE index_block_hash = ?1 AND orphaned = 0",
+            params![source_canonical_tip],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Error::SQLError)?;
+    match tip_height {
+        Some(height) if height > squash_stacks_height => {}
+        Some(height) => {
+            return Err(Error::CorruptionError(format!(
+                "source canonical tip {source_canonical_tip} is at height {height}, not above the \
+                 squash boundary {squash_stacks_height}"
+            )));
+        }
+        None => {
+            return Err(Error::CorruptionError(format!(
+                "source canonical tip {source_canonical_tip} is absent or orphaned in the source \
+                 staging blocks"
+            )));
+        }
+    }
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS replay_chain; \
+         CREATE TEMP TABLE replay_chain (index_block_hash TEXT PRIMARY KEY);",
+    )
+    .map_err(Error::SQLError)?;
+    conn.execute(
+        "INSERT INTO replay_chain (index_block_hash) \
+         WITH RECURSIVE chain(index_block_hash, parent_block_id, height) AS ( \
+             SELECT index_block_hash, parent_block_id, height \
+             FROM src.nakamoto_staging_blocks \
+             WHERE index_block_hash = ?1 AND orphaned = 0 \
+             UNION ALL \
+             SELECT s.index_block_hash, s.parent_block_id, s.height \
+             FROM src.nakamoto_staging_blocks s \
+             JOIN chain c ON s.index_block_hash = c.parent_block_id \
+             WHERE c.height > ?2 AND s.orphaned = 0 \
+         ) \
+         SELECT index_block_hash FROM chain WHERE height > ?2",
+        params![source_canonical_tip, squash_stacks_height],
+    )
+    .map_err(Error::SQLError)?;
+    Ok(())
 }
 
 /// Return the hashes of confirmed microblocks descending from `parent_ibh`.
@@ -370,10 +543,16 @@ pub fn copy_epoch2_block_files(
 
 /// Create and populate `nakamoto.sqlite` with canonical `nakamoto_staging_blocks` rows.
 /// The INSERT runs with `synchronous = OFF` and secondary indexes dropped + rebuilt.
+///
+/// `source_canonical_tip` is the hex `index_block_hash` of the source chainstate's
+/// canonical Nakamoto tip. It must be `Some(_)` when the squashed index carries a
+/// boundary - the post-boundary replay chain is walked back from it (see
+/// [`build_replay_chain_temp_table`]) - and `None` for a full copy.
 pub fn copy_nakamoto_staging_blocks(
     src_nakamoto_path: &str,
     dst_nakamoto_path: &str,
     squashed_index_path: &str,
+    source_canonical_tip: Option<&str>,
 ) -> Result<NakamotoBlockCopyStats, Error> {
     with_offline_write_session(
         dst_nakamoto_path,
@@ -385,17 +564,41 @@ pub fn copy_nakamoto_staging_blocks(
             conn.execute("INSERT INTO db_version SELECT * FROM src.db_version", [])
                 .map_err(Error::SQLError)?;
 
+            let squash_stacks_height = squashed_index_marf_height(conn)?;
+            let squashed = squash_stacks_height.is_some();
+            if let Some(height) = squash_stacks_height {
+                let tip = source_canonical_tip.ok_or_else(|| {
+                    Error::CorruptionError(
+                        "squashed index present but no source canonical tip supplied to seed the \
+                         nakamoto staging replay chain"
+                            .into(),
+                    )
+                })?;
+                build_replay_chain_temp_table(conn, height, tip)?;
+            }
+            let membership = nakamoto_staging_blocks_membership_predicate("s", squashed);
+
+            // The membership predicate excludes orphans: `set_block_orphaned`
+            // cascades to children via parent_block_id, so a copied orphan could
+            // poison the replayed chain.
             with_indexes_dropped(conn, "nakamoto_staging_blocks", |conn| {
                 conn.execute(
-                    "INSERT INTO nakamoto_staging_blocks \
-                     SELECT s.* FROM src.nakamoto_staging_blocks s \
-                     INNER JOIN idx.nakamoto_block_headers nh \
-                       ON s.index_block_hash = nh.index_block_hash",
+                    &format!(
+                        "INSERT INTO nakamoto_staging_blocks ({NAKAMOTO_STAGING_BLOCK_COLUMNS}) \
+                         {} \
+                         WHERE {membership}",
+                        nakamoto_staging_blocks_source_select("s", squashed, true)
+                    ),
                     [],
                 )
                 .map_err(Error::SQLError)?;
                 Ok(())
             })?;
+
+            if squashed {
+                conn.execute_batch("DROP TABLE IF EXISTS replay_chain")
+                    .map_err(Error::SQLError)?;
+            }
 
             let stats: NakamotoBlockCopyStats = conn
                 .query_row(
@@ -445,14 +648,14 @@ pub fn validate_microblock_streams(
          WHERE s.microblock_hash IN (SELECT hash FROM temp.val_selected_mblocks) \
            AND s.index_block_hash IN (SELECT ibh FROM temp.val_selected_parents) \
            AND s.orphaned = 0",
-    );
+    )?;
 
     let staging_microblocks_data_match = full_row_except_match(
         &conn,
         "SELECT block_hash, block_data FROM staging_microblocks_data",
         "SELECT s.block_hash, s.block_data FROM src.staging_microblocks_data s \
          WHERE s.block_hash IN (SELECT hash FROM temp.val_selected_mblocks)",
-    );
+    )?;
 
     let staging_microblocks_no_extra_rows = conn
         .query_row(
@@ -490,10 +693,16 @@ pub fn validate_microblock_streams(
 }
 
 /// Validate nakamoto staging blocks.
+///
+/// `source_canonical_tip` mirrors [`copy_nakamoto_staging_blocks`]: the hex
+/// `index_block_hash` of the source canonical Nakamoto tip, `Some(_)` when the
+/// squashed index carries a boundary (to rebuild the expected replay chain) and
+/// `None` for a boundary-less full copy.
 pub fn validate_nakamoto_staging_blocks(
     src_nakamoto_path: &str,
     dst_nakamoto_path: &str,
     squashed_index_path: &str,
+    source_canonical_tip: Option<&str>,
 ) -> Result<NakamotoBlockValidation, Error> {
     let conn = Connection::open_with_flags(
         dst_nakamoto_path,
@@ -507,36 +716,67 @@ pub fn validate_nakamoto_staging_blocks(
     conn.execute("ATTACH DATABASE ?1 AS idx", params![squashed_index_path])
         .map_err(Error::SQLError)?;
 
-    let metadata_columns = "block_hash, consensus_hash, parent_block_id, is_tenure_start, \
-                            burn_attachable, processed, orphaned, height, index_block_hash, \
-                            processed_time, obtain_method, signing_weight";
+    let squash_stacks_height = squashed_index_marf_height(&conn)?;
+    let squashed = squash_stacks_height.is_some();
+    if let Some(height) = squash_stacks_height {
+        let tip = source_canonical_tip.ok_or_else(|| {
+            Error::CorruptionError(
+                "squashed index present but no source canonical tip supplied to validate the \
+                 nakamoto staging replay chain"
+                    .into(),
+            )
+        })?;
+        build_replay_chain_temp_table(&conn, height, tip)?;
+    }
+    let source_membership = nakamoto_staging_blocks_membership_predicate("s", squashed);
+    let dest_membership =
+        nakamoto_staging_blocks_membership_predicate("nakamoto_staging_blocks", squashed);
 
+    // The dst must hold exactly the membership the copy produced: anchor blocks
+    // plus the `replay_chain` -- no forks, orphans, or missing links.
     let metadata_match = full_row_except_match(
         &conn,
-        &format!("SELECT {metadata_columns} FROM nakamoto_staging_blocks"),
+        &format!("SELECT {NAKAMOTO_STAGING_BLOCK_METADATA_COLUMNS} FROM nakamoto_staging_blocks"),
         &format!(
-            "SELECT {metadata_columns} FROM src.nakamoto_staging_blocks \
-             WHERE index_block_hash IN (SELECT index_block_hash FROM idx.nakamoto_block_headers)"
+            "{} WHERE {source_membership}",
+            nakamoto_staging_blocks_source_select("s", squashed, false)
         ),
-    );
+    )?;
 
     let no_extra_blocks = conn
         .query_row(
-            "SELECT COUNT(*) FROM nakamoto_staging_blocks \
-             WHERE index_block_hash NOT IN \
-               (SELECT index_block_hash FROM idx.nakamoto_block_headers)",
+            &format!(
+                "SELECT COUNT(*) FROM nakamoto_staging_blocks \
+                 WHERE NOT ({dest_membership})"
+            ),
             [],
             |row| row.get::<_, i64>(0),
         )
-        .unwrap_or(1)
+        .map_err(Error::SQLError)?
         == 0;
+
+    let no_dangling_parents = if let Some(boundary) = squash_stacks_height {
+        conn.query_row(
+            "SELECT COUNT(*) FROM nakamoto_staging_blocks n \
+             WHERE n.height > ?1 \
+               AND n.parent_block_id NOT IN (SELECT index_block_hash FROM nakamoto_staging_blocks) \
+               AND n.parent_block_id NOT IN (SELECT index_block_hash FROM idx.nakamoto_block_headers)",
+            params![boundary],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Error::SQLError)?
+            == 0
+    } else {
+        true
+    };
 
     let blob_bytes_match = conn
         .query_row(
             "SELECT COUNT(*) FROM nakamoto_staging_blocks n \
              INNER JOIN src.nakamoto_staging_blocks s \
                ON n.index_block_hash = s.index_block_hash \
-             WHERE n.data != s.data",
+             WHERE s.orphaned = 0 \
+               AND n.data != s.data",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -547,7 +787,7 @@ pub fn validate_nakamoto_staging_blocks(
         &conn,
         "SELECT * FROM db_version",
         "SELECT * FROM src.db_version",
-    );
+    )?;
 
     let schema_match = full_row_except_match(
         &conn,
@@ -559,7 +799,7 @@ pub fn validate_nakamoto_staging_blocks(
                 REPLACE(REPLACE(sql, 'IF NOT EXISTS ', ''), 'IF NOT EXISTS', '') \
          FROM src.sqlite_master \
          WHERE type IN ('table', 'index') AND sql IS NOT NULL",
-    );
+    )?;
 
     conn.execute_batch("DETACH DATABASE idx; DETACH DATABASE src")
         .map_err(Error::SQLError)?;
@@ -567,6 +807,7 @@ pub fn validate_nakamoto_staging_blocks(
     Ok(NakamotoBlockValidation {
         metadata_match,
         no_extra_blocks,
+        no_dangling_parents,
         blob_bytes_match,
         db_version_match,
         schema_match,

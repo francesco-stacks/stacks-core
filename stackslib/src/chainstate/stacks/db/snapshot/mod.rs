@@ -38,7 +38,8 @@ pub use index::{
     IndexSideTableValidation,
 };
 pub use sortition::{
-    copy_sortition_side_tables, validate_sortition_side_tables, SortitionSideTableStats,
-    SortitionSideTableValidation,
+    copy_sortition_side_tables, copy_sortition_side_tables_with_boundary,
+    validate_sortition_side_tables, validate_sortition_side_tables_with_boundary,
+    SortitionSideTableStats, SortitionSideTableValidation, SortitionTipCopyBoundary,
 };
 pub use spv::{copy_spv_headers, validate_spv_headers, SpvHeadersCopyStats, SpvHeadersValidation};

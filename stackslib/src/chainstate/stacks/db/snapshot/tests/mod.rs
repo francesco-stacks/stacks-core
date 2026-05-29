@@ -606,7 +606,11 @@ fn test_matured_rewards_detects_fabricated_rows() {
 // Sortition side-table tests
 // ---------------------------------------------------------------
 
-use super::sortition::{copy_sortition_side_tables, validate_sortition_side_tables};
+use super::sortition::{
+    copy_sortition_side_tables, copy_sortition_side_tables_with_boundary,
+    validate_sortition_side_tables, validate_sortition_side_tables_with_boundary,
+    SortitionTipCopyBoundary,
+};
 use crate::chainstate::burn::db::sortdb::{
     SORTITION_DB_INITIAL_SCHEMA, SORTITION_DB_SCHEMA_10, SORTITION_DB_SCHEMA_11,
     SORTITION_DB_SCHEMA_2, SORTITION_DB_SCHEMA_3, SORTITION_DB_SCHEMA_4, SORTITION_DB_SCHEMA_5,
@@ -794,6 +798,16 @@ fn create_sortition_dest_db(path: &std::path::Path, canonical_sortition_ids: &[&
             params![h as i64, sid.as_bytes()],
         )
         .unwrap();
+    }
+}
+
+fn sortition_test_tip_boundary(max_stacks_height: u64) -> SortitionTipCopyBoundary {
+    SortitionTipCopyBoundary {
+        max_stacks_height,
+        anchor_consensus_hash: ConsensusHash([0x11; 20]),
+        anchor_burn_view_consensus_hash: ConsensusHash([0x11; 20]),
+        anchor_block_hash: BlockHeaderHash([0x22; 32]),
+        anchor_block_height: max_stacks_height,
     }
 }
 
@@ -1132,6 +1146,150 @@ fn test_sortition_stacks_chain_tips_by_burn_view_copied() {
         validation.is_valid(),
         "validation should pass: {validation:?}"
     );
+}
+
+#[test]
+fn test_sortition_tip_copy_rewrites_rows_above_stacks_boundary() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src_sort.sqlite");
+    let conn = create_sortition_source_db(&src_path);
+
+    insert_snapshot(&conn, "sort_0", "bhh_0", 0);
+    insert_snapshot(&conn, "sort_1", "bhh_1", 1);
+    insert_epoch(&conn, 0, 2);
+
+    let boundary = sortition_test_tip_boundary(10);
+    let anchor_ch = boundary.anchor_consensus_hash.to_string();
+    let anchor_burn_view_ch = boundary.anchor_burn_view_consensus_hash.to_string();
+    let anchor_bhh = boundary.anchor_block_hash.to_string();
+    let source_tip_bhh = BlockHeaderHash([0x33; 32]).to_string();
+
+    conn.execute(
+        "UPDATE snapshots SET consensus_hash = ?1 WHERE sortition_id = ?2",
+        params![&anchor_burn_view_ch, hex_id("sort_1")],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO stacks_chain_tips \
+         (sortition_id, consensus_hash, block_hash, block_height) \
+         VALUES (?1, ?2, ?3, 20)",
+        params![hex_id("sort_1"), &anchor_ch, &source_tip_bhh],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO stacks_chain_tips_by_burn_view \
+         (sortition_id, consensus_hash, burn_view_consensus_hash, block_hash, block_height) \
+         VALUES (?1, ?2, ?3, ?4, 20)",
+        params![
+            hex_id("sort_1"),
+            &anchor_ch,
+            &anchor_burn_view_ch,
+            &source_tip_bhh
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_sort.sqlite");
+    create_sortition_dest_db(&dst_path, &["sort_0", "sort_1"]);
+
+    copy_sortition_side_tables_with_boundary(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        Some(&boundary),
+    )
+    .unwrap();
+
+    let dst_conn = Connection::open(&dst_path).unwrap();
+    let old_tip: (String, String, i64) = dst_conn
+        .query_row(
+            "SELECT consensus_hash, block_hash, block_height FROM stacks_chain_tips \
+             WHERE sortition_id = ?1",
+            params![hex_id("sort_1")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(old_tip, (anchor_ch.clone(), anchor_bhh.clone(), 10));
+
+    let burn_view_tip: (String, String, String, i64) = dst_conn
+        .query_row(
+            "SELECT consensus_hash, burn_view_consensus_hash, block_hash, block_height \
+             FROM stacks_chain_tips_by_burn_view WHERE sortition_id = ?1",
+            params![hex_id("sort_1")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        burn_view_tip,
+        (anchor_ch, anchor_burn_view_ch, anchor_bhh, 10)
+    );
+
+    let validation = validate_sortition_side_tables_with_boundary(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        Some(&boundary),
+    )
+    .unwrap();
+    assert!(
+        validation.stacks_chain_tips_within_stacks_boundary,
+        "rewritten tips must be within the Stacks boundary"
+    );
+    assert!(
+        validation.is_valid(),
+        "validation should accept rewritten sortition tips: {validation:?}"
+    );
+}
+
+#[test]
+fn test_sortition_validation_rejects_tip_above_stacks_boundary() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src_sort.sqlite");
+    let conn = create_sortition_source_db(&src_path);
+
+    insert_snapshot(&conn, "sort_0", "bhh_0", 0);
+    insert_snapshot(&conn, "sort_1", "bhh_1", 1);
+    insert_epoch(&conn, 0, 2);
+
+    let boundary = sortition_test_tip_boundary(10);
+    let anchor_ch = boundary.anchor_consensus_hash.to_string();
+    let anchor_burn_view_ch = boundary.anchor_burn_view_consensus_hash.to_string();
+    let source_tip_bhh = BlockHeaderHash([0x33; 32]).to_string();
+
+    conn.execute(
+        "UPDATE snapshots SET consensus_hash = ?1 WHERE sortition_id = ?2",
+        params![&anchor_burn_view_ch, hex_id("sort_1")],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO stacks_chain_tips_by_burn_view \
+         (sortition_id, consensus_hash, burn_view_consensus_hash, block_hash, block_height) \
+         VALUES (?1, ?2, ?3, ?4, 20)",
+        params![
+            hex_id("sort_1"),
+            &anchor_ch,
+            &anchor_burn_view_ch,
+            &source_tip_bhh
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_sort.sqlite");
+    create_sortition_dest_db(&dst_path, &["sort_0", "sort_1"]);
+
+    copy_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap()).unwrap();
+
+    let validation = validate_sortition_side_tables_with_boundary(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        Some(&boundary),
+    )
+    .unwrap();
+    assert!(
+        !validation.stacks_chain_tips_within_stacks_boundary,
+        "validation must reject copied sortition tips beyond the Stacks boundary"
+    );
+    assert!(!validation.is_valid(), "validation must fail");
 }
 
 // -----------------------------------------------------------------------
@@ -1881,6 +2039,7 @@ fn test_nakamoto_copy_and_validate() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -1919,11 +2078,426 @@ fn test_nakamoto_copy_and_validate() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
+        None,
     )
     .unwrap();
     assert!(v.is_valid(), "nakamoto validation should pass: {v:?}");
     assert!(v.db_version_match, "db_version should match");
     assert!(v.schema_match, "schema should match");
+}
+
+#[test]
+fn test_nakamoto_copy_includes_post_boundary_blocks() {
+    let dir = tempdir().unwrap();
+    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
+    let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
+    let idx_path = dir.path().join("squashed_index.sqlite");
+
+    let src_conn = create_source_nakamoto_db(&src_nak_path);
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "canonical_bh_1",
+        "canonical_ch_1",
+        "parent_1",
+        100,
+        "canonical_ibh_1",
+        "Fetched",
+        b"block_data_1",
+    );
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "post_boundary_bh",
+        "post_boundary_ch",
+        "canonical_ibh_1",
+        102,
+        "post_boundary_ibh",
+        "Fetched",
+        b"post_boundary_data",
+    );
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "below_boundary_bh",
+        "below_boundary_ch",
+        "parent_x",
+        100,
+        "below_boundary_ibh",
+        "Fetched",
+        b"below_boundary_data",
+    );
+    drop(src_conn);
+
+    let idx_conn = Connection::open(&idx_path).unwrap();
+    idx_conn
+        .execute_batch(
+            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY);
+             CREATE TABLE marf_squash_info (
+                 squash_root_node_hash TEXT NOT NULL,
+                 marf_height INTEGER NOT NULL,
+                 bitcoin_height INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+    idx_conn
+        .execute(
+            "INSERT INTO nakamoto_block_headers VALUES ('canonical_ibh_1')",
+            [],
+        )
+        .unwrap();
+    idx_conn
+        .execute(
+            "INSERT INTO marf_squash_info VALUES ('root', 101, 943335)",
+            [],
+        )
+        .unwrap();
+    drop(idx_conn);
+
+    let stats = super::blocks::copy_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+        Some("post_boundary_ibh"),
+    )
+    .unwrap();
+
+    assert_eq!(stats.rows_copied, 2);
+
+    let dst_conn = Connection::open(&dst_nak_path).unwrap();
+    let post_count: i64 = dst_conn
+        .query_row(
+            "SELECT COUNT(*) FROM nakamoto_staging_blocks \
+             WHERE index_block_hash = 'post_boundary_ibh'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(post_count, 1, "post-boundary block should be copied");
+    let post_processed: i64 = dst_conn
+        .query_row(
+            "SELECT processed FROM nakamoto_staging_blocks \
+             WHERE index_block_hash = 'post_boundary_ibh'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        post_processed, 0,
+        "post-boundary block must be replayed by the booted node"
+    );
+    let below_noncanonical_count: i64 = dst_conn
+        .query_row(
+            "SELECT COUNT(*) FROM nakamoto_staging_blocks \
+             WHERE index_block_hash = 'below_boundary_ibh'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        below_noncanonical_count, 0,
+        "below-boundary block must still require an index header"
+    );
+    drop(dst_conn);
+
+    let v = super::blocks::validate_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+        Some("post_boundary_ibh"),
+    )
+    .unwrap();
+    assert!(v.is_valid(), "nakamoto validation should pass: {v:?}");
+}
+
+#[test]
+fn test_nakamoto_copy_excludes_competing_processed_fork() {
+    // A non-canonical *processed* fork above the boundary must NOT be seeded for
+    // replay: only the canonical descendant chain (walked back from the source
+    // canonical tip) is copied -- even when the fork extends higher than the tip.
+    let dir = tempdir().unwrap();
+    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
+    let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
+    let idx_path = dir.path().join("squashed_index.sqlite");
+
+    let src_conn = create_source_nakamoto_db(&src_nak_path);
+    // Canonical block at/below the boundary (lives in the squashed index).
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "canonical_bh_1",
+        "canonical_ch_1",
+        "parent_1",
+        100,
+        "canonical_ibh_1",
+        "Fetched",
+        b"block_data_1",
+    );
+    // Canonical descendant above the boundary == the source canonical tip.
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "post_boundary_bh",
+        "post_boundary_ch",
+        "canonical_ibh_1",
+        102,
+        "post_boundary_ibh",
+        "Fetched",
+        b"post_boundary_data",
+    );
+    // Competing processed fork off the same parent, extending one block higher
+    // than the canonical tip. Neither block is an ancestor of the tip.
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "fork_bh",
+        "fork_ch",
+        "canonical_ibh_1",
+        102,
+        "fork_ibh",
+        "Fetched",
+        b"fork_data",
+    );
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "fork_child_bh",
+        "fork_child_ch",
+        "fork_ibh",
+        103,
+        "fork_child_ibh",
+        "Fetched",
+        b"fork_child_data",
+    );
+    drop(src_conn);
+
+    let idx_conn = Connection::open(&idx_path).unwrap();
+    idx_conn
+        .execute_batch(
+            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY);
+             CREATE TABLE marf_squash_info (
+                 squash_root_node_hash TEXT NOT NULL,
+                 marf_height INTEGER NOT NULL,
+                 bitcoin_height INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+    idx_conn
+        .execute(
+            "INSERT INTO nakamoto_block_headers VALUES ('canonical_ibh_1')",
+            [],
+        )
+        .unwrap();
+    idx_conn
+        .execute(
+            "INSERT INTO marf_squash_info VALUES ('root', 101, 943335)",
+            [],
+        )
+        .unwrap();
+    drop(idx_conn);
+
+    let stats = super::blocks::copy_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+        Some("post_boundary_ibh"),
+    )
+    .unwrap();
+
+    // Exactly the anchor and the single canonical descendant -- not the fork.
+    assert_eq!(stats.rows_copied, 2);
+
+    let dst_conn = Connection::open(&dst_nak_path).unwrap();
+    let fork_count: i64 = dst_conn
+        .query_row(
+            "SELECT COUNT(*) FROM nakamoto_staging_blocks \
+             WHERE index_block_hash IN ('fork_ibh', 'fork_child_ibh')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        fork_count, 0,
+        "competing processed fork must not be copied into the replay set"
+    );
+    let post_processed: i64 = dst_conn
+        .query_row(
+            "SELECT processed FROM nakamoto_staging_blocks \
+             WHERE index_block_hash = 'post_boundary_ibh'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        post_processed, 0,
+        "canonical descendant must be replayed by the booted node"
+    );
+    drop(dst_conn);
+
+    let v = super::blocks::validate_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+        Some("post_boundary_ibh"),
+    )
+    .unwrap();
+    assert!(
+        v.is_valid(),
+        "validation should accept the canonical-only replay set: {v:?}"
+    );
+}
+
+#[test]
+fn test_nakamoto_copy_rejects_invalid_source_tip() {
+    // A source canonical tip that is missing/orphaned or at-or-below the
+    // boundary must fail fast, not silently produce an empty replay set.
+    let dir = tempdir().unwrap();
+    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
+    let idx_path = dir.path().join("squashed_index.sqlite");
+
+    let src_conn = create_source_nakamoto_db(&src_nak_path);
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "canonical_bh_1",
+        "canonical_ch_1",
+        "parent_1",
+        100,
+        "canonical_ibh_1",
+        "Fetched",
+        b"block_data_1",
+    );
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "post_boundary_bh",
+        "post_boundary_ch",
+        "canonical_ibh_1",
+        102,
+        "post_boundary_ibh",
+        "Fetched",
+        b"post_boundary_data",
+    );
+    drop(src_conn);
+
+    let idx_conn = Connection::open(&idx_path).unwrap();
+    idx_conn
+        .execute_batch(
+            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY);
+             CREATE TABLE marf_squash_info (
+                 squash_root_node_hash TEXT NOT NULL,
+                 marf_height INTEGER NOT NULL,
+                 bitcoin_height INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+    idx_conn
+        .execute(
+            "INSERT INTO nakamoto_block_headers VALUES ('canonical_ibh_1')",
+            [],
+        )
+        .unwrap();
+    idx_conn
+        .execute(
+            "INSERT INTO marf_squash_info VALUES ('root', 101, 943335)",
+            [],
+        )
+        .unwrap();
+    drop(idx_conn);
+
+    // Tip absent from the source staging blocks.
+    let missing = super::blocks::copy_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dir.path().join("dst_missing.sqlite").to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+        Some("does_not_exist"),
+    );
+    assert!(missing.is_err(), "missing source tip must be rejected");
+
+    // Tip at/below the boundary (height 100 <= 101).
+    let below = super::blocks::copy_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dir.path().join("dst_below.sqlite").to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+        Some("canonical_ibh_1"),
+    );
+    assert!(
+        below.is_err(),
+        "source tip at/below the boundary must be rejected"
+    );
+}
+
+#[test]
+fn test_nakamoto_validate_detects_broken_replay_chain() {
+    // The tip is valid (above the boundary), but its parent link is absent, so
+    // the parent walk never reaches the anchor. `no_dangling_parents` must flag
+    // the resulting gap at validation even though the copy itself succeeds.
+    let dir = tempdir().unwrap();
+    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
+    let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
+    let idx_path = dir.path().join("squashed_index.sqlite");
+
+    let src_conn = create_source_nakamoto_db(&src_nak_path);
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "canonical_bh_1",
+        "canonical_ch_1",
+        "parent_1",
+        100,
+        "canonical_ibh_1",
+        "Fetched",
+        b"block_data_1",
+    );
+    // Tip's parent "missing_ibh" is never inserted -> the walk stops short.
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "tip_bh",
+        "tip_ch",
+        "missing_ibh",
+        103,
+        "tip_ibh",
+        "Fetched",
+        b"tip_data",
+    );
+    drop(src_conn);
+
+    let idx_conn = Connection::open(&idx_path).unwrap();
+    idx_conn
+        .execute_batch(
+            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY);
+             CREATE TABLE marf_squash_info (
+                 squash_root_node_hash TEXT NOT NULL,
+                 marf_height INTEGER NOT NULL,
+                 bitcoin_height INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+    idx_conn
+        .execute(
+            "INSERT INTO nakamoto_block_headers VALUES ('canonical_ibh_1')",
+            [],
+        )
+        .unwrap();
+    idx_conn
+        .execute(
+            "INSERT INTO marf_squash_info VALUES ('root', 101, 943335)",
+            [],
+        )
+        .unwrap();
+    drop(idx_conn);
+
+    // Copy succeeds: the tip itself is valid; the gap only surfaces on validate.
+    super::blocks::copy_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+        Some("tip_ibh"),
+    )
+    .unwrap();
+
+    let v = super::blocks::validate_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+        Some("tip_ibh"),
+    )
+    .unwrap();
+    assert!(
+        !v.no_dangling_parents,
+        "a replay block whose parent never reaches the anchor must be flagged"
+    );
+    assert!(!v.is_valid(), "overall validation must fail");
 }
 
 #[test]
@@ -1956,6 +2530,7 @@ fn test_nakamoto_validate_detects_db_version_drift() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -1971,6 +2546,7 @@ fn test_nakamoto_validate_detects_db_version_drift() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
+        None,
     )
     .unwrap();
     assert!(!v.db_version_match, "should detect db_version drift");
@@ -2005,6 +2581,7 @@ fn test_nakamoto_validate_detects_schema_drift() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -2019,6 +2596,7 @@ fn test_nakamoto_validate_detects_schema_drift() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
+        None,
     )
     .unwrap();
     assert!(

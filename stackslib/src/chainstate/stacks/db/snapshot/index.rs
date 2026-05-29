@@ -475,7 +475,7 @@ pub fn validate_index_side_tables(
             "SELECT * FROM __fork_storage",
             "SELECT f.* FROM src.__fork_storage f \
              INNER JOIN val_fork_leaf_values lv ON f.value_hash = lv.value_hash",
-        );
+        )?;
         conn.execute_batch("DROP TABLE IF EXISTS val_fork_leaf_values")
             .map_err(Error::SQLError)?;
         ok
@@ -609,7 +609,7 @@ pub fn validate_index_side_tables(
              WHERE s.index_block_hash IN ({cb}) \
                AND s.processed = 1 AND s.orphaned = 0"
         ),
-    );
+    )?;
 
     // Schema-fidelity tables should be empty.
     let invalidated_microblocks_data_empty = conn
@@ -626,7 +626,7 @@ pub fn validate_index_side_tables(
         &conn,
         "SELECT * FROM nakamoto_reward_sets",
         &format!("SELECT * FROM src.nakamoto_reward_sets WHERE index_block_hash IN ({cb})"),
-    );
+    )?;
 
     let signer_stats_scope = derive_max_reward_cycle(&conn, first_burn_height, reward_cycle_len)?;
 
@@ -653,7 +653,7 @@ pub fn validate_index_side_tables(
                     "SELECT public_key, reward_cycle FROM src.signer_stats \
                      WHERE reward_cycle <= {cycle}"
                 ),
-            );
+            )?;
             // No inflated counters.
             let counters_ok: i64 = conn
                 .query_row(
@@ -677,19 +677,19 @@ pub fn validate_index_side_tables(
         &conn,
         "SELECT * FROM matured_rewards",
         &format!("SELECT * FROM src.matured_rewards WHERE child_index_block_hash IN ({cb})"),
-    );
+    )?;
 
     let burnchain_txids_match = full_row_except_match(
         &conn,
         "SELECT * FROM burnchain_txids",
         &format!("SELECT * FROM src.burnchain_txids WHERE index_block_hash IN ({cb})"),
-    );
+    )?;
 
     let epoch_transitions_match = full_row_except_match(
         &conn,
         "SELECT * FROM epoch_transitions",
         &format!("SELECT * FROM src.epoch_transitions WHERE block_id IN ({cb})"),
-    );
+    )?;
 
     let _ = conn.execute_batch("DROP TABLE IF EXISTS val_canonical_blocks");
 
