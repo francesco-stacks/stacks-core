@@ -16,6 +16,7 @@
 pub mod blocks;
 pub mod burnchain;
 pub mod common;
+pub mod fork_storage;
 pub mod index;
 pub mod sortition;
 pub mod spv;

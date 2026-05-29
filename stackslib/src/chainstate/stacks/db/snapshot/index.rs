@@ -20,15 +20,16 @@ use rusqlite::{params, Connection, OptionalExtension};
 use stacks_common::types::chainstate::StacksBlockId;
 
 use super::common::{
-    clone_schemas_from_source, collect_canonical_leaf_hashes, copy_canonical_fork_storage,
-    dst_subset_of_src, execute_copy_specs, full_row_except_match, with_offline_write_session,
-    TableCopySpec,
+    clone_schemas_from_source, dst_subset_of_src, execute_copy_specs, full_row_except_match,
+    with_offline_write_session, TableCopySpec,
 };
+use super::fork_storage::{collect_canonical_leaf_hashes, copy_canonical_fork_storage};
 use crate::burnchains::PoxConstants;
 use crate::chainstate::stacks::index::Error;
 
-/// Required table names that must be present in the squashed index DB.
-const REQUIRED_TABLES: &[&str] = &[
+/// Tables copied (with canonical-filtered content) into the squashed index
+/// DB and validated row-for-row against the source.
+const COPIED_TABLES: &[&str] = &[
     "db_config",
     "block_headers",
     "nakamoto_block_headers",
@@ -41,14 +42,33 @@ const REQUIRED_TABLES: &[&str] = &[
     "burnchain_txids",
     "epoch_transitions",
     "staging_blocks",
+];
+
+/// Tables whose schema the index copy clones for fidelity but does not
+/// populate itself. `staging_microblocks`/`staging_microblocks_data` are filled
+/// in later by the block-preservation phase; the other two stay empty. Cloning
+/// their schema prevents missing-table crashes if any code path references them.
+const SCHEMA_ONLY_TABLES: &[&str] = &[
     "staging_microblocks",
     "staging_microblocks_data",
-    // Schema fidelity: these tables exist in archival nodes but are expected
-    // unused in a Nakamoto-era GSS node. Included to prevent missing-table
-    // crashes if any code path references them.
     "invalidated_microblocks_data", // Epoch 2.x block orphaning only (blocks.rs:2189)
     "user_supporters",              // Dead table: zero runtime references
 ];
+
+/// The schema-only tables the index phase expects to stay empty (never written
+/// by any squash phase). Validated as empty. `staging_microblocks*` are
+/// deliberately excluded: the separate block-preservation phase populates them,
+/// so asserting them empty here would spuriously fail a `--blocks`/`--all` run.
+const EXPECTED_EMPTY_TABLES: &[&str] = &["invalidated_microblocks_data", "user_supporters"];
+
+/// Every table whose schema must exist in the squashed dst (copied + schema-only).
+fn all_required_tables() -> Vec<&'static str> {
+    COPIED_TABLES
+        .iter()
+        .chain(SCHEMA_ONLY_TABLES)
+        .copied()
+        .collect()
+}
 
 /// Row-count statistics returned by [`copy_index_side_tables`].
 #[derive(Debug, Clone)]
@@ -73,41 +93,53 @@ pub struct IndexSideTableValidation {
     pub tables_present: bool,
     pub db_config_matches: bool,
     pub fork_storage_match: bool,
-    pub block_headers_count_match: bool,
-    pub nakamoto_headers_count_match: bool,
-    pub payments_count_match: bool,
-    pub transactions_count_match: bool,
-    pub nakamoto_tenure_events_count_match: bool,
+    pub block_headers_match: bool,
+    pub nakamoto_headers_match: bool,
+    pub payments_match: bool,
+    pub transactions_match: bool,
+    pub nakamoto_tenure_events_match: bool,
     pub nakamoto_reward_sets_match: bool,
     pub signer_stats_match: bool,
     pub matured_rewards_match: bool,
     pub burnchain_txids_match: bool,
     pub epoch_transitions_match: bool,
     pub staging_blocks_match: bool,
-    pub invalidated_microblocks_data_empty: bool,
-    pub transactions_no_extra_blocks: bool,
-    pub tenure_events_no_extra_blocks: bool,
+    pub expected_tables_empty: bool,
 }
 
 impl IndexSideTableValidation {
+    /// Every validation dimension as `(name, passed)` pairs. This is the
+    /// single source of truth for [`is_valid`](Self::is_valid) and for
+    /// diagnostics: a new dimension is wired into the overall verdict simply
+    /// by listing it here, so the verdict and the printout can't drift apart.
+    pub fn checks(&self) -> [(&'static str, bool); 15] {
+        [
+            ("tables_present", self.tables_present),
+            ("db_config_matches", self.db_config_matches),
+            ("fork_storage_match", self.fork_storage_match),
+            ("block_headers_match", self.block_headers_match),
+            ("nakamoto_headers_match", self.nakamoto_headers_match),
+            ("payments_match", self.payments_match),
+            ("transactions_match", self.transactions_match),
+            (
+                "nakamoto_tenure_events_match",
+                self.nakamoto_tenure_events_match,
+            ),
+            (
+                "nakamoto_reward_sets_match",
+                self.nakamoto_reward_sets_match,
+            ),
+            ("signer_stats_match", self.signer_stats_match),
+            ("matured_rewards_match", self.matured_rewards_match),
+            ("burnchain_txids_match", self.burnchain_txids_match),
+            ("epoch_transitions_match", self.epoch_transitions_match),
+            ("staging_blocks_match", self.staging_blocks_match),
+            ("expected_tables_empty", self.expected_tables_empty),
+        ]
+    }
+
     pub fn is_valid(&self) -> bool {
-        self.tables_present
-            && self.db_config_matches
-            && self.fork_storage_match
-            && self.block_headers_count_match
-            && self.nakamoto_headers_count_match
-            && self.payments_count_match
-            && self.transactions_count_match
-            && self.nakamoto_tenure_events_count_match
-            && self.nakamoto_reward_sets_match
-            && self.signer_stats_match
-            && self.matured_rewards_match
-            && self.burnchain_txids_match
-            && self.epoch_transitions_match
-            && self.staging_blocks_match
-            && self.invalidated_microblocks_data_empty
-            && self.transactions_no_extra_blocks
-            && self.tenure_events_no_extra_blocks
+        self.checks().iter().all(|(_, ok)| *ok)
     }
 }
 
@@ -301,7 +333,7 @@ pub fn copy_index_side_tables(
     let leaf_hashes = collect_canonical_leaf_hashes::<StacksBlockId>(dst_path)?;
 
     with_offline_write_session(dst_path, &[("src", src_path)], "", |conn| {
-        clone_schemas_from_source(conn, REQUIRED_TABLES)?;
+        clone_schemas_from_source(conn, &all_required_tables())?;
         copy_tables_inner(conn, &leaf_hashes, first_burn_height, reward_cycle_len)
     })
 }
@@ -419,42 +451,33 @@ pub fn validate_index_side_tables(
     conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
         .map_err(Error::SQLError)?;
 
-    // Check all required tables exist.
-    let tables_present = REQUIRED_TABLES.iter().all(|table| {
-        conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-            params![table],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-            > 0
-    });
+    // Single-`i64` query (COUNT etc.), error-propagating rather than
+    // swallowing into a sentinel: a SQL failure here is itself corruption.
+    let count = |sql: &str| -> Result<i64, Error> {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .map_err(Error::SQLError)
+    };
 
-    // db_config verbatim match.
-    let db_config_matches = conn
-        .query_row(
-            "SELECT COUNT(*) FROM (
-                SELECT version, mainnet, chain_id FROM db_config
-                EXCEPT
-                SELECT version, mainnet, chain_id FROM src.db_config
-            )",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(1)
-        == 0
-        && conn
+    // All required tables (copied + schema-only) must exist.
+    let mut tables_present = true;
+    for table in all_required_tables() {
+        let exists = conn
             .query_row(
-                "SELECT COUNT(*) FROM (
-                    SELECT version, mainnet, chain_id FROM src.db_config
-                    EXCEPT
-                    SELECT version, mainnet, chain_id FROM db_config
-                )",
-                [],
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table],
                 |row| row.get::<_, i64>(0),
             )
-            .unwrap_or(1)
-            == 0;
+            .map_err(Error::SQLError)?
+            > 0;
+        tables_present &= exists;
+    }
+
+    // db_config verbatim match (bidirectional).
+    let db_config_matches = full_row_except_match(
+        &conn,
+        "SELECT version, mainnet, chain_id FROM db_config",
+        "SELECT version, mainnet, chain_id FROM src.db_config",
+    )?;
 
     // __fork_storage: canonical-only copy.
     // Validate against the canonical filtered source set
@@ -481,124 +504,45 @@ pub fn validate_index_side_tables(
         ok
     };
 
-    // Build canonical block set.
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS val_canonical_blocks (index_block_hash TEXT PRIMARY KEY)",
-    )
-    .map_err(Error::SQLError)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO val_canonical_blocks (index_block_hash) \
-         SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
-        [],
-    )
-    .map_err(Error::SQLError)?;
+    // Build the canonical block set using the SAME guarded path as the copy
+    // (rejects empty `marf_squashed_blocks` and canonical ids absent from
+    // src), so validation is never more lenient than the copy that produced
+    // the dst.
+    populate_canonical_blocks(&conn)?;
+    let cb = "SELECT index_block_hash FROM canonical_blocks";
 
-    let cb = "SELECT index_block_hash FROM val_canonical_blocks";
+    // Canonical-filtered tables: bidirectional full-row EXCEPT (not count-only)
+    // so a row with a canonical `index_block_hash` but corrupted contents is
+    // still caught.
+    let block_headers_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM block_headers",
+        &format!("SELECT * FROM src.block_headers WHERE index_block_hash IN ({cb})"),
+    )?;
 
-    // Count-match validations (cheaper for large tables).
-    let block_headers_count_match = {
-        let src_count: i64 = conn
-            .query_row(
-                &format!("SELECT COUNT(*) FROM src.block_headers WHERE index_block_hash IN ({cb})"),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(-1);
-        let dst_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM block_headers", [], |row| row.get(0))
-            .unwrap_or(-2);
-        src_count == dst_count
-    };
+    let nakamoto_headers_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM nakamoto_block_headers",
+        &format!("SELECT * FROM src.nakamoto_block_headers WHERE index_block_hash IN ({cb})"),
+    )?;
 
-    let nakamoto_headers_count_match = {
-        let src_count: i64 = conn
-            .query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM src.nakamoto_block_headers \
-                     WHERE index_block_hash IN ({cb})"
-                ),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(-1);
-        let dst_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM nakamoto_block_headers", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(-2);
-        src_count == dst_count
-    };
+    let payments_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM payments",
+        &format!("SELECT * FROM src.payments WHERE index_block_hash IN ({cb})"),
+    )?;
 
-    let payments_count_match = {
-        let src_count: i64 = conn
-            .query_row(
-                &format!("SELECT COUNT(*) FROM src.payments WHERE index_block_hash IN ({cb})"),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(-1);
-        let dst_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM payments", [], |row| row.get(0))
-            .unwrap_or(-2);
-        src_count == dst_count
-    };
+    let transactions_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM transactions",
+        &format!("SELECT * FROM src.transactions WHERE index_block_hash IN ({cb})"),
+    )?;
 
-    let transactions_count_match = {
-        let src_count: i64 = conn
-            .query_row(
-                &format!("SELECT COUNT(*) FROM src.transactions WHERE index_block_hash IN ({cb})"),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(-1);
-        let dst_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))
-            .unwrap_or(-2);
-        src_count == dst_count
-    };
-
-    let nakamoto_tenure_events_count_match = {
-        let src_count: i64 = conn
-            .query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM src.nakamoto_tenure_events WHERE block_id IN ({cb})"
-                ),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(-1);
-        let dst_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM nakamoto_tenure_events", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(-2);
-        src_count == dst_count
-    };
-
-    // No out-of-range rows leaked.
-    let transactions_no_extra_blocks = conn
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM transactions \
-                 WHERE index_block_hash NOT IN ({cb})"
-            ),
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(1)
-        == 0;
-
-    let tenure_events_no_extra_blocks = conn
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM nakamoto_tenure_events \
-                 WHERE block_id NOT IN ({cb})"
-            ),
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(1)
-        == 0;
+    let nakamoto_tenure_events_match = full_row_except_match(
+        &conn,
+        "SELECT * FROM nakamoto_tenure_events",
+        &format!("SELECT * FROM src.nakamoto_tenure_events WHERE block_id IN ({cb})"),
+    )?;
 
     // staging_blocks: bidirectional full-row EXCEPT against canonical source rows.
     let staging_blocks_match = full_row_except_match(
@@ -611,17 +555,6 @@ pub fn validate_index_side_tables(
         ),
     )?;
 
-    // Schema-fidelity tables should be empty.
-    let invalidated_microblocks_data_empty = conn
-        .query_row(
-            "SELECT COUNT(*) FROM invalidated_microblocks_data",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(1)
-        == 0;
-
-    // Canonical-filtered tables: bidirectional full-row EXCEPT match.
     let nakamoto_reward_sets_match = full_row_except_match(
         &conn,
         "SELECT * FROM nakamoto_reward_sets",
@@ -638,12 +571,7 @@ pub fn validate_index_side_tables(
     // Pre-Nakamoto: src.signer_stats verified empty by `derive_max_reward_cycle`,
     // so we only check that dst is also empty.
     let signer_stats_match = match signer_stats_scope {
-        RewardCycleScope::PreNakamoto => conn
-            .query_row("SELECT COUNT(*) FROM signer_stats", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map(|c| c == 0)
-            .unwrap_or(false),
+        RewardCycleScope::PreNakamoto => count("SELECT COUNT(*) FROM signer_stats")? == 0,
         RewardCycleScope::Through(cycle) => {
             // No fabricated keys.
             let keys_ok = dst_subset_of_src(
@@ -655,17 +583,13 @@ pub fn validate_index_side_tables(
                 ),
             )?;
             // No inflated counters.
-            let counters_ok: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM signer_stats d \
-                     JOIN src.signer_stats s \
-                       ON d.public_key = s.public_key AND d.reward_cycle = s.reward_cycle \
-                     WHERE d.blocks_signed > s.blocks_signed",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(1);
-            keys_ok && counters_ok == 0
+            let inflated = count(
+                "SELECT COUNT(*) FROM signer_stats d \
+                 JOIN src.signer_stats s \
+                   ON d.public_key = s.public_key AND d.reward_cycle = s.reward_cycle \
+                 WHERE d.blocks_signed > s.blocks_signed",
+            )?;
+            keys_ok && inflated == 0
         }
     };
 
@@ -691,8 +615,23 @@ pub fn validate_index_side_tables(
         &format!("SELECT * FROM src.epoch_transitions WHERE block_id IN ({cb})"),
     )?;
 
-    let _ = conn.execute_batch("DROP TABLE IF EXISTS val_canonical_blocks");
+    // Tables that no squash phase should ever write must be empty.
+    // (staging_microblocks* are intentionally excluded: the block-preservation
+    // phase populates them, so they are not asserted empty here.)
+    let mut expected_tables_empty = true;
+    for &table in EXPECTED_EMPTY_TABLES {
+        let rows = count(&format!("SELECT COUNT(*) FROM {table}"))?;
+        if rows != 0 {
+            warn!(
+                "[index] table expected to be empty is non-empty in squashed dst";
+                "table" => table, "rows" => rows
+            );
+            expected_tables_empty = false;
+        }
+    }
 
+    conn.execute_batch("DROP TABLE IF EXISTS canonical_blocks")
+        .map_err(Error::SQLError)?;
     conn.execute_batch("DETACH DATABASE src")
         .map_err(Error::SQLError)?;
 
@@ -700,19 +639,17 @@ pub fn validate_index_side_tables(
         tables_present,
         db_config_matches,
         fork_storage_match,
-        block_headers_count_match,
-        nakamoto_headers_count_match,
-        payments_count_match,
-        transactions_count_match,
-        nakamoto_tenure_events_count_match,
+        block_headers_match,
+        nakamoto_headers_match,
+        payments_match,
+        transactions_match,
+        nakamoto_tenure_events_match,
         nakamoto_reward_sets_match,
         signer_stats_match,
         matured_rewards_match,
         burnchain_txids_match,
         epoch_transitions_match,
         staging_blocks_match,
-        invalidated_microblocks_data_empty,
-        transactions_no_extra_blocks,
-        tenure_events_no_extra_blocks,
+        expected_tables_empty,
     })
 }

@@ -19,9 +19,10 @@ use rusqlite::{params, Connection};
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, SortitionId};
 
 use super::common::{
-    clone_schemas_from_source, collect_canonical_leaf_hashes, copy_canonical_fork_storage,
-    execute_copy_specs, full_row_except_match, with_offline_write_session, TableCopySpec,
+    clone_schemas_from_source, execute_copy_specs, full_row_except_match,
+    with_offline_write_session, TableCopySpec,
 };
+use super::fork_storage::{collect_canonical_leaf_hashes, copy_canonical_fork_storage};
 use crate::chainstate::stacks::index::Error;
 
 /// Required sortition tables always present in production.

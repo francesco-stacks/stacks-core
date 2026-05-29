@@ -388,44 +388,9 @@ fn print_validation(stats: &SquashValidationStats) {
 
 fn print_index_side_table_validation(v: &IndexSideTableValidation) {
     println!("Index side-table validation:");
-    println!("  tables_present: {}", v.tables_present);
-    println!("  db_config_matches: {}", v.db_config_matches);
-    println!("  fork_storage_match: {}", v.fork_storage_match);
-    println!(
-        "  block_headers_count_match: {}",
-        v.block_headers_count_match
-    );
-    println!(
-        "  nakamoto_headers_count_match: {}",
-        v.nakamoto_headers_count_match
-    );
-    println!("  payments_count_match: {}", v.payments_count_match);
-    println!("  transactions_count_match: {}", v.transactions_count_match);
-    println!(
-        "  nakamoto_tenure_events_count_match: {}",
-        v.nakamoto_tenure_events_count_match
-    );
-    println!(
-        "  nakamoto_reward_sets_match: {}",
-        v.nakamoto_reward_sets_match
-    );
-    println!("  signer_stats_match: {}", v.signer_stats_match);
-    println!("  matured_rewards_match: {}", v.matured_rewards_match);
-    println!("  burnchain_txids_match: {}", v.burnchain_txids_match);
-    println!("  epoch_transitions_match: {}", v.epoch_transitions_match);
-    println!("  staging_blocks_match: {}", v.staging_blocks_match);
-    println!(
-        "  invalidated_microblocks_data_empty: {}",
-        v.invalidated_microblocks_data_empty
-    );
-    println!(
-        "  transactions_no_extra_blocks: {}",
-        v.transactions_no_extra_blocks
-    );
-    println!(
-        "  tenure_events_no_extra_blocks: {}",
-        v.tenure_events_no_extra_blocks
-    );
+    for (name, ok) in v.checks() {
+        println!("  {name}: {ok}");
+    }
     println!("  Index side-table valid: {}", v.is_valid());
 }
 

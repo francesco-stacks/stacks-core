@@ -13,16 +13,12 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::collections::HashSet;
 use std::time::Instant;
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use rusqlite::{params, Connection, OptionalExtension};
-use stacks_common::util::hash::to_hex;
 
-use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
-use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
-use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
+use crate::chainstate::stacks::index::Error;
 
 /// A spec for copying a single table from the ATTACHed `src` database.
 ///
@@ -94,21 +90,6 @@ pub fn clone_schemas_from_source(conn: &Connection, tables: &[&str]) -> Result<(
     Ok(())
 }
 
-/// Check if a table exists in the given schema prefix (empty for main, "src" for attached).
-pub fn table_exists(conn: &Connection, schema: &str, table: &str) -> bool {
-    let master = if schema.is_empty() {
-        "sqlite_master".to_string()
-    } else {
-        format!("{schema}.sqlite_master")
-    };
-    conn.query_row(
-        &format!("SELECT COUNT(*) > 0 FROM {master} WHERE type='table' AND name=?1"),
-        params![table],
-        |row| row.get(0),
-    )
-    .unwrap_or(false)
-}
-
 /// Check bidirectional full-row EXCEPT equality.
 /// Returns true if the two result sets are identical.
 pub fn full_row_except_match(
@@ -161,35 +142,15 @@ pub fn execute_copy_specs(
     let mut results = Vec::with_capacity(specs.len());
     for spec in specs {
         let t_total = Instant::now();
-
-        let t_drop = Instant::now();
-        let saved_indexes = collect_user_indexes(conn, spec.table)?;
-        for (name, _) in &saved_indexes {
-            conn.execute(&format!("DROP INDEX IF EXISTS \"{name}\""), [])
-                .map_err(Error::SQLError)?;
-        }
-        let drop_elapsed = t_drop.elapsed();
-
-        let t_insert = Instant::now();
-        let sql = format!("INSERT INTO {} {}", spec.table, spec.source_sql);
-        let rows = conn.execute(&sql, []).map_err(Error::SQLError)? as u64;
-        let insert_elapsed = t_insert.elapsed();
-
-        let t_rebuild = Instant::now();
-        for (_, create_sql) in &saved_indexes {
-            conn.execute(create_sql, []).map_err(Error::SQLError)?;
-        }
-        let rebuild_elapsed = t_rebuild.elapsed();
-
+        let rows = with_indexes_dropped(conn, spec.table, |conn| {
+            let sql = format!("INSERT INTO {} {}", spec.table, spec.source_sql);
+            Ok(conn.execute(&sql, []).map_err(Error::SQLError)? as u64)
+        })?;
         info!(
-            "[copy] {} ({} rows) in {:?} (insert {:?}, drop {} idx {:?}, rebuild {:?})",
+            "[copy] {} ({} rows) in {:?}",
             spec.table,
             rows,
             t_total.elapsed(),
-            insert_elapsed,
-            saved_indexes.len(),
-            drop_elapsed,
-            rebuild_elapsed,
         );
         results.push((spec.table, rows));
     }
@@ -217,129 +178,6 @@ pub(crate) fn collect_user_indexes(
         .map_err(Error::SQLError)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Error::SQLError)?;
-    Ok(rows)
-}
-
-/// Collect the hex-encoded `MARFValue` of every leaf in the squashed trie.
-///
-/// Opens the MARF at `db_path` read-only, resolves the tip, and walks the
-/// trie via `for_each_leaf`.  Auto-detects external blobs.
-///
-/// Returns `(tip_block_hash, leaf_value_hashes)`.
-pub fn collect_leaf_value_hashes<T: MarfTrieId>(
-    db_path: &str,
-) -> Result<(T, HashSet<String>), Error> {
-    let external_blobs = std::path::Path::new(&format!("{db_path}.blobs")).exists();
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", external_blobs);
-    let storage = TrieFileStorage::open_readonly(db_path, open_opts)?;
-    let mut marf = MARF::<T>::from_storage(storage);
-    let tip = trie_sql::get_latest_confirmed_block_hash::<T>(marf.sqlite_conn())?;
-
-    let mut hashes: HashSet<String> = HashSet::new();
-    marf.with_conn(|conn| {
-        MARF::for_each_leaf(conn, &tip, |_hash, value| {
-            hashes.insert(to_hex(&value.0));
-            Ok(())
-        })
-    })?;
-
-    Ok((tip, hashes))
-}
-
-/// Walk the squashed MARF at `dst_path` read-only and return the
-/// canonical leaf value hashes for `copy_canonical_fork_storage`.
-///
-/// Returns an empty set when dst has no `marf_data` (practically
-/// only in tests, but this makes them easier).
-pub fn collect_canonical_leaf_hashes<T: MarfTrieId>(
-    dst_path: &str,
-) -> Result<HashSet<String>, Error> {
-    let probe = Connection::open_with_flags(
-        dst_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(Error::SQLError)?;
-    let has_marf_data: bool = probe
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='marf_data'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    drop(probe);
-    if !has_marf_data {
-        return Ok(HashSet::new());
-    }
-
-    let t = Instant::now();
-    let (_tip, leaf_hashes) = collect_leaf_value_hashes::<T>(dst_path)?;
-    info!(
-        "[fork_storage] collected {} leaf hashes in {:?}",
-        leaf_hashes.len(),
-        t.elapsed()
-    );
-    Ok(leaf_hashes)
-}
-
-/// Copy canonical `__fork_storage` rows from `src` into `main`. i.e.
-/// only the rows whose `value_hash` is referenced by a leaf in the
-/// squashed MARF.
-///
-/// An empty `leaf_hashes` results in zero rows copied. the strict
-/// `clone_schemas_from_source` ensures the schema is still cloned.
-pub fn copy_canonical_fork_storage(
-    conn: &Connection,
-    leaf_hashes: &HashSet<String>,
-) -> Result<u64, Error> {
-    let src_has_table: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM src.sqlite_master WHERE type='table' AND name='__fork_storage'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
-
-    if !src_has_table {
-        return Err(Error::CorruptionError(
-            "src has no __fork_storage; expected on any chainstate that ran the MARF migration"
-                .into(),
-        ));
-    }
-
-    clone_schemas_from_source(conn, &["__fork_storage"])?;
-
-    // `get_ref` borrows the key bytes from SQLite's row buffer; we only
-    // allocate `value` when the row passes the canonical-leaf check.
-    let t = Instant::now();
-    let mut select = conn
-        .prepare("SELECT value_hash, value FROM src.__fork_storage")
-        .map_err(Error::SQLError)?;
-    let mut insert = conn
-        .prepare("INSERT OR REPLACE INTO __fork_storage (value_hash, value) VALUES (?1, ?2)")
-        .map_err(Error::SQLError)?;
-    let mut rows: u64 = 0;
-    let mut scanned: u64 = 0;
-    let mut rows_iter = select.query([]).map_err(Error::SQLError)?;
-    while let Some(row) = rows_iter.next().map_err(Error::SQLError)? {
-        scanned += 1;
-        let key_ref = row.get_ref(0).map_err(Error::SQLError)?;
-        let key_str = key_ref.as_str().map_err(|e| {
-            Error::CorruptionError(format!("src.__fork_storage.value_hash is not TEXT: {e:?}"))
-        })?;
-        if leaf_hashes.contains(key_str) {
-            let value: String = row.get(1).map_err(Error::SQLError)?;
-            insert
-                .execute(params![key_str, &value])
-                .map_err(Error::SQLError)?;
-            rows += 1;
-        }
-    }
-    info!(
-        "[fork_storage] stream-filter src.__fork_storage: scanned {scanned}, \
-         copied {rows} rows in {:?}",
-        t.elapsed()
-    );
-
     Ok(rows)
 }
 

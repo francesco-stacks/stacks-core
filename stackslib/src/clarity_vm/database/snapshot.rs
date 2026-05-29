@@ -22,9 +22,8 @@ use clarity::vm::types::QualifiedContractIdentifier;
 use rusqlite::Connection;
 use stacks_common::types::chainstate::StacksBlockId;
 
-use crate::chainstate::stacks::db::snapshot::common::{
-    collect_leaf_value_hashes, with_offline_write_session,
-};
+use crate::chainstate::stacks::db::snapshot::common::with_offline_write_session;
+use crate::chainstate::stacks::db::snapshot::fork_storage::collect_leaf_value_hashes;
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{trie_sql, Error};

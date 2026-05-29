@@ -244,14 +244,12 @@ fn test_copy_index_side_tables_round_trip() {
     );
     assert!(validation.tables_present);
     assert!(validation.db_config_matches);
-    assert!(validation.block_headers_count_match);
-    assert!(validation.payments_count_match);
-    assert!(validation.transactions_count_match);
-    assert!(validation.nakamoto_tenure_events_count_match);
-    assert!(validation.transactions_no_extra_blocks);
-    assert!(validation.tenure_events_no_extra_blocks);
+    assert!(validation.block_headers_match);
+    assert!(validation.payments_match);
+    assert!(validation.transactions_match);
+    assert!(validation.nakamoto_tenure_events_match);
     assert!(validation.staging_blocks_match);
-    assert!(validation.invalidated_microblocks_data_empty);
+    assert!(validation.expected_tables_empty);
 }
 
 #[test]
@@ -323,12 +321,8 @@ fn test_validate_index_side_tables_detects_extra_rows() {
             .unwrap();
 
     assert!(
-        !validation.transactions_no_extra_blocks,
-        "should detect extra block"
-    );
-    assert!(
-        !validation.transactions_count_match,
-        "count should mismatch"
+        !validation.transactions_match,
+        "extra non-canonical transaction row should be detected"
     );
     assert!(!validation.is_valid(), "validation must fail");
 }
@@ -600,6 +594,89 @@ fn test_matured_rewards_detects_fabricated_rows() {
         "matured_rewards should fail with fabricated row"
     );
     assert!(!validation.is_valid());
+}
+
+#[test]
+fn test_copy_canonical_fork_storage_filters_by_leaf_hash() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src.sqlite");
+    let dst_path = dir.path().join("dst.sqlite");
+
+    // src.__fork_storage: two canonical entries (aa, cc) and one
+    // non-canonical fork entry (bb) that must be excluded.
+    let src = Connection::open(&src_path).unwrap();
+    src.execute_batch(
+        "CREATE TABLE __fork_storage (\
+             value_hash TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);\
+         INSERT INTO __fork_storage VALUES ('aa','va'),('bb','vb'),('cc','vc');",
+    )
+    .unwrap();
+    drop(src);
+
+    // Empty dst with src attached; the copy filters by the canonical leaf set.
+    let dst = Connection::open(&dst_path).unwrap();
+    dst.execute(
+        "ATTACH DATABASE ?1 AS src",
+        params![src_path.to_str().unwrap()],
+    )
+    .unwrap();
+    let leaf_hashes: std::collections::HashSet<String> =
+        ["aa".to_string(), "cc".to_string()].into_iter().collect();
+
+    let copied = super::fork_storage::copy_canonical_fork_storage(&dst, &leaf_hashes).unwrap();
+    assert_eq!(copied, 2, "only canonical value_hashes are copied");
+
+    let present: i64 = dst
+        .query_row(
+            "SELECT COUNT(*) FROM __fork_storage WHERE value_hash IN ('aa','cc')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(present, 2);
+    let forked: i64 = dst
+        .query_row(
+            "SELECT COUNT(*) FROM __fork_storage WHERE value_hash = 'bb'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(forked, 0, "non-canonical fork row excluded");
+}
+
+#[test]
+fn test_index_validation_allows_populated_staging_microblocks() {
+    // `staging_microblocks_data` is schema-cloned by the index copy but
+    // populated by the separate block-preservation phase. Index validation must
+    // NOT assert it empty, otherwise a `--blocks`/`--all` run that preserved
+    // microblocks would fail validation spuriously.
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src.sqlite");
+    let conn = create_source_db(&src_path);
+    insert_block_header(&conn, 1, "1");
+    drop(conn);
+
+    let dst_path = dir.path().join("dst.sqlite");
+    create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
+    copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1).unwrap();
+
+    // Simulate block preservation writing microblock data into the squashed dst.
+    let dst = Connection::open(&dst_path).unwrap();
+    dst.execute(
+        "INSERT INTO staging_microblocks_data (block_hash, block_data) VALUES ('mb1', X'00')",
+        [],
+    )
+    .unwrap();
+    drop(dst);
+
+    let validation =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+    assert!(
+        validation.expected_tables_empty,
+        "populated staging_microblocks_data must not fail index validation: {validation:?}"
+    );
+    assert!(validation.is_valid(), "{validation:?}");
 }
 
 // ---------------------------------------------------------------
