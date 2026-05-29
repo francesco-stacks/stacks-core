@@ -57,11 +57,12 @@ pub fn collect_leaf_value_hashes<T: MarfTrieId>(
     Ok((tip, hashes))
 }
 
-/// Walk the squashed MARF at `dst_path` read-only and return the
-/// canonical leaf value hashes for `copy_canonical_fork_storage`.
+/// Walk the squashed MARF at `dst_path` read-only and return its canonical
+/// leaf value hashes (for [`copy_canonical_fork_storage`]).
 ///
-/// Returns an empty set when dst has no `marf_data` (practically
-/// only in tests, but this makes them easier).
+/// Returns an empty set when `dst_path` has no `marf_data`. That only happens
+/// under `cfg!(test)`, where dsts are built without a real trie; in production
+/// a missing `marf_data` is treated as corruption.
 pub fn collect_canonical_leaf_hashes<T: MarfTrieId>(
     dst_path: &str,
 ) -> Result<HashSet<String>, Error> {
@@ -76,10 +77,15 @@ pub fn collect_canonical_leaf_hashes<T: MarfTrieId>(
             [],
             |row| row.get(0),
         )
-        .unwrap_or(false);
+        .map_err(Error::SQLError)?;
     drop(probe);
     if !has_marf_data {
-        return Ok(HashSet::new());
+        if cfg!(test) {
+            return Ok(HashSet::new());
+        }
+        return Err(Error::CorruptionError(format!(
+            "squashed dst `{dst_path}` is missing `marf_data`; the MARF was not squashed into it"
+        )));
     }
 
     let t = Instant::now();

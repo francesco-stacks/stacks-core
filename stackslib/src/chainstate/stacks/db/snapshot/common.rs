@@ -296,6 +296,42 @@ where
     Ok(value)
 }
 
+/// The user tables in `conn`'s `main` schema not in `known`. Each squash copy
+/// module lists the tables it handles and a guard test asserts this is empty, so
+/// a new migration can't silently drop a table from the copy.
+#[cfg(test)]
+pub(crate) fn unclassified_tables(conn: &Connection, known: &[&str]) -> Vec<String> {
+    let known: std::collections::HashSet<&str> = known.iter().copied().collect();
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .expect("query sqlite_master");
+    let tables: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("read table names")
+        .map(Result::unwrap)
+        .collect();
+    tables
+        .into_iter()
+        .filter(|t| !known.contains(t.as_str()))
+        .collect()
+}
+
+/// MARF / Clarity-store infrastructure tables. They live in every MARF-backed
+/// source DB and are created by the squash engine (`MARF::squash_to_path`) or
+/// store init — not by a side-table copy — so the drift guards treat them as
+/// already handled.
+#[cfg(test)]
+pub(crate) const MARF_INFRA_TABLES: &[&str] = &[
+    "marf_data",
+    "__fork_storage",
+    "marf_squash_info",
+    "marf_squashed_blocks",
+    "mined_blocks",
+    "block_extension_locks",
+    "schema_version",
+    "migrated_version",
+];
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;

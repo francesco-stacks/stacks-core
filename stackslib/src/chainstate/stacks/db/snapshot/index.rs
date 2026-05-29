@@ -29,7 +29,7 @@ use crate::chainstate::stacks::index::Error;
 
 /// Tables copied (with canonical-filtered content) into the squashed index
 /// DB and validated row-for-row against the source.
-const COPIED_TABLES: &[&str] = &[
+pub(crate) const COPIED_TABLES: &[&str] = &[
     "db_config",
     "block_headers",
     "nakamoto_block_headers",
@@ -48,7 +48,7 @@ const COPIED_TABLES: &[&str] = &[
 /// populate itself. `staging_microblocks`/`staging_microblocks_data` are filled
 /// in later by the block-preservation phase; the other two stay empty. Cloning
 /// their schema prevents missing-table crashes if any code path references them.
-const SCHEMA_ONLY_TABLES: &[&str] = &[
+pub(crate) const SCHEMA_ONLY_TABLES: &[&str] = &[
     "staging_microblocks",
     "staging_microblocks_data",
     "invalidated_microblocks_data", // Epoch 2.x block orphaning only (blocks.rs:2189)
@@ -165,7 +165,6 @@ fn populate_canonical_blocks(conn: &Connection) -> Result<(), Error> {
     }
     // Source-completeness: every canonical block must exist in src as an
     // epoch-2 or Nakamoto header. A canonical ID not in src is corruption.
-    // The squash claimed a block that the source doesn't have.
     let orphans: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM canonical_blocks \

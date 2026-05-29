@@ -127,6 +127,11 @@ fn squashed_index_marf_height(conn: &Connection) -> Result<Option<i64>, Error> {
     .map_err(Error::SQLError)
 }
 
+/// Tables copied from the source Nakamoto staging-blocks DB. The index-side
+/// staging tables (`staging_microblocks*`) come from the index DB and are
+/// classified in `index.rs`.
+pub(crate) const NAKAMOTO_STAGING_TABLES: &[&str] = &["nakamoto_staging_blocks", "db_version"];
+
 const NAKAMOTO_STAGING_BLOCK_COLUMNS: &str = "\
     block_hash, consensus_hash, parent_block_id, is_tenure_start, \
     burn_attachable, processed, orphaned, height, index_block_hash, \
@@ -559,7 +564,7 @@ pub fn copy_nakamoto_staging_blocks(
         &[("src", src_nakamoto_path), ("idx", squashed_index_path)],
         "",
         |conn| {
-            clone_schemas_from_source(conn, &["nakamoto_staging_blocks", "db_version"])?;
+            clone_schemas_from_source(conn, NAKAMOTO_STAGING_TABLES)?;
 
             conn.execute("INSERT INTO db_version SELECT * FROM src.db_version", [])
                 .map_err(Error::SQLError)?;

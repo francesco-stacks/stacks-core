@@ -13,13 +13,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-pub mod blocks;
-pub mod burnchain;
-pub mod common;
-pub mod fork_storage;
-pub mod index;
-pub mod sortition;
-pub mod spv;
+pub(crate) mod blocks;
+pub(crate) mod burnchain;
+pub(crate) mod common;
+pub(crate) mod fork_storage;
+pub(crate) mod index;
+pub(crate) mod sortition;
+pub(crate) mod spv;
 
 #[cfg(test)]
 mod tests;

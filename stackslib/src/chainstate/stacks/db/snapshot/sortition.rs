@@ -26,7 +26,7 @@ use super::fork_storage::{collect_canonical_leaf_hashes, copy_canonical_fork_sto
 use crate::chainstate::stacks::index::Error;
 
 /// Required sortition tables always present in production.
-const REQUIRED_TABLES: &[&str] = &[
+pub(crate) const REQUIRED_TABLES: &[&str] = &[
     "db_config",
     "snapshots",
     "leader_keys",

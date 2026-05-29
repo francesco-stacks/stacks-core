@@ -22,7 +22,7 @@ use super::common::{clone_schemas_from_source, full_row_except_match, with_offli
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all burnchain.sqlite versions.
-const REQUIRED_TABLES: &[&str] = &[
+pub(crate) const REQUIRED_TABLES: &[&str] = &[
     "burnchain_db_block_headers",
     "burnchain_db_block_ops",
     "block_commit_metadata",

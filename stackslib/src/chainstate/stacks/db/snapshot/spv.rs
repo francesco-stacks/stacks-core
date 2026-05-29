@@ -22,7 +22,7 @@ use super::common::{clone_schemas_from_source, full_row_except_match, with_offli
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all headers.sqlite versions.
-const REQUIRED_TABLES: &[&str] = &["headers", "db_config", "chain_work"];
+pub(crate) const REQUIRED_TABLES: &[&str] = &["headers", "db_config", "chain_work"];
 
 /// Bitcoin difficulty chunk size (2016 blocks per difficulty interval).
 const DIFFICULTY_CHUNK_SIZE: u32 = 2016;

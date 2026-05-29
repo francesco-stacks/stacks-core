@@ -5,6 +5,7 @@ use stacks_common::util::hash::Sha512Trunc256Sum;
 use stacks_common::util::secp256k1::MessageSignature;
 use tempfile::tempdir;
 
+use super::common::{unclassified_tables, MARF_INFRA_TABLES};
 use super::index::{copy_index_side_tables, validate_index_side_tables};
 use crate::chainstate::nakamoto::staging_blocks::{
     NAKAMOTO_STAGING_DB_SCHEMA_1, NAKAMOTO_STAGING_DB_SCHEMA_2, NAKAMOTO_STAGING_DB_SCHEMA_3,
@@ -1588,51 +1589,90 @@ fn test_epoch2_block_file_missing_source_is_error() {
 }
 
 #[test]
-fn test_all_required_tables_exist() {
+fn test_no_unclassified_source_tables() {
+    // Drift guard: every table the chainstate migrations create must be
+    // classified, so a future migration can't silently drop one from the squash.
     let dir = tempdir().unwrap();
-    let src_path = dir.path().join("src.sqlite");
-    let conn = create_source_db(&src_path);
-    // Source-completeness: the canonical block listed in dst must also
-    // exist in src.block_headers. Insert a matching row.
-    insert_block_header(&conn, 0, "1");
-    drop(conn);
+    let conn = create_source_db(&dir.path().join("src.sqlite"));
+    let known: Vec<&str> = super::index::COPIED_TABLES
+        .iter()
+        .chain(super::index::SCHEMA_ONLY_TABLES)
+        .chain(MARF_INFRA_TABLES.iter())
+        .copied()
+        .collect();
+    let extra = unclassified_tables(&conn, &known);
+    assert!(
+        extra.is_empty(),
+        "unclassified index table(s) {extra:?}: classify each in COPIED_TABLES or \
+         SCHEMA_ONLY_TABLES (snapshot/index.rs)"
+    );
+}
 
-    let dst_path = dir.path().join("dst.sqlite");
-    // Use one canonical block so `marf_squashed_blocks` isn't empty;
-    // this test asserts schema presence, not canonical-set semantics.
-    create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
+#[test]
+fn test_no_unclassified_sortition_tables() {
+    let dir = tempdir().unwrap();
+    let conn = create_sortition_source_db(&dir.path().join("src.sqlite"));
+    let known: Vec<&str> = super::sortition::REQUIRED_TABLES
+        .iter()
+        .chain(MARF_INFRA_TABLES.iter())
+        .copied()
+        .collect();
+    let extra = unclassified_tables(&conn, &known);
+    assert!(
+        extra.is_empty(),
+        "unclassified sortition table(s) {extra:?}: classify each in REQUIRED_TABLES \
+         (snapshot/sortition.rs)"
+    );
+}
 
-    copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1).unwrap();
+#[test]
+fn test_no_unclassified_burnchain_tables() {
+    let dir = tempdir().unwrap();
+    let conn = create_burnchain_db(&dir.path().join("src.sqlite"));
+    let known: Vec<&str> = super::burnchain::REQUIRED_TABLES
+        .iter()
+        .chain(MARF_INFRA_TABLES.iter())
+        .copied()
+        .collect();
+    let extra = unclassified_tables(&conn, &known);
+    assert!(
+        extra.is_empty(),
+        "unclassified burnchain table(s) {extra:?}: classify each in REQUIRED_TABLES \
+         (snapshot/burnchain.rs)"
+    );
+}
 
-    let dst_conn = Connection::open(&dst_path).unwrap();
+#[test]
+fn test_no_unclassified_spv_tables() {
+    let dir = tempdir().unwrap();
+    let conn = create_spv_headers_db(&dir.path().join("src.sqlite"));
+    let known: Vec<&str> = super::spv::REQUIRED_TABLES
+        .iter()
+        .chain(MARF_INFRA_TABLES.iter())
+        .copied()
+        .collect();
+    let extra = unclassified_tables(&conn, &known);
+    assert!(
+        extra.is_empty(),
+        "unclassified SPV table(s) {extra:?}: classify each in REQUIRED_TABLES (snapshot/spv.rs)"
+    );
+}
 
-    // Verify all required tables exist including the newly added ones.
-    for table in &[
-        "staging_blocks",
-        "staging_microblocks",
-        "staging_microblocks_data",
-        "invalidated_microblocks_data",
-        "user_supporters",
-    ] {
-        let count: i64 = dst_conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                params![table],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1, "table '{table}' should exist");
-    }
-
-    // invalidated_microblocks_data should be empty.
-    let count: i64 = dst_conn
-        .query_row(
-            "SELECT COUNT(*) FROM invalidated_microblocks_data",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 0, "invalidated_microblocks_data should be empty");
+#[test]
+fn test_no_unclassified_nakamoto_staging_tables() {
+    let dir = tempdir().unwrap();
+    let conn = create_source_nakamoto_db(&dir.path().join("src.sqlite"));
+    let known: Vec<&str> = super::blocks::NAKAMOTO_STAGING_TABLES
+        .iter()
+        .chain(MARF_INFRA_TABLES.iter())
+        .copied()
+        .collect();
+    let extra = unclassified_tables(&conn, &known);
+    assert!(
+        extra.is_empty(),
+        "unclassified Nakamoto staging table(s) {extra:?}: classify each in \
+         NAKAMOTO_STAGING_TABLES (snapshot/blocks.rs)"
+    );
 }
 
 /// Build a minimal serializable StacksMicroblock with the given sequence
@@ -2753,7 +2793,7 @@ use crate::burnchains::db::{
 
 /// Create a burnchain.sqlite source.
 /// Replays the real schema: SCHEMA_2 then MIGRATION_V2_TO_V3, plus indexes.
-fn create_burnchain_db_v3(path: &std::path::Path) -> Connection {
+fn create_burnchain_db(path: &std::path::Path) -> Connection {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(BURNCHAIN_DB_SCHEMA_2).unwrap();
     conn.execute("INSERT INTO db_config (version) VALUES ('2')", [])
@@ -2823,7 +2863,7 @@ fn test_burnchain_db_copy_and_validate() {
     let canonical = vec![(0, "hash_0"), (1, "hash_1"), (2, "hash_2")];
     create_squashed_sortition(&sort_path, &canonical);
 
-    let src = create_burnchain_db_v3(&src_path);
+    let src = create_burnchain_db(&src_path);
     // Insert canonical block headers.
     for (h, hash) in &canonical {
         src.execute(
@@ -2897,7 +2937,7 @@ fn test_burnchain_db_excludes_non_canonical_fork() {
     // Only hash_a is canonical at height 1.
     create_squashed_sortition(&sort_path, &[(0, "genesis"), (1, "hash_a")]);
 
-    let src = create_burnchain_db_v3(&src_path);
+    let src = create_burnchain_db(&src_path);
     src.execute(
         "INSERT INTO burnchain_db_block_headers VALUES (0, 'genesis', 'none', 0, 0)",
         [],
@@ -2946,7 +2986,7 @@ fn test_burnchain_db_block_ops_follow_canonical_headers() {
 
     create_squashed_sortition(&sort_path, &[(0, "canon")]);
 
-    let src = create_burnchain_db_v3(&src_path);
+    let src = create_burnchain_db(&src_path);
     src.execute(
         "INSERT INTO burnchain_db_block_headers VALUES (0, 'canon', 'none', 0, 0)",
         [],
@@ -2995,7 +3035,7 @@ fn test_burnchain_db_anchor_blocks_filtered() {
 
     create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1")]);
 
-    let src = create_burnchain_db_v3(&src_path);
+    let src = create_burnchain_db(&src_path);
     src.execute(
         "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
         [],
@@ -3057,7 +3097,7 @@ fn test_burnchain_db_validate_detects_non_canonical_leak() {
 
     create_squashed_sortition(&sort_path, &[(0, "h0")]);
 
-    let src = create_burnchain_db_v3(&src_path);
+    let src = create_burnchain_db(&src_path);
     src.execute(
         "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
         [],
@@ -3123,7 +3163,7 @@ fn test_burnchain_db_sortition_tip_mismatch_is_error() {
     // Sortition tip is at height 5.
     create_squashed_sortition(&sort_path, &[(0, "h0"), (5, "h5")]);
 
-    let src = create_burnchain_db_v3(&src_path);
+    let src = create_burnchain_db(&src_path);
     src.execute(
         "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
         [],
@@ -3155,7 +3195,7 @@ fn test_burnchain_db_fresh_output_dir() {
 
     create_squashed_sortition(&sort_path, &[(0, "h0")]);
 
-    let src = create_burnchain_db_v3(&src_path);
+    let src = create_burnchain_db(&src_path);
     src.execute(
         "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
         [],
@@ -3423,7 +3463,7 @@ fn test_burnchain_db_copy_fails_when_source_missing_canonical_hash() {
     create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1"), (2, "h2")]);
 
     // But source burnchain.sqlite only has h0 and h1 - h2 is missing.
-    let src = create_burnchain_db_v3(&src_path);
+    let src = create_burnchain_db(&src_path);
     src.execute(
         "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
         [],
@@ -3457,7 +3497,7 @@ fn test_burnchain_db_validate_detects_missing_canonical_hash() {
 
     create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1")]);
 
-    let src = create_burnchain_db_v3(&src_path);
+    let src = create_burnchain_db(&src_path);
     src.execute(
         "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
         [],

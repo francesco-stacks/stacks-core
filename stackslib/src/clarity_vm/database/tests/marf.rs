@@ -21,6 +21,7 @@ use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use tempfile::tempdir;
 
+use crate::chainstate::stacks::db::snapshot::common::{unclassified_tables, MARF_INFRA_TABLES};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
 use crate::chainstate::stacks::index::storage::{SquashBoundary, TrieHashCalculationMode};
 use crate::chainstate::stacks::index::{ClarityMarfTrieId as _, MARFValue};
@@ -466,4 +467,26 @@ fn test_copy_clarity_side_tables_with_double_colon_metadata_keys() {
         assert!(md2.is_some(), "vm-metadata::10::sub should be present");
         assert_eq!(md2.unwrap(), "meta_value_10_sub");
     }
+}
+
+#[test]
+fn test_no_unclassified_clarity_source_tables() {
+    // Drift guard for the Clarity MARF DB: every table must be either copied by
+    // `copy_clarity_side_tables` (data_table, metadata_table) or owned by the
+    // MARF trie itself (copied by `MARF::squash_to_path`).
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    build_clarity_marf(&src_dir, 2, "test-contract", "");
+    let conn = rusqlite::Connection::open(clarity_marf_db_path(&src_dir)).unwrap();
+
+    let known: Vec<&str> = ["data_table", "metadata_table"]
+        .into_iter()
+        .chain(MARF_INFRA_TABLES.iter().copied())
+        .collect();
+    let extra = unclassified_tables(&conn, &known);
+    assert!(
+        extra.is_empty(),
+        "unclassified Clarity source table(s) {extra:?}: handle each in \
+         copy_clarity_side_tables (clarity_vm/database/snapshot.rs)"
+    );
 }
