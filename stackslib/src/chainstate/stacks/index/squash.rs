@@ -859,43 +859,23 @@ impl<T: MarfTrieId> MARF<T> {
     /// `tip` is used to identify the canonical fork the squash height
     /// lives on: it must be at or above `height`.
     ///
-    /// # Squash protocol preconditions
+    /// # Squash preconditions
     ///
-    /// This function squashes a single MARF in isolation. The orchestrator
-    /// is responsible for satisfying the following invariants across the full
-    /// chainstate so the resulting snapshot can be safely consumed by a
-    /// `stacks-node` at boot:
+    /// `squash_to_path` rewrites one MARF. The boot-snapshot orchestrator
+    /// must enforce these chainstate-wide invariants:
     ///
-    /// 1. **MARFs are squashed as a unit.** The Index, Clarity, and
-    ///    Sortition MARFs must be squashed in the same overall operation
-    ///    so that their guards activate together. The chosen heights may
-    ///    differ between MARFs when the use case requires, but no MARF is
-    ///    squashed in isolation.
-    ///
-    /// 2. **Side-tables and other chainstate DBs are capped at the squash
-    ///    height.** All SQL side-tables (e.g. `nakamoto_reward_sets`,
-    ///    `nakamoto_tenure_events`, `nakamoto_block_headers`) must contain
-    ///    only rows for blocks at and below the squash height. No
-    ///    post-squash data should appear in the snapshot; the node will
-    ///    sync that forward after boot.
-    ///
-    /// 3. **Epoch 3.4 minimum.** The squash boundary must be at epoch 3.4
-    ///    or later. Pre-3.4 Clarity exposed `at-block`, which could read
-    ///    arbitrary historical state - squashing across that boundary
-    ///    would break contracts that depend on `at-block`. Epoch 3.4
-    ///    removes the function, making historical state collapses safe.
-    ///
-    /// 4. **Finality buffer.** The squash boundary must be at least six
-    ///    bitcoin tenures behind the current bitcoin tip. Only past
-    ///    that point is data guaranteed to never be reorganized away.
-    ///    Squashing closer to the tip risks invalidating data that a
-    ///    later reorg would otherwise overwrite.
-    ///
-    /// 5. **Canonical-only.** No non-canonical blocks (orphans, pruned
-    ///    forks) may appear in the squashed MARF or in any copied
-    ///    side-table. All past forks below the squash height are
-    ///    filtered before the snapshot is constructed so the resulting
-    ///    chainstate is canonical-only by construction.
+    /// 1. **Squash MARFs together.** Index, Clarity, and Sortition guards
+    ///    must activate in one operation. Heights may differ by use case.
+    /// 2. **Cap copied SQL at the boundary.** Side-tables and other
+    ///    chainstate DBs contain only rows at or below their squash height;
+    ///    post-squash data is synced after boot.
+    /// 3. **Epoch 3.4 or later.** Earlier `at-block` reads arbitrary
+    ///    historical state, which squashing cannot preserve.
+    /// 4. **Finality buffer.** The boundary is at least six bitcoin tenures
+    ///    behind the bitcoin tip, so copied data will not be reorged away.
+    /// 5. **Canonical-only.** Squashed MARFs and copied side-tables contain
+    ///    no orphan/pruned-fork rows; below the boundary the snapshot is
+    ///    canonical by construction.
     pub fn squash_to_path(
         src_path: &str,
         dst_path: &str,

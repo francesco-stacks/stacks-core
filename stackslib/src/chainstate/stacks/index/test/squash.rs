@@ -62,7 +62,7 @@ fn squash_helper(
     let stats = MARF::squash_to_path(
         src_path,
         dst_db_path.to_str().unwrap(),
-        src_open_opts,
+        open_opts,
         tip,
         boundary,
         "test",
