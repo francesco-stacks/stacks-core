@@ -180,20 +180,34 @@ fn nakamoto_staging_blocks_source_select(
     } else {
         String::new()
     };
-    // Post-boundary replay-chain members are reset to unprocessed so the booted
-    // node replays them.
-    let (processed_expr, processed_time_expr) = if squashed {
+    // Replay-chain members are reset to unprocessed (to be replayed) and, except the boundary
+    // tenure, to burn_attachable=0: their sortition was truncated and must be re-derived before
+    // they can be attached, so replay re-marks each tenure as it rebuilds its sortition. The
+    // boundary tenure's sortition is retained, so it stays attachable.
+    let (processed_expr, processed_time_expr, burn_attachable_expr) = if squashed {
         let replay = format!(
             "{source_alias}.index_block_hash IN (SELECT index_block_hash FROM replay_chain)"
+        );
+        // The boundary tenure (the deepest retained canonical block's tenure) is the only replay
+        // tenure whose sortition is retained.
+        let boundary_ch = format!(
+            "(SELECT bch.consensus_hash FROM src.nakamoto_staging_blocks bch \
+              WHERE bch.index_block_hash IN (SELECT index_block_hash FROM idx.nakamoto_block_headers) \
+              ORDER BY bch.height DESC LIMIT 1)"
         );
         (
             format!("CASE WHEN {replay} THEN 0 ELSE {source_alias}.processed END"),
             format!("CASE WHEN {replay} THEN 0 ELSE {source_alias}.processed_time END"),
+            format!(
+                "CASE WHEN {replay} AND {source_alias}.consensus_hash <> {boundary_ch} \
+                 THEN 0 ELSE {source_alias}.burn_attachable END"
+            ),
         )
     } else {
         (
             format!("{source_alias}.processed"),
             format!("{source_alias}.processed_time"),
+            format!("{source_alias}.burn_attachable"),
         )
     };
 
@@ -202,7 +216,7 @@ fn nakamoto_staging_blocks_source_select(
                 {source_alias}.consensus_hash, \
                 {source_alias}.parent_block_id, \
                 {source_alias}.is_tenure_start, \
-                {source_alias}.burn_attachable, \
+                {burn_attachable_expr}, \
                 {processed_expr}, \
                 {source_alias}.orphaned, \
                 {source_alias}.height, \
