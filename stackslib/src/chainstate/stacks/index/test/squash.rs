@@ -35,7 +35,7 @@ use crate::chainstate::stacks::index::node::{
 use crate::chainstate::stacks::index::squash::{
     compute_node_hash, deserialize_node, serialize_node, stream_squash_blob, NodeStore,
 };
-use crate::chainstate::stacks::index::storage::{SquashBoundary, TrieHashCalculationMode};
+use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{
     blob_layout, trie_sql, ClarityMarfTrieId, Error, MARFValue, TrieLeaf, TrieMerkleProof,
 };
@@ -52,19 +52,13 @@ fn squash_helper(
 ) -> (PathBuf, SquashStats) {
     std::fs::create_dir_all(dst_dir).unwrap();
     let dst_db_path = dst_dir.join("index.sqlite");
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    // Tests don't care about the bitcoin_height value; reuse `height` so the
-    // squash metadata round-trips consistently.
-    let boundary = SquashBoundary {
-        marf_height: height,
-        bitcoin_height: height,
-    };
+    let src_open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
     let stats = MARF::squash_to_path(
         src_path,
         dst_db_path.to_str().unwrap(),
-        open_opts,
+        src_open_opts,
         tip,
-        boundary,
+        height,
         "test",
     )
     .unwrap();
@@ -173,7 +167,7 @@ fn test_squash_info_detected_on_open() {
             Ok((
                 conn.is_squashed(),
                 info.archival_marf_root_hash,
-                info.boundary.marf_height,
+                info.squash_height,
             ))
         })
         .unwrap();
@@ -185,7 +179,7 @@ fn test_squash_info_detected_on_open() {
 
     assert!(is_squashed);
     assert_eq!(info_root, sql_info.archival_marf_root_hash);
-    assert_eq!(info_height, sql_info.boundary.marf_height);
+    assert_eq!(info_height, sql_info.squash_height);
     assert_eq!(info_height, 1);
 }
 
@@ -977,10 +971,7 @@ fn test_squash_internal_blobs_extend_with_compression() {
         dst_db_path.to_str().unwrap(),
         src_opts,
         &b2,
-        SquashBoundary {
-            marf_height: 1,
-            bitcoin_height: 1,
-        },
+        1,
         "test",
     )
     .unwrap();
@@ -1712,7 +1703,7 @@ fn test_squash_handles_commit_to_renamed_blocks_below_tip() {
             .unwrap_or_else(|| panic!("missing block at height {h}"));
         assert_eq!(bh, reals[h as usize], "height {h} resolved to wrong block");
     }
-    assert_eq!(stats.marf_height, 3);
+    assert_eq!(stats.squash_height, 3);
     assert_eq!(stats.historical_placeholder_count, 3);
 }
 
@@ -1761,7 +1752,7 @@ fn test_squash_handles_commit_to_renamed_blocks_at_tip() {
             .unwrap_or_else(|| panic!("missing block at height {h}"));
         assert_eq!(bh, reals[h as usize], "height {h} resolved to wrong block");
     }
-    assert_eq!(stats.marf_height, 2);
+    assert_eq!(stats.squash_height, 2);
 }
 
 /// Re-squash walks new blocks and reads old heights from the side table.
@@ -1826,7 +1817,7 @@ fn test_resquash_after_squash_succeeds() {
         &post[2],
         4,
     );
-    assert_eq!(resquash_stats.marf_height, 4);
+    assert_eq!(resquash_stats.squash_height, 4);
 
     let mut resquashed = MARF::from_path(
         resquashed_path.to_str().unwrap(),
@@ -1886,10 +1877,7 @@ fn test_resquash_rejects_height_at_or_below_existing_squash() {
             dst_db_path.to_str().unwrap(),
             open_opts.clone(),
             &post,
-            SquashBoundary {
-                marf_height: bad_height,
-                bitcoin_height: bad_height,
-            },
+            bad_height,
             "test",
         );
         match result {
@@ -1981,10 +1969,7 @@ fn test_squash_rejects_existing_destination() {
         dst_db_path.to_str().unwrap(),
         open_opts.clone(),
         blocks.last().unwrap(),
-        SquashBoundary {
-            marf_height: 1,
-            bitcoin_height: 1,
-        },
+        1,
         "test",
     );
     match result {
@@ -2002,10 +1987,7 @@ fn test_squash_rejects_existing_destination() {
         dst_db_path.to_str().unwrap(),
         open_opts,
         blocks.last().unwrap(),
-        SquashBoundary {
-            marf_height: 1,
-            bitcoin_height: 1,
-        },
+        1,
         "test",
     );
     match result {
@@ -2203,10 +2185,7 @@ fn test_squash_extend_many_keys_patch_backptr_regression() {
         dst_db_path.to_str().unwrap(),
         open_opts.clone(),
         &b2,
-        SquashBoundary {
-            marf_height: 1,
-            bitcoin_height: 1,
-        },
+        1,
         "test",
     )
     .unwrap();
