@@ -2,7 +2,6 @@ use stackslib::chainstate::stacks::db::snapshot::{
     SortitionTipCopyBoundary, copy_confirmed_epoch2_microblocks, copy_epoch2_block_files,
     copy_nakamoto_staging_blocks,
 };
-use stackslib::chainstate::stacks::index::storage::SquashBoundary;
 
 use crate::cli::{BlocksSection, SquashArgs, ValidateArgs, VerifyArgs};
 use crate::manifest::generate_manifest;
@@ -161,14 +160,6 @@ pub fn run_squash(args: SquashArgs) {
     let sortition_tip = targets.sortition_canonical_tip.clone();
     let first_bitcoin_height = targets.first_bitcoin_height;
     let squash_bitcoin_height = targets.squash_bitcoin_height;
-    let stacks_boundary = SquashBoundary {
-        marf_height: stacks_height,
-        bitcoin_height: squash_bitcoin_height,
-    };
-    let sortition_boundary = SquashBoundary {
-        marf_height: sortition_marf_height,
-        bitcoin_height: squash_bitcoin_height,
-    };
 
     eprintln!(
         "Squash at tenure start Bitcoin height {tenure_start_bitcoin_height}, \
@@ -192,7 +183,7 @@ pub fn run_squash(args: SquashArgs) {
             &paths.clarity,
             &out,
             &stacks_tip,
-            stacks_boundary,
+            stacks_height,
             SideTableMode::Clarity,
             squash_marf_open_opts(),
         );
@@ -206,7 +197,7 @@ pub fn run_squash(args: SquashArgs) {
             &paths.index,
             &out,
             &stacks_tip,
-            stacks_boundary,
+            stacks_height,
             SideTableMode::Index {
                 first_bitcoin_height,
                 reward_cycle_len: pox.reward_cycle_length,
@@ -223,7 +214,7 @@ pub fn run_squash(args: SquashArgs) {
             &paths.sortition,
             &out,
             &sortition_tip,
-            sortition_boundary,
+            sortition_marf_height,
             SideTableMode::Sortition {
                 stacks_tip_boundary: stacks_tip_boundary.clone(),
             },
@@ -380,7 +371,7 @@ pub fn run_squash(args: SquashArgs) {
                 &paths.clarity,
                 clarity_out.as_ref().unwrap(),
                 &stacks_tip,
-                stacks_boundary,
+                stacks_height,
                 args.full,
                 SideTableMode::Clarity,
                 squash_marf_open_opts(),
@@ -394,7 +385,7 @@ pub fn run_squash(args: SquashArgs) {
                 &paths.index,
                 index_out.as_ref().unwrap(),
                 &stacks_tip,
-                stacks_boundary,
+                stacks_height,
                 args.full,
                 SideTableMode::Index {
                     first_bitcoin_height,
@@ -411,7 +402,7 @@ pub fn run_squash(args: SquashArgs) {
                 &paths.sortition,
                 &sortition_out.as_ref().unwrap().0,
                 &sortition_tip,
-                sortition_boundary,
+                sortition_marf_height,
                 args.full,
                 SideTableMode::Sortition {
                     stacks_tip_boundary: stacks_tip_boundary.clone(),
@@ -537,14 +528,6 @@ pub fn run_validate(args: ValidateArgs) {
     let sortition_tip = targets.sortition_canonical_tip.clone();
     let first_bitcoin_height = targets.first_bitcoin_height;
     let squash_bitcoin_height = targets.squash_bitcoin_height;
-    let stacks_boundary = SquashBoundary {
-        marf_height: stacks_height,
-        bitcoin_height: squash_bitcoin_height,
-    };
-    let sortition_boundary = SquashBoundary {
-        marf_height: sortition_marf_height,
-        bitcoin_height: squash_bitcoin_height,
-    };
 
     let mut all_valid = true;
 
@@ -553,7 +536,7 @@ pub fn run_validate(args: ValidateArgs) {
             &source_paths.clarity,
             &squashed_paths.clarity,
             &stacks_tip,
-            stacks_boundary,
+            stacks_height,
             args.full,
             SideTableMode::Clarity,
             squash_marf_open_opts(),
@@ -567,7 +550,7 @@ pub fn run_validate(args: ValidateArgs) {
             &source_paths.index,
             &squashed_paths.index,
             &stacks_tip,
-            stacks_boundary,
+            stacks_height,
             args.full,
             SideTableMode::Index {
                 first_bitcoin_height,
@@ -584,7 +567,7 @@ pub fn run_validate(args: ValidateArgs) {
             &source_paths.sortition,
             &squashed_paths.sortition,
             &sortition_tip,
-            sortition_boundary,
+            sortition_marf_height,
             args.full,
             SideTableMode::Sortition {
                 stacks_tip_boundary: stacks_tip_boundary.clone(),

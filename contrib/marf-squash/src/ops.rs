@@ -10,7 +10,6 @@ use stackslib::chainstate::stacks::db::snapshot::{
 };
 use stackslib::chainstate::stacks::index::MarfTrieId;
 use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, SquashValidationStats};
-use stackslib::chainstate::stacks::index::storage::SquashBoundary;
 use stackslib::clarity_vm::database::snapshot::{
     copy_clarity_side_tables, validate_clarity_side_tables,
 };
@@ -46,7 +45,7 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
     source: &TargetPaths,
     out: &TargetPaths,
     tip: &T,
-    boundary: SquashBoundary,
+    squash_height: u32,
     side_table_mode: SideTableMode,
     open_opts: MARFOpenOpts,
 ) {
@@ -69,7 +68,7 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
         out.db.to_str().unwrap(),
         open_opts,
         tip,
-        boundary,
+        squash_height,
         label,
     ) {
         Ok(stats) => stats,
@@ -179,10 +178,7 @@ pub fn squash_and_copy_one<T: MarfTrieId>(
         (savings as f64 / original_total as f64) * 100.0
     };
 
-    println!(
-        "Squash complete ({label}) at marf_height {} (bitcoin_height {})",
-        boundary.marf_height, boundary.bitcoin_height,
-    );
+    println!("Squash complete ({label}) at MARF height {squash_height}");
     println!("Node count: {}", stats.node_count);
     println!(
         "Original: db={original_db_size} bytes, blobs={original_blobs_size} bytes, total={original_total} bytes"
@@ -202,7 +198,7 @@ pub fn validate_one<T: MarfTrieId>(
     source: &TargetPaths,
     squashed: &TargetPaths,
     tip: &T,
-    boundary: SquashBoundary,
+    squash_height: u32,
     full: bool,
     side_table_mode: SideTableMode,
     open_opts: MARFOpenOpts,
@@ -220,7 +216,7 @@ pub fn validate_one<T: MarfTrieId>(
             .unwrap(),
         open_opts,
         tip,
-        boundary,
+        squash_height,
         full,
     );
     println!("Validation results for {label}:");
@@ -322,7 +318,7 @@ fn validate_or_exit<T: MarfTrieId>(
     squashed_blobs: &str,
     open_opts: MARFOpenOpts,
     tip: &T,
-    boundary: SquashBoundary,
+    squash_height: u32,
     full_leaf_scan: bool,
 ) -> SquashValidationStats {
     if let Some(blobs) = source_blobs {
@@ -335,7 +331,7 @@ fn validate_or_exit<T: MarfTrieId>(
         squashed_db,
         open_opts,
         tip,
-        boundary,
+        squash_height,
         full_leaf_scan,
     ) {
         Ok(stats) => stats,
@@ -350,14 +346,7 @@ fn print_validation(stats: &SquashValidationStats) {
     println!("Validation:");
     println!("Archival root present: {}", stats.archival_root_present);
     println!("Archival root matches: {}", stats.archival_root_matches);
-    println!(
-        "Squash MARF height matches: {}",
-        stats.squash_marf_height_matches
-    );
-    println!(
-        "Squash Bitcoin height matches: {}",
-        stats.squash_bitcoin_height_matches
-    );
+    println!("Squash height matches: {}", stats.squash_height_matches);
     println!(
         "Squash node hash present: {}",
         stats.squash_node_hash_present

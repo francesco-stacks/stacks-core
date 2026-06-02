@@ -592,7 +592,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         // hash - not the root hash for the specific block we opened. Read the
         // correct per-height root hash from the SQL table instead.
         let ancestor_root_hash = if storage
-            .squash_marf_height()
+            .squash_height()
             .is_some_and(|h| ancestor_height <= h)
         {
             trie_sql::read_squashed_block_root_hash_by_height(
@@ -691,10 +691,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                 // the verifier uses it directly, bypassing the incorrect
                 // content hash computation.
                 let prev_height = current_height + (1u32 << (idx - 1));
-                if storage
-                    .squash_marf_height()
-                    .is_some_and(|h| prev_height <= h)
-                {
+                if storage.squash_height().is_some_and(|h| prev_height <= h) {
                     let archival_trie = trie_sql::read_squashed_block_root_hash_by_height(
                         storage.sqlite_conn(),
                         prev_height,

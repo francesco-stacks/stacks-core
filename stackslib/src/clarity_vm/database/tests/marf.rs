@@ -23,7 +23,7 @@ use tempfile::tempdir;
 
 use crate::chainstate::stacks::db::snapshot::common::{unclassified_tables, MARF_INFRA_TABLES};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
-use crate::chainstate::stacks::index::storage::{SquashBoundary, TrieHashCalculationMode};
+use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId as _, MARFValue};
 use crate::clarity_vm::clarity::ClarityMarfStoreTransaction as _;
 use crate::clarity_vm::database::marf::MarfedKV;
@@ -132,10 +132,7 @@ fn squash_clarity_marf(
         dst_db.to_str().unwrap(),
         open_opts,
         tip,
-        SquashBoundary {
-            marf_height: height,
-            bitcoin_height: height,
-        },
+        height,
         "test",
     )
     .unwrap();
@@ -337,10 +334,7 @@ fn test_mismatched_clarity_db_causes_data_read_failure() {
         dst_db.to_str().unwrap(),
         open_opts,
         blocks.last().unwrap(),
-        SquashBoundary {
-            marf_height: 3,
-            bitcoin_height: 3,
-        },
+        3,
         "test",
     )
     .unwrap();
@@ -391,10 +385,7 @@ fn test_validate_clarity_side_tables_detects_mismatch() {
         dst_db.to_str().unwrap(),
         open_opts,
         blocks.last().unwrap(),
-        SquashBoundary {
-            marf_height: 3,
-            bitcoin_height: 3,
-        },
+        3,
         "test",
     )
     .unwrap();

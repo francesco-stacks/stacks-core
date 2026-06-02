@@ -4,7 +4,6 @@ use std::path::Path;
 
 use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
 use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, MarfConnection};
-use stackslib::chainstate::stacks::index::storage::SquashBoundary;
 use stackslib::chainstate::stacks::index::{MarfTrieId, trie_sql};
 
 use crate::cli::{
@@ -21,7 +20,7 @@ pub struct ReadSquashMetadata<T: MarfTrieId> {
     pub tip: T,
     pub archival_root_hash: String,
     pub squash_root_node_hash: String,
-    pub boundary: SquashBoundary,
+    pub squash_height: u32,
 }
 
 /// Read squash metadata from a just-squashed MARF DB.
@@ -50,7 +49,7 @@ pub fn read_squash_metadata<T: MarfTrieId + std::fmt::Display>(
         tip,
         archival_root_hash: format!("0x{}", info.archival_marf_root_hash),
         squash_root_node_hash: format!("0x{}", info.squash_root_node_hash),
-        boundary: info.boundary,
+        squash_height: info.squash_height,
     }
 }
 
@@ -61,21 +60,11 @@ fn insert_expected_rel(base: &Path, abs_path: &Path, set: &mut HashSet<String>) 
     }
 }
 
-/// Assert that a squashed DB stores the boundary the caller expected.
+/// Assert that a squashed DB stores the squash height the caller expected.
 /// Exits on mismatch.
-fn assert_manifest_boundary(label: &str, actual: SquashBoundary, expected: SquashBoundary) {
-    if actual.marf_height != expected.marf_height {
-        eprintln!(
-            "Manifest error: {label} squash MARF height {} != expected {}",
-            actual.marf_height, expected.marf_height
-        );
-        std::process::exit(1);
-    }
-    if actual.bitcoin_height != expected.bitcoin_height {
-        eprintln!(
-            "Manifest error: {label} squash Bitcoin height {} != expected {}",
-            actual.bitcoin_height, expected.bitcoin_height
-        );
+fn assert_squash_height(label: &str, actual: u32, expected: u32) {
+    if actual != expected {
+        eprintln!("Manifest error: {label} squash MARF height {actual} != expected {expected}");
         std::process::exit(1);
     }
 }
@@ -131,22 +120,17 @@ pub fn generate_manifest(
     blocks_section: BlocksSection,
     copied_block_rel_paths: &[String],
 ) {
-    let stacks_boundary = SquashBoundary {
-        marf_height: stacks_height,
-        bitcoin_height,
-    };
-
     let index_meta = read_squash_metadata::<StacksBlockId>(
         index_out.db.to_str().unwrap(),
         squash_marf_open_opts(),
     );
-    assert_manifest_boundary("Index", index_meta.boundary, stacks_boundary);
+    assert_squash_height("Index", index_meta.squash_height, stacks_height);
 
     let clarity_meta = read_squash_metadata::<StacksBlockId>(
         clarity_out.db.to_str().unwrap(),
         squash_marf_open_opts(),
     );
-    assert_manifest_boundary("Clarity", clarity_meta.boundary, stacks_boundary);
+    assert_squash_height("Clarity", clarity_meta.squash_height, stacks_height);
     if clarity_meta.tip != index_meta.tip {
         eprintln!(
             "Manifest error: Clarity tip {} != Index tip {}",
@@ -160,11 +144,11 @@ pub fn generate_manifest(
         sortition_paths.db.to_str().unwrap(),
         sortition_open_opts_for_path(&sortition_paths.db),
     );
-    let sortition_boundary = SquashBoundary {
-        marf_height: sortition_marf_height,
-        bitcoin_height,
-    };
-    assert_manifest_boundary("Sortition", sortition_meta.boundary, sortition_boundary);
+    assert_squash_height(
+        "Sortition",
+        sortition_meta.squash_height,
+        sortition_marf_height,
+    );
 
     // Read db_config from the squashed index DB.
     let (chain_id, mainnet) = {
@@ -210,16 +194,25 @@ pub fn generate_manifest(
                 );
                 std::process::exit(1);
             });
-        let btc_hash: String = conn
+        let (btc_hash, snapshot_burn_height): (String, i64) = conn
             .query_row(
-                "SELECT burn_header_hash FROM snapshots WHERE sortition_id = ?1",
+                "SELECT burn_header_hash, block_height FROM snapshots WHERE sortition_id = ?1",
                 [&sort_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap_or_else(|e| {
-                eprintln!("Failed to read burn_header_hash for sortition_id {sort_id}: {e}");
+                eprintln!("Failed to read snapshot for sortition_id {sort_id}: {e}");
                 std::process::exit(1);
             });
+        // The boundary sortition (selected by `sortition_marf_height`) must sit at
+        // the Bitcoin height recorded in the manifest; a mismatch means the
+        // snapshot's `bitcoin_height` disagrees with the sortition MARF it squashed.
+        if snapshot_burn_height != i64::from(bitcoin_height) {
+            eprintln!(
+                "Manifest error: boundary sortition Bitcoin height {snapshot_burn_height} != manifest bitcoin_height {bitcoin_height}"
+            );
+            std::process::exit(1);
+        }
         format!("0x{btc_hash}")
     };
 
