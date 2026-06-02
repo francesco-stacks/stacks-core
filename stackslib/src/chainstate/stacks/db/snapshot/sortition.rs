@@ -70,8 +70,8 @@ pub struct SortitionSideTableStats {
 /// A squash can anchor the sortition MARF at a burn view whose runtime source
 /// tip is later than the copied Stacks MARF. In that case, the memoized
 /// sortition tip must be rewritten to the copied Stacks anchor so a booting
-/// node replays the intra-tenure descendants instead of believing they are
-/// already processed.
+/// node still processes the intra-tenure descendants (re-fetched from peers)
+/// instead of believing they are already processed.
 #[derive(Debug, Clone)]
 pub struct SortitionTipCopyBoundary {
     pub max_stacks_height: u64,

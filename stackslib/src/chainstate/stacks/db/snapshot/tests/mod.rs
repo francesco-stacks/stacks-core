@@ -2156,7 +2156,6 @@ fn test_nakamoto_copy_and_validate() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
-        None,
     )
     .unwrap();
 
@@ -2195,7 +2194,6 @@ fn test_nakamoto_copy_and_validate() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
-        None,
     )
     .unwrap();
     assert!(v.is_valid(), "nakamoto validation should pass: {v:?}");
@@ -2204,243 +2202,120 @@ fn test_nakamoto_copy_and_validate() {
 }
 
 #[test]
-fn test_nakamoto_copy_includes_post_boundary_blocks() {
+fn test_nakamoto_copy_excludes_post_boundary_blocks() {
+    // The squash boundary lives entirely in the squashed index: a staging row is
+    // retained iff its index_block_hash is in idx.nakamoto_block_headers (<=H). A
+    // block above H must be neither copied nor accepted by validation.
     let dir = tempdir().unwrap();
     let src_nak_path = dir.path().join("src_nakamoto.sqlite");
     let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
     let idx_path = dir.path().join("squashed_index.sqlite");
 
+    // Source: two <=H canonical blocks plus one post-boundary (H+1) child of H.
     let src_conn = create_source_nakamoto_db(&src_nak_path);
     insert_nakamoto_staging_block(
-        &src_conn,
-        "canonical_bh_1",
-        "canonical_ch_1",
-        "parent_1",
-        100,
-        "canonical_ibh_1",
-        "Fetched",
-        b"block_data_1",
+        &src_conn, "bh_a", "ch_a", "parent_a", 100, "ibh_a", "Fetched", b"data_a",
+    );
+    insert_nakamoto_staging_block(
+        &src_conn, "bh_h", "ch_h", "ibh_a", 101, "ibh_h", "Fetched", b"data_h",
     );
     insert_nakamoto_staging_block(
         &src_conn,
-        "post_boundary_bh",
-        "post_boundary_ch",
-        "canonical_ibh_1",
+        "bh_post",
+        "ch_post",
+        "ibh_h",
         102,
-        "post_boundary_ibh",
+        "ibh_post",
         "Fetched",
-        b"post_boundary_data",
+        b"data_post",
     );
+    // A block that IS in the index but is orphaned must still be excluded -- this
+    // isolates the `orphaned = 0` half of the predicate (set_block_orphaned can
+    // mark a block's children orphaned via parent_block_id).
     insert_nakamoto_staging_block(
         &src_conn,
-        "below_boundary_bh",
-        "below_boundary_ch",
-        "parent_x",
-        100,
-        "below_boundary_ibh",
+        "bh_orphan",
+        "ch_orphan",
+        "ibh_a",
+        101,
+        "ibh_orphan",
         "Fetched",
-        b"below_boundary_data",
+        b"data_orphan",
     );
-    drop(src_conn);
-
-    let idx_conn = Connection::open(&idx_path).unwrap();
-    idx_conn
-        .execute_batch(
-            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY);
-             CREATE TABLE marf_squash_info (
-                 squash_root_node_hash TEXT NOT NULL,
-                 marf_height INTEGER NOT NULL,
-                 bitcoin_height INTEGER NOT NULL
-             );",
-        )
-        .unwrap();
-    idx_conn
+    src_conn
         .execute(
-            "INSERT INTO nakamoto_block_headers VALUES ('canonical_ibh_1')",
+            "UPDATE nakamoto_staging_blocks SET orphaned = 1 WHERE block_hash = 'bh_orphan'",
             [],
         )
         .unwrap();
+    drop(src_conn);
+
+    // Squashed index stops at H: ibh_a and ibh_h only -- NOT ibh_post.
+    let idx_conn = Connection::open(&idx_path).unwrap();
+    idx_conn
+        .execute_batch(
+            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY)",
+        )
+        .unwrap();
     idx_conn
         .execute(
-            "INSERT INTO marf_squash_info VALUES ('root', 101, 943335)",
+            "INSERT INTO nakamoto_block_headers VALUES ('ibh_a'), ('ibh_h'), ('ibh_orphan')",
             [],
         )
         .unwrap();
     drop(idx_conn);
 
+    // Copy: only the two <=H blocks are retained.
     let stats = super::blocks::copy_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
-        Some("post_boundary_ibh"),
     )
     .unwrap();
-
-    assert_eq!(stats.rows_copied, 2);
+    assert_eq!(stats.rows_copied, 2, "only <=H blocks should be copied");
 
     let dst_conn = Connection::open(&dst_nak_path).unwrap();
     let post_count: i64 = dst_conn
         .query_row(
-            "SELECT COUNT(*) FROM nakamoto_staging_blocks \
-             WHERE index_block_hash = 'post_boundary_ibh'",
+            "SELECT COUNT(*) FROM nakamoto_staging_blocks WHERE block_hash = 'bh_post'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(post_count, 1, "post-boundary block should be copied");
-    let post_processed: i64 = dst_conn
+    assert_eq!(post_count, 0, "post-boundary block must not be copied");
+    let orphan_count: i64 = dst_conn
         .query_row(
-            "SELECT processed FROM nakamoto_staging_blocks \
-             WHERE index_block_hash = 'post_boundary_ibh'",
+            "SELECT COUNT(*) FROM nakamoto_staging_blocks WHERE block_hash = 'bh_orphan'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(
-        post_processed, 0,
-        "post-boundary block must be replayed by the booted node"
-    );
-    let below_noncanonical_count: i64 = dst_conn
-        .query_row(
-            "SELECT COUNT(*) FROM nakamoto_staging_blocks \
-             WHERE index_block_hash = 'below_boundary_ibh'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        below_noncanonical_count, 0,
-        "below-boundary block must still require an index header"
+        orphan_count, 0,
+        "in-index but orphaned block must not be copied"
     );
     drop(dst_conn);
 
+    // The clean <=H-only artifact validates.
     let v = super::blocks::validate_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
-        Some("post_boundary_ibh"),
     )
     .unwrap();
-    assert!(v.is_valid(), "nakamoto validation should pass: {v:?}");
-}
+    assert!(v.is_valid(), "<=H-only artifact should validate: {v:?}");
 
-#[test]
-fn test_nakamoto_copy_excludes_competing_processed_fork() {
-    // A non-canonical *processed* fork above the boundary must NOT be seeded for
-    // replay: only the canonical descendant chain (walked back from the source
-    // canonical tip) is copied -- even when the fork extends higher than the tip.
-    let dir = tempdir().unwrap();
-    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
-    let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
-    let idx_path = dir.path().join("squashed_index.sqlite");
-
-    let src_conn = create_source_nakamoto_db(&src_nak_path);
-    // Canonical block at/below the boundary (lives in the squashed index).
-    insert_nakamoto_staging_block(
-        &src_conn,
-        "canonical_bh_1",
-        "canonical_ch_1",
-        "parent_1",
-        100,
-        "canonical_ibh_1",
-        "Fetched",
-        b"block_data_1",
-    );
-    // Canonical descendant above the boundary == the source canonical tip.
-    insert_nakamoto_staging_block(
-        &src_conn,
-        "post_boundary_bh",
-        "post_boundary_ch",
-        "canonical_ibh_1",
-        102,
-        "post_boundary_ibh",
-        "Fetched",
-        b"post_boundary_data",
-    );
-    // Competing processed fork off the same parent, extending one block higher
-    // than the canonical tip. Neither block is an ancestor of the tip.
-    insert_nakamoto_staging_block(
-        &src_conn,
-        "fork_bh",
-        "fork_ch",
-        "canonical_ibh_1",
-        102,
-        "fork_ibh",
-        "Fetched",
-        b"fork_data",
-    );
-    insert_nakamoto_staging_block(
-        &src_conn,
-        "fork_child_bh",
-        "fork_child_ch",
-        "fork_ibh",
-        103,
-        "fork_child_ibh",
-        "Fetched",
-        b"fork_child_data",
-    );
-    drop(src_conn);
-
-    let idx_conn = Connection::open(&idx_path).unwrap();
-    idx_conn
-        .execute_batch(
-            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY);
-             CREATE TABLE marf_squash_info (
-                 squash_root_node_hash TEXT NOT NULL,
-                 marf_height INTEGER NOT NULL,
-                 bitcoin_height INTEGER NOT NULL
-             );",
-        )
-        .unwrap();
-    idx_conn
-        .execute(
-            "INSERT INTO nakamoto_block_headers VALUES ('canonical_ibh_1')",
-            [],
-        )
-        .unwrap();
-    idx_conn
-        .execute(
-            "INSERT INTO marf_squash_info VALUES ('root', 101, 943335)",
-            [],
-        )
-        .unwrap();
-    drop(idx_conn);
-
-    let stats = super::blocks::copy_nakamoto_staging_blocks(
-        src_nak_path.to_str().unwrap(),
-        dst_nak_path.to_str().unwrap(),
-        idx_path.to_str().unwrap(),
-        Some("post_boundary_ibh"),
-    )
-    .unwrap();
-
-    // Exactly the anchor and the single canonical descendant -- not the fork.
-    assert_eq!(stats.rows_copied, 2);
-
+    // If a post-boundary block leaks into the destination, validation rejects it.
     let dst_conn = Connection::open(&dst_nak_path).unwrap();
-    let fork_count: i64 = dst_conn
-        .query_row(
-            "SELECT COUNT(*) FROM nakamoto_staging_blocks \
-             WHERE index_block_hash IN ('fork_ibh', 'fork_child_ibh')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        fork_count, 0,
-        "competing processed fork must not be copied into the replay set"
-    );
-    let post_processed: i64 = dst_conn
-        .query_row(
-            "SELECT processed FROM nakamoto_staging_blocks \
-             WHERE index_block_hash = 'post_boundary_ibh'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        post_processed, 0,
-        "canonical descendant must be replayed by the booted node"
+    insert_nakamoto_staging_block(
+        &dst_conn,
+        "bh_post",
+        "ch_post",
+        "ibh_h",
+        102,
+        "ibh_post",
+        "Fetched",
+        b"data_post",
     );
     drop(dst_conn);
 
@@ -2448,173 +2323,16 @@ fn test_nakamoto_copy_excludes_competing_processed_fork() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
-        Some("post_boundary_ibh"),
     )
     .unwrap();
     assert!(
-        v.is_valid(),
-        "validation should accept the canonical-only replay set: {v:?}"
-    );
-}
-
-#[test]
-fn test_nakamoto_copy_rejects_invalid_source_tip() {
-    // A source canonical tip that is missing/orphaned or at-or-below the
-    // boundary must fail fast, not silently produce an empty replay set.
-    let dir = tempdir().unwrap();
-    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
-    let idx_path = dir.path().join("squashed_index.sqlite");
-
-    let src_conn = create_source_nakamoto_db(&src_nak_path);
-    insert_nakamoto_staging_block(
-        &src_conn,
-        "canonical_bh_1",
-        "canonical_ch_1",
-        "parent_1",
-        100,
-        "canonical_ibh_1",
-        "Fetched",
-        b"block_data_1",
-    );
-    insert_nakamoto_staging_block(
-        &src_conn,
-        "post_boundary_bh",
-        "post_boundary_ch",
-        "canonical_ibh_1",
-        102,
-        "post_boundary_ibh",
-        "Fetched",
-        b"post_boundary_data",
-    );
-    drop(src_conn);
-
-    let idx_conn = Connection::open(&idx_path).unwrap();
-    idx_conn
-        .execute_batch(
-            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY);
-             CREATE TABLE marf_squash_info (
-                 squash_root_node_hash TEXT NOT NULL,
-                 marf_height INTEGER NOT NULL,
-                 bitcoin_height INTEGER NOT NULL
-             );",
-        )
-        .unwrap();
-    idx_conn
-        .execute(
-            "INSERT INTO nakamoto_block_headers VALUES ('canonical_ibh_1')",
-            [],
-        )
-        .unwrap();
-    idx_conn
-        .execute(
-            "INSERT INTO marf_squash_info VALUES ('root', 101, 943335)",
-            [],
-        )
-        .unwrap();
-    drop(idx_conn);
-
-    // Tip absent from the source staging blocks.
-    let missing = super::blocks::copy_nakamoto_staging_blocks(
-        src_nak_path.to_str().unwrap(),
-        dir.path().join("dst_missing.sqlite").to_str().unwrap(),
-        idx_path.to_str().unwrap(),
-        Some("does_not_exist"),
-    );
-    assert!(missing.is_err(), "missing source tip must be rejected");
-
-    // Tip at/below the boundary (height 100 <= 101).
-    let below = super::blocks::copy_nakamoto_staging_blocks(
-        src_nak_path.to_str().unwrap(),
-        dir.path().join("dst_below.sqlite").to_str().unwrap(),
-        idx_path.to_str().unwrap(),
-        Some("canonical_ibh_1"),
+        !v.no_extra_blocks,
+        "leaked post-boundary block must register as an extra row"
     );
     assert!(
-        below.is_err(),
-        "source tip at/below the boundary must be rejected"
+        !v.is_valid(),
+        "validation must fail when a post-boundary block leaks in"
     );
-}
-
-#[test]
-fn test_nakamoto_validate_detects_broken_replay_chain() {
-    // The tip is valid (above the boundary), but its parent link is absent, so
-    // the parent walk never reaches the anchor. `no_dangling_parents` must flag
-    // the resulting gap at validation even though the copy itself succeeds.
-    let dir = tempdir().unwrap();
-    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
-    let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
-    let idx_path = dir.path().join("squashed_index.sqlite");
-
-    let src_conn = create_source_nakamoto_db(&src_nak_path);
-    insert_nakamoto_staging_block(
-        &src_conn,
-        "canonical_bh_1",
-        "canonical_ch_1",
-        "parent_1",
-        100,
-        "canonical_ibh_1",
-        "Fetched",
-        b"block_data_1",
-    );
-    // Tip's parent "missing_ibh" is never inserted -> the walk stops short.
-    insert_nakamoto_staging_block(
-        &src_conn,
-        "tip_bh",
-        "tip_ch",
-        "missing_ibh",
-        103,
-        "tip_ibh",
-        "Fetched",
-        b"tip_data",
-    );
-    drop(src_conn);
-
-    let idx_conn = Connection::open(&idx_path).unwrap();
-    idx_conn
-        .execute_batch(
-            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY);
-             CREATE TABLE marf_squash_info (
-                 squash_root_node_hash TEXT NOT NULL,
-                 marf_height INTEGER NOT NULL,
-                 bitcoin_height INTEGER NOT NULL
-             );",
-        )
-        .unwrap();
-    idx_conn
-        .execute(
-            "INSERT INTO nakamoto_block_headers VALUES ('canonical_ibh_1')",
-            [],
-        )
-        .unwrap();
-    idx_conn
-        .execute(
-            "INSERT INTO marf_squash_info VALUES ('root', 101, 943335)",
-            [],
-        )
-        .unwrap();
-    drop(idx_conn);
-
-    // Copy succeeds: the tip itself is valid; the gap only surfaces on validate.
-    super::blocks::copy_nakamoto_staging_blocks(
-        src_nak_path.to_str().unwrap(),
-        dst_nak_path.to_str().unwrap(),
-        idx_path.to_str().unwrap(),
-        Some("tip_ibh"),
-    )
-    .unwrap();
-
-    let v = super::blocks::validate_nakamoto_staging_blocks(
-        src_nak_path.to_str().unwrap(),
-        dst_nak_path.to_str().unwrap(),
-        idx_path.to_str().unwrap(),
-        Some("tip_ibh"),
-    )
-    .unwrap();
-    assert!(
-        !v.no_dangling_parents,
-        "a replay block whose parent never reaches the anchor must be flagged"
-    );
-    assert!(!v.is_valid(), "overall validation must fail");
 }
 
 #[test]
@@ -2647,7 +2365,6 @@ fn test_nakamoto_validate_detects_db_version_drift() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
-        None,
     )
     .unwrap();
 
@@ -2663,7 +2380,6 @@ fn test_nakamoto_validate_detects_db_version_drift() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
-        None,
     )
     .unwrap();
     assert!(!v.db_version_match, "should detect db_version drift");
@@ -2698,7 +2414,6 @@ fn test_nakamoto_validate_detects_schema_drift() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
-        None,
     )
     .unwrap();
 
@@ -2713,7 +2428,6 @@ fn test_nakamoto_validate_detects_schema_drift() {
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
-        None,
     )
     .unwrap();
     assert!(

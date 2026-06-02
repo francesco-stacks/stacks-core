@@ -505,8 +505,6 @@ pub struct CanonicalSquashTargets {
     pub sortition_marf_height: u32,
     pub sortition_canonical_tip: SortitionId,
     pub first_bitcoin_height: u32,
-    /// Source chainstate's canonical Nakamoto Stacks tip; seeds the staging replay chain.
-    pub source_canonical_stacks_tip: StacksBlockId,
 }
 
 fn find_tenure_start_ancestor_from_end(
@@ -649,10 +647,10 @@ pub fn resolve_canonical_squash_targets(
     // sortition (i.e. starts a NEW tenure), so the current tenure does not
     // extend forward via flash blocks.
     //
-    // Clarity/Index anchor at the first block in the tenure so intra-tenure
-    // descendants are replayed as post-boundary blocks. Sortition remains
-    // anchored at the tenure's burn view, whose runtime canonical tip is the
-    // highest canonical block in the tenure.
+    // The boundary is the first block in the tenure; intra-tenure descendants
+    // above it are dropped from the artifact and re-synced from peers on boot.
+    // Sortition remains anchored at the tenure's burn view, whose runtime
+    // canonical tip is the highest canonical block in the tenure.
     let next_height = start_height
         .checked_add(1)
         .ok_or_else(|| format!("Bitcoin height {start_height} + 1 overflows u64"))?;
@@ -855,18 +853,6 @@ pub fn resolve_canonical_squash_targets(
         ));
     }
 
-    // Canonical Nakamoto Stacks tip of the source chainstate (seeds the replay chain).
-    let source_canonical_stacks_tip = SortitionDB::get_canonical_nakamoto_tip_hash_and_height(
-        sortition_db.conn(),
-        &canonical_tip,
-    )
-    .map_err(|e| format!("Failed to resolve source canonical Nakamoto tip: {e}"))?
-    .map(|(ch, bhh, _height)| StacksBlockId::new(&ch, &bhh))
-    .ok_or_else(|| {
-        "Source chainstate has no canonical Nakamoto tip; cannot seed the staging replay chain"
-            .to_string()
-    })?;
-
     Ok(CanonicalSquashTargets {
         stacks_height,
         stacks_tip,
@@ -877,7 +863,6 @@ pub fn resolve_canonical_squash_targets(
         sortition_marf_height,
         sortition_canonical_tip,
         first_bitcoin_height,
-        source_canonical_stacks_tip,
     })
 }
 

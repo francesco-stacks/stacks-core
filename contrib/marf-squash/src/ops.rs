@@ -449,7 +449,6 @@ pub fn validate_block_data(
     dst_blocks_dir: &Path,
     src_nakamoto: &Path,
     dst_nakamoto: &Path,
-    source_canonical_tip: Option<&str>,
 ) -> bool {
     println!("Validating block data...");
     let mut valid = true;
@@ -489,12 +488,10 @@ pub fn validate_block_data(
             src_nakamoto.to_str().unwrap(),
             dst_nakamoto.to_str().unwrap(),
             dst_index,
-            source_canonical_tip,
         ) {
             Ok(v) => {
                 println!("  nakamoto_metadata_match: {}", v.metadata_match);
                 println!("  nakamoto_no_extra_blocks: {}", v.no_extra_blocks);
-                println!("  nakamoto_no_dangling_parents: {}", v.no_dangling_parents);
                 println!("  nakamoto_blob_bytes_match: {}", v.blob_bytes_match);
                 println!("  nakamoto_db_version_match: {}", v.db_version_match);
                 println!("  nakamoto_schema_match: {}", v.schema_match);

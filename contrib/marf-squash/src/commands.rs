@@ -310,12 +310,10 @@ pub fn run_squash(args: SquashArgs) {
             std::process::exit(1);
         }
         println!("Copying nakamoto staging blocks...");
-        let source_canonical_tip_hex = targets.source_canonical_stacks_tip.to_hex();
         let nak_stats = match copy_nakamoto_staging_blocks(
             src_nakamoto.to_str().unwrap(),
             dst_nakamoto.to_str().unwrap(),
             dst_index_path,
-            Some(source_canonical_tip_hex.as_str()),
         ) {
             Ok(st) => {
                 println!(
@@ -428,7 +426,6 @@ pub fn run_squash(args: SquashArgs) {
             let i_out = index_out
                 .as_ref()
                 .expect("--blocks requires --index; index_out must be set");
-            let source_canonical_tip_hex = targets.source_canonical_stacks_tip.to_hex();
             if !validate_block_data(
                 paths.index.db.to_str().unwrap(),
                 i_out.db.to_str().unwrap(),
@@ -436,7 +433,6 @@ pub fn run_squash(args: SquashArgs) {
                 &dst_blocks_dir,
                 &src_nakamoto,
                 &dst_nakamoto,
-                Some(source_canonical_tip_hex.as_str()),
             ) {
                 all_valid = false;
             }
@@ -611,7 +607,6 @@ pub fn run_validate(args: ValidateArgs) {
             .join("chainstate/blocks/nakamoto.sqlite");
         let src_blocks_dir = args.source_chainstate.join("chainstate/blocks");
         let dst_blocks_dir = args.squashed_chainstate.join("chainstate/blocks");
-        let source_canonical_tip_hex = targets.source_canonical_stacks_tip.to_hex();
         if !validate_block_data(
             source_paths.index.db.to_str().unwrap(),
             squashed_paths.index.db.to_str().unwrap(),
@@ -619,7 +614,6 @@ pub fn run_validate(args: ValidateArgs) {
             &dst_blocks_dir,
             &src_nakamoto,
             &dst_nakamoto,
-            Some(source_canonical_tip_hex.as_str()),
         ) {
             all_valid = false;
         }
