@@ -23,8 +23,8 @@ use crate::chainstate::stacks::index::Error;
 /// A spec for copying a single table from the ATTACHed `src` database.
 ///
 /// The `source_sql` is the exact `SELECT` used to filter source rows.
-/// Copy uses plain `INSERT ... SELECT` (no `OR IGNORE`) so that unexpected
-/// pre-population in the destination fails loudly.
+/// Copy uses plain `INSERT ... SELECT` (no `OR IGNORE`/`OR REPLACE`) so that
+/// unexpected pre-population in the destination fails loudly.
 pub struct TableCopySpec {
     pub table: &'static str,
     /// The exact SELECT for the source side, e.g.
@@ -59,12 +59,9 @@ pub fn clone_schemas_from_source(conn: &Connection, tables: &[&str]) -> Result<(
                 ))
             })?;
 
-        let safe_sql = if create_sql.contains("IF NOT EXISTS") {
-            create_sql
-        } else {
-            create_sql.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
-        };
-        stmts.push(safe_sql);
+        // sqlite_master stores the normalized statement (any `IF NOT
+        // EXISTS` is stripped), so add the guard back.
+        stmts.push(create_sql.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1));
 
         let mut idx_stmt = conn
             .prepare("SELECT sql FROM src.sqlite_master WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL")
@@ -74,12 +71,7 @@ pub fn clone_schemas_from_source(conn: &Connection, tables: &[&str]) -> Result<(
             .map_err(Error::SQLError)?;
         for idx_sql in idx_rows {
             let idx_sql = idx_sql.map_err(Error::SQLError)?;
-            let safe_sql = if idx_sql.contains("IF NOT EXISTS") {
-                idx_sql
-            } else {
-                idx_sql.replacen("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
-            };
-            stmts.push(safe_sql);
+            stmts.push(idx_sql.replacen("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1));
         }
     }
 
@@ -278,8 +270,7 @@ where
 
 /// Drop user-defined indexes on `main.table` while `body` bulk-loads
 /// it, then recreate them on `Ok` (one rebuild vs N per-row B-tree
-/// updates). On `Err`, indexes are not recreated . marf-squash
-/// discards dst on failure, so the half-state is never observed.
+/// updates). On `Err`, indexes are not recreated.
 pub fn with_indexes_dropped<F, T>(conn: &Connection, table: &str, body: F) -> Result<T, Error>
 where
     F: FnOnce(&Connection) -> Result<T, Error>,
@@ -338,6 +329,8 @@ mod tests {
 
     use super::percent_encode_path;
 
+    /// Representative paths survive the `file:` URI percent-encoding used
+    /// by [`super::with_offline_write_session`]'s read-only ATTACH.
     #[rstest]
     #[case::unix_absolute("/tmp/marf-squash/index.sqlite", "/tmp/marf-squash/index.sqlite")]
     #[case::windows_drive_letter("C:/Users/test/index.sqlite", "C:/Users/test/index.sqlite")]
