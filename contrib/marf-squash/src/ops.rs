@@ -40,7 +40,7 @@ impl SideTableMode {
 }
 
 /// Squash a single MARF target and copy its side tables. Exits on error.
-pub fn squash_and_copy_one<T: MarfTrieId>(
+pub fn squash_and_copy_one<T: MarfTrieId + Send + Sync>(
     label: &str,
     source: &TargetPaths,
     out: &TargetPaths,
