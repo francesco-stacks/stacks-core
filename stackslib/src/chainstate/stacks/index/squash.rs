@@ -27,13 +27,14 @@ use std::time::{Duration, Instant};
 use rusqlite::params;
 use stacks_common::types::chainstate::TrieHash;
 
+use crate::chainstate::stacks::index::blob_layout::BlobHeader;
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
 use crate::chainstate::stacks::index::node::{clear_backptr, is_backptr, TrieNodeID, TriePtr};
 use crate::chainstate::stacks::index::storage::{
     SquashInfo, TrieFileStorage, TrieHashCalculationMode, TrieStorageConnection,
 };
 use crate::chainstate::stacks::index::trie::Trie;
-use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
+use crate::chainstate::stacks::index::{trie_sql, Error, MarfDataEntry, MarfTrieId};
 
 mod node_store;
 mod stream;
@@ -457,12 +458,10 @@ impl SquashValidationStats {
     }
 }
 
-/// Step 1: load confirmed `(block_id, block_hash, external_offset)` rows and
-/// seed the blob-offset cache from the same scan.
-///
-/// Later steps reuse this Vec: header pre-read sorts it by offset, and
+/// Step 1: load the confirmed [`MarfDataEntry`] rows and seed the
+/// blob-offset cache from the same scan.
 /// placeholder insertion consumes it to build a `block_hash -> id` map.
-fn collect_block_entries<T: MarfTrieId>(src: &mut MARF<T>) -> Result<Vec<(u32, T, u64)>, Error> {
+fn collect_block_entries<T: MarfTrieId>(src: &mut MARF<T>) -> Result<Vec<MarfDataEntry<T>>, Error> {
     src.with_conn(|conn| {
         let block_entries = trie_sql::bulk_read_block_entries::<T>(conn.sqlite_conn())?;
         conn.warm_trie_offsets_from_entries(&block_entries);
@@ -477,8 +476,7 @@ fn verify_blob_root_matches_marf<T: MarfTrieId>(
     block_hash: &T,
 ) -> Result<(), Error> {
     let block_id = trie_sql::get_block_identifier(conn.sqlite_conn(), block_hash)?;
-    let (_parent_from_blob, root_from_blob): (T, TrieHash) =
-        conn.read_parent_and_root_hash(block_id)?;
+    let root_from_blob = conn.read_blob_header(block_id)?.root_hash;
     let root_from_marf = conn.get_root_hash_at(block_hash)?;
     if root_from_blob != root_from_marf {
         return Err(Error::CorruptionError(format!(
@@ -490,16 +488,16 @@ fn verify_blob_root_matches_marf<T: MarfTrieId>(
 
 /// Read blob headers in storage order for the later in-memory chain walk.
 ///
-/// Caller must pre-sort `block_entries` by `(external_offset, block_id)`;
+/// Caller must pre-sort `block_entries` by `external_offset`;
 /// `bulk_read_blob_headers_sorted` splits that order into contiguous chunks
 /// so each parallel reader stays in one file region. Falls back to per-row
 /// reads through SQLite `blob_open` when the source MARF stores blobs
 /// inside the SQLite database.
 fn pre_read_blob_headers<T: MarfTrieId + Send + Sync>(
     conn: &mut TrieStorageConnection<T>,
-    block_entries: &[(u32, T, u64)],
+    block_entries: &[MarfDataEntry<T>],
     label: &str,
-) -> Result<HashMap<T, (T, TrieHash)>, Error> {
+) -> Result<HashMap<T, BlobHeader<T>>, Error> {
     let start = Instant::now();
     info!(
         "[{label}] [2/8] Pre-reading {} blob headers (sorted by offset)...",
@@ -523,7 +521,7 @@ fn pre_read_blob_headers<T: MarfTrieId + Send + Sync>(
 fn collect_per_height_metadata<T: MarfTrieId + Send + Sync>(
     conn: &mut TrieStorageConnection<T>,
     block_at_height: &T,
-    block_entries: &mut [(u32, T, u64)],
+    block_entries: &mut [MarfDataEntry<T>],
     src_squash_height: Option<u32>,
     height: u32,
     label: &str,
@@ -536,8 +534,11 @@ fn collect_per_height_metadata<T: MarfTrieId + Send + Sync>(
     let walk_floor = src_squash_height.map(|sh| sh + 1).unwrap_or(0);
     debug_assert!(walk_floor <= height);
 
-    // Pre-read in offset order.
-    block_entries.sort_unstable_by_key(|(block_id, _, off)| (*off, *block_id));
+    // Pre-read in offset order. Each parallel reader sweeps a
+    // contiguous file region. `block_id` is only helpful for squashed
+    // marfs (where every row shares the squash blob's offset);
+    // no downstream logic depends on `block_id. ordering.
+    block_entries.sort_unstable_by_key(|e| (e.external_offset, e.block_id));
     let headers = pre_read_blob_headers(conn, block_entries, label)?;
     log_rss(label, "after [2/8] pre-read (headers held)");
 
@@ -552,7 +553,7 @@ fn collect_per_height_metadata<T: MarfTrieId + Send + Sync>(
                  height arg or a truncated chain"
             )));
         }
-        let (parent, root_hash) = headers.get(&current).ok_or_else(|| {
+        let header = headers.get(&current).ok_or_else(|| {
             Error::CorruptionError(format!(
                 "Pre-read missing header for block hash {current} at height {h}"
             ))
@@ -560,18 +561,19 @@ fn collect_per_height_metadata<T: MarfTrieId + Send + Sync>(
         block_info.push(BlockInfo {
             height: h,
             block_hash: current.clone(),
-            root_hash: *root_hash,
+            root_hash: header.root_hash,
         });
 
         if h == 0 {
             // Genesis must point at sentinel.
-            if *parent != sentinel {
+            if header.parent_hash != sentinel {
                 return Err(Error::CorruptionError(format!(
-                    "Block at height 0 ({current}) has non-sentinel parent {parent}"
+                    "Block at height 0 ({current}) has non-sentinel parent {}",
+                    header.parent_hash
                 )));
             }
         } else {
-            current = parent.clone();
+            current = header.parent_hash.clone();
         }
     }
     info!(
@@ -652,22 +654,18 @@ fn insert_placeholder_blocks<T: MarfTrieId>(
     conn: &rusqlite::Connection,
     block_info: &[BlockInfo<T>],
     block_at_height: &T,
-    block_entries: Vec<(u32, T, u64)>,
+    block_entries: Vec<MarfDataEntry<T>>,
     label: &str,
 ) -> Result<(Vec<u32>, u32, u64), Error> {
     let start = Instant::now();
 
     // Step [2/8] may have sorted the entries by offset.
-    let max_archival_id = block_entries
-        .iter()
-        .map(|(id, _, _)| *id)
-        .max()
-        .unwrap_or(0);
+    let max_archival_id = block_entries.iter().map(|e| e.block_id).max().unwrap_or(0);
 
     // Short-lived map for placeholder insertion.
     let block_map: HashMap<T, u32> = block_entries
         .into_iter()
-        .map(|(id, bh, _)| (bh, id))
+        .map(|e| (e.block_hash, e.block_id))
         .collect();
 
     // Index by archival block_id; 0 means not mapped.
@@ -709,7 +707,13 @@ fn insert_placeholder_blocks<T: MarfTrieId>(
         }
     }
 
-    // Mirror the source sentinel id when it exists, so sentinel backpointers remap.
+    // Every archival `block_id` that appears as a node origin in the DFS
+    // must be mappable in `archival_to_squashed`. The loop above covers the
+    // historical heights but skips `block_at_height` and the sentinel; add
+    // them explicitly so `remap_child_ptrs` can resolve all children.
+    //
+    // Sentinel: already flushed to the destination `marf_data` by
+    // `tx.begin()` -> `flush()`, so mirror its id when the source has one.
     let sentinel = T::sentinel();
     if let Some(&archival_sentinel_id) = block_map.get(&sentinel) {
         let squashed_sentinel_id: u32 = conn.query_row(
@@ -722,7 +726,10 @@ fn insert_placeholder_blocks<T: MarfTrieId>(
             .ok_or(Error::OverflowError)? = squashed_sentinel_id;
     }
 
-    // Claim the tip block_id now; step [7/8] updates this row with the real blob.
+    // `block_at_height`: not yet in the destination `marf_data` (only in
+    // `block_extension_locks`). Insert an empty placeholder now to get a
+    // real `block_id`; step [7/8] will UPDATE this row with the real blob
+    // via `update_external_trie_blob` instead of inserting a new one.
     let archival_tip_id = *block_map.get(block_at_height).ok_or(Error::NotFoundError)?;
     let empty_blob: &[u8] = &[];
     let squashed_tip_placeholder_id: u32 = stmt
@@ -1303,7 +1310,7 @@ impl<T: MarfTrieId> MARF<T> {
                         if source_to_idx.contains_key(&(target_block_id, target_in_block_ptr)) {
                             continue;
                         }
-                        source.prefetch_node(target_block_id, target_in_block_ptr);
+                        source.prefetch_node(target_block_id, target_in_block_ptr, ptr.id());
                     }
                     descend_frame = Some(DfsFrame {
                         origin_block_id: child_block_id,
@@ -1473,7 +1480,7 @@ impl<T: MarfTrieId> MARF<T> {
 
         let source_block_map: HashMap<T, u32> = collect_block_entries(&mut src)?
             .into_iter()
-            .map(|(id, bh, _)| (bh, id))
+            .map(|e| (e.block_hash, e.block_id))
             .collect();
 
         info!("Validate: per-height walks for source root hashes ...");
@@ -1500,7 +1507,7 @@ impl<T: MarfTrieId> MARF<T> {
                          height->hash mapping but missing from marf_data"
                     ))
                 })?;
-                let (_parent, rh): (T, TrieHash) = conn.read_parent_and_root_hash(block_id)?;
+                let rh = conn.read_blob_header(block_id)?.root_hash;
                 source_block_hashes.insert(h, bh);
                 source_root_hashes.insert(h, rh);
                 if last_log.elapsed().as_secs() >= 30 || (h > 0 && h % 100_000 == 0) {

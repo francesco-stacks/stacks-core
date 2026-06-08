@@ -102,6 +102,17 @@ pub trait MarfTrieId:
 {
 }
 
+/// One confirmed `marf_data` row, as loaded by
+/// [`trie_sql::bulk_read_block_entries`].
+#[derive(Debug, Clone)]
+struct MarfDataEntry<T> {
+    /// SQLite rowid of the block in `marf_data`.
+    pub block_id: u32,
+    pub block_hash: T,
+    /// Byte offset of the block's trie blob in external `.blobs` storage.
+    pub external_offset: u64,
+}
+
 pub const SENTINEL_ARRAY: [u8; 32] = [255u8; 32];
 
 macro_rules! impl_clarity_marf_trie_id {
@@ -274,8 +285,10 @@ pub enum Error {
         block_height: u32,
         squash_height: u32,
     },
+    /// Operation requires a different `TrieFile` backing. Carries the
+    /// operation name.
+    UnsupportedTrieFileType(&'static str),
     /// A destination path required to be empty already exists. Carries the
-    /// offending path.
     DestinationExists(String),
 }
 
@@ -355,6 +368,12 @@ impl fmt::Display for Error {
                 "Historical read at height {block_height} below squash height {squash_height} \
                  is not supported on a squashed MARF"
             ),
+            Error::UnsupportedTrieFileType(op) => {
+                write!(
+                    f,
+                    "Operation `{op}` is not supported by this TrieFile backing"
+                )
+            }
             Error::DestinationExists(ref p) => {
                 write!(f, "Destination path already exists: {p}")
             }

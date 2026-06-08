@@ -23,27 +23,24 @@ use std::{env, fs, io};
 #[cfg(test)]
 use rusqlite::params;
 use rusqlite::Connection;
-use stacks_common::types::chainstate::{BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE};
 
 use crate::chainstate::stacks::index::bits::{
-    read_hash_bytes, read_nodetype_at_head, read_nodetype_at_head_nohash,
+    get_node_max_byte_len, read_hash_bytes, read_nodetype_at_head, read_nodetype_at_head_nohash,
 };
+use crate::chainstate::stacks::index::blob_layout::{self, BlobHeader};
 use crate::chainstate::stacks::index::node::{TrieNodeType, TriePtr};
 use crate::chainstate::stacks::index::storage::NodeHashReader;
 #[cfg(test)]
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
-use crate::chainstate::stacks::index::{blob_layout, trie_sql, Error, MarfTrieId};
+use crate::chainstate::stacks::index::{trie_sql, Error, MarfDataEntry, MarfTrieId};
 use crate::types::chainstate::TrieHash;
 use crate::util_lib::db::sql_vacuum;
-
-/// Page granularity assumed for prefetch hints.
-const PREFETCH_PAGE_SIZE: u64 = 4096;
 
 /// Reader-thread count for the bulk header fan-out.
 ///
 /// The workers spend nearly all their time blocked on small positioned
 /// reads, so the count targets a device queue depth rather than a core
-/// count.
+/// count. Always in `16..=32`.
 fn header_read_parallelism() -> usize {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -58,7 +55,7 @@ fn header_read_parallelism() -> usize {
 /// `FileExt::seek_read` does mutate the cursor, so we save and restore it
 /// explicitly via the `Seek` impl on `&File`. This save/read/restore sequence
 /// is not atomic with other cursor-using operations on the same file handle.
-pub(crate) fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+pub(super) fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
@@ -138,7 +135,7 @@ fn prefetch_file_range(file: &File, offset: u64, len: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Read the `(parent_hash, root_hash)` blob header of every entry in `chunk`.
+/// Read the [`BlobHeader`] of every entry in `chunk`.
 /// Worker body for [`TrieFile::bulk_read_blob_headers_sorted`].
 ///
 /// Opens its own handle: positioned reads share no cursor state across
@@ -146,25 +143,14 @@ fn prefetch_file_range(file: &File, offset: u64, len: u64) -> io::Result<()> {
 /// restores the handle's cursor non-atomically).
 fn read_blob_header_chunk<T: MarfTrieId + Send + Sync>(
     path: &str,
-    chunk: &[(u32, T, u64)],
-) -> Result<Vec<(T, (T, TrieHash))>, Error> {
+    chunk: &[MarfDataEntry<T>],
+) -> Result<Vec<(T, BlobHeader<T>)>, Error> {
     let file = File::open(path).map_err(Error::IOError)?;
     let mut buf = [0u8; blob_layout::READER_PREFIX_LEN];
     let mut headers = Vec::with_capacity(chunk.len());
-    for (_block_id, block_hash, offset) in chunk {
-        read_exact_at(&file, &mut buf, *offset).map_err(Error::IOError)?;
-
-        let mut parent_bytes = [0u8; BLOCK_HEADER_HASH_ENCODED_SIZE];
-        parent_bytes.copy_from_slice(&buf[..BLOCK_HEADER_HASH_ENCODED_SIZE]);
-        let mut root_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
-        root_bytes.copy_from_slice(
-            &buf[blob_layout::ROOT_NODE_OFFSET
-                ..blob_layout::ROOT_NODE_OFFSET + TRIEHASH_ENCODED_SIZE],
-        );
-        headers.push((
-            block_hash.clone(),
-            (T::from_bytes(parent_bytes), TrieHash(root_bytes)),
-        ));
+    for entry in chunk {
+        read_exact_at(&file, &mut buf, entry.external_offset).map_err(Error::IOError)?;
+        headers.push((entry.block_hash.clone(), BlobHeader::parse(&buf)));
     }
     Ok(headers)
 }
@@ -249,14 +235,20 @@ impl TrieFile {
         Ok(())
     }
 
-    /// Async-prefetch the single 4 KiB page containing the start offset of
-    /// the node at `(block_id, in_block_ptr)`. The largest node (Node256)
-    /// is ~3.7 KiB and could spill into the next page, but we have few
-    /// nodes that large.
+    /// Async-prefetch the node at `(block_id, in_block_ptr)`: hint the
+    /// node's max on-disk size for its type (`node_id`) from its start. The
+    /// kernel rounds to its own page size, so a node inside one page warms
+    /// just that page, while one straddling a boundary warms both.
     ///
     /// Best-effort: requires the blob offset already in `trie_offsets`,
     /// else no-op. No-op for RAM-backed `TrieFile`s and non-Linux targets.
-    pub(crate) fn prefetch_node(&self, block_id: u32, in_block_ptr: u64) {
+    pub(super) fn prefetch_node(
+        &self,
+        block_id: u32,
+        in_block_ptr: u64,
+        node_id: u8,
+        u64_ptr_offsets: bool,
+    ) {
         let TrieFile::Disk(disk) = self else {
             return;
         };
@@ -266,8 +258,10 @@ impl TrieFile {
         let Some(abs) = blob_offset.checked_add(in_block_ptr) else {
             return;
         };
-        let page_aligned = abs & !(PREFETCH_PAGE_SIZE - 1);
-        let _ = prefetch_file_range(&disk.fd, page_aligned, PREFETCH_PAGE_SIZE);
+        let Ok(len) = get_node_max_byte_len(node_id, u64_ptr_offsets) else {
+            return;
+        };
+        let _ = prefetch_file_range(&disk.fd, abs, len as u64);
     }
 
     /// Get a copy of the path to this TrieFile.
@@ -498,7 +492,7 @@ impl NodeHashReader for TrieFileNodeHashReader<'_> {
 
 impl TrieFile {
     /// Cache a known trie blob offset.
-    pub(crate) fn cache_trie_offset(&mut self, block_id: u32, offset: u64) {
+    pub(super) fn cache_trie_offset(&mut self, block_id: u32, offset: u64) {
         let offsets_cache = match self {
             TrieFile::RAM(ref mut ram) => &mut ram.trie_offsets,
             TrieFile::Disk(ref mut disk) => &mut disk.trie_offsets,
@@ -619,27 +613,19 @@ impl TrieFile {
         Ok(offset)
     }
 
-    /// Read `(parent_hash, root_hash)` from a block's blob header.
-    pub fn read_parent_and_root_hash<T: MarfTrieId>(
+    /// Read a block's [`BlobHeader`].
+    pub(super) fn read_blob_header<T: MarfTrieId>(
         &mut self,
         db: &Connection,
         block_id: u32,
-    ) -> Result<(T, TrieHash), Error> {
+    ) -> Result<BlobHeader<T>, Error> {
         let blob_offset = self.get_trie_offset(db, block_id)?;
         let mut buf = [0u8; blob_layout::READER_PREFIX_LEN];
         self.read_blob_bytes_at(blob_offset, &mut buf)?;
-
-        let mut parent_bytes = [0u8; BLOCK_HEADER_HASH_ENCODED_SIZE];
-        parent_bytes.copy_from_slice(&buf[..BLOCK_HEADER_HASH_ENCODED_SIZE]);
-        let mut root_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
-        root_bytes.copy_from_slice(
-            &buf[blob_layout::ROOT_NODE_OFFSET
-                ..blob_layout::ROOT_NODE_OFFSET + TRIEHASH_ENCODED_SIZE],
-        );
-        Ok((T::from_bytes(parent_bytes), TrieHash(root_bytes)))
+        Ok(BlobHeader::parse(&buf))
     }
 
-    /// Bulk-read `(parent_hash, root_hash)` for every entry in offset order.
+    /// Bulk-read the [`BlobHeader`] of every entry in offset order.
     /// Returns a map keyed by block hash.
     ///
     /// Fans the entries out to oversubscribed reader threads in contiguous
@@ -648,21 +634,20 @@ impl TrieFile {
     /// header-sized read, so only the pages backing headers are touched.
     ///
     /// Requires a `Disk`-backed `TrieFile`; callers should fall back to
-    /// [`Self::read_parent_and_root_hash`] otherwise.
-    pub(crate) fn bulk_read_blob_headers_sorted<T: MarfTrieId + Send + Sync>(
+    /// [`Self::read_blob_header`] otherwise.
+    pub(super) fn bulk_read_blob_headers_sorted<T: MarfTrieId + Send + Sync>(
         &self,
-        sorted_entries: &[(u32, T, u64)],
-    ) -> Result<HashMap<T, (T, TrieHash)>, Error> {
+        sorted_entries: &[MarfDataEntry<T>],
+    ) -> Result<HashMap<T, BlobHeader<T>>, Error> {
         let TrieFile::Disk(disk) = self else {
-            return Err(Error::CorruptionError(
-                "bulk_read_blob_headers_sorted requires a disk-backed TrieFile".into(),
+            return Err(Error::UnsupportedTrieFileType(
+                "bulk_read_blob_headers_sorted",
             ));
         };
         if sorted_entries.is_empty() {
-            return Err(Error::CorruptionError(
-                "bulk_read_blob_headers_sorted: no block entries; source MARF has no confirmed blocks"
-                    .into(),
-            ));
+            // Callers resolve the tip block before reaching this point, so a
+            // confirmed-block-free entry list means a corrupt source.
+            return Err(Error::CorruptionError("bulk_read_blob_headers_sorted: no block entries; source MARF has no confirmed blocks".into()));
         }
 
         let num_threads = header_read_parallelism().min(sorted_entries.len());
