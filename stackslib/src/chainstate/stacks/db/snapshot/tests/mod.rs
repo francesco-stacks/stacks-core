@@ -16,10 +16,11 @@
 use std::collections::HashSet;
 
 use clarity::vm::costs::ExecutionCost;
+use rstest::rstest;
 use rusqlite::{params, Connection};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, StacksBlockId, TrieHash,
+    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksBlockId, TrieHash,
 };
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use stacks_common::util::secp256k1::MessageSignature;
@@ -35,7 +36,8 @@ use crate::chainstate::nakamoto::staging_blocks::{
 };
 use crate::chainstate::nakamoto::{NakamotoBlockHeader, NakamotoChainState};
 use crate::chainstate::stacks::db::{StacksChainState, StacksHeaderInfo, CHAINSTATE_VERSION};
-use crate::chainstate::stacks::index::Error;
+use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
+use crate::chainstate::stacks::index::{ClarityMarfTrieId, Error, MARFValue};
 use crate::chainstate::stacks::{
     StacksMicroblock, StacksMicroblockHeader, StacksTransaction, TokenTransferMemo,
     TransactionAuth, TransactionPayload, TransactionSpendingCondition, TransactionVersion,
@@ -49,32 +51,44 @@ fn create_source_db(path: &std::path::Path) -> Connection {
     Connection::open(path).unwrap()
 }
 
-/// Render a short test identifier as the lowercase-hex form of its UTF-8 bytes.
-///
-/// The production squash code stores 32-byte `index_block_hash` values as
-/// BLOB in `marf_squashed_blocks.block_hash` and joins them against the
-/// chainstate `index_block_hash` TEXT columns via `lower(hex(block_hash))`.
-/// Tests use short labels like `"ibh1"` for readability; this helper converts
-/// such a label to the matching lower-hex TEXT so a label-based fixture is
-/// consistent with what production code expects to see in the chainstate
-/// tables.
-fn hex_id(label: &str) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(label.len() * 2);
-    for b in label.as_bytes() {
-        write!(out, "{:02x}", b).unwrap();
-    }
-    out
+/// A deterministic 32-byte [`StacksBlockId`] for a short test label: the
+/// label's UTF-8 bytes, zero-padded. Tests use labels like `"ibh1"` for
+/// readability; the canonical-set fixtures store these ids as BLOBs (as
+/// the squash engine does) and the chainstate fixtures store [`hex_id`]
+/// TEXT, so the two sides join.
+fn label_block_id(label: &str) -> StacksBlockId {
+    let mut bytes = [0u8; 32];
+    let len = label.len().min(32);
+    bytes[..len].copy_from_slice(&label.as_bytes()[..len]);
+    StacksBlockId(bytes)
 }
 
-/// Create a destination DB that simulates a squashed MARF by adding the
-/// `marf_squashed_blocks` table with the given canonical block-hash labels.
-///
-/// Each label is stored as raw UTF-8 bytes in the BLOB column, so
-/// `lower(hex(block_hash))` returns the same TEXT that test chainstate
-/// inserts write via [`hex_id`]. Returns the connection for
+/// The lowercase-hex form of [`label_block_id`], for the chainstate
+/// `index_block_hash` TEXT columns.
+fn hex_id(label: &str) -> String {
+    label_block_id(label).to_hex()
+}
+
+/// The single leaf value committed into every fixture MARF (see
+/// [`create_dest_db_with_canonical_blocks`]): a src `__fork_storage` row
+/// keyed by its hex is canonical and gets copied.
+const FIXTURE_LEAF: MARFValue = MARFValue([0xff; 40]);
+
+/// Create a destination DB that simulates a squashed MARF: a real (tiny)
+/// MARF with one confirmed block and one [`FIXTURE_LEAF`] leaf, plus the
+/// `marf_squashed_blocks` table holding the given canonical block labels
+/// (stored as [`label_block_id`] BLOBs). Returns the connection for
 /// [`append_canonical_block`].
 fn create_dest_db_with_canonical_blocks(path: &std::path::Path, canonical: &[&str]) -> Connection {
+    let mut marf =
+        MARF::<StacksBlockId>::from_path(path.to_str().unwrap(), MARFOpenOpts::default())
+            .expect("MARF init failed");
+    marf.begin(&StacksBlockId::sentinel(), &label_block_id("marf_tip"))
+        .unwrap();
+    marf.insert("test::leaf", FIXTURE_LEAF).unwrap();
+    marf.commit().unwrap();
+    drop(marf);
+
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS marf_squashed_blocks (
@@ -85,10 +99,11 @@ fn create_dest_db_with_canonical_blocks(path: &std::path::Path, canonical: &[&st
     )
     .unwrap();
     for (h, bh) in canonical.iter().enumerate() {
+        let id = label_block_id(bh);
         conn.execute(
             "INSERT INTO marf_squashed_blocks (height, block_hash, marf_root_hash) \
-             VALUES (?1, ?2, X'00')",
-            params![h as i64, bh.as_bytes()],
+             VALUES (?1, ?2, ?3)",
+            params![h as i64, id.0.as_slice(), [0u8; 32].as_slice()],
         )
         .unwrap();
     }
@@ -100,14 +115,14 @@ fn create_dest_db_with_canonical_blocks(path: &std::path::Path, canonical: &[&st
 fn append_canonical_block(conn: &Connection, block_hash: &[u8]) {
     conn.execute(
         "INSERT INTO marf_squashed_blocks (height, block_hash, marf_root_hash) \
-         VALUES ((SELECT COALESCE(MAX(height) + 1, 0) FROM marf_squashed_blocks), ?1, X'00')",
-        params![block_hash],
+         VALUES ((SELECT COALESCE(MAX(height) + 1, 0) FROM marf_squashed_blocks), ?1, ?2)",
+        params![block_hash, [0u8; 32].as_slice()],
     )
     .unwrap();
 }
 
-/// Insert a block_headers row at the given height.
-fn insert_block_header(conn: &Connection, height: u32, suffix: &str) {
+/// Insert an epoch-2 `block_headers` row at the given height.
+fn insert_epoch2_block_header(conn: &Connection, height: u32, suffix: &str) {
     conn.execute(
             "INSERT INTO block_headers (version, total_burn, total_work, proof, parent_block, \
              parent_microblock, parent_microblock_sequence, tx_merkle_root, state_index_root, \
@@ -177,6 +192,8 @@ fn insert_nakamoto_header(conn: &Connection, label: &str, burn_height: u32) -> S
 
     let mut header = NakamotoBlockHeader::empty();
     header.consensus_hash = ConsensusHash(ch);
+    // chain_length is irrelevant to the copy logic; reuse burn_height
+    // for fixture simplicity.
     header.chain_length = burn_height.into();
 
     let tip_info = StacksHeaderInfo {
@@ -217,7 +234,7 @@ fn test_copy_index_side_tables_round_trip() {
 
     // Insert test data at heights 1, 2, 3.
     for (h, s) in [(1, "1"), (2, "2"), (3, "3")] {
-        insert_block_header(&conn, h, s);
+        insert_epoch2_block_header(&conn, h, s);
         insert_payment(&conn, h, s);
         insert_transaction(&conn, h as i64, &format!("ibh{s}"));
     }
@@ -233,6 +250,13 @@ fn test_copy_index_side_tables_round_trip() {
     conn.execute(
         "INSERT INTO nakamoto_reward_sets (index_block_hash, reward_set) VALUES (?1,'{}')",
         params![hex_id("ibh1")],
+    )
+    .unwrap();
+    // One canonical __fork_storage row (referenced by the fixture MARF's
+    // leaf) and one fork-only row that must be excluded.
+    conn.execute(
+        "INSERT INTO __fork_storage (value_hash, value) VALUES (?1, 'vleaf'), (?2, 'vfork')",
+        params![FIXTURE_LEAF.to_hex(), MARFValue([0xee; 40]).to_hex()],
     )
     .unwrap();
     drop(conn);
@@ -254,6 +278,10 @@ fn test_copy_index_side_tables_round_trip() {
     assert_eq!(stats.payments_rows, 2, "2 canonical payments");
     assert_eq!(stats.transactions_rows, 2, "2 canonical transactions");
     assert_eq!(
+        stats.fork_storage_rows, 1,
+        "only the leaf-referenced __fork_storage row"
+    );
+    assert_eq!(
         stats.nakamoto_tenure_events_rows, 1,
         "1 tenure event for ibh1"
     );
@@ -267,6 +295,16 @@ fn test_copy_index_side_tables_round_trip() {
     assert_eq!(count("SELECT COUNT(*) FROM payments"), 2);
     assert_eq!(count("SELECT COUNT(*) FROM transactions"), 2);
     assert_eq!(count("SELECT COUNT(*) FROM nakamoto_tenure_events"), 1);
+    // The leaf-referenced __fork_storage row landed; the fork-only one didn't.
+    let fork_storage_keys: i64 = dst
+        .query_row(
+            "SELECT COUNT(*) FROM __fork_storage WHERE value_hash = ?1",
+            params![FIXTURE_LEAF.to_hex()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fork_storage_keys, 1);
+    assert_eq!(count("SELECT COUNT(*) FROM __fork_storage"), 1);
     // Schema-only compatibility table is present but empty.
     assert_eq!(
         count("SELECT COUNT(*) FROM invalidated_microblocks_data"),
@@ -304,10 +342,10 @@ fn test_copy_excludes_fork_rows() {
     let conn = create_source_db(&src_path);
 
     // Insert canonical block at height 1.
-    insert_block_header(&conn, 1, "1_canonical");
+    insert_epoch2_block_header(&conn, 1, "1_canonical");
     insert_transaction(&conn, 1, "ibh1_canonical");
     // Insert fork block at same height 1 (different consensus hash).
-    insert_block_header(&conn, 1, "1_fork");
+    insert_epoch2_block_header(&conn, 1, "1_fork");
     insert_transaction(&conn, 2, "ibh1_fork");
     // Canonical Nakamoto tip (squashing requires an epoch 3.4+ src).
     let tip_id = insert_nakamoto_header(&conn, "tip", 2);
@@ -358,13 +396,22 @@ fn test_copy_canonical_fork_storage_filters_by_leaf_hash() {
 
     // src.__fork_storage: two canonical entries (aa, cc) and one
     // non-canonical fork entry (bb) that must be excluded.
+    let aa = MARFValue([0xaa; 40]);
+    let bb = MARFValue([0xbb; 40]);
+    let cc = MARFValue([0xcc; 40]);
     let src = Connection::open(&src_path).unwrap();
     src.execute_batch(
         "CREATE TABLE __fork_storage (\
-             value_hash TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);\
-         INSERT INTO __fork_storage VALUES ('aa','va'),('bb','vb'),('cc','vc');",
+             value_hash TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);",
     )
     .unwrap();
+    for (key, value) in [(&aa, "va"), (&bb, "vb"), (&cc, "vc")] {
+        src.execute(
+            "INSERT INTO __fork_storage VALUES (?1, ?2)",
+            params![key.to_hex(), value],
+        )
+        .unwrap();
+    }
     drop(src);
 
     // Empty dst with src attached; the copy filters by the canonical leaf set.
@@ -374,31 +421,73 @@ fn test_copy_canonical_fork_storage_filters_by_leaf_hash() {
         params![src_path.to_str().unwrap()],
     )
     .unwrap();
-    let leaf_hashes: std::collections::HashSet<String> =
-        ["aa".to_string(), "cc".to_string()].into_iter().collect();
+    let leaf_hashes: HashSet<MARFValue> = [aa.clone(), cc.clone()].into_iter().collect();
 
     let copied = super::fork_storage::copy_canonical_fork_storage(&dst, &leaf_hashes).unwrap();
     assert_eq!(copied, 2, "only canonical value_hashes are copied");
 
     let present: i64 = dst
         .query_row(
-            "SELECT COUNT(*) FROM __fork_storage WHERE value_hash IN ('aa','cc')",
-            [],
+            "SELECT COUNT(*) FROM __fork_storage WHERE value_hash IN (?1, ?2)",
+            params![aa.to_hex(), cc.to_hex()],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(present, 2);
     let forked: i64 = dst
         .query_row(
-            "SELECT COUNT(*) FROM __fork_storage WHERE value_hash = 'bb'",
-            [],
+            "SELECT COUNT(*) FROM __fork_storage WHERE value_hash = ?1",
+            params![bb.to_hex()],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(forked, 0, "non-canonical fork row excluded");
 }
-/// Insert a staging_blocks row with the given `processed`/`orphaned` flags.
-fn insert_staging_block(
+
+/// Invalid `value_hash` encodings are corruption: `store_indexed` is the
+/// only writer and always stores the full hash as lowercase hex, and the
+/// runtime reads it back the same way (so a copied row with any other
+/// encoding would be unreachable in dst).
+#[rstest]
+#[case::not_a_marf_value("aa".into(), "is not a hex MARFValue")]
+#[case::uppercase(
+    MARFValue([0xaa; 40]).to_hex().to_uppercase(),
+    "is not canonical lowercase hex"
+)]
+fn test_fork_storage_invalid_value_hash_is_corruption(
+    #[case] value_hash: String,
+    #[case] needle: &str,
+) {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src.sqlite");
+    let dst_path = dir.path().join("dst.sqlite");
+
+    let src = Connection::open(&src_path).unwrap();
+    src.execute_batch(
+        "CREATE TABLE __fork_storage (\
+             value_hash TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);",
+    )
+    .unwrap();
+    src.execute(
+        "INSERT INTO __fork_storage VALUES (?1, 'va')",
+        params![value_hash],
+    )
+    .unwrap();
+    drop(src);
+
+    let dst = Connection::open(&dst_path).unwrap();
+    dst.execute(
+        "ATTACH DATABASE ?1 AS src",
+        params![src_path.to_str().unwrap()],
+    )
+    .unwrap();
+
+    let err = super::fork_storage::copy_canonical_fork_storage(&dst, &HashSet::new()).unwrap_err();
+    assert_corruption_containing(err, needle);
+}
+/// Insert an epoch-2 `staging_blocks` row with the given
+/// `processed`/`orphaned` flags.
+fn insert_epoch2_staging_block(
     conn: &Connection,
     suffix: &str,
     height: u32,
@@ -440,15 +529,15 @@ fn test_staging_blocks_populated_for_canonical() {
 
     // Insert block headers and staging blocks at heights 1, 2, 3.
     for (h, s) in [(1, "1"), (2, "2"), (3, "3")] {
-        insert_block_header(&conn, h, s);
-        insert_staging_block(&conn, s, h, 1, 0);
+        insert_epoch2_block_header(&conn, h, s);
+        insert_epoch2_staging_block(&conn, s, h, 1, 0);
     }
     // Canonical blocks excluded by the semantic predicate:
     // ibh4 is unprocessed, ibh5 is orphaned.
-    insert_block_header(&conn, 4, "4");
-    insert_staging_block(&conn, "4", 4, 0, 0);
-    insert_block_header(&conn, 5, "5");
-    insert_staging_block(&conn, "5", 5, 1, 1);
+    insert_epoch2_block_header(&conn, 4, "4");
+    insert_epoch2_staging_block(&conn, "4", 4, 0, 0);
+    insert_epoch2_block_header(&conn, 5, "5");
+    insert_epoch2_staging_block(&conn, "5", 5, 1, 1);
     // Canonical Nakamoto tip (squashing requires an epoch 3.4+ src).
     let tip_id = insert_nakamoto_header(&conn, "tip", 6);
     drop(conn);
@@ -503,7 +592,7 @@ fn test_signer_stats_copied_through_tip_reward_cycle() {
     let conn = create_source_db(&src_path);
 
     // Canonical chain: epoch2 block ibh1, Nakamoto tip at burn height 10.
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     let tip_id = insert_nakamoto_header(&conn, "tip", 10);
     conn.execute(
         "INSERT INTO signer_stats (public_key, reward_cycle, blocks_signed) \
@@ -545,7 +634,7 @@ fn test_src_without_nakamoto_blocks_is_corruption() {
     let src_path = dir.path().join("src.sqlite");
     let conn = create_source_db(&src_path);
 
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     drop(conn);
 
     let dst_path = dir.path().join("dst.sqlite");
@@ -566,14 +655,14 @@ fn test_epoch2_tip_above_nakamoto_block_is_corruption() {
     let conn = create_source_db(&src_path);
 
     let nak_id = insert_nakamoto_header(&conn, "nak", 10);
-    insert_block_header(&conn, 2, "2");
+    insert_epoch2_block_header(&conn, 2, "2");
     drop(conn);
 
     // ibh2 (epoch-2) sits above the Nakamoto block in the canonical set.
     let dst_path = dir.path().join("dst.sqlite");
     let dst = create_dest_db_with_canonical_blocks(&dst_path, &[]);
     append_canonical_block(&dst, &nak_id.0);
-    append_canonical_block(&dst, "ibh2".as_bytes());
+    append_canonical_block(&dst, &label_block_id("ibh2").0);
     drop(dst);
 
     let err = copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 5)
@@ -588,7 +677,7 @@ fn test_empty_canonical_set_is_corruption() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let conn = create_source_db(&src_path);
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     drop(conn);
 
     let dst_path = dir.path().join("dst.sqlite");
@@ -606,7 +695,7 @@ fn test_canonical_block_missing_from_src_is_corruption() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let conn = create_source_db(&src_path);
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     drop(conn);
 
     let dst_path = dir.path().join("dst.sqlite");
@@ -660,7 +749,7 @@ fn test_validate_index_side_tables_detects_extra_rows() {
     let conn = create_source_db(&src_path);
 
     // Insert one block + transaction.
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     insert_transaction(&conn, 1, "ibh1");
     // Canonical Nakamoto tip (squashing requires an epoch 3.4+ src).
     let tip_id = insert_nakamoto_header(&conn, "tip", 2);
@@ -706,7 +795,7 @@ fn test_signer_stats_validates_with_source_drift() {
     let src_path = dir.path().join("src_index.sqlite");
     let conn = create_source_db(&src_path);
 
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     // Nakamoto header so derive_max_reward_cycle can compute a cycle.
     let tip_id = insert_nakamoto_header(&conn, "tip", 10);
     conn.execute(
@@ -757,7 +846,7 @@ fn test_signer_stats_detects_fabricated_keys() {
     let src_path = dir.path().join("src_index.sqlite");
     let conn = create_source_db(&src_path);
 
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     let tip_id = insert_nakamoto_header(&conn, "tip", 10);
     conn.execute(
         "INSERT INTO signer_stats (public_key, reward_cycle, blocks_signed) \
@@ -807,7 +896,7 @@ fn test_signer_stats_detects_inflated_counters() {
     let src_path = dir.path().join("src_index.sqlite");
     let conn = create_source_db(&src_path);
 
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     let tip_id = insert_nakamoto_header(&conn, "tip", 10);
     conn.execute(
         "INSERT INTO signer_stats (public_key, reward_cycle, blocks_signed) \
@@ -858,7 +947,7 @@ fn test_matured_rewards_validates_with_source_growth() {
     let src_path = dir.path().join("src_index.sqlite");
     let conn = create_source_db(&src_path);
 
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     let tip_id = insert_nakamoto_header(&conn, "tip", 10);
     conn.execute(
         "INSERT INTO matured_rewards (address, recipient, vtxindex, coinbase, \
@@ -915,7 +1004,7 @@ fn test_matured_rewards_detects_fabricated_rows() {
     let src_path = dir.path().join("src_index.sqlite");
     let conn = create_source_db(&src_path);
 
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     let tip_id = insert_nakamoto_header(&conn, "tip", 10);
     drop(conn);
 
@@ -962,7 +1051,7 @@ fn test_index_validation_allows_populated_staging_microblocks() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let conn = create_source_db(&src_path);
-    insert_block_header(&conn, 1, "1");
+    insert_epoch2_block_header(&conn, 1, "1");
     // Canonical Nakamoto tip (squashing requires an epoch 3.4+ src).
     let tip_id = insert_nakamoto_header(&conn, "tip", 2);
     drop(conn);
@@ -998,8 +1087,8 @@ fn test_staging_blocks_validation_detects_drift() {
     let src_path = dir.path().join("src.sqlite");
     let conn = create_source_db(&src_path);
 
-    insert_block_header(&conn, 1, "1");
-    insert_staging_block(&conn, "1", 1, 1, 0);
+    insert_epoch2_block_header(&conn, 1, "1");
+    insert_epoch2_staging_block(&conn, "1", 1, 1, 0);
     // Canonical Nakamoto tip (squashing requires an epoch 3.4+ src).
     let tip_id = insert_nakamoto_header(&conn, "tip", 2);
     drop(conn);
@@ -1215,6 +1304,17 @@ fn insert_epoch(conn: &Connection, start: u32, epoch_id: u32) {
 /// column, so `lower(hex(block_hash))` returns the hex form that test
 /// chainstate inserts use (sortition IDs in `snapshots` are TEXT).
 fn create_sortition_dest_db(path: &std::path::Path, canonical_sortition_ids: &[&str]) {
+    // A real (tiny) MARF so the leaf walk in `collect_canonical_leaf_hashes`
+    // succeeds; its single leaf is irrelevant to the sortition assertions
+    // (src `__fork_storage` is empty, so nothing matches it anyway).
+    let mut marf = MARF::<SortitionId>::from_path(path.to_str().unwrap(), MARFOpenOpts::default())
+        .expect("MARF init failed");
+    marf.begin(&SortitionId::sentinel(), &SortitionId([0x99; 32]))
+        .unwrap();
+    marf.insert("test::leaf", MARFValue([0xff; 40])).unwrap();
+    marf.commit().unwrap();
+    drop(marf);
+
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS marf_squashed_blocks (
@@ -1225,10 +1325,18 @@ fn create_sortition_dest_db(path: &std::path::Path, canonical_sortition_ids: &[&
     )
     .unwrap();
     for (h, sid) in canonical_sortition_ids.iter().enumerate() {
+        // Store the 32-byte zero-padded id so `lower(hex(block_hash))`
+        // matches the `hex_id`-encoded sortition_id in `src.snapshots`,
+        // and a 32-byte root hash so the `bulk_read_squashed_blocks`
+        // accessor (which validates lengths) accepts it.
         conn.execute(
             "INSERT INTO marf_squashed_blocks (height, block_hash, marf_root_hash) \
-             VALUES (?1, ?2, X'00')",
-            params![h as i64, sid.as_bytes()],
+             VALUES (?1, ?2, ?3)",
+            params![
+                h as i64,
+                label_block_id(sid).0.as_slice(),
+                [0u8; 32].as_slice()
+            ],
         )
         .unwrap();
     }

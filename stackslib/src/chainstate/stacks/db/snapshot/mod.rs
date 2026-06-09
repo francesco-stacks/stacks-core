@@ -28,7 +28,7 @@ pub(crate) mod blocks;
 pub(crate) mod burnchain;
 pub(crate) mod common;
 pub(crate) mod fork_storage;
-pub(crate) mod index;
+mod index;
 pub(crate) mod sortition;
 pub(crate) mod spv;
 

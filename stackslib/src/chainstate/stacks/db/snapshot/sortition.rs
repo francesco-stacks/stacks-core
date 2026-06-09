@@ -23,7 +23,7 @@ use super::common::{
     with_offline_write_session, TableCopySpec,
 };
 use super::fork_storage::{collect_canonical_leaf_hashes, copy_canonical_fork_storage};
-use crate::chainstate::stacks::index::Error;
+use crate::chainstate::stacks::index::{trie_sql, Error, MARFValue};
 
 /// Required sortition tables always present in production.
 pub(crate) const REQUIRED_TABLES: &[&str] = &[
@@ -142,17 +142,31 @@ impl SortitionSideTableValidation {
     }
 }
 
+/// Fill the (already-created) `canonical_sortitions` temp table from the
+/// squashed MARF metadata, read through the MARF-domain accessor
+/// [`trie_sql::bulk_read_squashed_blocks`] rather than a raw read of the
+/// MARF-owned `marf_squashed_blocks` table. The `SortitionId` binds as its
+/// lowercase-hex form, matching the `sortition_id` TEXT in `src.snapshots`.
+/// Returns the number of ids inserted.
+fn insert_canonical_sortition_ids(conn: &Connection) -> Result<usize, Error> {
+    let canonical = trie_sql::bulk_read_squashed_blocks::<SortitionId>(conn)?;
+    let mut insert = conn
+        .prepare("INSERT INTO canonical_sortitions (sortition_id) VALUES (?1)")
+        .map_err(Error::SQLError)?;
+    let mut inserted = 0usize;
+    for (_, sortition_id, _) in &canonical {
+        inserted += insert
+            .execute(params![sortition_id])
+            .map_err(Error::SQLError)?;
+    }
+    Ok(inserted)
+}
+
 /// Build temp tables for the canonical sortition set and canonical burn hashes.
 fn populate_canonical_sortitions(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch("CREATE TEMP TABLE canonical_sortitions (sortition_id TEXT PRIMARY KEY)")
         .map_err(Error::SQLError)?;
-    let inserted = conn
-        .execute(
-            "INSERT OR IGNORE INTO canonical_sortitions (sortition_id) \
-             SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
-            [],
-        )
-        .map_err(Error::SQLError)?;
+    let inserted = insert_canonical_sortition_ids(conn)?;
     if inserted == 0 {
         return Err(Error::CorruptionError(
             "marf_squashed_blocks is empty; post-squash dst must have at least one canonical sortition"
@@ -350,6 +364,10 @@ fn sortition_copy_specs(boundary: Option<&SortitionTipCopyBoundary>) -> Vec<Tabl
     let bhh = "SELECT burn_header_hash FROM canonical_burn_hashes";
 
     vec![
+        TableCopySpec {
+            table: "db_config",
+            source_sql: "SELECT * FROM src.db_config".into(),
+        },
         // sortition_id-filtered tables
         TableCopySpec {
             table: "snapshots",
@@ -454,17 +472,9 @@ pub fn copy_sortition_side_tables_with_boundary(
 
 fn copy_sortition_tables_inner(
     conn: &Connection,
-    leaf_hashes: &HashSet<String>,
+    leaf_hashes: &HashSet<MARFValue>,
     stacks_boundary: Option<&SortitionTipCopyBoundary>,
 ) -> Result<SortitionSideTableStats, Error> {
-    // Copy db_config verbatim.
-    let db_config_rows = conn
-        .execute(
-            "INSERT OR REPLACE INTO db_config SELECT * FROM src.db_config",
-            [],
-        )
-        .map_err(Error::SQLError)? as u64;
-
     // Copy only canonical __fork_storage rows. The squashed MARF trie
     // leaves reference these by value_hash. Non-canonical fork entries
     // are excluded.
@@ -493,7 +503,7 @@ fn copy_sortition_tables_inner(
             .iter()
             .find(|(t, _)| *t == name)
             .map(|(_, r)| *r)
-            .unwrap_or(0)
+            .unwrap_or_else(|| panic!("BUG: no copy-spec result for `{name}`"))
     };
 
     Ok(SortitionSideTableStats {
@@ -511,7 +521,7 @@ fn copy_sortition_tables_inner(
         delegate_stx_rows: get("delegate_stx"),
         vote_for_aggregate_key_rows: get("vote_for_aggregate_key"),
         epochs_rows: get("epochs"),
-        db_config_rows,
+        db_config_rows: get("db_config"),
         fork_storage_rows,
     })
 }
@@ -559,17 +569,12 @@ pub fn validate_sortition_side_tables_with_boundary(
             > 0
     });
 
-    // Build canonical set from squash metadata.
+    // Build canonical set from squash metadata, via the MARF-domain accessor.
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS canonical_sortitions (sortition_id TEXT PRIMARY KEY)",
     )
     .map_err(Error::SQLError)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO canonical_sortitions (sortition_id) \
-         SELECT lower(hex(block_hash)) FROM marf_squashed_blocks",
-        [],
-    )
-    .map_err(Error::SQLError)?;
+    insert_canonical_sortition_ids(&conn)?;
 
     // Cross-check: every sortition_id the destination claims as canonical must
     // actually exist in the source snapshots table.
@@ -697,7 +702,7 @@ pub fn validate_sortition_side_tables_with_boundary(
                 .prepare("INSERT INTO val_fork_leaf_values (value_hash) VALUES (?1)")
                 .map_err(Error::SQLError)?;
             for hash in &leaf_hashes {
-                stmt.execute([hash]).map_err(Error::SQLError)?;
+                stmt.execute([hash.to_hex()]).map_err(Error::SQLError)?;
             }
         }
         let ok = full_row_except_match(

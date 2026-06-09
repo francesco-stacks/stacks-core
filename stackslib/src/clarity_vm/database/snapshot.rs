@@ -23,7 +23,9 @@ use rusqlite::Connection;
 use stacks_common::types::chainstate::StacksBlockId;
 
 use crate::chainstate::stacks::db::snapshot::common::with_offline_write_session;
-use crate::chainstate::stacks::db::snapshot::fork_storage::collect_leaf_value_hashes;
+use crate::chainstate::stacks::db::snapshot::fork_storage::{
+    collect_leaf_value_hashes, copy_leaf_referenced_rows,
+};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{trie_sql, Error};
@@ -85,38 +87,9 @@ pub fn copy_clarity_side_tables(
                 t.elapsed()
             );
 
-            // Single sequential SELECT + HashSet membership check.
-            // `get_ref` borrows the key from the row buffer; the value
-            // is only allocated for rows that pass the filter.
-            let t = Instant::now();
-            let mut select = conn
-                .prepare("SELECT key, value FROM src.data_table")
-                .map_err(Error::SQLError)?;
-            let mut insert = conn
-                .prepare("INSERT OR IGNORE INTO data_table (key, value) VALUES (?1, ?2)")
-                .map_err(Error::SQLError)?;
-            let mut data_rows: u64 = 0;
-            let mut scanned: u64 = 0;
-            let mut rows = select.query([]).map_err(Error::SQLError)?;
-            while let Some(row) = rows.next().map_err(Error::SQLError)? {
-                scanned += 1;
-                let key_ref = row.get_ref(0).map_err(Error::SQLError)?;
-                let key_str = key_ref.as_str().map_err(|e| {
-                    Error::CorruptionError(format!("src.data_table.key is not TEXT: {e:?}"))
-                })?;
-                if needed_keys.contains(key_str) {
-                    let value: String = row.get(1).map_err(Error::SQLError)?;
-                    insert
-                        .execute(rusqlite::params![key_str, &value])
-                        .map_err(Error::SQLError)?;
-                    data_rows += 1;
-                }
-            }
-            info!(
-                "[clarity] data_table stream-filter: scanned {scanned}, inserted {data_rows} \
-                 in {:?}",
-                t.elapsed()
-            );
+            // data_table is content-addressed (key = hex MARFValue), like
+            // the index `__fork_storage`, so it shares the same stream-filter.
+            let data_rows = copy_leaf_referenced_rows(conn, "data_table", "key", &needed_keys)?;
 
             let t = Instant::now();
             let mut metadata_rows: u64 = 0;
@@ -135,7 +108,7 @@ pub fn copy_clarity_side_tables(
                 .map_err(Error::SQLError)?;
             let mut insert = conn
                 .prepare(
-                    "INSERT OR IGNORE INTO metadata_table (key, blockhash, value) \
+                    "INSERT INTO metadata_table (key, blockhash, value) \
                      VALUES (?1, ?2, ?3)",
                 )
                 .map_err(Error::SQLError)?;
@@ -346,10 +319,10 @@ pub fn validate_clarity_side_tables(
         .map_err(Error::SQLError)?;
     {
         let mut stmt = dst_conn
-            .prepare("INSERT OR IGNORE INTO trie_values (key) VALUES (?1)")
+            .prepare("INSERT INTO trie_values (key) VALUES (?1)")
             .map_err(Error::SQLError)?;
         for key in needed_keys.iter() {
-            stmt.execute([key]).map_err(Error::SQLError)?;
+            stmt.execute([key.to_hex()]).map_err(Error::SQLError)?;
         }
     }
     let missing_required_data_table_keys: u64 = dst_conn
