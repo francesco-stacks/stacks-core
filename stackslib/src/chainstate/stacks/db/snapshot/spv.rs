@@ -150,7 +150,7 @@ pub fn validate_spv_headers(
         "SELECT * FROM chain_work",
         &format!(
             "SELECT * FROM src.chain_work \
-                 WHERE (interval + 1) * {BLOCK_DIFFICULTY_CHUNK_SIZE} - 1 <= {burn_height}"
+             WHERE (interval + 1) * {BLOCK_DIFFICULTY_CHUNK_SIZE} - 1 <= {burn_height}"
         ),
     )?;
 
