@@ -174,16 +174,9 @@ fn burnchain_copy_specs() -> Vec<TableCopySpec> {
     ]
 }
 
-fn copy_burnchain_db_inner(
-    conn: &Connection,
-    expected_burn_height: u32,
-) -> Result<BurnchainDbCopyStats, Error> {
-    clone_schemas_from_source(conn, REQUIRED_TABLES)?;
-
-    // Build canonical burn hash set from squashed sortition DB.
-    populate_canonical_burn_hashes(conn)?;
-
-    // Consistency assertion: sortition tip must match expected burn height.
+/// Consistency assertion: the squashed sortition DB's tip (ATTACHed as
+/// `sort`) must match the caller's expected burn height.
+fn assert_sortition_tip_height(conn: &Connection, expected_burn_height: u32) -> Result<(), Error> {
     let actual_max_height: u32 = conn
         .query_row(
             "SELECT COALESCE(MAX(block_height), 0) FROM sort.snapshots",
@@ -196,6 +189,19 @@ fn copy_burnchain_db_inner(
             "Sortition tip height mismatch: expected {expected_burn_height}, got {actual_max_height}"
         )));
     }
+    Ok(())
+}
+
+fn copy_burnchain_db_inner(
+    conn: &Connection,
+    expected_burn_height: u32,
+) -> Result<BurnchainDbCopyStats, Error> {
+    clone_schemas_from_source(conn, REQUIRED_TABLES)?;
+
+    // Build canonical burn hash set from squashed sortition DB.
+    populate_canonical_burn_hashes(conn)?;
+
+    assert_sortition_tip_height(conn, expected_burn_height)?;
 
     // Completeness assertion: every canonical burn hash must exist in source.
     let missing_count: i64 = conn
@@ -244,19 +250,7 @@ pub fn validate_burnchain_db(
 
     populate_canonical_burn_hashes(&conn)?;
 
-    // Consistency assertion.
-    let actual_max_height: u32 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(block_height), 0) FROM sort.snapshots",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
-    if actual_max_height != expected_burn_height {
-        return Err(Error::CorruptionError(format!(
-            "Sortition tip height mismatch: expected {expected_burn_height}, got {actual_max_height}"
-        )));
-    }
+    assert_sortition_tip_height(&conn, expected_burn_height)?;
 
     // Completeness: every canonical burn hash must be present in destination.
     let missing_in_dst: i64 = conn

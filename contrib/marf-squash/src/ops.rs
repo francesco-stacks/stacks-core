@@ -383,7 +383,6 @@ fn print_index_side_table_validation(v: &IndexSideTableValidation) {
 
 fn print_sortition_side_table_validation(v: &SortitionSideTableValidation) {
     println!("Sortition side-table validation:");
-    println!("  required_tables_present: {}", v.required_tables_present);
     println!("  canonical_set_in_source: {}", v.canonical_set_in_source);
     println!("  fork_storage_match: {}", v.fork_storage_match);
     println!("  snapshots_match: {}", v.snapshots_match);

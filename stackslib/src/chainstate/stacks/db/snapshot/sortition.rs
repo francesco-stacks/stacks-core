@@ -24,6 +24,7 @@ use super::common::{
 };
 use super::fork_storage::{collect_canonical_leaf_hashes, copy_canonical_fork_storage};
 use crate::chainstate::stacks::index::{trie_sql, Error, MARFValue};
+use crate::util_lib::db::u64_to_sql;
 
 /// Required sortition tables always present in production.
 pub(crate) const REQUIRED_TABLES: &[&str] = &[
@@ -88,7 +89,6 @@ pub struct SortitionTipCopyBoundary {
 /// canonicality. MARF trie validation must be done separately.
 #[derive(Debug, Clone)]
 pub struct SortitionSideTableValidation {
-    pub required_tables_present: bool,
     /// Every sortition_id in destination `marf_squashed_blocks` exists in
     /// the source `snapshots` table. False if the destination claims sortition IDs
     /// that the source doesn't have.
@@ -119,8 +119,7 @@ pub struct SortitionSideTableValidation {
 
 impl SortitionSideTableValidation {
     pub fn is_valid(&self) -> bool {
-        self.required_tables_present
-            && self.canonical_set_in_source
+        self.canonical_set_in_source
             && self.snapshots_match
             && self.leader_keys_match
             && self.block_commits_match
@@ -213,18 +212,8 @@ fn validate_tip_boundary(boundary: Option<&SortitionTipCopyBoundary>) -> Result<
                 boundary.anchor_block_height, boundary.max_stacks_height
             )));
         }
-        let _ = i64::try_from(boundary.max_stacks_height).map_err(|_| {
-            Error::CorruptionError(format!(
-                "Stacks boundary height {} exceeds SQLite INTEGER range",
-                boundary.max_stacks_height
-            ))
-        })?;
-        let _ = i64::try_from(boundary.anchor_block_height).map_err(|_| {
-            Error::CorruptionError(format!(
-                "sortition tip rewrite anchor height {} exceeds SQLite INTEGER range",
-                boundary.anchor_block_height
-            ))
-        })?;
+        u64_to_sql(boundary.max_stacks_height)?;
+        u64_to_sql(boundary.anchor_block_height)?;
     }
     Ok(())
 }
@@ -285,12 +274,7 @@ fn sortition_tip_heights_within_boundary(
     let Some(boundary) = boundary else {
         return Ok(true);
     };
-    let max_height = i64::try_from(boundary.max_stacks_height).map_err(|_| {
-        Error::CorruptionError(format!(
-            "Stacks boundary height {} exceeds SQLite INTEGER range",
-            boundary.max_stacks_height
-        ))
-    })?;
+    let max_height = u64_to_sql(boundary.max_stacks_height)?;
     conn.query_row(
         "SELECT COUNT(*) = 0 FROM ( \
              SELECT block_height FROM stacks_chain_tips WHERE block_height > ?1 \
@@ -310,12 +294,7 @@ fn sortition_tip_anchor_matches_boundary(
     let Some(boundary) = boundary else {
         return Ok(true);
     };
-    let anchor_height = i64::try_from(boundary.anchor_block_height).map_err(|_| {
-        Error::CorruptionError(format!(
-            "sortition tip rewrite anchor height {} exceeds SQLite INTEGER range",
-            boundary.anchor_block_height
-        ))
-    })?;
+    let anchor_height = u64_to_sql(boundary.anchor_block_height)?;
     let anchor_ch = boundary.anchor_consensus_hash.to_string();
     let anchor_burn_view_ch = boundary.anchor_burn_view_consensus_hash.to_string();
     let anchor_bhh = boundary.anchor_block_hash.to_string();
@@ -552,17 +531,6 @@ pub fn validate_sortition_side_tables_with_boundary(
     conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
         .map_err(Error::SQLError)?;
 
-    // Check all required tables exist in destination.
-    let required_tables_present = REQUIRED_TABLES.iter().all(|table| {
-        conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-            params![table],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-            > 0
-    });
-
     // Build canonical set from squash metadata, via the MARF-domain accessor.
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS canonical_sortitions (sortition_id TEXT PRIMARY KEY)",
@@ -716,7 +684,6 @@ pub fn validate_sortition_side_tables_with_boundary(
         .map_err(Error::SQLError)?;
 
     Ok(SortitionSideTableValidation {
-        required_tables_present,
         canonical_set_in_source,
         snapshots_match,
         leader_keys_match,

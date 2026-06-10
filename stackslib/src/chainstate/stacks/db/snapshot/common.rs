@@ -82,28 +82,14 @@ pub fn clone_schemas_from_source(conn: &Connection, tables: &[&str]) -> Result<(
     Ok(())
 }
 
-/// Check bidirectional full-row EXCEPT equality.
-/// Returns true if the two result sets are identical.
+/// Check bidirectional full-row EXCEPT equality: each result set must be a
+/// subset of the other. Returns true if the two result sets are identical.
 pub fn full_row_except_match(
     conn: &Connection,
     dst_sql: &str,
     src_sql: &str,
 ) -> Result<bool, Error> {
-    let extra_in_dst: i64 = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM ({dst_sql} EXCEPT {src_sql})"),
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
-    let extra_in_src: i64 = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM ({src_sql} EXCEPT {dst_sql})"),
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
-    Ok(extra_in_dst == 0 && extra_in_src == 0)
+    Ok(dst_subset_of_src(conn, dst_sql, src_sql)? && dst_subset_of_src(conn, src_sql, dst_sql)?)
 }
 
 /// One-directional subset check: every row in `dst_sql` must exist in

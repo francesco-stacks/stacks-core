@@ -16,7 +16,7 @@
 //! Sortition side-table copy/validate tests.
 
 use rusqlite::{params, Connection};
-use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, SortitionId};
+use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, SortitionId, TrieHash};
 use tempfile::tempdir;
 
 use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
@@ -33,7 +33,7 @@ use crate::chainstate::burn::db::sortdb::{
     SORTITION_DB_VERSION,
 };
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
-use crate::chainstate::stacks::index::{ClarityMarfTrieId, Error, MARFValue};
+use crate::chainstate::stacks::index::{trie_sql, ClarityMarfTrieId, Error, MARFValue};
 
 /// Create a sortition source DB with the real schema (all migrations
 /// through schema 11). Applies only the DDL; epoch data inserts are
@@ -203,9 +203,9 @@ fn insert_epoch(conn: &Connection, start: u32, epoch_id: u32) {
 /// Create a sortition dest DB simulating a squashed MARF with the given
 /// canonical sortition-ID labels.
 ///
-/// Each label is stored as raw UTF-8 bytes in the `marf_squashed_blocks` BLOB
-/// column, so `lower(hex(block_hash))` returns the hex form that test
-/// chainstate inserts use (sortition IDs in `snapshots` are TEXT).
+/// Each label is stored as a 32-byte zero-padded id so its hex form matches
+/// the `hex_id`-encoded sortition_id that test chainstate inserts use
+/// (sortition IDs in `snapshots` are TEXT).
 fn create_sortition_dest_db(path: &std::path::Path, canonical_sortition_ids: &[&str]) {
     // A real (tiny) MARF so the leaf walk in `collect_canonical_leaf_hashes`
     // succeeds; its single leaf is irrelevant to the sortition assertions
@@ -219,27 +219,12 @@ fn create_sortition_dest_db(path: &std::path::Path, canonical_sortition_ids: &[&
     drop(marf);
 
     let conn = Connection::open(path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS marf_squashed_blocks (
-            height INTEGER PRIMARY KEY,
-            block_hash BLOB NOT NULL UNIQUE,
-            marf_root_hash BLOB NOT NULL
-        )",
-    )
-    .unwrap();
     for (h, sid) in canonical_sortition_ids.iter().enumerate() {
-        // Store the 32-byte zero-padded id so `lower(hex(block_hash))`
-        // matches the `hex_id`-encoded sortition_id in `src.snapshots`,
-        // and a 32-byte root hash so the `bulk_read_squashed_blocks`
-        // accessor (which validates lengths) accepts it.
-        conn.execute(
-            "INSERT INTO marf_squashed_blocks (height, block_hash, marf_root_hash) \
-             VALUES (?1, ?2, ?3)",
-            params![
-                h as i64,
-                label_block_id(sid).0.as_slice(),
-                [0u8; 32].as_slice()
-            ],
+        trie_sql::test_insert_squashed_block(
+            &conn,
+            h as u32,
+            &SortitionId(label_block_id(sid).0),
+            &TrieHash([0u8; 32]),
         )
         .unwrap();
     }

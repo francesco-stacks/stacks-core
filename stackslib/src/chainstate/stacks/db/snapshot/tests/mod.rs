@@ -16,12 +16,12 @@ use std::collections::HashSet;
 
 use rstest::rstest;
 use rusqlite::{params, Connection};
-use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use tempfile::tempdir;
 
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
-use crate::chainstate::stacks::index::{ClarityMarfTrieId, Error, MARFValue};
+use crate::chainstate::stacks::index::{trie_sql, ClarityMarfTrieId, Error, MARFValue};
 
 mod blocks;
 mod burnchain;
@@ -61,9 +61,9 @@ fn hex_id(label: &str) -> String {
 const FIXTURE_LEAF: MARFValue = MARFValue([0xff; 40]);
 
 /// Create a destination DB that simulates a squashed MARF: a real (tiny)
-/// MARF with one confirmed block and one [`FIXTURE_LEAF`] leaf, plus the
-/// `marf_squashed_blocks` table holding the given canonical block labels
-/// (stored as [`label_block_id`] BLOBs). Returns the connection for
+/// MARF with one confirmed block and one [`FIXTURE_LEAF`] leaf, plus
+/// `marf_squashed_blocks` rows for the given canonical block labels
+/// (stored as [`label_block_id`] ids). Returns the connection for
 /// [`append_canonical_block`].
 fn create_dest_db_with_canonical_blocks(path: &std::path::Path, canonical: &[&str]) -> Connection {
     let mut marf =
@@ -76,35 +76,22 @@ fn create_dest_db_with_canonical_blocks(path: &std::path::Path, canonical: &[&st
     drop(marf);
 
     let conn = Connection::open(path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS marf_squashed_blocks (
-            height INTEGER PRIMARY KEY,
-            block_hash BLOB NOT NULL UNIQUE,
-            marf_root_hash BLOB NOT NULL
-        )",
-    )
-    .unwrap();
     for (h, bh) in canonical.iter().enumerate() {
-        let id = label_block_id(bh);
-        conn.execute(
-            "INSERT INTO marf_squashed_blocks (height, block_hash, marf_root_hash) \
-             VALUES (?1, ?2, ?3)",
-            params![h as i64, id.0.as_slice(), [0u8; 32].as_slice()],
+        trie_sql::test_insert_squashed_block(
+            &conn,
+            h as u32,
+            &label_block_id(bh),
+            &TrieHash([0u8; 32]),
         )
         .unwrap();
     }
     conn
 }
 
-/// Append a canonical block above the existing ones. `block_hash` is the
-/// raw BLOB content: a test label or a computed [`StacksBlockId`].
-fn append_canonical_block(conn: &Connection, block_hash: &[u8]) {
-    conn.execute(
-        "INSERT INTO marf_squashed_blocks (height, block_hash, marf_root_hash) \
-         VALUES ((SELECT COALESCE(MAX(height) + 1, 0) FROM marf_squashed_blocks), ?1, ?2)",
-        params![block_hash, [0u8; 32].as_slice()],
-    )
-    .unwrap();
+/// Append a canonical block above the existing ones. `block_hash` is a
+/// test label or a computed [`StacksBlockId`].
+fn append_canonical_block(conn: &Connection, block_hash: &StacksBlockId) {
+    trie_sql::test_append_squashed_block(conn, block_hash, &TrieHash([0u8; 32])).unwrap();
 }
 
 /// Assert `err` is a [`Error::CorruptionError`] whose message contains

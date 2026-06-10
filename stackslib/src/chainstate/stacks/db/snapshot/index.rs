@@ -26,6 +26,7 @@ use super::common::{
 use super::fork_storage::{collect_canonical_leaf_hashes, copy_canonical_fork_storage};
 use crate::burnchains::PoxConstants;
 use crate::chainstate::stacks::index::{trie_sql, Error, MARFValue};
+use crate::util_lib::db::table_exists;
 
 /// Tables copied (with canonical-filtered content) into the squashed index
 /// DB and validated row-for-row against the source.
@@ -90,7 +91,9 @@ pub struct IndexSideTableStats {
 /// Validation result for index side tables in a squashed DB.
 #[derive(Debug, Clone)]
 pub struct IndexSideTableValidation {
-    pub tables_present: bool,
+    /// The schema-only staging-microblock tables exist (the only tables no
+    /// validation query reads; see `validate_index_side_tables`).
+    pub staging_microblock_tables_present: bool,
     pub db_config_matches: bool,
     pub fork_storage_match: bool,
     pub block_headers_match: bool,
@@ -114,7 +117,10 @@ impl IndexSideTableValidation {
     /// by listing it here, so the verdict and the printout can't drift apart.
     pub fn checks(&self) -> [(&'static str, bool); 15] {
         [
-            ("tables_present", self.tables_present),
+            (
+                "staging_microblock_tables_present",
+                self.staging_microblock_tables_present,
+            ),
             ("db_config_matches", self.db_config_matches),
             ("fork_storage_match", self.fork_storage_match),
             ("block_headers_match", self.block_headers_match),
@@ -400,18 +406,17 @@ pub fn validate_index_side_tables(
             .map_err(Error::SQLError)
     };
 
-    // All required tables (copied + schema-only) must exist.
-    let mut tables_present = true;
-    for table in all_required_tables() {
-        let exists = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                params![table],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(Error::SQLError)?
-            > 0;
-        tables_present &= exists;
+    // Existence is only checked for the tables no validation query reads:
+    // every other required table is read below, so a missing one already
+    // fails its own check. The staging-microblock tables are populated by
+    // the separate block-preservation phase, and an index-only validation
+    // never touches them.
+    let mut staging_microblock_tables_present = true;
+    for table in SCHEMA_ONLY_TABLES
+        .iter()
+        .filter(|table| !EXPECTED_EMPTY_TABLES.contains(table))
+    {
+        staging_microblock_tables_present &= table_exists(&conn, table)?;
     }
 
     // db_config verbatim match (bidirectional).
@@ -574,7 +579,7 @@ pub fn validate_index_side_tables(
         .map_err(Error::SQLError)?;
 
     Ok(IndexSideTableValidation {
-        tables_present,
+        staging_microblock_tables_present,
         db_config_matches,
         fork_storage_match,
         block_headers_match,
