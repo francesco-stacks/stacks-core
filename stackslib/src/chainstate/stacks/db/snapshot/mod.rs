@@ -27,9 +27,7 @@
 mod blocks;
 mod burnchain;
 mod clarity;
-// `pub(crate)` for the drift-guard helpers used by the clarity MARF tests
-// in `clarity_vm::database::tests`.
-pub(crate) mod common;
+mod common;
 mod fork_storage;
 mod index;
 mod sortition;

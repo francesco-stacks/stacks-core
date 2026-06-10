@@ -13,6 +13,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+//! Clarity MARF squash + side-table (`data_table`, `metadata_table`)
+//! copy/validate tests.
+
 use std::path::PathBuf;
 
 use clarity::vm::database::clarity_store::make_contract_hash_key;
@@ -21,10 +24,8 @@ use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use tempfile::tempdir;
 
-use crate::chainstate::stacks::db::snapshot::common::{unclassified_tables, MARF_INFRA_TABLES};
-use crate::chainstate::stacks::db::snapshot::{
-    copy_clarity_side_tables, validate_clarity_side_tables,
-};
+use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
+use super::super::{copy_clarity_side_tables, validate_clarity_side_tables};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId as _, MARFValue};
