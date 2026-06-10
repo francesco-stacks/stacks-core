@@ -22,14 +22,14 @@ use stacks_common::util::hash::Sha512Trunc256Sum;
 use tempfile::tempdir;
 
 use crate::chainstate::stacks::db::snapshot::common::{unclassified_tables, MARF_INFRA_TABLES};
+use crate::chainstate::stacks::db::snapshot::{
+    copy_clarity_side_tables, validate_clarity_side_tables,
+};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId as _, MARFValue};
 use crate::clarity_vm::clarity::ClarityMarfStoreTransaction as _;
 use crate::clarity_vm::database::marf::MarfedKV;
-use crate::clarity_vm::database::snapshot::{
-    copy_clarity_side_tables, validate_clarity_side_tables,
-};
 
 /// Build a Clarity MARF with N blocks of data and a single contract.
 /// Returns the block hashes for each height.
@@ -145,6 +145,9 @@ fn squash_clarity_marf(
     dst_db
 }
 
+/// End-to-end squash + side-table copy of a Clarity MARF: every
+/// trie-referenced data key and required metadata row is present in the
+/// destination.
 #[test]
 fn test_copy_clarity_side_tables_round_trip() {
     let dir = tempdir().unwrap();
@@ -179,6 +182,8 @@ fn test_copy_clarity_side_tables_round_trip() {
     assert_eq!(validation.missing_required_metadata_rows, 0);
 }
 
+/// `SqliteConnection::check_schema` accepts the squashed Clarity DB
+/// (tables and index recreated by the copy).
 #[test]
 fn test_squashed_clarity_marf_check_schema_passes() {
     let dir = tempdir().unwrap();
@@ -198,6 +203,9 @@ fn test_squashed_clarity_marf_check_schema_passes() {
         .expect("check_schema should pass on squashed Clarity MARF");
 }
 
+/// Clarity data reads through `MarfedKV` work on the squashed MARF,
+/// including a key overwritten at the squash height and one written only
+/// at height 0.
 #[test]
 fn test_squashed_clarity_marf_data_reads_work() {
     let dir = tempdir().unwrap();
@@ -232,6 +240,8 @@ fn test_squashed_clarity_marf_data_reads_work() {
     }
 }
 
+/// Contract metadata reads through `MarfedKV` work on the squashed MARF
+/// (the lookup resolves the deployment block via the copied trie).
 #[test]
 fn test_squashed_clarity_marf_metadata_reads_work() {
     let dir = tempdir().unwrap();
@@ -263,6 +273,8 @@ fn test_squashed_clarity_marf_metadata_reads_work() {
     }
 }
 
+/// Extending the squashed MARF and the archival MARF from the squash
+/// height with the same block yields identical root hashes.
 #[test]
 fn test_squashed_clarity_marf_extend_hash_equality() {
     let dir = tempdir().unwrap();
@@ -313,6 +325,8 @@ fn test_squashed_clarity_marf_extend_hash_equality() {
     );
 }
 
+/// Side tables copied from the wrong source MARF leave trie value hashes
+/// dangling: data and metadata reads must fail, not return wrong data.
 #[test]
 fn test_mismatched_clarity_db_causes_data_read_failure() {
     let dir = tempdir().unwrap();
@@ -364,6 +378,8 @@ fn test_mismatched_clarity_db_causes_data_read_failure() {
     );
 }
 
+/// Validation against the true source detects side tables copied from a
+/// different MARF.
 #[test]
 fn test_validate_clarity_side_tables_detects_mismatch() {
     let dir = tempdir().unwrap();
@@ -403,6 +419,8 @@ fn test_validate_clarity_side_tables_detects_mismatch() {
     );
 }
 
+/// Metadata keys containing `::` split on the first separator only: the
+/// copy keeps them, and they remain readable after the squash.
 #[test]
 fn test_copy_clarity_side_tables_with_double_colon_metadata_keys() {
     let dir = tempdir().unwrap();
@@ -478,6 +496,6 @@ fn test_no_unclassified_clarity_source_tables() {
     assert!(
         extra.is_empty(),
         "unclassified Clarity source table(s) {extra:?}: handle each in \
-         copy_clarity_side_tables (clarity_vm/database/snapshot.rs)"
+         copy_clarity_side_tables (chainstate/stacks/db/snapshot/clarity.rs)"
     );
 }

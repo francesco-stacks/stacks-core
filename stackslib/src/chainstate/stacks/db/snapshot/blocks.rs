@@ -21,8 +21,8 @@ use rusqlite::{params, Connection, OpenFlags};
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 
 use super::common::{
-    clone_schemas_from_source, full_row_except_match, with_indexes_dropped,
-    with_offline_write_session,
+    clone_schemas_from_source, copied_rows, execute_copy_specs, full_row_except_match,
+    with_indexes_dropped, with_offline_write_session, TableCopySpec,
 };
 use crate::chainstate::stacks::db::blocks::index_block_hash_to_rel_path;
 use crate::chainstate::stacks::index::Error;
@@ -303,24 +303,26 @@ pub fn copy_confirmed_epoch2_microblocks(
                 "selected_parents",
             )?;
 
-            stats.microblock_rows_copied = conn
-                .execute(
-                    "INSERT INTO staging_microblocks \
-                     SELECT s.* FROM src.staging_microblocks s \
-                     WHERE s.microblock_hash IN (SELECT hash FROM temp.selected_microblocks) \
-                       AND s.index_block_hash IN (SELECT ibh FROM temp.selected_parents) \
-                       AND s.orphaned = 0",
-                    [],
-                )
-                .map_err(Error::SQLError)? as u64;
-
-            conn.execute(
-                "INSERT INTO staging_microblocks_data \
-                 SELECT s.* FROM src.staging_microblocks_data s \
-                 WHERE s.block_hash IN (SELECT hash FROM temp.selected_microblocks)",
-                [],
-            )
-            .map_err(Error::SQLError)?;
+            let results = execute_copy_specs(
+                conn,
+                &[
+                    TableCopySpec {
+                        table: "staging_microblocks",
+                        source_sql: "SELECT s.* FROM src.staging_microblocks s \
+                             WHERE s.microblock_hash IN (SELECT hash FROM temp.selected_microblocks) \
+                               AND s.index_block_hash IN (SELECT ibh FROM temp.selected_parents) \
+                               AND s.orphaned = 0"
+                            .into(),
+                    },
+                    TableCopySpec {
+                        table: "staging_microblocks_data",
+                        source_sql: "SELECT s.* FROM src.staging_microblocks_data s \
+                             WHERE s.block_hash IN (SELECT hash FROM temp.selected_microblocks)"
+                            .into(),
+                    },
+                ],
+            )?;
+            stats.microblock_rows_copied = copied_rows(&results, "staging_microblocks");
 
             stats.microblock_bytes_copied = conn
                 .query_row(
@@ -422,7 +424,6 @@ pub fn copy_epoch2_block_files(
 }
 
 /// Create and populate `nakamoto.sqlite` with canonical `nakamoto_staging_blocks` rows.
-/// The INSERT runs with `synchronous = OFF` and secondary indexes dropped + rebuilt.
 ///
 /// The retained set is bounded entirely by `squashed_index_path`: a non-orphan row is kept
 /// iff its `index_block_hash` is in that index's `nakamoto_block_headers`. This function has no
@@ -526,7 +527,7 @@ pub fn validate_microblock_streams(
             [],
             |row| row.get::<_, i64>(0),
         )
-        .unwrap_or(1)
+        .map_err(Error::SQLError)?
         == 0
         && conn
             .query_row(
@@ -535,7 +536,7 @@ pub fn validate_microblock_streams(
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .unwrap_or(1)
+            .map_err(Error::SQLError)?
             == 0;
 
     conn.execute_batch(
@@ -608,7 +609,7 @@ pub fn validate_nakamoto_staging_blocks(
             [],
             |row| row.get::<_, i64>(0),
         )
-        .unwrap_or(1)
+        .map_err(Error::SQLError)?
         == 0;
 
     let db_version_match = full_row_except_match(

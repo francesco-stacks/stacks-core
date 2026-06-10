@@ -24,13 +24,16 @@
 //!
 //! Detectable violations surface as `CorruptionError`s.
 
-pub(crate) mod blocks;
-pub(crate) mod burnchain;
+mod blocks;
+mod burnchain;
+mod clarity;
+// `pub(crate)` for the drift-guard helpers used by the clarity MARF tests
+// in `clarity_vm::database::tests`.
 pub(crate) mod common;
-pub(crate) mod fork_storage;
+mod fork_storage;
 mod index;
-pub(crate) mod sortition;
-pub(crate) mod spv;
+mod sortition;
+mod spv;
 
 #[cfg(test)]
 mod tests;
@@ -43,6 +46,10 @@ pub use blocks::{
 };
 pub use burnchain::{
     copy_burnchain_db, validate_burnchain_db, BurnchainDbCopyStats, BurnchainDbValidation,
+};
+pub use clarity::{
+    copy_clarity_side_tables, validate_clarity_side_tables, ClaritySideTableStats,
+    ClaritySideTableValidation,
 };
 pub use index::{
     copy_index_side_tables, validate_index_side_tables, IndexSideTableStats,

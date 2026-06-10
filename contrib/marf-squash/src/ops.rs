@@ -3,16 +3,14 @@ use std::path::Path;
 
 use stackslib::chainstate::stacks::db::snapshot::{
     IndexSideTableValidation, SortitionSideTableValidation, SortitionTipCopyBoundary,
-    copy_burnchain_db, copy_index_side_tables, copy_sortition_side_tables_with_boundary,
-    copy_spv_headers, validate_burnchain_db, validate_epoch2_block_files,
-    validate_index_side_tables, validate_microblock_streams, validate_nakamoto_staging_blocks,
+    copy_burnchain_db, copy_clarity_side_tables, copy_index_side_tables,
+    copy_sortition_side_tables_with_boundary, copy_spv_headers, validate_burnchain_db,
+    validate_clarity_side_tables, validate_epoch2_block_files, validate_index_side_tables,
+    validate_microblock_streams, validate_nakamoto_staging_blocks,
     validate_sortition_side_tables_with_boundary, validate_spv_headers,
 };
 use stackslib::chainstate::stacks::index::MarfTrieId;
 use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, SquashValidationStats};
-use stackslib::clarity_vm::database::snapshot::{
-    copy_clarity_side_tables, validate_clarity_side_tables,
-};
 
 use crate::cli::TargetPaths;
 use crate::util::{die_with_cleanup, ensure_blobs_match};

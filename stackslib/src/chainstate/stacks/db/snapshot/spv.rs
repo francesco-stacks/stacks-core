@@ -18,14 +18,15 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OpenFlags};
 
-use super::common::{clone_schemas_from_source, full_row_except_match, with_offline_write_session};
+use super::common::{
+    clone_schemas_from_source, copied_rows, execute_copy_specs, full_row_except_match,
+    with_offline_write_session, TableCopySpec,
+};
+use crate::burnchains::bitcoin::spv::BLOCK_DIFFICULTY_CHUNK_SIZE;
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all headers.sqlite versions.
 pub(crate) const REQUIRED_TABLES: &[&str] = &["headers", "db_config", "chain_work"];
-
-/// Bitcoin difficulty chunk size (2016 blocks per difficulty interval).
-const DIFFICULTY_CHUNK_SIZE: u32 = 2016;
 
 /// Row-count statistics returned by [`copy_spv_headers`].
 #[derive(Debug, Clone)]
@@ -73,34 +74,40 @@ pub fn copy_spv_headers(
     })
 }
 
+/// Build the copy specs for the SPV headers DB: `db_config` verbatim,
+/// `headers` up to `burn_height`, `chain_work` for complete difficulty
+/// intervals only.
+fn spv_copy_specs(burn_height: u32) -> Vec<TableCopySpec> {
+    vec![
+        TableCopySpec {
+            table: "db_config",
+            source_sql: "SELECT * FROM src.db_config".into(),
+        },
+        TableCopySpec {
+            table: "headers",
+            source_sql: format!("SELECT * FROM src.headers WHERE height <= {burn_height}"),
+        },
+        TableCopySpec {
+            table: "chain_work",
+            source_sql: format!(
+                "SELECT * FROM src.chain_work \
+                 WHERE (interval + 1) * {BLOCK_DIFFICULTY_CHUNK_SIZE} - 1 <= {burn_height}"
+            ),
+        },
+    ]
+}
+
 fn copy_spv_headers_inner(
     conn: &Connection,
     burn_height: u32,
 ) -> Result<SpvHeadersCopyStats, Error> {
     clone_schemas_from_source(conn, REQUIRED_TABLES)?;
 
-    conn.execute("INSERT INTO db_config SELECT * FROM src.db_config", [])
-        .map_err(Error::SQLError)?;
-
-    let headers_rows = conn
-        .execute(
-            "INSERT INTO headers SELECT * FROM src.headers WHERE height <= ?1",
-            params![burn_height],
-        )
-        .map_err(Error::SQLError)? as u64;
-
-    // Copy chain_work for complete intervals only.
-    let chain_work_rows = conn
-        .execute(
-            "INSERT INTO chain_work SELECT * FROM src.chain_work \
-             WHERE (interval + 1) * ?1 - 1 <= ?2",
-            params![DIFFICULTY_CHUNK_SIZE, burn_height],
-        )
-        .map_err(Error::SQLError)? as u64;
+    let results = execute_copy_specs(conn, &spv_copy_specs(burn_height))?;
 
     Ok(SpvHeadersCopyStats {
-        headers_rows,
-        chain_work_rows,
+        headers_rows: copied_rows(&results, "headers"),
+        chain_work_rows: copied_rows(&results, "chain_work"),
     })
 }
 
@@ -143,7 +150,7 @@ pub fn validate_spv_headers(
         "SELECT * FROM chain_work",
         &format!(
             "SELECT * FROM src.chain_work \
-                 WHERE (interval + 1) * {DIFFICULTY_CHUNK_SIZE} - 1 <= {burn_height}"
+                 WHERE (interval + 1) * {BLOCK_DIFFICULTY_CHUNK_SIZE} - 1 <= {burn_height}"
         ),
     )?;
 
@@ -154,7 +161,7 @@ pub fn validate_spv_headers(
             [],
             |row| row.get(0),
         )
-        .unwrap_or(1);
+        .map_err(Error::SQLError)?;
     let no_extra_headers = extra_above == 0;
 
     conn.execute_batch("DETACH DATABASE src")

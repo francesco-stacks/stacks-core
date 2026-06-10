@@ -742,6 +742,8 @@ fn test_no_unclassified_source_tables() {
     );
 }
 
+/// A transaction row injected for a block outside the canonical set
+/// must fail validation.
 #[test]
 fn test_validate_index_side_tables_detects_extra_rows() {
     let dir = tempdir().unwrap();
@@ -785,12 +787,12 @@ fn test_validate_index_side_tables_detects_extra_rows() {
     assert!(!validation.is_valid(), "validation must fail");
 }
 
+/// `signer_stats` is a non-consensus counter table: after the squash the
+/// source keeps incrementing `blocks_signed` for existing
+/// `(public_key, reward_cycle)` pairs. Validation only requires dst keys
+/// to be a subset of src keys, so drifted counters still pass.
 #[test]
 fn test_signer_stats_validates_with_source_drift() {
-    // signer_stats is a non-consensus counter table. After the squash, the
-    // source node continues running and increments blocks_signed for existing
-    // (public_key, reward_cycle) pairs. Validation should still pass because
-    // we only check that the destination keys are a subset of the source keys.
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src_index.sqlite");
     let conn = create_source_db(&src_path);
@@ -838,10 +840,17 @@ fn test_signer_stats_validates_with_source_drift() {
     );
 }
 
-#[test]
-fn test_signer_stats_detects_fabricated_keys() {
-    // If the destination has a (public_key, reward_cycle) pair that doesn't
-    // exist in the source at all, validation must fail.
+/// Destination tampering with `signer_stats` must fail validation: a
+/// fabricated `(public_key, reward_cycle)` key that does not exist in the
+/// source, or a counter inflated past the source's (`blocks_signed` only
+/// grows).
+#[rstest]
+#[case::fabricated_key(
+    "INSERT INTO signer_stats (public_key, reward_cycle, blocks_signed) \
+     VALUES ('pk_FAKE', 1, 99)"
+)]
+#[case::inflated_counter("UPDATE signer_stats SET blocks_signed = 999 WHERE public_key = 'pk1'")]
+fn test_signer_stats_detects_tampering(#[case] tamper_sql: &str) {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src_index.sqlite");
     let conn = create_source_db(&src_path);
@@ -865,16 +874,9 @@ fn test_signer_stats_detects_fabricated_keys() {
         copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
             .unwrap();
 
-    // Inject a fabricated signer key into the destination.
     {
         let dst_conn = Connection::open(&dst_path).unwrap();
-        dst_conn
-            .execute(
-                "INSERT INTO signer_stats (public_key, reward_cycle, blocks_signed) \
-                 VALUES ('pk_FAKE', 1, 99)",
-                [],
-            )
-            .unwrap();
+        dst_conn.execute(tamper_sql, []).unwrap();
     }
 
     let validation =
@@ -883,66 +885,17 @@ fn test_signer_stats_detects_fabricated_keys() {
 
     assert!(
         !validation.signer_stats_match,
-        "signer_stats should fail with fabricated key"
+        "signer_stats should fail after tampering"
     );
     assert!(!validation.is_valid());
 }
 
-#[test]
-fn test_signer_stats_detects_inflated_counters() {
-    // If the destination has blocks_signed > source for an existing key,
-    // validation must fail (the counter is monotonically increasing).
-    let dir = tempdir().unwrap();
-    let src_path = dir.path().join("src_index.sqlite");
-    let conn = create_source_db(&src_path);
-
-    insert_epoch2_block_header(&conn, 1, "1");
-    let tip_id = insert_nakamoto_header(&conn, "tip", 10);
-    conn.execute(
-        "INSERT INTO signer_stats (public_key, reward_cycle, blocks_signed) \
-         VALUES ('pk1', 1, 5)",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    let dst_path = dir.path().join("dst_index.sqlite");
-    let dst = create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
-    append_canonical_block(&dst, &tip_id.0);
-    drop(dst);
-
-    let _stats =
-        copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
-            .unwrap();
-
-    // Inflate the counter in the destination beyond the source value.
-    {
-        let dst_conn = Connection::open(&dst_path).unwrap();
-        dst_conn
-            .execute(
-                "UPDATE signer_stats SET blocks_signed = 999 WHERE public_key = 'pk1'",
-                [],
-            )
-            .unwrap();
-    }
-
-    let validation =
-        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
-            .unwrap();
-
-    assert!(
-        !validation.signer_stats_match,
-        "signer_stats should fail with inflated counter"
-    );
-    assert!(!validation.is_valid());
-}
-
+/// `matured_rewards` is a non-consensus cache: after the squash, new
+/// source blocks mature rewards of older canonical blocks, adding rows
+/// that match the canonical filter. Validation only checks
+/// dst ⊆ filtered-src, so source growth still passes.
 #[test]
 fn test_matured_rewards_validates_with_source_growth() {
-    // matured_rewards is a non-consensus cache. After the squash, new blocks
-    // on the source trigger maturation of rewards for older canonical blocks,
-    // adding rows that match the canonical filter. Validation should still
-    // pass because we only check dst ⊆ filtered-src.
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src_index.sqlite");
     let conn = create_source_db(&src_path);
@@ -996,10 +949,10 @@ fn test_matured_rewards_validates_with_source_growth() {
     );
 }
 
+/// A destination `matured_rewards` row absent from the filtered source
+/// must fail validation.
 #[test]
 fn test_matured_rewards_detects_fabricated_rows() {
-    // If the destination has a matured_rewards row not in the filtered source,
-    // validation must fail.
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src_index.sqlite");
     let conn = create_source_db(&src_path);
@@ -1042,12 +995,12 @@ fn test_matured_rewards_detects_fabricated_rows() {
     assert!(!validation.is_valid());
 }
 
+/// `staging_microblocks_data` is schema-cloned by the index copy but
+/// populated by the separate block-preservation phase. Index validation
+/// must NOT assert it empty, otherwise a `--blocks`/`--all` run that
+/// preserved microblocks would fail spuriously.
 #[test]
 fn test_index_validation_allows_populated_staging_microblocks() {
-    // `staging_microblocks_data` is schema-cloned by the index copy but
-    // populated by the separate block-preservation phase. Index validation must
-    // NOT assert it empty, otherwise a `--blocks`/`--all` run that preserved
-    // microblocks would fail validation spuriously.
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let conn = create_source_db(&src_path);
@@ -1081,6 +1034,8 @@ fn test_index_validation_allows_populated_staging_microblocks() {
     assert!(validation.is_valid(), "{validation:?}");
 }
 
+/// A corrupted `staging_blocks` column in the destination flips
+/// `staging_blocks_match` from passing to failing.
 #[test]
 fn test_staging_blocks_validation_detects_drift() {
     let dir = tempdir().unwrap();
@@ -1137,6 +1092,7 @@ use crate::chainstate::burn::db::sortdb::{
     SORTITION_DB_INITIAL_SCHEMA, SORTITION_DB_SCHEMA_10, SORTITION_DB_SCHEMA_11,
     SORTITION_DB_SCHEMA_2, SORTITION_DB_SCHEMA_3, SORTITION_DB_SCHEMA_4, SORTITION_DB_SCHEMA_5,
     SORTITION_DB_SCHEMA_6, SORTITION_DB_SCHEMA_7, SORTITION_DB_SCHEMA_8, SORTITION_DB_SCHEMA_9,
+    SORTITION_DB_VERSION,
 };
 
 /// Create a sortition source DB with the real schema (all migrations
@@ -1177,9 +1133,15 @@ fn create_sortition_source_db(path: &std::path::Path) -> Connection {
     for cmd in SORTITION_DB_SCHEMA_11 {
         conn.execute_batch(cmd).unwrap();
     }
+    // Sentinel: a new sortition schema bumps SORTITION_DB_VERSION; this
+    // fixture must then replay the new migration too.
+    assert_eq!(
+        SORTITION_DB_VERSION, 11,
+        "sortition schema changed: replay the new migration in this fixture"
+    );
     conn.execute(
-        "INSERT OR REPLACE INTO db_config (version) VALUES ('11')",
-        [],
+        "INSERT OR REPLACE INTO db_config (version) VALUES (?1)",
+        params![SORTITION_DB_VERSION.to_string()],
     )
     .unwrap();
     // Same reason as `create_source_db`: satisfy the strict
@@ -1198,8 +1160,9 @@ fn create_sortition_source_db(path: &std::path::Path) -> Connection {
 /// Insert a snapshot row for the given sortition_id and burn_header_hash labels.
 ///
 /// `sortition_id` is stored as its [`hex_id`] form so it joins against the
-/// canonical-sortitions temp table that `populate_canonical_sortitions`
-/// builds via `lower(hex(block_hash))` from `marf_squashed_blocks`.
+/// canonical-sortitions temp table, which `populate_canonical_sortitions`
+/// fills with the lowercase-hex ids read via
+/// `trie_sql::bulk_read_squashed_blocks`.
 fn insert_snapshot(
     conn: &Connection,
     sortition_id_label: &str,
@@ -1352,6 +1315,8 @@ fn sortition_test_tip_boundary(max_stacks_height: u64) -> SortitionTipCopyBounda
     }
 }
 
+/// Canonical and fork rows across every sortition_id-filtered table:
+/// only the canonical sortitions' rows are copied, and validation passes.
 #[test]
 fn test_sortition_copy_excludes_fork_data() {
     let dir = tempdir().unwrap();
@@ -1472,6 +1437,8 @@ fn test_sortition_copy_excludes_fork_data() {
     );
 }
 
+/// A corrupted non-key column in a copied `snapshots` row must fail
+/// validation (full-row compare, not count-only).
 #[test]
 fn test_sortition_validate_detects_payload_corruption() {
     let dir = tempdir().unwrap();
@@ -1509,6 +1476,8 @@ fn test_sortition_validate_detects_payload_corruption() {
     assert!(!validation.is_valid(), "validation must fail");
 }
 
+/// A `leader_keys` row injected into the destination with no source
+/// counterpart must fail validation.
 #[test]
 fn test_sortition_validate_detects_extra_rows() {
     let dir = tempdir().unwrap();
@@ -1548,10 +1517,10 @@ fn test_sortition_validate_detects_extra_rows() {
     assert!(!validation.is_valid(), "validation must fail");
 }
 
+/// burn_header_hash-keyed tables (`stack_stx`, `transfer_stx`, ...) must
+/// exclude rows associated with non-canonical burn hashes.
 #[test]
 fn test_sortition_burn_header_hash_filtering() {
-    // Verify that burn_header_hash-keyed tables (stack_stx, transfer_stx, etc.)
-    // correctly exclude rows associated with non-canonical burn hashes.
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src_sort.sqlite");
     let conn = create_sortition_source_db(&src_path);
@@ -1601,6 +1570,8 @@ fn test_sortition_burn_header_hash_filtering() {
     );
 }
 
+/// A destination claiming a canonical sortition_id absent from
+/// `src.snapshots` is corruption: the copy must abort.
 #[test]
 fn test_sortition_copy_rejects_fabricated_canonical_set() {
     let dir = tempdir().unwrap();
@@ -1626,6 +1597,8 @@ fn test_sortition_copy_rejects_fabricated_canonical_set() {
     }
 }
 
+/// `stacks_chain_tips_by_burn_view` (schema 11) rows for canonical
+/// sortitions are copied and reported in the stats.
 #[test]
 fn test_sortition_stacks_chain_tips_by_burn_view_copied() {
     let dir = tempdir().unwrap();
@@ -1689,6 +1662,9 @@ fn test_sortition_stacks_chain_tips_by_burn_view_copied() {
     );
 }
 
+/// Sortition tip memo rows pointing above the Stacks boundary are
+/// rewritten down to the anchor in both memo tables, and boundary
+/// validation accepts the result.
 #[test]
 fn test_sortition_tip_copy_rewrites_rows_above_stacks_boundary() {
     let dir = tempdir().unwrap();
@@ -1781,6 +1757,8 @@ fn test_sortition_tip_copy_rewrites_rows_above_stacks_boundary() {
     );
 }
 
+/// A copy without the boundary rewrite leaves tips above the Stacks
+/// boundary; boundary validation must reject them.
 #[test]
 fn test_sortition_validation_rejects_tip_above_stacks_boundary() {
     let dir = tempdir().unwrap();
@@ -1837,6 +1815,9 @@ fn test_sortition_validation_rejects_tip_above_stacks_boundary() {
 // Block preservation tests
 // -----------------------------------------------------------------------
 
+/// End-to-end epoch-2 block file copy: genesis is skipped, the height-1
+/// file lands byte-identical at its hashed relative path, and validation
+/// passes.
 #[test]
 fn test_epoch2_block_file_copy_and_validate() {
     let dir = tempdir().unwrap();
@@ -1898,6 +1879,8 @@ fn test_epoch2_block_file_copy_and_validate() {
     assert!(v.is_valid(), "validation should pass: {v:?}");
 }
 
+/// A canonical block whose flat file is missing from the source archive
+/// is corruption: the copy must abort.
 #[test]
 fn test_epoch2_block_file_missing_source_is_error() {
     let dir = tempdir().unwrap();
@@ -1939,6 +1922,8 @@ fn test_epoch2_block_file_missing_source_is_error() {
     }
 }
 
+/// Drift guard: every table the sortition migrations create must be
+/// classified, so a future migration can't silently drop one from the copy.
 #[test]
 fn test_no_unclassified_sortition_tables() {
     let dir = tempdir().unwrap();
@@ -1956,6 +1941,8 @@ fn test_no_unclassified_sortition_tables() {
     );
 }
 
+/// Drift guard: every table the burnchain migrations create must be
+/// classified, so a future migration can't silently drop one from the copy.
 #[test]
 fn test_no_unclassified_burnchain_tables() {
     let dir = tempdir().unwrap();
@@ -1973,6 +1960,8 @@ fn test_no_unclassified_burnchain_tables() {
     );
 }
 
+/// Drift guard: every table the SPV migrations create must be
+/// classified, so a future migration can't silently drop one from the copy.
 #[test]
 fn test_no_unclassified_spv_tables() {
     let dir = tempdir().unwrap();
@@ -1989,6 +1978,9 @@ fn test_no_unclassified_spv_tables() {
     );
 }
 
+/// Drift guard: every table the Nakamoto staging migrations create must
+/// be classified, so a future migration can't silently drop one from the
+/// copy.
 #[test]
 fn test_no_unclassified_nakamoto_staging_tables() {
     let dir = tempdir().unwrap();
@@ -2185,6 +2177,9 @@ fn insert_nakamoto_staging_block(
     .unwrap();
 }
 
+/// A confirmed 2-microblock stream referenced by a canonical child block
+/// is copied in full; an orphaned microblock of the same parent is left
+/// behind, and validation passes.
 #[test]
 fn test_microblock_stream_copy_and_validate() {
     let dir = tempdir().unwrap();
@@ -2341,6 +2336,8 @@ fn test_microblock_stream_copy_and_validate() {
     assert!(v.is_valid(), "microblock validation should pass: {v:?}");
 }
 
+/// A stream whose microblocks are unprocessed cannot be confirmed: it is
+/// skipped with a warning, not an error.
 #[test]
 fn test_microblock_stream_unprocessed_skipped() {
     let dir = tempdir().unwrap();
@@ -2419,6 +2416,9 @@ fn test_microblock_stream_unprocessed_skipped() {
     assert_eq!(stats.microblock_rows_copied, 0);
 }
 
+/// Canonical staging rows are copied with data blobs, `obtain_method`,
+/// and `db_version` preserved; a row not in the squashed index headers is
+/// dropped, and validation passes.
 #[test]
 fn test_nakamoto_copy_and_validate() {
     let dir = tempdir().unwrap();
@@ -2532,11 +2532,12 @@ fn test_nakamoto_copy_and_validate() {
     assert!(v.schema_match, "schema should match");
 }
 
+/// The squash boundary lives entirely in the squashed index: a staging
+/// row is retained iff its index_block_hash is in
+/// idx.nakamoto_block_headers (<=H). A block above H, or an in-index but
+/// orphaned block, must be neither copied nor accepted by validation.
 #[test]
 fn test_nakamoto_copy_excludes_post_boundary_blocks() {
-    // The squash boundary lives entirely in the squashed index: a staging row is
-    // retained iff its index_block_hash is in idx.nakamoto_block_headers (<=H). A
-    // block above H must be neither copied nor accepted by validation.
     let dir = tempdir().unwrap();
     let src_nak_path = dir.path().join("src_nakamoto.sqlite");
     let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
@@ -2666,8 +2667,21 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
     );
 }
 
-#[test]
-fn test_nakamoto_validate_detects_db_version_drift() {
+/// Destination drift after the copy must fail validation: a tampered
+/// `db_version`, or an extra index breaking the `sqlite_master` schema
+/// comparison.
+#[rstest]
+#[case::db_version_drift("UPDATE db_version SET version = 99", false, true)]
+#[case::schema_drift(
+    "CREATE INDEX extra_idx ON nakamoto_staging_blocks(height)",
+    true,
+    false
+)]
+fn test_nakamoto_validate_detects_drift(
+    #[case] tamper_sql: &str,
+    #[case] expected_db_version_match: bool,
+    #[case] expected_schema_match: bool,
+) {
     let dir = tempdir().unwrap();
     let src_nak_path = dir.path().join("src_nakamoto.sqlite");
     let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
@@ -2691,7 +2705,6 @@ fn test_nakamoto_validate_detects_db_version_drift() {
         .unwrap();
     drop(idx_conn);
 
-    // Copy first.
     super::blocks::copy_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
@@ -2699,75 +2712,23 @@ fn test_nakamoto_validate_detects_db_version_drift() {
     )
     .unwrap();
 
-    // Tamper with destination db_version.
     let dst_conn = Connection::open(&dst_nak_path).unwrap();
-    dst_conn
-        .execute("UPDATE db_version SET version = 99", [])
-        .unwrap();
+    dst_conn.execute_batch(tamper_sql).unwrap();
     drop(dst_conn);
 
-    // Validate - should detect drift.
     let v = super::blocks::validate_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
     )
     .unwrap();
-    assert!(!v.db_version_match, "should detect db_version drift");
+    assert_eq!(v.db_version_match, expected_db_version_match);
+    assert_eq!(v.schema_match, expected_schema_match);
     assert!(!v.is_valid(), "overall validation should fail");
 }
 
-#[test]
-fn test_nakamoto_validate_detects_schema_drift() {
-    let dir = tempdir().unwrap();
-    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
-    let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
-    let idx_path = dir.path().join("squashed_index.sqlite");
-
-    let src_conn = create_source_nakamoto_db(&src_nak_path);
-    insert_nakamoto_staging_block(
-        &src_conn, "bh1", "ch1", "p1", 100, "ibh1", "Fetched", b"data1",
-    );
-    drop(src_conn);
-
-    let idx_conn = Connection::open(&idx_path).unwrap();
-    idx_conn
-        .execute_batch(
-            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY)",
-        )
-        .unwrap();
-    idx_conn
-        .execute("INSERT INTO nakamoto_block_headers VALUES ('ibh1')", [])
-        .unwrap();
-    drop(idx_conn);
-
-    super::blocks::copy_nakamoto_staging_blocks(
-        src_nak_path.to_str().unwrap(),
-        dst_nak_path.to_str().unwrap(),
-        idx_path.to_str().unwrap(),
-    )
-    .unwrap();
-
-    // Add an extra index to destination to cause schema drift.
-    let dst_conn = Connection::open(&dst_nak_path).unwrap();
-    dst_conn
-        .execute_batch("CREATE INDEX extra_idx ON nakamoto_staging_blocks(height)")
-        .unwrap();
-    drop(dst_conn);
-
-    let v = super::blocks::validate_nakamoto_staging_blocks(
-        src_nak_path.to_str().unwrap(),
-        dst_nak_path.to_str().unwrap(),
-        idx_path.to_str().unwrap(),
-    )
-    .unwrap();
-    assert!(
-        !v.schema_match,
-        "should detect schema drift from extra index"
-    );
-    assert!(!v.is_valid());
-}
-
+/// `nakamoto.sqlite` and its journal sidecars live in the blocks dir but
+/// are not epoch-2 files: the extra-file walk must ignore them.
 #[test]
 fn test_epoch2_file_validation_ignores_nakamoto_sqlite() {
     let dir = tempdir().unwrap();
@@ -2897,6 +2858,8 @@ fn create_spv_headers_db(path: &std::path::Path) -> Connection {
     conn
 }
 
+/// End-to-end burnchain copy: canonical headers, ops, and commit
+/// metadata are copied, fork rows are dropped, and validation passes.
 #[test]
 fn test_burnchain_db_copy_and_validate() {
     let dir = tempdir().unwrap();
@@ -2972,6 +2935,8 @@ fn test_burnchain_db_copy_and_validate() {
     assert!(v.is_valid(), "validation failed: {v:?}");
 }
 
+/// Two headers at the same height: only the one whose hash is in the
+/// squashed sortition snapshots is copied.
 #[test]
 fn test_burnchain_db_excludes_non_canonical_fork() {
     let dir = tempdir().unwrap();
@@ -3022,6 +2987,8 @@ fn test_burnchain_db_excludes_non_canonical_fork() {
     assert_eq!(count, 0);
 }
 
+/// Block ops follow their header's canonicality: ops of a fork header
+/// are dropped.
 #[test]
 fn test_burnchain_db_block_ops_follow_canonical_headers() {
     let dir = tempdir().unwrap();
@@ -3071,6 +3038,8 @@ fn test_burnchain_db_block_ops_follow_canonical_headers() {
     assert_eq!(op, "op_c");
 }
 
+/// `anchor_blocks` and `overrides` are restricted to reward cycles
+/// referenced by the copied commit metadata.
 #[test]
 fn test_burnchain_db_anchor_blocks_filtered() {
     let dir = tempdir().unwrap();
@@ -3133,6 +3102,8 @@ fn test_burnchain_db_anchor_blocks_filtered() {
     assert_eq!(override_map, "map_1");
 }
 
+/// A non-canonical header injected into the destination must fail
+/// validation (`no_extra_headers`).
 #[test]
 fn test_burnchain_db_validate_detects_non_canonical_leak() {
     let dir = tempdir().unwrap();
@@ -3179,6 +3150,7 @@ fn test_burnchain_db_validate_detects_non_canonical_leak() {
     assert!(!v.no_extra_headers);
 }
 
+/// A missing source burnchain.sqlite is an error.
 #[test]
 fn test_burnchain_db_missing_source_is_error() {
     let dir = tempdir().unwrap();
@@ -3198,6 +3170,8 @@ fn test_burnchain_db_missing_source_is_error() {
     assert!(result.is_err());
 }
 
+/// A sortition tip height that disagrees with the caller's expected burn
+/// height is corruption: the copy must abort.
 #[test]
 fn test_burnchain_db_sortition_tip_mismatch_is_error() {
     let dir = tempdir().unwrap();
@@ -3226,6 +3200,7 @@ fn test_burnchain_db_sortition_tip_mismatch_is_error() {
     assert!(result.is_err(), "should fail on sortition tip mismatch");
 }
 
+/// The copy creates missing parent directories for the destination path.
 #[test]
 fn test_burnchain_db_fresh_output_dir() {
     let dir = tempdir().unwrap();
@@ -3264,6 +3239,8 @@ fn test_burnchain_db_fresh_output_dir() {
 // Burnchain auxiliary: headers.sqlite (SPV) tests
 // -----------------------------------------------------------------------
 
+/// Headers are copied up to the burn height and `chain_work` only for
+/// complete 2016-block intervals; validation passes.
 #[test]
 fn test_spv_headers_copy_and_validate() {
     let dir = tempdir().unwrap();
@@ -3308,154 +3285,55 @@ fn test_spv_headers_copy_and_validate() {
     assert!(v.is_valid(), "validation failed: {v:?}");
 }
 
-#[test]
-fn test_spv_headers_chain_work_boundary_0() {
+/// Chain-work interval boundary cases: interval `k` is copied iff it is
+/// complete at the squash height, i.e. `(k + 1) * 2016 - 1 <= burn_height`.
+/// Headers are always copied through `burn_height` inclusive; the source
+/// holds one more `chain_work` interval than the expected copy where
+/// possible, so each case proves the cutoff.
+#[rstest]
+#[case::below_first_interval_end(0, 1, 0)]
+#[case::exactly_first_interval_end(2015, 2, 1)]
+#[case::one_past_first_interval_end(2016, 2, 1)]
+#[case::exactly_second_interval_end(4031, 3, 2)]
+#[case::one_past_second_interval_end(4032, 3, 2)]
+fn test_spv_headers_chain_work_boundaries(
+    #[case] burn_height: u32,
+    #[case] src_chain_work_intervals: u32,
+    #[case] expected_chain_work_rows: u64,
+) {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
 
     let src = create_spv_headers_db(&src_path);
-    src.execute(
-        "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, 0, 'h0')",
-        [],
+    for h in 0..=burn_height {
+        src.execute(
+            "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
+            params![h, format!("h{h}")],
+        )
+        .unwrap();
+    }
+    for interval in 0..src_chain_work_intervals {
+        src.execute(
+            "INSERT INTO chain_work VALUES (?1, ?2)",
+            params![interval, format!("w{interval}")],
+        )
+        .unwrap();
+    }
+    drop(src);
+
+    let stats = super::spv::copy_spv_headers(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        burn_height,
     )
     .unwrap();
-    src.execute("INSERT INTO chain_work VALUES (0, 'w0')", [])
-        .unwrap();
-    drop(src);
 
-    let stats =
-        super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0)
-            .unwrap();
-
-    assert_eq!(stats.headers_rows, 1);
-    // (0+1)*2016-1 = 2015 > 0 -> no intervals included.
-    assert_eq!(stats.chain_work_rows, 0);
+    assert_eq!(stats.headers_rows, u64::from(burn_height) + 1);
+    assert_eq!(stats.chain_work_rows, expected_chain_work_rows);
 }
 
-#[test]
-fn test_spv_headers_chain_work_boundary_2015() {
-    let dir = tempdir().unwrap();
-    let src_path = dir.path().join("src.sqlite");
-    let dst_path = dir.path().join("dst.sqlite");
-
-    let src = create_spv_headers_db(&src_path);
-    for h in 0..=2015u32 {
-        src.execute(
-            "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
-            params![h, format!("h{h}")],
-        )
-        .unwrap();
-    }
-    src.execute("INSERT INTO chain_work VALUES (0, 'w0')", [])
-        .unwrap();
-    src.execute("INSERT INTO chain_work VALUES (1, 'w1')", [])
-        .unwrap();
-    drop(src);
-
-    let stats =
-        super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 2015)
-            .unwrap();
-
-    assert_eq!(stats.headers_rows, 2016);
-    // (0+1)*2016-1 = 2015 <= 2015 ✓ -> 1 interval.
-    assert_eq!(stats.chain_work_rows, 1);
-}
-
-#[test]
-fn test_spv_headers_chain_work_boundary_2016() {
-    let dir = tempdir().unwrap();
-    let src_path = dir.path().join("src.sqlite");
-    let dst_path = dir.path().join("dst.sqlite");
-
-    let src = create_spv_headers_db(&src_path);
-    for h in 0..=2016u32 {
-        src.execute(
-            "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
-            params![h, format!("h{h}")],
-        )
-        .unwrap();
-    }
-    src.execute("INSERT INTO chain_work VALUES (0, 'w0')", [])
-        .unwrap();
-    src.execute("INSERT INTO chain_work VALUES (1, 'w1')", [])
-        .unwrap();
-    drop(src);
-
-    let stats =
-        super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 2016)
-            .unwrap();
-
-    assert_eq!(stats.headers_rows, 2017);
-    // (0+1)*2016-1 = 2015 <= 2016 ✓
-    // (1+1)*2016-1 = 4031 <= 2016 ✗
-    assert_eq!(stats.chain_work_rows, 1);
-}
-
-#[test]
-fn test_spv_headers_chain_work_boundary_4031() {
-    let dir = tempdir().unwrap();
-    let src_path = dir.path().join("src.sqlite");
-    let dst_path = dir.path().join("dst.sqlite");
-
-    let src = create_spv_headers_db(&src_path);
-    for h in 0..=4031u32 {
-        src.execute(
-            "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
-            params![h, format!("h{h}")],
-        )
-        .unwrap();
-    }
-    src.execute("INSERT INTO chain_work VALUES (0, 'w0')", [])
-        .unwrap();
-    src.execute("INSERT INTO chain_work VALUES (1, 'w1')", [])
-        .unwrap();
-    src.execute("INSERT INTO chain_work VALUES (2, 'w2')", [])
-        .unwrap();
-    drop(src);
-
-    let stats =
-        super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 4031)
-            .unwrap();
-
-    assert_eq!(stats.headers_rows, 4032);
-    // (0+1)*2016-1 = 2015 <= 4031 ✓
-    // (1+1)*2016-1 = 4031 <= 4031 ✓
-    // (2+1)*2016-1 = 6047 <= 4031 ✗
-    assert_eq!(stats.chain_work_rows, 2);
-}
-
-#[test]
-fn test_spv_headers_chain_work_boundary_4032() {
-    let dir = tempdir().unwrap();
-    let src_path = dir.path().join("src.sqlite");
-    let dst_path = dir.path().join("dst.sqlite");
-
-    let src = create_spv_headers_db(&src_path);
-    for h in 0..=4032u32 {
-        src.execute(
-            "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
-            params![h, format!("h{h}")],
-        )
-        .unwrap();
-    }
-    src.execute("INSERT INTO chain_work VALUES (0, 'w0')", [])
-        .unwrap();
-    src.execute("INSERT INTO chain_work VALUES (1, 'w1')", [])
-        .unwrap();
-    src.execute("INSERT INTO chain_work VALUES (2, 'w2')", [])
-        .unwrap();
-    drop(src);
-
-    let stats =
-        super::spv::copy_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 4032)
-            .unwrap();
-
-    assert_eq!(stats.headers_rows, 4033);
-    // (2+1)*2016-1 = 6047 <= 4032 ✗ -> still only 2 intervals.
-    assert_eq!(stats.chain_work_rows, 2);
-}
-
+/// A missing source headers.sqlite is an error.
 #[test]
 fn test_spv_headers_missing_source_is_error() {
     let dir = tempdir().unwrap();
@@ -3467,6 +3345,7 @@ fn test_spv_headers_missing_source_is_error() {
     assert!(result.is_err(), "missing source should error");
 }
 
+/// Validating a missing destination is an error.
 #[test]
 fn test_spv_headers_validate_source_present_dest_missing_fails() {
     let dir = tempdir().unwrap();
@@ -3483,6 +3362,7 @@ fn test_spv_headers_validate_source_present_dest_missing_fails() {
     assert!(result.is_err());
 }
 
+/// Validating with both source and destination missing is an error.
 #[test]
 fn test_spv_headers_validate_both_absent_is_error() {
     let dir = tempdir().unwrap();
@@ -3497,6 +3377,8 @@ fn test_spv_headers_validate_both_absent_is_error() {
     assert!(result.is_err(), "both absent should error");
 }
 
+/// A canonical burn hash absent from the source headers is corruption:
+/// the copy must abort.
 #[test]
 fn test_burnchain_db_copy_fails_when_source_missing_canonical_hash() {
     let dir = tempdir().unwrap();
@@ -3533,6 +3415,8 @@ fn test_burnchain_db_copy_fails_when_source_missing_canonical_hash() {
     );
 }
 
+/// A canonical header deleted from the destination must fail validation
+/// (`canonical_complete`).
 #[test]
 fn test_burnchain_db_validate_detects_missing_canonical_hash() {
     let dir = tempdir().unwrap();
@@ -3584,6 +3468,8 @@ fn test_burnchain_db_validate_detects_missing_canonical_hash() {
     assert!(!v.canonical_complete);
 }
 
+/// A stale destination file must not mask a missing source: the copy
+/// still errors.
 #[test]
 fn test_spv_headers_stale_destination_errors_when_source_absent() {
     let dir = tempdir().unwrap();
@@ -3602,6 +3488,8 @@ fn test_spv_headers_stale_destination_errors_when_source_absent() {
     );
 }
 
+/// The read-only ATTACH of a missing source must not create the file as
+/// a side effect.
 #[test]
 fn test_burnchain_db_missing_source_does_not_create_file() {
     let dir = tempdir().unwrap();

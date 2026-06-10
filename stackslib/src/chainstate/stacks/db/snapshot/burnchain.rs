@@ -18,7 +18,10 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OpenFlags};
 
-use super::common::{clone_schemas_from_source, full_row_except_match, with_offline_write_session};
+use super::common::{
+    clone_schemas_from_source, copied_rows, execute_copy_specs, full_row_except_match,
+    with_offline_write_session, TableCopySpec,
+};
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all burnchain.sqlite versions.
@@ -124,15 +127,58 @@ pub fn copy_burnchain_db(
     )
 }
 
+/// Build the copy specs for the burnchain DB, in dependency order:
+/// canonical headers and ops (burn-hash filtered), commit metadata,
+/// `anchor_blocks` derived from the copied commit metadata, and `overrides`
+/// derived from the copied anchor blocks.
+fn burnchain_copy_specs() -> Vec<TableCopySpec> {
+    let bhh = "SELECT burn_header_hash FROM canonical_burn_hashes";
+    vec![
+        TableCopySpec {
+            table: "db_config",
+            source_sql: "SELECT * FROM src.db_config".into(),
+        },
+        TableCopySpec {
+            table: "burnchain_db_block_headers",
+            source_sql: format!(
+                "SELECT * FROM src.burnchain_db_block_headers WHERE block_hash IN ({bhh})"
+            ),
+        },
+        TableCopySpec {
+            table: "burnchain_db_block_ops",
+            source_sql: format!(
+                "SELECT * FROM src.burnchain_db_block_ops WHERE block_hash IN ({bhh})"
+            ),
+        },
+        TableCopySpec {
+            table: "block_commit_metadata",
+            source_sql: format!(
+                "SELECT * FROM src.block_commit_metadata WHERE burn_block_hash IN ({bhh})"
+            ),
+        },
+        TableCopySpec {
+            table: "anchor_blocks",
+            source_sql: "SELECT * FROM src.anchor_blocks \
+                 WHERE reward_cycle IN ( \
+                     SELECT DISTINCT anchor_block FROM block_commit_metadata \
+                     WHERE anchor_block IS NOT NULL \
+                 )"
+            .into(),
+        },
+        TableCopySpec {
+            table: "overrides",
+            source_sql: "SELECT * FROM src.overrides \
+                 WHERE reward_cycle IN (SELECT reward_cycle FROM anchor_blocks)"
+                .into(),
+        },
+    ]
+}
+
 fn copy_burnchain_db_inner(
     conn: &Connection,
     expected_burn_height: u32,
 ) -> Result<BurnchainDbCopyStats, Error> {
     clone_schemas_from_source(conn, REQUIRED_TABLES)?;
-
-    // Copy db_config verbatim.
-    conn.execute("INSERT INTO db_config SELECT * FROM src.db_config", [])
-        .map_err(Error::SQLError)?;
 
     // Build canonical burn hash set from squashed sortition DB.
     populate_canonical_burn_hashes(conn)?;
@@ -167,65 +213,14 @@ fn copy_burnchain_db_inner(
         )));
     }
 
-    // Dependency-ordered copy:
-    // 1. Canonical headers and ops
-    let block_headers_rows = conn
-        .execute(
-            "INSERT INTO burnchain_db_block_headers \
-             SELECT * FROM src.burnchain_db_block_headers \
-             WHERE block_hash IN (SELECT burn_header_hash FROM canonical_burn_hashes)",
-            [],
-        )
-        .map_err(Error::SQLError)? as u64;
-
-    let block_ops_rows = conn
-        .execute(
-            "INSERT INTO burnchain_db_block_ops \
-             SELECT * FROM src.burnchain_db_block_ops \
-             WHERE block_hash IN (SELECT burn_header_hash FROM canonical_burn_hashes)",
-            [],
-        )
-        .map_err(Error::SQLError)? as u64;
-
-    // 2. Canonical block_commit_metadata
-    let block_commit_metadata_rows = conn
-        .execute(
-            "INSERT INTO block_commit_metadata \
-             SELECT * FROM src.block_commit_metadata \
-             WHERE burn_block_hash IN (SELECT burn_header_hash FROM canonical_burn_hashes)",
-            [],
-        )
-        .map_err(Error::SQLError)? as u64;
-
-    // 3. anchor_blocks derived from copied commit metadata
-    let anchor_blocks_rows = conn
-        .execute(
-            "INSERT INTO anchor_blocks \
-             SELECT * FROM src.anchor_blocks \
-             WHERE reward_cycle IN ( \
-                 SELECT DISTINCT anchor_block FROM block_commit_metadata \
-                 WHERE anchor_block IS NOT NULL \
-             )",
-            [],
-        )
-        .map_err(Error::SQLError)? as u64;
-
-    // 4. overrides derived from copied anchor blocks
-    let overrides_rows = conn
-        .execute(
-            "INSERT INTO overrides \
-             SELECT * FROM src.overrides \
-             WHERE reward_cycle IN (SELECT reward_cycle FROM anchor_blocks)",
-            [],
-        )
-        .map_err(Error::SQLError)? as u64;
+    let results = execute_copy_specs(conn, &burnchain_copy_specs())?;
 
     Ok(BurnchainDbCopyStats {
-        block_headers_rows,
-        block_ops_rows,
-        block_commit_metadata_rows,
-        anchor_blocks_rows,
-        overrides_rows,
+        block_headers_rows: copied_rows(&results, "burnchain_db_block_headers"),
+        block_ops_rows: copied_rows(&results, "burnchain_db_block_ops"),
+        block_commit_metadata_rows: copied_rows(&results, "block_commit_metadata"),
+        anchor_blocks_rows: copied_rows(&results, "anchor_blocks"),
+        overrides_rows: copied_rows(&results, "overrides"),
     })
 }
 
@@ -272,7 +267,7 @@ pub fn validate_burnchain_db(
             [],
             |row| row.get(0),
         )
-        .unwrap_or(1);
+        .map_err(Error::SQLError)?;
     let canonical_complete = missing_in_dst == 0;
 
     let bhh = "SELECT burn_header_hash FROM canonical_burn_hashes";
@@ -328,7 +323,7 @@ pub fn validate_burnchain_db(
             [],
             |row| row.get(0),
         )
-        .unwrap_or(1);
+        .map_err(Error::SQLError)?;
     let no_extra_headers = extra_non_canonical == 0;
 
     conn.execute_batch("DETACH DATABASE sort")

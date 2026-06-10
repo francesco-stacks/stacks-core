@@ -19,7 +19,7 @@ use rusqlite::{params, Connection};
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, SortitionId};
 
 use super::common::{
-    clone_schemas_from_source, execute_copy_specs, full_row_except_match,
+    clone_schemas_from_source, copied_rows, execute_copy_specs, full_row_except_match,
     with_offline_write_session, TableCopySpec,
 };
 use super::fork_storage::{collect_canonical_leaf_hashes, copy_canonical_fork_storage};
@@ -497,31 +497,25 @@ fn copy_sortition_tables_inner(
     conn.execute_batch("DROP TABLE IF EXISTS canonical_burn_hashes")
         .map_err(Error::SQLError)?;
 
-    // Map results to stats struct by table name.
-    let get = |name: &str| -> u64 {
-        results
-            .iter()
-            .find(|(t, _)| *t == name)
-            .map(|(_, r)| *r)
-            .unwrap_or_else(|| panic!("BUG: no copy-spec result for `{name}`"))
-    };
-
     Ok(SortitionSideTableStats {
-        snapshots_rows: get("snapshots"),
-        leader_keys_rows: get("leader_keys"),
-        block_commits_rows: get("block_commits"),
-        block_commit_parents_rows: get("block_commit_parents"),
-        snapshot_transition_ops_rows: get("snapshot_transition_ops"),
-        stacks_chain_tips_rows: get("stacks_chain_tips"),
-        stacks_chain_tips_by_burn_view_rows: get("stacks_chain_tips_by_burn_view"),
-        preprocessed_reward_sets_rows: get("preprocessed_reward_sets"),
-        missed_commits_rows: get("missed_commits"),
-        stack_stx_rows: get("stack_stx"),
-        transfer_stx_rows: get("transfer_stx"),
-        delegate_stx_rows: get("delegate_stx"),
-        vote_for_aggregate_key_rows: get("vote_for_aggregate_key"),
-        epochs_rows: get("epochs"),
-        db_config_rows: get("db_config"),
+        snapshots_rows: copied_rows(&results, "snapshots"),
+        leader_keys_rows: copied_rows(&results, "leader_keys"),
+        block_commits_rows: copied_rows(&results, "block_commits"),
+        block_commit_parents_rows: copied_rows(&results, "block_commit_parents"),
+        snapshot_transition_ops_rows: copied_rows(&results, "snapshot_transition_ops"),
+        stacks_chain_tips_rows: copied_rows(&results, "stacks_chain_tips"),
+        stacks_chain_tips_by_burn_view_rows: copied_rows(
+            &results,
+            "stacks_chain_tips_by_burn_view",
+        ),
+        preprocessed_reward_sets_rows: copied_rows(&results, "preprocessed_reward_sets"),
+        missed_commits_rows: copied_rows(&results, "missed_commits"),
+        stack_stx_rows: copied_rows(&results, "stack_stx"),
+        transfer_stx_rows: copied_rows(&results, "transfer_stx"),
+        delegate_stx_rows: copied_rows(&results, "delegate_stx"),
+        vote_for_aggregate_key_rows: copied_rows(&results, "vote_for_aggregate_key"),
+        epochs_rows: copied_rows(&results, "epochs"),
+        db_config_rows: copied_rows(&results, "db_config"),
         fork_storage_rows,
     })
 }
