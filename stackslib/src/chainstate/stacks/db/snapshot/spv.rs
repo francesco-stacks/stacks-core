@@ -26,7 +26,7 @@ use crate::burnchains::bitcoin::spv::BLOCK_DIFFICULTY_CHUNK_SIZE;
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all headers.sqlite versions.
-pub(crate) const REQUIRED_TABLES: &[&str] = &["headers", "db_config", "chain_work"];
+pub(super) const REQUIRED_TABLES: &[&str] = &["headers", "db_config", "chain_work"];
 
 /// Row-count statistics returned by [`copy_spv_headers`].
 #[derive(Debug, Clone)]

@@ -30,7 +30,7 @@ use crate::util_lib::db::table_exists;
 
 /// Tables copied (with canonical-filtered content) into the squashed index
 /// DB and validated row-for-row against the source.
-pub(crate) const COPIED_TABLES: &[&str] = &[
+pub(super) const COPIED_TABLES: &[&str] = &[
     "db_config",
     "block_headers",
     "nakamoto_block_headers",
@@ -49,7 +49,7 @@ pub(crate) const COPIED_TABLES: &[&str] = &[
 /// populate itself. `staging_microblocks`/`staging_microblocks_data` are filled
 /// in later by the block-preservation phase; the other two stay empty. Cloning
 /// their schema prevents missing-table crashes if any code path references them.
-pub(crate) const SCHEMA_ONLY_TABLES: &[&str] = &[
+pub(super) const SCHEMA_ONLY_TABLES: &[&str] = &[
     "staging_microblocks",
     "staging_microblocks_data",
     "invalidated_microblocks_data", // Only written when orphaning epoch 2.x blocks

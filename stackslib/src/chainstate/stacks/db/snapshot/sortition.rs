@@ -27,7 +27,7 @@ use crate::chainstate::stacks::index::{trie_sql, Error, MARFValue};
 use crate::util_lib::db::u64_to_sql;
 
 /// Required sortition tables always present in production.
-pub(crate) const REQUIRED_TABLES: &[&str] = &[
+pub(super) const REQUIRED_TABLES: &[&str] = &[
     "db_config",
     "snapshots",
     "leader_keys",

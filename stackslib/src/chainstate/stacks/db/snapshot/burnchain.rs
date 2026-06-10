@@ -25,7 +25,7 @@ use super::common::{
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all burnchain.sqlite versions.
-pub(crate) const REQUIRED_TABLES: &[&str] = &[
+pub(super) const REQUIRED_TABLES: &[&str] = &[
     "burnchain_db_block_headers",
     "burnchain_db_block_ops",
     "block_commit_metadata",

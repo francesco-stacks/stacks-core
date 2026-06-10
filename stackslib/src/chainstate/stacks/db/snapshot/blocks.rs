@@ -106,7 +106,7 @@ impl Epoch2BlockFileValidation {
 /// Tables copied from the source Nakamoto staging-blocks DB. The index-side
 /// staging tables (`staging_microblocks*`) come from the index DB and are
 /// classified in `index.rs`.
-pub(crate) const NAKAMOTO_STAGING_TABLES: &[&str] = &["nakamoto_staging_blocks", "db_version"];
+pub(super) const NAKAMOTO_STAGING_TABLES: &[&str] = &["nakamoto_staging_blocks", "db_version"];
 
 const NAKAMOTO_STAGING_BLOCK_COLUMNS: &str = "\
     block_hash, consensus_hash, parent_block_id, is_tenure_start, \

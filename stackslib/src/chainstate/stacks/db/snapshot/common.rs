@@ -150,10 +150,7 @@ pub fn copied_rows(results: &[(&'static str, u64)], table: &str) -> u64 {
 /// CREATE statement so the caller can drop and later rebuild them.
 /// Excludes `sqlite_autoindex_*` (those have `sql IS NULL` and are
 /// recreated implicitly with the table).
-pub(crate) fn collect_user_indexes(
-    conn: &Connection,
-    table: &str,
-) -> Result<Vec<(String, String)>, Error> {
+fn collect_user_indexes(conn: &Connection, table: &str) -> Result<Vec<(String, String)>, Error> {
     let mut stmt = conn
         .prepare(
             "SELECT name, sql FROM sqlite_master \
@@ -288,7 +285,7 @@ where
 /// module lists the tables it handles and a guard test asserts this is empty, so
 /// a new migration can't silently drop a table from the copy.
 #[cfg(test)]
-pub(crate) fn unclassified_tables(conn: &Connection, known: &[&str]) -> Vec<String> {
+pub(super) fn unclassified_tables(conn: &Connection, known: &[&str]) -> Vec<String> {
     let known: std::collections::HashSet<&str> = known.iter().copied().collect();
     let mut stmt = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
@@ -309,7 +306,7 @@ pub(crate) fn unclassified_tables(conn: &Connection, known: &[&str]) -> Vec<Stri
 /// store init — not by a side-table copy — so the drift guards treat them as
 /// already handled.
 #[cfg(test)]
-pub(crate) const MARF_INFRA_TABLES: &[&str] = &[
+pub(super) const MARF_INFRA_TABLES: &[&str] = &[
     "marf_data",
     "__fork_storage",
     "marf_squash_info",
