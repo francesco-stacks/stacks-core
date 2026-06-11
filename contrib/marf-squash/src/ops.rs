@@ -383,46 +383,9 @@ fn print_index_side_table_validation(v: &IndexSideTableValidation) {
 
 fn print_sortition_side_table_validation(v: &SortitionSideTableValidation) {
     println!("Sortition side-table validation:");
-    println!("  canonical_set_in_source: {}", v.canonical_set_in_source);
-    println!("  fork_storage_match: {}", v.fork_storage_match);
-    println!("  snapshots_match: {}", v.snapshots_match);
-    println!("  leader_keys_match: {}", v.leader_keys_match);
-    println!("  block_commits_match: {}", v.block_commits_match);
-    println!(
-        "  block_commit_parents_match: {}",
-        v.block_commit_parents_match
-    );
-    println!(
-        "  snapshot_transition_ops_match: {}",
-        v.snapshot_transition_ops_match
-    );
-    println!("  stacks_chain_tips_match: {}", v.stacks_chain_tips_match);
-    println!(
-        "  stacks_chain_tips_by_burn_view_match: {}",
-        v.stacks_chain_tips_by_burn_view_match
-    );
-    println!(
-        "  stacks_chain_tips_within_stacks_boundary: {}",
-        v.stacks_chain_tips_within_stacks_boundary
-    );
-    println!(
-        "  stacks_chain_tips_anchor_match: {}",
-        v.stacks_chain_tips_anchor_match
-    );
-    println!(
-        "  preprocessed_reward_sets_match: {}",
-        v.preprocessed_reward_sets_match
-    );
-    println!("  missed_commits_match: {}", v.missed_commits_match);
-    println!("  stack_stx_match: {}", v.stack_stx_match);
-    println!("  transfer_stx_match: {}", v.transfer_stx_match);
-    println!("  delegate_stx_match: {}", v.delegate_stx_match);
-    println!(
-        "  vote_for_aggregate_key_match: {}",
-        v.vote_for_aggregate_key_match
-    );
-    println!("  epochs_match: {}", v.epochs_match);
-    println!("  db_config_match: {}", v.db_config_match);
+    for (name, ok) in v.checks() {
+        println!("  {name}: {ok}");
+    }
     println!("  Sortition side-table valid: {}", v.is_valid());
 }
 

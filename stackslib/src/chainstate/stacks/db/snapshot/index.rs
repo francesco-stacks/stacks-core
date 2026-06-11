@@ -20,10 +20,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use stacks_common::types::chainstate::StacksBlockId;
 
 use super::common::{
-    clone_schemas_from_source, copied_rows, dst_subset_of_src, execute_copy_specs,
-    full_row_except_match, with_offline_write_session, TableCopySpec,
+    clone_schemas_from_source, copied_rows, dst_subset_of_src, execute_copy_specs, spec_result,
+    validate_copy_specs, with_offline_write_session, with_readonly_session, TableCopySpec,
 };
-use super::fork_storage::{collect_canonical_leaf_hashes, copy_canonical_fork_storage};
+use super::fork_storage::{
+    collect_canonical_leaf_hashes, copy_canonical_fork_storage, validate_canonical_fork_storage,
+};
 use crate::burnchains::PoxConstants;
 use crate::chainstate::stacks::index::{trie_sql, Error, MARFValue};
 use crate::util_lib::db::table_exists;
@@ -395,204 +397,115 @@ pub fn validate_index_side_tables(
     first_burn_height: u64,
     reward_cycle_len: u64,
 ) -> Result<IndexSideTableValidation, Error> {
-    let conn = Connection::open(dst_path).map_err(Error::SQLError)?;
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
-        .map_err(Error::SQLError)?;
+    with_readonly_session(dst_path, &[("src", src_path)], |conn| {
+        // Single-`i64` query (COUNT etc.), error-propagating rather than
+        // swallowing into a sentinel: a SQL failure here is itself corruption.
+        let count = |sql: &str| -> Result<i64, Error> {
+            conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+                .map_err(Error::SQLError)
+        };
 
-    // Single-`i64` query (COUNT etc.), error-propagating rather than
-    // swallowing into a sentinel: a SQL failure here is itself corruption.
-    let count = |sql: &str| -> Result<i64, Error> {
-        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
-            .map_err(Error::SQLError)
-    };
-
-    // Existence is only checked for the tables no validation query reads:
-    // every other required table is read below, so a missing one already
-    // fails its own check. The staging-microblock tables are populated by
-    // the separate block-preservation phase, and an index-only validation
-    // never touches them.
-    let mut staging_microblock_tables_present = true;
-    for table in SCHEMA_ONLY_TABLES
-        .iter()
-        .filter(|table| !EXPECTED_EMPTY_TABLES.contains(table))
-    {
-        staging_microblock_tables_present &= table_exists(&conn, table)?;
-    }
-
-    // db_config verbatim match (bidirectional).
-    let db_config_matches = full_row_except_match(
-        &conn,
-        "SELECT version, mainnet, chain_id FROM db_config",
-        "SELECT version, mainnet, chain_id FROM src.db_config",
-    )?;
-
-    // __fork_storage: canonical-only copy.
-    // Validate against the canonical filtered source set
-    let fork_storage_match = {
-        let leaf_hashes = collect_canonical_leaf_hashes::<StacksBlockId>(dst_path)?;
-        conn.execute_batch("CREATE TEMP TABLE val_fork_leaf_values (value_hash TEXT PRIMARY KEY)")
-            .map_err(Error::SQLError)?;
+        // Existence is only checked for the tables no validation query reads:
+        // every other required table is read below, so a missing one already
+        // fails its own check. The staging-microblock tables are populated by
+        // the separate block-preservation phase, and an index-only validation
+        // never touches them.
+        let mut staging_microblock_tables_present = true;
+        for table in SCHEMA_ONLY_TABLES
+            .iter()
+            .filter(|table| !EXPECTED_EMPTY_TABLES.contains(table))
         {
-            let mut stmt = conn
-                .prepare("INSERT INTO val_fork_leaf_values (value_hash) VALUES (?1)")
-                .map_err(Error::SQLError)?;
-            for hash in &leaf_hashes {
-                stmt.execute([hash.to_hex()]).map_err(Error::SQLError)?;
+            staging_microblock_tables_present &= table_exists(conn, table)?;
+        }
+
+        let fork_storage_match = validate_canonical_fork_storage::<StacksBlockId>(conn, dst_path)?;
+
+        // Build the canonical block set using the SAME guarded path as the
+        // copy (rejects empty `marf_squashed_blocks` and canonical ids absent
+        // from src), so validation is never more lenient than the copy that
+        // produced the dst.
+        let canonical_tip = populate_canonical_blocks(conn)?;
+        let max_reward_cycle =
+            derive_max_reward_cycle(conn, &canonical_tip, first_burn_height, reward_cycle_len)?;
+
+        // Bidirectional full-row EXCEPT against each copy spec (not
+        // count-only), so a row with a canonical key but corrupted contents
+        // is still caught. signer_stats and matured_rewards are skipped: the
+        // source legitimately drifts for them after the snapshot.
+        let results = validate_copy_specs(
+            conn,
+            &index_copy_specs(max_reward_cycle),
+            &["signer_stats", "matured_rewards"],
+        )?;
+
+        let cb = "SELECT index_block_hash FROM canonical_blocks";
+
+        // signer_stats is a non-consensus counter table whose only writer uses
+        // INSERT ... ON CONFLICT DO UPDATE SET blocks_signed = blocks_signed + 1.
+        // After the snapshot the source keeps incrementing, so we check:
+        //   1. every (public_key, reward_cycle) key in dst exists in filtered src
+        //   2. dst.blocks_signed <= src.blocks_signed
+        let signer_stats_match = {
+            // No fabricated keys.
+            let keys_ok = dst_subset_of_src(
+                conn,
+                "SELECT public_key, reward_cycle FROM signer_stats",
+                &format!(
+                    "SELECT public_key, reward_cycle FROM src.signer_stats \
+                     WHERE reward_cycle <= {max_reward_cycle}"
+                ),
+            )?;
+            // No inflated counters.
+            let inflated = count(
+                "SELECT COUNT(*) FROM signer_stats d \
+                 JOIN src.signer_stats s \
+                   ON d.public_key = s.public_key AND d.reward_cycle = s.reward_cycle \
+                 WHERE d.blocks_signed > s.blocks_signed",
+            )?;
+            keys_ok && inflated == 0
+        };
+
+        // matured_rewards is a non-consensus cache populated as new blocks
+        // trigger maturation of older canonical blocks' rewards. The source
+        // legitimately gains rows after the snapshot, so we only verify no
+        // fabricated rows exist in the destination.
+        let matured_rewards_match = dst_subset_of_src(
+            conn,
+            "SELECT * FROM matured_rewards",
+            &format!("SELECT * FROM src.matured_rewards WHERE child_index_block_hash IN ({cb})"),
+        )?;
+
+        // Tables that no squash phase should ever write must be empty.
+        // (staging_microblocks* are intentionally excluded: the block-preservation
+        // phase populates them, so they are not asserted empty here.)
+        let mut expected_tables_empty = true;
+        for &table in EXPECTED_EMPTY_TABLES {
+            let rows = count(&format!("SELECT COUNT(*) FROM {table}"))?;
+            if rows != 0 {
+                warn!(
+                    "[index] table expected to be empty is non-empty in squashed dst";
+                    "table" => table, "rows" => rows
+                );
+                expected_tables_empty = false;
             }
         }
-        let ok = full_row_except_match(
-            &conn,
-            "SELECT * FROM __fork_storage",
-            "SELECT f.* FROM src.__fork_storage f \
-             INNER JOIN val_fork_leaf_values lv ON f.value_hash = lv.value_hash",
-        )?;
-        conn.execute_batch("DROP TABLE IF EXISTS val_fork_leaf_values")
-            .map_err(Error::SQLError)?;
-        ok
-    };
 
-    // Build the canonical block set using the SAME guarded path as the copy
-    // (rejects empty `marf_squashed_blocks` and canonical ids absent from
-    // src), so validation is never more lenient than the copy that produced
-    // the dst.
-    let canonical_tip = populate_canonical_blocks(&conn)?;
-    let cb = "SELECT index_block_hash FROM canonical_blocks";
-
-    // Canonical-filtered tables: bidirectional full-row EXCEPT (not count-only)
-    // so a row with a canonical `index_block_hash` but corrupted contents is
-    // still caught.
-    let block_headers_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM block_headers",
-        &format!("SELECT * FROM src.block_headers WHERE index_block_hash IN ({cb})"),
-    )?;
-
-    let nakamoto_headers_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM nakamoto_block_headers",
-        &format!("SELECT * FROM src.nakamoto_block_headers WHERE index_block_hash IN ({cb})"),
-    )?;
-
-    let payments_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM payments",
-        &format!("SELECT * FROM src.payments WHERE index_block_hash IN ({cb})"),
-    )?;
-
-    let transactions_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM transactions",
-        &format!("SELECT * FROM src.transactions WHERE index_block_hash IN ({cb})"),
-    )?;
-
-    let nakamoto_tenure_events_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM nakamoto_tenure_events",
-        &format!("SELECT * FROM src.nakamoto_tenure_events WHERE block_id IN ({cb})"),
-    )?;
-
-    // staging_blocks: bidirectional full-row EXCEPT against canonical source rows.
-    let staging_blocks_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM staging_blocks",
-        &format!(
-            "SELECT s.* FROM src.staging_blocks s \
-             WHERE s.index_block_hash IN ({cb}) \
-               AND s.processed = 1 AND s.orphaned = 0"
-        ),
-    )?;
-
-    let nakamoto_reward_sets_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM nakamoto_reward_sets",
-        &format!("SELECT * FROM src.nakamoto_reward_sets WHERE index_block_hash IN ({cb})"),
-    )?;
-
-    let max_reward_cycle =
-        derive_max_reward_cycle(&conn, &canonical_tip, first_burn_height, reward_cycle_len)?;
-
-    // signer_stats is a non-consensus counter table whose only writer uses
-    // INSERT ... ON CONFLICT DO UPDATE SET blocks_signed = blocks_signed + 1.
-    // After the snapshot the source keeps incrementing, so we check:
-    //   1. every (public_key, reward_cycle) key in dst exists in filtered src
-    //   2. dst.blocks_signed <= src.blocks_signed
-    let signer_stats_match = {
-        // No fabricated keys.
-        let keys_ok = dst_subset_of_src(
-            &conn,
-            "SELECT public_key, reward_cycle FROM signer_stats",
-            &format!(
-                "SELECT public_key, reward_cycle FROM src.signer_stats \
-                 WHERE reward_cycle <= {max_reward_cycle}"
-            ),
-        )?;
-        // No inflated counters.
-        let inflated = count(
-            "SELECT COUNT(*) FROM signer_stats d \
-             JOIN src.signer_stats s \
-               ON d.public_key = s.public_key AND d.reward_cycle = s.reward_cycle \
-             WHERE d.blocks_signed > s.blocks_signed",
-        )?;
-        keys_ok && inflated == 0
-    };
-
-    // matured_rewards is a non-consensus cache populated as new blocks
-    // trigger maturation of older canonical blocks' rewards. The source
-    // legitimately gains rows after the snapshot, so we only verify no
-    // fabricated rows exist in the destination.
-    let matured_rewards_match = dst_subset_of_src(
-        &conn,
-        "SELECT * FROM matured_rewards",
-        &format!("SELECT * FROM src.matured_rewards WHERE child_index_block_hash IN ({cb})"),
-    )?;
-
-    let burnchain_txids_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM burnchain_txids",
-        &format!("SELECT * FROM src.burnchain_txids WHERE index_block_hash IN ({cb})"),
-    )?;
-
-    let epoch_transitions_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM epoch_transitions",
-        &format!("SELECT * FROM src.epoch_transitions WHERE block_id IN ({cb})"),
-    )?;
-
-    // Tables that no squash phase should ever write must be empty.
-    // (staging_microblocks* are intentionally excluded: the block-preservation
-    // phase populates them, so they are not asserted empty here.)
-    let mut expected_tables_empty = true;
-    for &table in EXPECTED_EMPTY_TABLES {
-        let rows = count(&format!("SELECT COUNT(*) FROM {table}"))?;
-        if rows != 0 {
-            warn!(
-                "[index] table expected to be empty is non-empty in squashed dst";
-                "table" => table, "rows" => rows
-            );
-            expected_tables_empty = false;
-        }
-    }
-
-    conn.execute_batch("DROP TABLE IF EXISTS canonical_blocks")
-        .map_err(Error::SQLError)?;
-    conn.execute_batch("DETACH DATABASE src")
-        .map_err(Error::SQLError)?;
-
-    Ok(IndexSideTableValidation {
-        staging_microblock_tables_present,
-        db_config_matches,
-        fork_storage_match,
-        block_headers_match,
-        nakamoto_headers_match,
-        payments_match,
-        transactions_match,
-        nakamoto_tenure_events_match,
-        nakamoto_reward_sets_match,
-        signer_stats_match,
-        matured_rewards_match,
-        burnchain_txids_match,
-        epoch_transitions_match,
-        staging_blocks_match,
-        expected_tables_empty,
+        Ok(IndexSideTableValidation {
+            staging_microblock_tables_present,
+            db_config_matches: spec_result(&results, "db_config"),
+            fork_storage_match,
+            block_headers_match: spec_result(&results, "block_headers"),
+            nakamoto_headers_match: spec_result(&results, "nakamoto_block_headers"),
+            payments_match: spec_result(&results, "payments"),
+            transactions_match: spec_result(&results, "transactions"),
+            nakamoto_tenure_events_match: spec_result(&results, "nakamoto_tenure_events"),
+            nakamoto_reward_sets_match: spec_result(&results, "nakamoto_reward_sets"),
+            signer_stats_match,
+            matured_rewards_match,
+            burnchain_txids_match: spec_result(&results, "burnchain_txids"),
+            epoch_transitions_match: spec_result(&results, "epoch_transitions"),
+            staging_blocks_match: spec_result(&results, "staging_blocks"),
+            expected_tables_empty,
+        })
     })
 }

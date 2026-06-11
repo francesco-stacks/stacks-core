@@ -22,11 +22,14 @@ use clarity::vm::types::QualifiedContractIdentifier;
 use rusqlite::Connection;
 use stacks_common::types::chainstate::StacksBlockId;
 
-use super::common::{with_indexes_dropped, with_offline_write_session};
+use super::common::{clone_schemas_from_source, with_indexes_dropped, with_offline_write_session};
 use super::fork_storage::{collect_leaf_value_hashes, copy_leaf_referenced_rows};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{trie_sql, Error};
+
+/// Clarity side-storage tables copied by [`copy_clarity_side_tables`].
+pub(super) const CLARITY_SIDE_TABLES: &[&str] = &["data_table", "metadata_table"];
 
 /// Copy Clarity side-storage tables (`data_table`, `metadata_table`) from a
 /// source MARF database to a squashed MARF database.
@@ -35,10 +38,10 @@ use crate::chainstate::stacks::index::{trie_sql, Error};
 /// trie in `dst_db_path`.
 ///
 /// This function:
-/// 1. Initialises the Clarity schema on the destination (tables + indices + WAL).
+/// 1. Reads the squashed trie to determine which side-storage rows are still reachable.
 /// 2. Attaches the source database.
-/// 3. Reads the squashed trie to determine which side-storage rows are still reachable.
-/// 4. Copies only the required rows in a single transaction.
+/// 3. Clones the side-table schemas from the source and copies only the
+///    required rows.
 pub fn copy_clarity_side_tables(
     src_db_path: &str,
     dst_db_path: &str,
@@ -58,21 +61,13 @@ pub fn copy_clarity_side_tables(
 
     let required_contract_ids = resolve_required_contracts(src_db_path, &squashed_tip)?;
 
-    // `initialize_conn` issues `PRAGMA journal_mode`, which SQLite
-    // forbids inside any transaction. Run it on a separate conn
-    // before the helper opens its own and enters `BEGIN IMMEDIATE`.
-    {
-        let init_conn = Connection::open(dst_db_path).map_err(Error::SQLError)?;
-        SqliteConnection::initialize_conn(&init_conn).map_err(|e| {
-            Error::CorruptionError(format!("Failed to initialize Clarity schema: {e:?}"))
-        })?;
-    }
-
     let stats = with_offline_write_session(
         dst_db_path,
         &[("src", src_db_path)],
         "",
         |conn| -> Result<ClaritySideTableStats, Error> {
+            clone_schemas_from_source(conn, CLARITY_SIDE_TABLES)?;
+
             let t = Instant::now();
             let src_data_count: u64 = conn
                 .query_row("SELECT COUNT(*) FROM src.data_table", [], |row| row.get(0))

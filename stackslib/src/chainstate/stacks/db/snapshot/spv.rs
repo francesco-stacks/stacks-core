@@ -16,11 +16,11 @@
 use std::fs;
 use std::path::Path;
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::Connection;
 
 use super::common::{
-    clone_schemas_from_source, copied_rows, execute_copy_specs, full_row_except_match,
-    with_offline_write_session, TableCopySpec,
+    clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result, validate_copy_specs,
+    with_offline_write_session, with_readonly_session, TableCopySpec,
 };
 use crate::burnchains::bitcoin::spv::BLOCK_DIFFICULTY_CHUNK_SIZE;
 use crate::chainstate::stacks::index::Error;
@@ -127,50 +127,24 @@ pub fn validate_spv_headers(
         return Err(Error::NotFoundError);
     }
 
-    let conn = Connection::open_with_flags(dst_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(Error::SQLError)?;
+    with_readonly_session(dst_path, &[("src", src_path)], |conn| {
+        let results = validate_copy_specs(conn, &spv_copy_specs(burn_height), &[])?;
 
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_path])
-        .map_err(Error::SQLError)?;
+        // No headers above burn_height in destination.
+        let extra_above: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM headers WHERE height > {burn_height}"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Error::SQLError)?;
+        let no_extra_headers = extra_above == 0;
 
-    let db_config_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM db_config",
-        "SELECT * FROM src.db_config",
-    )?;
-
-    let headers_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM headers",
-        &format!("SELECT * FROM src.headers WHERE height <= {burn_height}"),
-    )?;
-
-    let chain_work_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM chain_work",
-        &format!(
-            "SELECT * FROM src.chain_work \
-             WHERE (interval + 1) * {BLOCK_DIFFICULTY_CHUNK_SIZE} - 1 <= {burn_height}"
-        ),
-    )?;
-
-    // No headers above burn_height in destination.
-    let extra_above: i64 = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM headers WHERE height > {burn_height}"),
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
-    let no_extra_headers = extra_above == 0;
-
-    conn.execute_batch("DETACH DATABASE src")
-        .map_err(Error::SQLError)?;
-
-    Ok(SpvHeadersValidation {
-        headers_match,
-        chain_work_match,
-        db_config_match,
-        no_extra_headers,
+        Ok(SpvHeadersValidation {
+            headers_match: spec_result(&results, "headers"),
+            chain_work_match: spec_result(&results, "chain_work"),
+            db_config_match: spec_result(&results, "db_config"),
+            no_extra_headers,
+        })
     })
 }

@@ -495,6 +495,35 @@ fn test_sortition_burn_header_hash_filtering() {
     );
 }
 
+/// The validator applies the same canonical-set guards as the copy: a
+/// destination claiming a sortition_id absent from `src.snapshots` is a
+/// corruption error, not merely a failed check (validation must never be
+/// more lenient than the copy).
+#[test]
+fn test_sortition_validation_rejects_fabricated_canonical_set() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src_sort.sqlite");
+    let conn = create_sortition_source_db(&src_path);
+
+    insert_snapshot(&conn, "sort_0", "bhh_0", 0);
+    insert_epoch(&conn, 0, 1);
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_sort.sqlite");
+    create_sortition_dest_db(&dst_path, &["sort_0", "sort_fake"]);
+
+    let err =
+        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .expect_err("validation must reject fabricated canonical sortition");
+    match err {
+        Error::CorruptionError(msg) => assert!(
+            msg.contains("canonical sortition") && msg.contains("absent from src.snapshots"),
+            "unexpected corruption message: {msg}"
+        ),
+        other => panic!("expected CorruptionError, got {other:?}"),
+    }
+}
+
 /// A destination claiming a canonical sortition_id absent from
 /// `src.snapshots` is corruption: the copy must abort.
 #[test]

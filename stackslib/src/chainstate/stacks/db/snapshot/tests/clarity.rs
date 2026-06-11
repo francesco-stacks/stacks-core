@@ -24,6 +24,7 @@ use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use tempfile::tempdir;
 
+use super::super::clarity::CLARITY_SIDE_TABLES;
 use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
 use super::super::{copy_clarity_side_tables, validate_clarity_side_tables};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
@@ -489,8 +490,9 @@ fn test_no_unclassified_clarity_source_tables() {
     build_clarity_marf(&src_dir, 2, "test-contract", "");
     let conn = rusqlite::Connection::open(clarity_marf_db_path(&src_dir)).unwrap();
 
-    let known: Vec<&str> = ["data_table", "metadata_table"]
-        .into_iter()
+    let known: Vec<&str> = CLARITY_SIDE_TABLES
+        .iter()
+        .copied()
         .chain(MARF_INFRA_TABLES.iter().copied())
         .collect();
     let extra = unclassified_tables(&conn, &known);

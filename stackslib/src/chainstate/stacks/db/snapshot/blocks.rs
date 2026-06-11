@@ -21,8 +21,9 @@ use rusqlite::{params, Connection, OpenFlags};
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 
 use super::common::{
-    clone_schemas_from_source, copied_rows, execute_copy_specs, full_row_except_match,
-    with_indexes_dropped, with_offline_write_session, TableCopySpec,
+    clone_schemas_from_source, copied_rows, execute_copy_specs, full_row_except_match, spec_result,
+    validate_copy_specs, with_indexes_dropped, with_offline_write_session, with_readonly_session,
+    TableCopySpec,
 };
 use crate::chainstate::stacks::db::blocks::index_block_hash_to_rel_path;
 use crate::chainstate::stacks::index::Error;
@@ -131,13 +132,28 @@ fn nakamoto_staging_blocks_membership_predicate(source_alias: &str) -> String {
     format!("{source_alias}.orphaned = 0 AND {canonical_by_index}")
 }
 
-fn nakamoto_staging_blocks_source_select(source_alias: &str, include_data: bool) -> String {
-    let data_column = if include_data {
-        format!(", {source_alias}.data")
-    } else {
-        String::new()
-    };
+fn nakamoto_staging_blocks_source_select(source_alias: &str) -> String {
+    format!(
+        "SELECT {source_alias}.block_hash, \
+                {source_alias}.consensus_hash, \
+                {source_alias}.parent_block_id, \
+                {source_alias}.is_tenure_start, \
+                {source_alias}.burn_attachable, \
+                {source_alias}.processed, \
+                {source_alias}.orphaned, \
+                {source_alias}.height, \
+                {source_alias}.index_block_hash, \
+                {source_alias}.processed_time, \
+                {source_alias}.obtain_method, \
+                {source_alias}.signing_weight, \
+                {source_alias}.data \
+         FROM src.nakamoto_staging_blocks {source_alias}"
+    )
+}
 
+/// Metadata-only projection of `src.nakamoto_staging_blocks` (every column
+/// except `data`), for validation comparisons that skip the blobs.
+fn nakamoto_staging_blocks_metadata_select(source_alias: &str) -> String {
     format!(
         "SELECT {source_alias}.block_hash, \
                 {source_alias}.consensus_hash, \
@@ -151,7 +167,6 @@ fn nakamoto_staging_blocks_source_select(source_alias: &str, include_data: bool)
                 {source_alias}.processed_time, \
                 {source_alias}.obtain_method, \
                 {source_alias}.signing_weight \
-                {data_column} \
          FROM src.nakamoto_staging_blocks {source_alias}"
     )
 }
@@ -255,18 +270,16 @@ fn populate_microblock_temp_tables(
     conn: &Connection,
     selected_hashes: &HashSet<BlockHeaderHash>,
     selected_parents: &HashSet<StacksBlockId>,
-    hash_table: &str,
-    parent_table: &str,
 ) -> Result<(), Error> {
-    conn.execute_batch(&format!(
-        "CREATE TEMP TABLE {hash_table} (hash TEXT NOT NULL PRIMARY KEY); \
-         CREATE TEMP TABLE {parent_table} (ibh TEXT NOT NULL PRIMARY KEY);"
-    ))
+    conn.execute_batch(
+        "CREATE TEMP TABLE selected_microblocks (hash TEXT NOT NULL PRIMARY KEY); \
+         CREATE TEMP TABLE selected_parents (ibh TEXT NOT NULL PRIMARY KEY);",
+    )
     .map_err(Error::SQLError)?;
 
     {
         let mut ins_hash = conn
-            .prepare(&format!("INSERT INTO temp.{hash_table} (hash) VALUES (?1)"))
+            .prepare("INSERT INTO temp.selected_microblocks (hash) VALUES (?1)")
             .map_err(Error::SQLError)?;
         for h in selected_hashes {
             ins_hash.execute(params![h]).map_err(Error::SQLError)?;
@@ -274,9 +287,7 @@ fn populate_microblock_temp_tables(
     }
     {
         let mut ins_parent = conn
-            .prepare(&format!(
-                "INSERT INTO temp.{parent_table} (ibh) VALUES (?1)"
-            ))
+            .prepare("INSERT INTO temp.selected_parents (ibh) VALUES (?1)")
             .map_err(Error::SQLError)?;
         for p in selected_parents {
             ins_parent.execute(params![p]).map_err(Error::SQLError)?;
@@ -284,6 +295,27 @@ fn populate_microblock_temp_tables(
     }
 
     Ok(())
+}
+
+/// Copy specs for the confirmed-microblock tables, filtered by the temp
+/// tables [`populate_microblock_temp_tables`] builds.
+fn microblock_copy_specs() -> Vec<TableCopySpec> {
+    vec![
+        TableCopySpec {
+            table: "staging_microblocks",
+            source_sql: "SELECT s.* FROM src.staging_microblocks s \
+                 WHERE s.microblock_hash IN (SELECT hash FROM temp.selected_microblocks) \
+                   AND s.index_block_hash IN (SELECT ibh FROM temp.selected_parents) \
+                   AND s.orphaned = 0"
+                .into(),
+        },
+        TableCopySpec {
+            table: "staging_microblocks_data",
+            source_sql: "SELECT s.* FROM src.staging_microblocks_data s \
+                 WHERE s.block_hash IN (SELECT hash FROM temp.selected_microblocks)"
+                .into(),
+        },
+    ]
 }
 
 /// Copy confirmed canonical epoch-2 microblock streams.
@@ -295,33 +327,9 @@ pub fn copy_confirmed_epoch2_microblocks(
         let (selected_hashes, selected_parents, mut stats) = derive_confirmed_microblock_set(conn)?;
 
         if !selected_hashes.is_empty() {
-            populate_microblock_temp_tables(
-                conn,
-                &selected_hashes,
-                &selected_parents,
-                "selected_microblocks",
-                "selected_parents",
-            )?;
+            populate_microblock_temp_tables(conn, &selected_hashes, &selected_parents)?;
 
-            let results = execute_copy_specs(
-                conn,
-                &[
-                    TableCopySpec {
-                        table: "staging_microblocks",
-                        source_sql: "SELECT s.* FROM src.staging_microblocks s \
-                             WHERE s.microblock_hash IN (SELECT hash FROM temp.selected_microblocks) \
-                               AND s.index_block_hash IN (SELECT ibh FROM temp.selected_parents) \
-                               AND s.orphaned = 0"
-                            .into(),
-                    },
-                    TableCopySpec {
-                        table: "staging_microblocks_data",
-                        source_sql: "SELECT s.* FROM src.staging_microblocks_data s \
-                             WHERE s.block_hash IN (SELECT hash FROM temp.selected_microblocks)"
-                            .into(),
-                    },
-                ],
-            )?;
+            let results = execute_copy_specs(conn, &microblock_copy_specs())?;
             stats.microblock_rows_copied = copied_rows(&results, "staging_microblocks");
 
             stats.microblock_bytes_copied = conn
@@ -331,12 +339,6 @@ pub fn copy_confirmed_epoch2_microblocks(
                     |row| row.get(0),
                 )
                 .map_err(Error::SQLError)?;
-
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS temp.selected_microblocks; \
-                 DROP TABLE IF EXISTS temp.selected_parents;",
-            )
-            .map_err(Error::SQLError)?;
         }
 
         Ok(stats)
@@ -455,7 +457,7 @@ pub fn copy_nakamoto_staging_blocks(
                         "INSERT INTO nakamoto_staging_blocks ({NAKAMOTO_STAGING_BLOCK_COLUMNS}) \
                          {} \
                          WHERE {membership}",
-                        nakamoto_staging_blocks_source_select("s", true)
+                        nakamoto_staging_blocks_source_select("s")
                     ),
                     [],
                 )
@@ -485,73 +487,36 @@ pub fn validate_microblock_streams(
     src_index_path: &str,
     dst_index_path: &str,
 ) -> Result<MicroblockValidation, Error> {
-    let conn = Connection::open_with_flags(
-        dst_index_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(Error::SQLError)?;
+    with_readonly_session(dst_index_path, &[("src", src_index_path)], |conn| {
+        let (selected_hashes, selected_parents, _stats) = derive_confirmed_microblock_set(conn)?;
+        populate_microblock_temp_tables(conn, &selected_hashes, &selected_parents)?;
 
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_index_path])
-        .map_err(Error::SQLError)?;
+        let results = validate_copy_specs(conn, &microblock_copy_specs(), &[])?;
 
-    let (selected_hashes, selected_parents, _stats) = derive_confirmed_microblock_set(&conn)?;
-
-    populate_microblock_temp_tables(
-        &conn,
-        &selected_hashes,
-        &selected_parents,
-        "val_selected_mblocks",
-        "val_selected_parents",
-    )?;
-
-    let staging_microblocks_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM staging_microblocks",
-        "SELECT s.* FROM src.staging_microblocks s \
-         WHERE s.microblock_hash IN (SELECT hash FROM temp.val_selected_mblocks) \
-           AND s.index_block_hash IN (SELECT ibh FROM temp.val_selected_parents) \
-           AND s.orphaned = 0",
-    )?;
-
-    let staging_microblocks_data_match = full_row_except_match(
-        &conn,
-        "SELECT block_hash, block_data FROM staging_microblocks_data",
-        "SELECT s.block_hash, s.block_data FROM src.staging_microblocks_data s \
-         WHERE s.block_hash IN (SELECT hash FROM temp.val_selected_mblocks)",
-    )?;
-
-    let staging_microblocks_no_extra_rows = conn
-        .query_row(
-            "SELECT COUNT(*) FROM staging_microblocks \
-             WHERE microblock_hash NOT IN (SELECT hash FROM temp.val_selected_mblocks)",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(Error::SQLError)?
-        == 0
-        && conn
+        let staging_microblocks_no_extra_rows = conn
             .query_row(
-                "SELECT COUNT(*) FROM staging_microblocks_data \
-                 WHERE block_hash NOT IN (SELECT hash FROM temp.val_selected_mblocks)",
+                "SELECT COUNT(*) FROM staging_microblocks \
+                 WHERE microblock_hash NOT IN (SELECT hash FROM temp.selected_microblocks)",
                 [],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(Error::SQLError)?
-            == 0;
+            == 0
+            && conn
+                .query_row(
+                    "SELECT COUNT(*) FROM staging_microblocks_data \
+                     WHERE block_hash NOT IN (SELECT hash FROM temp.selected_microblocks)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Error::SQLError)?
+                == 0;
 
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS temp.val_selected_mblocks; \
-         DROP TABLE IF EXISTS temp.val_selected_parents;",
-    )
-    .map_err(Error::SQLError)?;
-
-    conn.execute_batch("DETACH DATABASE src")
-        .map_err(Error::SQLError)?;
-
-    Ok(MicroblockValidation {
-        staging_microblocks_match,
-        staging_microblocks_data_match,
-        staging_microblocks_no_extra_rows,
+        Ok(MicroblockValidation {
+            staging_microblocks_match: spec_result(&results, "staging_microblocks"),
+            staging_microblocks_data_match: spec_result(&results, "staging_microblocks_data"),
+            staging_microblocks_no_extra_rows,
+        })
     })
 }
 
@@ -561,85 +526,79 @@ pub fn validate_nakamoto_staging_blocks(
     dst_nakamoto_path: &str,
     squashed_index_path: &str,
 ) -> Result<NakamotoBlockValidation, Error> {
-    let conn = Connection::open_with_flags(
+    with_readonly_session(
         dst_nakamoto_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(Error::SQLError)?;
+        &[("src", src_nakamoto_path), ("idx", squashed_index_path)],
+        |conn| {
+            let source_membership = nakamoto_staging_blocks_membership_predicate("s");
+            let dest_membership =
+                nakamoto_staging_blocks_membership_predicate("nakamoto_staging_blocks");
 
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_nakamoto_path])
-        .map_err(Error::SQLError)?;
+            // The dst must hold exactly the membership the copy produced: the canonical
+            // blocks in the index headers -- no forks or orphans.
+            let metadata_match = full_row_except_match(
+                conn,
+                &format!(
+                    "SELECT {NAKAMOTO_STAGING_BLOCK_METADATA_COLUMNS} FROM nakamoto_staging_blocks"
+                ),
+                &format!(
+                    "{} WHERE {source_membership}",
+                    nakamoto_staging_blocks_metadata_select("s")
+                ),
+            )?;
 
-    conn.execute("ATTACH DATABASE ?1 AS idx", params![squashed_index_path])
-        .map_err(Error::SQLError)?;
-
-    let source_membership = nakamoto_staging_blocks_membership_predicate("s");
-    let dest_membership = nakamoto_staging_blocks_membership_predicate("nakamoto_staging_blocks");
-
-    // The dst must hold exactly the membership the copy produced: the canonical
-    // blocks in the index headers -- no forks or orphans.
-    let metadata_match = full_row_except_match(
-        &conn,
-        &format!("SELECT {NAKAMOTO_STAGING_BLOCK_METADATA_COLUMNS} FROM nakamoto_staging_blocks"),
-        &format!(
-            "{} WHERE {source_membership}",
-            nakamoto_staging_blocks_source_select("s", false)
-        ),
-    )?;
-
-    let no_extra_blocks = conn
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM nakamoto_staging_blocks \
+            let no_extra_blocks = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM nakamoto_staging_blocks \
                  WHERE NOT ({dest_membership})"
-            ),
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(Error::SQLError)?
-        == 0;
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Error::SQLError)?
+                == 0;
 
-    let blob_bytes_match = conn
-        .query_row(
-            "SELECT COUNT(*) FROM nakamoto_staging_blocks n \
+            let blob_bytes_match = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM nakamoto_staging_blocks n \
              INNER JOIN src.nakamoto_staging_blocks s \
                ON n.index_block_hash = s.index_block_hash \
              WHERE s.orphaned = 0 \
                AND n.data != s.data",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(Error::SQLError)?
-        == 0;
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Error::SQLError)?
+                == 0;
 
-    let db_version_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM db_version",
-        "SELECT * FROM src.db_version",
-    )?;
+            let db_version_match = full_row_except_match(
+                conn,
+                "SELECT * FROM db_version",
+                "SELECT * FROM src.db_version",
+            )?;
 
-    let schema_match = full_row_except_match(
-        &conn,
-        "SELECT type, name, tbl_name, \
+            let schema_match = full_row_except_match(
+                conn,
+                "SELECT type, name, tbl_name, \
                 REPLACE(REPLACE(sql, 'IF NOT EXISTS ', ''), 'IF NOT EXISTS', '') \
          FROM sqlite_master \
          WHERE type IN ('table', 'index') AND sql IS NOT NULL",
-        "SELECT type, name, tbl_name, \
+                "SELECT type, name, tbl_name, \
                 REPLACE(REPLACE(sql, 'IF NOT EXISTS ', ''), 'IF NOT EXISTS', '') \
          FROM src.sqlite_master \
          WHERE type IN ('table', 'index') AND sql IS NOT NULL",
-    )?;
+            )?;
 
-    conn.execute_batch("DETACH DATABASE idx; DETACH DATABASE src")
-        .map_err(Error::SQLError)?;
-
-    Ok(NakamotoBlockValidation {
-        metadata_match,
-        no_extra_blocks,
-        blob_bytes_match,
-        db_version_match,
-        schema_match,
-    })
+            Ok(NakamotoBlockValidation {
+                metadata_match,
+                no_extra_blocks,
+                blob_bytes_match,
+                db_version_match,
+                schema_match,
+            })
+        },
+    )
 }
 
 /// Validate epoch 2.x block files.

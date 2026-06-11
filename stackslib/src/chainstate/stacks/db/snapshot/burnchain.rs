@@ -16,11 +16,11 @@
 use std::fs;
 use std::path::Path;
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::Connection;
 
 use super::common::{
-    clone_schemas_from_source, copied_rows, execute_copy_specs, full_row_except_match,
-    with_offline_write_session, TableCopySpec,
+    clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result, validate_copy_specs,
+    with_offline_write_session, with_readonly_session, TableCopySpec,
 };
 use crate::chainstate::stacks::index::Error;
 
@@ -237,102 +237,53 @@ pub fn validate_burnchain_db(
     squashed_sortition_path: &str,
     expected_burn_height: u32,
 ) -> Result<BurnchainDbValidation, Error> {
-    let conn = Connection::open_with_flags(dst_burnchain_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(Error::SQLError)?;
+    with_readonly_session(
+        dst_burnchain_db_path,
+        &[
+            ("src", src_burnchain_db_path),
+            ("sort", squashed_sortition_path),
+        ],
+        |conn| {
+            populate_canonical_burn_hashes(conn)?;
+            assert_sortition_tip_height(conn, expected_burn_height)?;
 
-    conn.execute("ATTACH DATABASE ?1 AS src", params![src_burnchain_db_path])
-        .map_err(Error::SQLError)?;
-    conn.execute(
-        "ATTACH DATABASE ?1 AS sort",
-        params![squashed_sortition_path],
+            // Completeness: every canonical burn hash must be present in
+            // the destination.
+            let missing_in_dst: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM canonical_burn_hashes \
+                     WHERE burn_header_hash NOT IN \
+                         (SELECT block_hash FROM burnchain_db_block_headers)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Error::SQLError)?;
+            let canonical_complete = missing_in_dst == 0;
+
+            let results = validate_copy_specs(conn, &burnchain_copy_specs(), &[])?;
+
+            // No non-canonical burn hashes in destination.
+            let extra_non_canonical: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM burnchain_db_block_headers \
+                     WHERE block_hash NOT IN \
+                         (SELECT burn_header_hash FROM canonical_burn_hashes)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Error::SQLError)?;
+            let no_extra_headers = extra_non_canonical == 0;
+
+            Ok(BurnchainDbValidation {
+                block_headers_match: spec_result(&results, "burnchain_db_block_headers"),
+                block_ops_match: spec_result(&results, "burnchain_db_block_ops"),
+                block_commit_metadata_match: spec_result(&results, "block_commit_metadata"),
+                anchor_blocks_match: spec_result(&results, "anchor_blocks"),
+                overrides_match: spec_result(&results, "overrides"),
+                db_config_match: spec_result(&results, "db_config"),
+                no_extra_headers,
+                canonical_complete,
+            })
+        },
     )
-    .map_err(Error::SQLError)?;
-
-    populate_canonical_burn_hashes(&conn)?;
-
-    assert_sortition_tip_height(&conn, expected_burn_height)?;
-
-    // Completeness: every canonical burn hash must be present in destination.
-    let missing_in_dst: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM canonical_burn_hashes \
-             WHERE burn_header_hash NOT IN \
-                 (SELECT block_hash FROM burnchain_db_block_headers)",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
-    let canonical_complete = missing_in_dst == 0;
-
-    let bhh = "SELECT burn_header_hash FROM canonical_burn_hashes";
-
-    let db_config_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM db_config",
-        "SELECT * FROM src.db_config",
-    )?;
-
-    let block_headers_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM burnchain_db_block_headers",
-        &format!("SELECT * FROM src.burnchain_db_block_headers WHERE block_hash IN ({bhh})"),
-    )?;
-
-    let block_ops_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM burnchain_db_block_ops",
-        &format!("SELECT * FROM src.burnchain_db_block_ops WHERE block_hash IN ({bhh})"),
-    )?;
-
-    let block_commit_metadata_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM block_commit_metadata",
-        &format!("SELECT * FROM src.block_commit_metadata WHERE burn_block_hash IN ({bhh})"),
-    )?;
-
-    let anchor_blocks_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM anchor_blocks",
-        "SELECT * FROM src.anchor_blocks \
-         WHERE reward_cycle IN ( \
-             SELECT DISTINCT anchor_block FROM block_commit_metadata \
-             WHERE anchor_block IS NOT NULL \
-         )",
-    )?;
-
-    let overrides_match = full_row_except_match(
-        &conn,
-        "SELECT * FROM overrides",
-        "SELECT * FROM src.overrides \
-         WHERE reward_cycle IN (SELECT reward_cycle FROM anchor_blocks)",
-    )?;
-
-    // No non-canonical burn hashes in destination.
-    let extra_non_canonical: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM burnchain_db_block_headers \
-                 WHERE block_hash NOT IN ({bhh})"
-            ),
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
-    let no_extra_headers = extra_non_canonical == 0;
-
-    conn.execute_batch("DETACH DATABASE sort")
-        .map_err(Error::SQLError)?;
-    conn.execute_batch("DETACH DATABASE src")
-        .map_err(Error::SQLError)?;
-
-    Ok(BurnchainDbValidation {
-        block_headers_match,
-        block_ops_match,
-        block_commit_metadata_match,
-        anchor_blocks_match,
-        overrides_match,
-        db_config_match,
-        no_extra_headers,
-        canonical_complete,
-    })
 }
