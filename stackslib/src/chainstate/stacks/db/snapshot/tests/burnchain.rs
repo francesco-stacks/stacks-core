@@ -19,9 +19,8 @@ use rusqlite::{params, Connection};
 use tempfile::tempdir;
 
 use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
-use crate::burnchains::db::{
-    BURNCHAIN_DB_INDEXES, BURNCHAIN_DB_MIGRATION_V2_TO_V3, BURNCHAIN_DB_SCHEMA_2,
-};
+use crate::burnchains::db::BurnchainDB;
+use crate::burnchains::Burnchain;
 
 /// Drift guard: every table the burnchain migrations create must be
 /// classified, so a future migration can't silently drop one from the copy.
@@ -42,20 +41,15 @@ fn test_no_unclassified_burnchain_tables() {
     );
 }
 
-/// Create a burnchain.sqlite source.
-/// Replays the real schema: SCHEMA_2 then MIGRATION_V2_TO_V3, plus indexes.
+/// Create a burnchain.sqlite source via the production initializer
+/// ([`BurnchainDB::connect`]), so the fixture always carries the current
+/// schema instead of replaying migrations by hand. `connect` also seeds
+/// the regtest first-block header.
 fn create_burnchain_db(path: &std::path::Path) -> Connection {
-    let conn = Connection::open(path).unwrap();
-    conn.execute_batch(BURNCHAIN_DB_SCHEMA_2).unwrap();
-    conn.execute("INSERT INTO db_config (version) VALUES ('2')", [])
-        .unwrap();
-    for idx in BURNCHAIN_DB_INDEXES {
-        conn.execute_batch(idx).unwrap();
-    }
-    conn.execute_batch(BURNCHAIN_DB_MIGRATION_V2_TO_V3).unwrap();
-    conn.execute("UPDATE db_config SET version = '3'", [])
-        .unwrap();
-    conn
+    let burnchain = Burnchain::regtest(":memory:");
+    let _db = BurnchainDB::connect(path.to_str().unwrap(), &burnchain, true)
+        .expect("burnchain DB init failed");
+    Connection::open(path).unwrap()
 }
 
 /// Create a squashed sortition DB with canonical burn hashes in a

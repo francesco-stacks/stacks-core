@@ -26,10 +26,7 @@ use tempfile::tempdir;
 
 use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
 use super::{create_dest_db_with_canonical_blocks, create_source_db};
-use crate::chainstate::nakamoto::staging_blocks::{
-    NAKAMOTO_STAGING_DB_SCHEMA_1, NAKAMOTO_STAGING_DB_SCHEMA_2, NAKAMOTO_STAGING_DB_SCHEMA_3,
-    NAKAMOTO_STAGING_DB_SCHEMA_4, NAKAMOTO_STAGING_DB_SCHEMA_5,
-};
+use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::index::Error;
 use crate::chainstate::stacks::{
     StacksMicroblock, StacksMicroblockHeader, StacksTransaction, TokenTransferMemo,
@@ -292,25 +289,19 @@ fn insert_staging_block_with_microblock_parent(
     .unwrap();
 }
 
-/// Create a source nakamoto.sqlite with the full schema (v1 through v5).
+/// Create a source nakamoto.sqlite via the production initializer
+/// ([`StacksChainState::open_nakamoto_staging_blocks`]), so the fixture
+/// always carries the current schema instead of replaying migrations by
+/// hand.
 fn create_source_nakamoto_db(path: &std::path::Path) -> Connection {
-    let conn = Connection::open(path).unwrap();
-    for cmd in NAKAMOTO_STAGING_DB_SCHEMA_1 {
-        conn.execute_batch(cmd).unwrap();
-    }
-    for cmd in NAKAMOTO_STAGING_DB_SCHEMA_2 {
-        conn.execute_batch(cmd).unwrap();
-    }
-    for cmd in NAKAMOTO_STAGING_DB_SCHEMA_3 {
-        conn.execute_batch(cmd).unwrap();
-    }
-    for cmd in NAKAMOTO_STAGING_DB_SCHEMA_4 {
-        conn.execute_batch(cmd).unwrap();
-    }
-    for cmd in NAKAMOTO_STAGING_DB_SCHEMA_5 {
-        conn.execute_batch(cmd).unwrap();
-    }
-    conn
+    // The first open instantiates the base schema only; migrations run on
+    // subsequent opens, so a second open brings the DB to the current
+    // version - exactly as node restarts do in production.
+    StacksChainState::open_nakamoto_staging_blocks(path.to_str().unwrap(), true)
+        .expect("nakamoto staging DB init failed");
+    StacksChainState::open_nakamoto_staging_blocks(path.to_str().unwrap(), true)
+        .expect("nakamoto staging DB migration failed");
+    Connection::open(path).unwrap()
 }
 
 /// Insert a nakamoto_staging_blocks row.
@@ -681,7 +672,7 @@ fn test_nakamoto_copy_and_validate() {
 
     // Verify db_version matches source.
     let dst_ver: i64 = dst_conn
-        .query_row("SELECT version FROM db_version", [], |row| row.get(0))
+        .query_row("SELECT MAX(version) FROM db_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(dst_ver, 5, "db_version should be 5 (latest migration)");
     drop(dst_conn);

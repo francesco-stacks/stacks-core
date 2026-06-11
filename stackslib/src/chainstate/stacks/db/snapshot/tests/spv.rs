@@ -20,9 +20,8 @@ use rusqlite::{params, Connection};
 use tempfile::tempdir;
 
 use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
-use crate::burnchains::bitcoin::spv::{
-    SPV_DB_VERSION, SPV_INITIAL_SCHEMA, SPV_SCHEMA_2, SPV_SCHEMA_3,
-};
+use crate::burnchains::bitcoin::spv::SpvClient;
+use crate::burnchains::bitcoin::BitcoinNetworkType;
 
 /// Drift guard: every table the SPV migrations create must be
 /// classified, so a future migration can't silently drop one from the copy.
@@ -42,25 +41,21 @@ fn test_no_unclassified_spv_tables() {
     );
 }
 
-/// Create a source headers.sqlite (SPV v3 schema with chain_work).
-/// Replays the real SPV migration pipeline: INITIAL -> SCHEMA_2 -> SCHEMA_3.
+/// Create a source headers.sqlite via the production initializer
+/// ([`SpvClient::new`]), so the fixture always carries the current schema
+/// instead of replaying migrations by hand. Initialization seeds the
+/// regtest genesis header at height 0, so tests insert from height 1.
 fn create_spv_headers_db(path: &std::path::Path) -> Connection {
-    let conn = Connection::open(path).unwrap();
-    for cmd in SPV_INITIAL_SCHEMA {
-        conn.execute_batch(cmd).unwrap();
-    }
-    for cmd in SPV_SCHEMA_2 {
-        conn.execute_batch(cmd).unwrap();
-    }
-    for cmd in SPV_SCHEMA_3 {
-        conn.execute_batch(cmd).unwrap();
-    }
-    conn.execute(
-        &format!("INSERT INTO db_config (version) VALUES ('{SPV_DB_VERSION}')"),
-        [],
+    SpvClient::new(
+        path.to_str().unwrap(),
+        0,
+        None,
+        BitcoinNetworkType::Regtest,
+        true,
+        false,
     )
-    .unwrap();
-    conn
+    .expect("SPV headers DB init failed");
+    Connection::open(path).unwrap()
 }
 
 /// Headers are copied up to the burn height and `chain_work` only for
@@ -73,7 +68,7 @@ fn test_spv_headers_copy_and_validate() {
 
     let src = create_spv_headers_db(&src_path);
     // Insert headers at heights 0..=5000.
-    for h in 0..=5000u32 {
+    for h in 1..=5000u32 {
         src.execute(
             "INSERT INTO headers VALUES (1, 'prev', 'merkle', 0, 0, 0, ?1, ?2)",
             params![h, format!("hash_{h}")],
@@ -133,7 +128,7 @@ fn test_spv_headers_chain_work_boundaries(
     let dst_path = dir.path().join("dst.sqlite");
 
     let src = create_spv_headers_db(&src_path);
-    for h in 0..=burn_height {
+    for h in 1..=burn_height {
         src.execute(
             "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
             params![h, format!("h{h}")],
