@@ -107,42 +107,31 @@ fn test_burnchain_db_copy_and_validate() {
     let src = create_burnchain_db(&src_path);
     // Insert canonical block headers.
     for (h, hash) in canonical.iter().enumerate() {
-        src.execute(
-            "INSERT INTO burnchain_db_block_headers VALUES (?1, ?2, ?3, 0, 0)",
-            params![h, hash.to_string(), format!("parent_{hash}")],
+        BurnchainDB::test_insert_block_header_row(
+            &src,
+            h as u64,
+            &hash.to_string(),
+            &format!("parent_{hash}"),
         )
         .unwrap();
     }
     // Insert a non-canonical block at height 1.
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, 'fork_hash_1', 'parent_fork', 0, 0)",
-        [],
-    )
-    .unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 1, "fork_hash_1", "parent_fork").unwrap();
     // Ops for canonical and non-canonical.
-    src.execute(
-        "INSERT INTO burnchain_db_block_ops VALUES (?1, 'op1', 'tx1')",
-        params![fixture_bhh(1).to_string()],
-    )
-    .unwrap();
-    src.execute(
-        "INSERT INTO burnchain_db_block_ops VALUES ('fork_hash_1', 'op_fork', 'tx_fork')",
-        [],
-    )
-    .unwrap();
-    // block_commit_metadata for canonical.
-    src.execute(
-            "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, anchor_block, anchor_block_descendant) \
-             VALUES (?1, 'tx1', 1, 0, NULL, NULL)",
-            params![fixture_bhh(1).to_string()],
-        )
+    BurnchainDB::test_insert_block_ops_row(&src, &fixture_bhh(1).to_string(), "op1", "tx1")
         .unwrap();
+    BurnchainDB::test_insert_block_ops_row(&src, "fork_hash_1", "op_fork", "tx_fork").unwrap();
+    // block_commit_metadata for canonical.
+    BurnchainDB::test_insert_block_commit_metadata_row(
+        &src,
+        &fixture_bhh(1).to_string(),
+        "tx1",
+        1,
+        None,
+    )
+    .unwrap();
     // block_commit_metadata for non-canonical.
-    src.execute(
-            "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, anchor_block, anchor_block_descendant) \
-             VALUES ('fork_hash_1', 'tx_fork', 1, 0, NULL, NULL)",
-            [],
-        )
+    BurnchainDB::test_insert_block_commit_metadata_row(&src, "fork_hash_1", "tx_fork", 1, None)
         .unwrap();
     drop(src);
 
@@ -181,21 +170,15 @@ fn test_burnchain_db_excludes_non_canonical_fork() {
     let sort_path = create_squashed_sortition(dir.path(), &[hash_a.clone()]);
 
     let src = create_burnchain_db(&src_path);
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
-        params![GENESIS_BHH.to_string()],
+    BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
+    BurnchainDB::test_insert_block_header_row(
+        &src,
+        1,
+        &hash_a.to_string(),
+        &GENESIS_BHH.to_string(),
     )
     .unwrap();
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, ?1, ?2, 0, 0)",
-        params![hash_a.to_string(), GENESIS_BHH.to_string()],
-    )
-    .unwrap();
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, 'hash_b', 'parent_b', 0, 0)",
-        [],
-    )
-    .unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 1, "hash_b", "parent_b").unwrap();
     drop(src);
 
     let stats = super::super::burnchain::copy_burnchain_db(
@@ -232,26 +215,10 @@ fn test_burnchain_db_block_ops_follow_canonical_headers() {
     let sort_path = create_squashed_sortition(dir.path(), &[]);
 
     let src = create_burnchain_db(&src_path);
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
-        params![GENESIS_BHH.to_string()],
-    )
-    .unwrap();
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'fork', 'none', 0, 0)",
-        [],
-    )
-    .unwrap();
-    src.execute(
-        "INSERT INTO burnchain_db_block_ops VALUES (?1, 'op_c', 'tx_c')",
-        params![GENESIS_BHH.to_string()],
-    )
-    .unwrap();
-    src.execute(
-        "INSERT INTO burnchain_db_block_ops VALUES ('fork', 'op_f', 'tx_f')",
-        [],
-    )
-    .unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 0, "fork", "none").unwrap();
+    BurnchainDB::test_insert_block_ops_row(&src, &GENESIS_BHH.to_string(), "op_c", "tx_c").unwrap();
+    BurnchainDB::test_insert_block_ops_row(&src, "fork", "op_f", "tx_f").unwrap();
     drop(src);
 
     let stats = super::super::burnchain::copy_burnchain_db(
@@ -283,34 +250,19 @@ fn test_burnchain_db_anchor_blocks_filtered() {
     let sort_path = create_squashed_sortition(dir.path(), &[h1.clone()]);
 
     let src = create_burnchain_db(&src_path);
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
-        params![GENESIS_BHH.to_string()],
-    )
-    .unwrap();
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, ?1, ?2, 0, 0)",
-        params![h1.to_string(), GENESIS_BHH.to_string()],
-    )
-    .unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 1, &h1.to_string(), &GENESIS_BHH.to_string())
+        .unwrap();
     // Anchor block for cycle 1 (referenced by canonical commit).
-    src.execute("INSERT INTO anchor_blocks VALUES (1)", [])
-        .unwrap();
+    BurnchainDB::test_insert_anchor_block_row(&src, 1).unwrap();
     // Anchor block for cycle 99 (not referenced by any canonical commit).
-    src.execute("INSERT INTO anchor_blocks VALUES (99)", [])
-        .unwrap();
+    BurnchainDB::test_insert_anchor_block_row(&src, 99).unwrap();
     // Canonical commit referencing anchor block cycle 1.
-    src.execute(
-            "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, anchor_block, anchor_block_descendant) \
-             VALUES (?1, 'tx_a', 1, 0, 1, NULL)",
-            params![h1.to_string()],
-        )
+    BurnchainDB::test_insert_block_commit_metadata_row(&src, &h1.to_string(), "tx_a", 1, Some(1))
         .unwrap();
     // Override for cycle 1 (should be copied) and cycle 99 (should not).
-    src.execute("INSERT INTO overrides VALUES (1, 'map_1')", [])
-        .unwrap();
-    src.execute("INSERT INTO overrides VALUES (99, 'map_99')", [])
-        .unwrap();
+    BurnchainDB::test_insert_override_row(&src, 1, "map_1").unwrap();
+    BurnchainDB::test_insert_override_row(&src, 99, "map_99").unwrap();
     drop(src);
 
     let stats = super::super::burnchain::copy_burnchain_db(
@@ -346,11 +298,7 @@ fn test_burnchain_db_validate_detects_non_canonical_leak() {
     let sort_path = create_squashed_sortition(dir.path(), &[]);
 
     let src = create_burnchain_db(&src_path);
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
-        params![GENESIS_BHH.to_string()],
-    )
-    .unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
     drop(src);
 
     // Copy normally first.
@@ -364,11 +312,7 @@ fn test_burnchain_db_validate_detects_non_canonical_leak() {
 
     // Inject a non-canonical row into the destination.
     let dst = Connection::open(&dst_path).unwrap();
-    dst.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'rogue', 'none', 0, 0)",
-        [],
-    )
-    .unwrap();
+    BurnchainDB::test_insert_block_header_row(&dst, 0, "rogue", "none").unwrap();
     drop(dst);
 
     let v = super::super::burnchain::validate_burnchain_db(
@@ -414,11 +358,7 @@ fn test_burnchain_db_sortition_tip_mismatch_is_error() {
     let sort_path = create_squashed_sortition(dir.path(), &hashes);
 
     let src = create_burnchain_db(&src_path);
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
-        params![GENESIS_BHH.to_string()],
-    )
-    .unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
     drop(src);
 
     // Pass expected_burn_height=10, but sortition tip is 5.
@@ -446,11 +386,7 @@ fn test_burnchain_db_fresh_output_dir() {
     let sort_path = create_squashed_sortition(dir.path(), &[]);
 
     let src = create_burnchain_db(&src_path);
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
-        params![GENESIS_BHH.to_string()],
-    )
-    .unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
     drop(src);
 
     let stats = super::super::burnchain::copy_burnchain_db(
@@ -478,14 +414,12 @@ fn test_burnchain_db_copy_fails_when_source_missing_canonical_hash() {
 
     // But source burnchain.sqlite only has heights 0 and 1 - 2 is missing.
     let src = create_burnchain_db(&src_path);
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
-        params![GENESIS_BHH.to_string()],
-    )
-    .unwrap();
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, ?1, ?2, 0, 0)",
-        params![fixture_bhh(1).to_string(), GENESIS_BHH.to_string()],
+    BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
+    BurnchainDB::test_insert_block_header_row(
+        &src,
+        1,
+        &fixture_bhh(1).to_string(),
+        &GENESIS_BHH.to_string(),
     )
     .unwrap();
     drop(src);
@@ -514,16 +448,9 @@ fn test_burnchain_db_validate_detects_missing_canonical_hash() {
     let sort_path = create_squashed_sortition(dir.path(), &[h1.clone()]);
 
     let src = create_burnchain_db(&src_path);
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
-        params![GENESIS_BHH.to_string()],
-    )
-    .unwrap();
-    src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, ?1, ?2, 0, 0)",
-        params![h1.to_string(), GENESIS_BHH.to_string()],
-    )
-    .unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 1, &h1.to_string(), &GENESIS_BHH.to_string())
+        .unwrap();
     drop(src);
 
     // Copy normally (source has all canonical hashes).

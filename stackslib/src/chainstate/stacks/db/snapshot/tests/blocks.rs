@@ -17,7 +17,7 @@
 //! streams, and the Nakamoto staging-blocks DB.
 
 use rstest::rstest;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 use stacks_common::util::hash::Sha512Trunc256Sum;
@@ -25,7 +25,11 @@ use stacks_common::util::secp256k1::MessageSignature;
 use tempfile::tempdir;
 
 use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
-use super::{create_dest_db_with_canonical_blocks, create_source_db};
+use super::{
+    create_dest_db_with_canonical_blocks, create_source_db, insert_epoch2_block_header_with_ibh,
+    insert_nakamoto_header,
+};
+use crate::chainstate::nakamoto::staging_blocks::test_insert_nakamoto_staging_block_row;
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::index::Error;
 use crate::chainstate::stacks::{
@@ -33,29 +37,21 @@ use crate::chainstate::stacks::{
     TransactionAuth, TransactionPayload, TransactionSpendingCondition, TransactionVersion,
 };
 use crate::core::EMPTY_MICROBLOCK_PARENT_HASH;
-use crate::util_lib::db::sqlite_open;
+
+/// All-zero `index_block_hash` of the fixtures' genesis header (height-0
+/// rows are skipped by the epoch-2 block file copy).
+const GENESIS_IBH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Create the fixture's squashed `index.sqlite`. Must be WAL: the epoch2
+/// block-file copy re-opens it with a read-only `sqlite_open`, whose WAL
+/// pragma rejects non-WAL files.
+fn create_squashed_index_db(path: &std::path::Path) -> Connection {
+    create_source_db(path)
+}
 
 /// End-to-end epoch-2 block file copy: genesis is skipped, the height-1
 /// file lands byte-identical at its hashed relative path, and validation
 /// passes.
-/// Create the fixture's squashed `index.sqlite` through [`sqlite_open`], so
-/// it is WAL like a production-created DB: the epoch2 block-file copy
-/// re-opens it with a read-only [`sqlite_open`], whose WAL pragma rejects
-/// non-WAL files.
-fn create_squashed_index_db(path: &std::path::Path) -> Connection {
-    let conn = sqlite_open(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        false,
-    )
-    .unwrap();
-    conn.execute_batch(
-        "CREATE TABLE block_headers (index_block_hash TEXT NOT NULL, block_height INTEGER NOT NULL)",
-    )
-    .unwrap();
-    conn
-}
-
 #[test]
 fn test_epoch2_block_file_copy_and_validate() {
     let dir = tempdir().unwrap();
@@ -65,18 +61,10 @@ fn test_epoch2_block_file_copy_and_validate() {
     // Create a squashed index.sqlite with 2 block headers (height 0 = genesis, height 1).
     let idx_path = dir.path().join("squashed_index.sqlite");
     let conn = create_squashed_index_db(&idx_path);
-    conn.execute(
-            "INSERT INTO block_headers VALUES ('0000000000000000000000000000000000000000000000000000000000000000', 0)",
-            [],
-        )
-        .unwrap();
+    insert_epoch2_block_header_with_ibh(&conn, 0, GENESIS_IBH, "_genesis");
     // Height 1 block: hex hash that maps to a known path.
     let hash_hex = "aabbccdd00000000000000000000000000000000000000000000000000000001";
-    conn.execute(
-        "INSERT INTO block_headers VALUES (?1, 1)",
-        params![hash_hex],
-    )
-    .unwrap();
+    insert_epoch2_block_header_with_ibh(&conn, 1, hash_hex, "1");
     drop(conn);
 
     // Create source block file for height 1.
@@ -125,11 +113,7 @@ fn test_epoch2_block_file_missing_source_is_error() {
     let idx_path = dir.path().join("squashed_index.sqlite");
     let conn = create_squashed_index_db(&idx_path);
     let hash_hex = "aabbccdd00000000000000000000000000000000000000000000000000000001";
-    conn.execute(
-        "INSERT INTO block_headers VALUES (?1, 1)",
-        params![hash_hex],
-    )
-    .unwrap();
+    insert_epoch2_block_header_with_ibh(&conn, 1, hash_hex, "1");
     drop(conn);
 
     std::fs::create_dir_all(&src_blocks_dir).unwrap();
@@ -326,21 +310,15 @@ fn insert_nakamoto_staging_block(
     obtain_method: &str,
     data: &[u8],
 ) {
-    conn.execute(
-        "INSERT INTO nakamoto_staging_blocks \
-             (block_hash, consensus_hash, parent_block_id, is_tenure_start, \
-              burn_attachable, processed, orphaned, height, index_block_hash, \
-              processed_time, obtain_method, signing_weight, data) \
-             VALUES (?1, ?2, ?3, 1, 1, 1, 0, ?4, ?5, 0, ?6, 100, ?7)",
-        params![
-            block_hash,
-            consensus_hash,
-            parent_block_id,
-            height,
-            index_block_hash,
-            obtain_method,
-            data,
-        ],
+    test_insert_nakamoto_staging_block_row(
+        conn,
+        block_hash,
+        consensus_hash,
+        parent_block_id,
+        height,
+        index_block_hash,
+        obtain_method,
+        data,
     )
     .unwrap();
 }
@@ -594,6 +572,12 @@ fn test_nakamoto_copy_and_validate() {
     let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
     let idx_path = dir.path().join("squashed_index.sqlite");
 
+    // Squashed index holding only the canonical blocks' headers.
+    let idx_conn = create_source_db(&idx_path);
+    let ibh_1 = insert_nakamoto_header(&idx_conn, "canonical_ibh_1", 100).to_hex();
+    let ibh_2 = insert_nakamoto_header(&idx_conn, "canonical_ibh_2", 101).to_hex();
+    drop(idx_conn);
+
     // Create source nakamoto.sqlite with canonical + non-canonical rows.
     let src_conn = create_source_nakamoto_db(&src_nak_path);
     insert_nakamoto_staging_block(
@@ -602,7 +586,7 @@ fn test_nakamoto_copy_and_validate() {
         "canonical_ch_1",
         "parent_1",
         100,
-        "canonical_ibh_1",
+        &ibh_1,
         "Fetched",
         b"block_data_1",
     );
@@ -612,7 +596,7 @@ fn test_nakamoto_copy_and_validate() {
         "canonical_ch_2",
         "parent_2",
         101,
-        "canonical_ibh_2",
+        &ibh_2,
         "Shadow",
         b"block_data_2",
     );
@@ -628,27 +612,6 @@ fn test_nakamoto_copy_and_validate() {
         b"orphan_data",
     );
     drop(src_conn);
-
-    // Create squashed index with nakamoto_block_headers for canonical blocks only.
-    let idx_conn = Connection::open(&idx_path).unwrap();
-    idx_conn
-        .execute_batch(
-            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY)",
-        )
-        .unwrap();
-    idx_conn
-        .execute(
-            "INSERT INTO nakamoto_block_headers VALUES ('canonical_ibh_1')",
-            [],
-        )
-        .unwrap();
-    idx_conn
-        .execute(
-            "INSERT INTO nakamoto_block_headers VALUES ('canonical_ibh_2')",
-            [],
-        )
-        .unwrap();
-    drop(idx_conn);
 
     // Copy.
     let stats = super::super::blocks::copy_nakamoto_staging_blocks(
@@ -711,19 +674,27 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
     let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
     let idx_path = dir.path().join("squashed_index.sqlite");
 
+    // Squashed index stops at H: ibh_a, ibh_h, and the in-index orphan --
+    // NOT the post-boundary block.
+    let idx_conn = create_source_db(&idx_path);
+    let ibh_a = insert_nakamoto_header(&idx_conn, "ibh_a", 100).to_hex();
+    let ibh_h = insert_nakamoto_header(&idx_conn, "ibh_h", 101).to_hex();
+    let ibh_orphan = insert_nakamoto_header(&idx_conn, "ibh_orphan", 101).to_hex();
+    drop(idx_conn);
+
     // Source: two <=H canonical blocks plus one post-boundary (H+1) child of H.
     let src_conn = create_source_nakamoto_db(&src_nak_path);
     insert_nakamoto_staging_block(
-        &src_conn, "bh_a", "ch_a", "parent_a", 100, "ibh_a", "Fetched", b"data_a",
+        &src_conn, "bh_a", "ch_a", "parent_a", 100, &ibh_a, "Fetched", b"data_a",
     );
     insert_nakamoto_staging_block(
-        &src_conn, "bh_h", "ch_h", "ibh_a", 101, "ibh_h", "Fetched", b"data_h",
+        &src_conn, "bh_h", "ch_h", &ibh_a, 101, &ibh_h, "Fetched", b"data_h",
     );
     insert_nakamoto_staging_block(
         &src_conn,
         "bh_post",
         "ch_post",
-        "ibh_h",
+        &ibh_h,
         102,
         "ibh_post",
         "Fetched",
@@ -736,9 +707,9 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
         &src_conn,
         "bh_orphan",
         "ch_orphan",
-        "ibh_a",
+        &ibh_a,
         101,
-        "ibh_orphan",
+        &ibh_orphan,
         "Fetched",
         b"data_orphan",
     );
@@ -749,21 +720,6 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
         )
         .unwrap();
     drop(src_conn);
-
-    // Squashed index stops at H: ibh_a and ibh_h only -- NOT ibh_post.
-    let idx_conn = Connection::open(&idx_path).unwrap();
-    idx_conn
-        .execute_batch(
-            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY)",
-        )
-        .unwrap();
-    idx_conn
-        .execute(
-            "INSERT INTO nakamoto_block_headers VALUES ('ibh_a'), ('ibh_h'), ('ibh_orphan')",
-            [],
-        )
-        .unwrap();
-    drop(idx_conn);
 
     // Copy: only the two <=H blocks are retained.
     let stats = super::super::blocks::copy_nakamoto_staging_blocks(
@@ -811,7 +767,7 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
         &dst_conn,
         "bh_post",
         "ch_post",
-        "ibh_h",
+        &ibh_h,
         102,
         "ibh_post",
         "Fetched",
@@ -856,22 +812,15 @@ fn test_nakamoto_validate_detects_drift(
     let idx_path = dir.path().join("squashed_index.sqlite");
 
     // Create matching source and destination with one canonical row.
+    let idx_conn = create_source_db(&idx_path);
+    let ibh1 = insert_nakamoto_header(&idx_conn, "ibh1", 100).to_hex();
+    drop(idx_conn);
+
     let src_conn = create_source_nakamoto_db(&src_nak_path);
     insert_nakamoto_staging_block(
-        &src_conn, "bh1", "ch1", "p1", 100, "ibh1", "Fetched", b"data1",
+        &src_conn, "bh1", "ch1", "p1", 100, &ibh1, "Fetched", b"data1",
     );
     drop(src_conn);
-
-    let idx_conn = Connection::open(&idx_path).unwrap();
-    idx_conn
-        .execute_batch(
-            "CREATE TABLE nakamoto_block_headers (index_block_hash TEXT NOT NULL PRIMARY KEY)",
-        )
-        .unwrap();
-    idx_conn
-        .execute("INSERT INTO nakamoto_block_headers VALUES ('ibh1')", [])
-        .unwrap();
-    drop(idx_conn);
 
     super::super::blocks::copy_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
@@ -906,16 +855,9 @@ fn test_epoch2_file_validation_ignores_nakamoto_sqlite() {
     // Create a squashed index with one block at height 1.
     let idx_path = dir.path().join("squashed_index.sqlite");
     let conn = create_squashed_index_db(&idx_path);
-    conn.execute(
-            "INSERT INTO block_headers VALUES ('0000000000000000000000000000000000000000000000000000000000000000', 0)",
-            [],
-        ).unwrap();
+    insert_epoch2_block_header_with_ibh(&conn, 0, GENESIS_IBH, "_genesis");
     let hash_hex = "aabbccdd00000000000000000000000000000000000000000000000000000001";
-    conn.execute(
-        "INSERT INTO block_headers VALUES (?1, 1)",
-        params![hash_hex],
-    )
-    .unwrap();
+    insert_epoch2_block_header_with_ibh(&conn, 1, hash_hex, "1");
     drop(conn);
 
     // Create source + dest block files.

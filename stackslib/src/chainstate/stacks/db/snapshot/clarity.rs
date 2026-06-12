@@ -22,11 +22,14 @@ use clarity::vm::types::QualifiedContractIdentifier;
 use rusqlite::{Connection, OpenFlags};
 use stacks_common::types::chainstate::StacksBlockId;
 
-use super::common::{clone_schemas_from_source, with_indexes_dropped, with_offline_write_session};
+use super::common::{
+    clone_schemas_from_source, with_indexes_dropped, with_offline_write_session,
+    with_readonly_session,
+};
 use super::fork_storage::{collect_leaf_value_hashes, copy_leaf_referenced_rows};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
-use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
-use crate::chainstate::stacks::index::{trie_sql, Error};
+use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
+use crate::chainstate::stacks::index::Error;
 use crate::util_lib::db::sqlite_open;
 
 /// Clarity side-storage tables copied by [`copy_clarity_side_tables`].
@@ -112,6 +115,14 @@ fn open_readonly_clarity_db(path: &str) -> Result<Connection, Error> {
     sqlite_open(path, OpenFlags::SQLITE_OPEN_READ_ONLY, false).map_err(Error::SQLError)
 }
 
+/// Open the MARF at `db_path` strictly read-only: contract probes must
+/// never take a write lock (the source may be a live node's file).
+fn open_readonly_marf(db_path: &str) -> Result<MARF<StacksBlockId>, Error> {
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let storage = TrieFileStorage::open_readonly(db_path, open_opts)?;
+    Ok(MARF::from_storage(storage))
+}
+
 /// Stream the source `metadata_table` into the destination, keeping only
 /// rows whose contract id is in `required`. Rows whose key is not in the
 /// [`SqliteConnection`] metadata format are skipped.
@@ -162,8 +173,7 @@ fn filter_required_contracts(
     tip: &StacksBlockId,
     contract_ids: &[String],
 ) -> Result<HashSet<String>, Error> {
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-    let mut marf = MARF::<StacksBlockId>::from_path(db_path, open_opts)?;
+    let mut marf = open_readonly_marf(db_path)?;
     let mut required: HashSet<String> = HashSet::new();
     for contract_id in contract_ids {
         let contract = QualifiedContractIdentifier::parse(contract_id).map_err(|e| {
@@ -226,142 +236,108 @@ pub fn validate_clarity_side_tables(
     src_db_path: &str,
     dst_db_path: &str,
 ) -> Result<ClaritySideTableValidation, Error> {
+    // The squashed trie's tip anchors every contract probe below; its
+    // leaves are the data keys the dst must retain.
+    let (dst_tip, needed_keys) = collect_leaf_value_hashes::<StacksBlockId>(dst_db_path)?;
+
     let src_conn = open_readonly_clarity_db(src_db_path)?;
 
-    let dst_conn = open_readonly_clarity_db(dst_db_path)?;
+    with_readonly_session(dst_db_path, &[("src", src_db_path)], |conn| {
+        let src_data_rows = SqliteConnection::count_data_rows(&src_conn)?;
+        let dst_data_rows = SqliteConnection::count_data_rows(conn)?;
+        let src_meta_rows = SqliteConnection::count_metadata_rows(&src_conn)?;
+        let dst_meta_rows = SqliteConnection::count_metadata_rows(conn)?;
 
-    let src_data_rows: u64 =
-        src_conn.query_row("SELECT COUNT(*) FROM data_table", [], |row| row.get(0))?;
-    let dst_data_rows: u64 =
-        dst_conn.query_row("SELECT COUNT(*) FROM data_table", [], |row| row.get(0))?;
+        const SAMPLE_CONTRACT_LIMIT: usize = 20;
+        let all_contract_ids_ordered = scan_metadata_contract_ids(&src_conn)?;
 
-    let src_meta_rows: u64 =
-        src_conn.query_row("SELECT COUNT(*) FROM metadata_table", [], |row| row.get(0))?;
-    let dst_meta_rows: u64 =
-        dst_conn.query_row("SELECT COUNT(*) FROM metadata_table", [], |row| row.get(0))?;
+        let sample_contract_ids: Vec<&str> = all_contract_ids_ordered
+            .iter()
+            .take(SAMPLE_CONTRACT_LIMIT)
+            .map(|s| s.as_str())
+            .collect();
 
-    const SAMPLE_CONTRACT_LIMIT: usize = 20;
-    let all_contract_ids_ordered = scan_metadata_contract_ids(&src_conn)?;
-    let dst_tip = trie_sql::get_latest_confirmed_block_hash::<StacksBlockId>(&dst_conn)?;
+        let mut sample_contracts_checked: u64 = 0;
+        let mut sample_contracts_missing_in_trie: u64 = 0;
+        let mut sample_contracts_missing_in_data_table: u64 = 0;
 
-    let sample_contract_ids: Vec<&str> = all_contract_ids_ordered
-        .iter()
-        .take(SAMPLE_CONTRACT_LIMIT)
-        .map(|s| s.as_str())
-        .collect();
+        if !sample_contract_ids.is_empty() {
+            let mut marf = open_readonly_marf(dst_db_path)?;
 
-    let mut sample_contracts_checked: u64 = 0;
-    let mut sample_contracts_missing_in_trie: u64 = 0;
-    let mut sample_contracts_missing_in_data_table: u64 = 0;
+            for contract_id in sample_contract_ids.iter() {
+                sample_contracts_checked += 1;
+                let contract = QualifiedContractIdentifier::parse(contract_id).map_err(|e| {
+                    Error::CorruptionError(format!(
+                        "Failed to parse contract identifier '{contract_id}': {e:?}"
+                    ))
+                })?;
+                let key = make_contract_hash_key(&contract);
+                let trie_value = marf.get(&dst_tip, &key)?;
+                let Some(trie_value) = trie_value else {
+                    sample_contracts_missing_in_trie += 1;
+                    continue;
+                };
 
-    if !sample_contract_ids.is_empty() {
-        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
-        let mut marf = MARF::<StacksBlockId>::from_path(dst_db_path, open_opts)?;
-
-        for contract_id in sample_contract_ids.iter() {
-            sample_contracts_checked += 1;
-            let contract = QualifiedContractIdentifier::parse(contract_id).map_err(|e| {
-                Error::CorruptionError(format!(
-                    "Failed to parse contract identifier '{contract_id}': {e:?}"
-                ))
-            })?;
-            let key = make_contract_hash_key(&contract);
-            let trie_value = marf.get(&dst_tip, &key)?;
-            let Some(trie_value) = trie_value else {
-                sample_contracts_missing_in_trie += 1;
-                continue;
-            };
-
-            let side_key = trie_value.to_hex();
-            let exists: bool = dst_conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM data_table WHERE key = ?1",
-                    [side_key],
-                    |row| row.get(0),
-                )
-                .map_err(Error::SQLError)?;
-            if !exists {
-                sample_contracts_missing_in_data_table += 1;
+                if !SqliteConnection::data_row_exists(conn, &trie_value.to_hex())? {
+                    sample_contracts_missing_in_data_table += 1;
+                }
             }
         }
-    }
 
-    let (_tip, needed_keys) = collect_leaf_value_hashes::<StacksBlockId>(dst_db_path)?;
-    dst_conn
-        .execute("ATTACH DATABASE ?1 AS src", [src_db_path])
-        .map_err(Error::SQLError)?;
-    dst_conn
-        .execute_batch("CREATE TEMP TABLE trie_values (key TEXT PRIMARY KEY)")
-        .map_err(Error::SQLError)?;
-    {
-        let mut stmt = dst_conn
-            .prepare("INSERT INTO trie_values (key) VALUES (?1)")
+        // Stage the trie-referenced keys in a temp table for the data_table
+        // comparison. The savepoint batches the inserts (the read-only
+        // session holds no transaction, and autocommit-per-row would be
+        // slow).
+        conn.execute_batch("CREATE TEMP TABLE trie_values (key TEXT PRIMARY KEY)")
             .map_err(Error::SQLError)?;
-        for key in needed_keys.iter() {
-            stmt.execute([key.to_hex()]).map_err(Error::SQLError)?;
+        conn.execute_batch("SAVEPOINT trie_values")
+            .map_err(Error::SQLError)?;
+        {
+            let mut stmt = conn
+                .prepare("INSERT INTO trie_values (key) VALUES (?1)")
+                .map_err(Error::SQLError)?;
+            for key in needed_keys.iter() {
+                stmt.execute([key.to_hex()]).map_err(Error::SQLError)?;
+            }
         }
-    }
-    let missing_required_data_table_keys: u64 = dst_conn
-        .query_row(
-            "SELECT COUNT(*) FROM src.data_table \
-         WHERE key IN (SELECT key FROM trie_values) \
-           AND key NOT IN (SELECT key FROM data_table)",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
-    dst_conn
-        .execute_batch("DETACH src")
-        .map_err(Error::SQLError)?;
-
-    let required_contract_ids =
-        filter_required_contracts(dst_db_path, &dst_tip, &all_contract_ids_ordered)?;
-
-    let mut missing_required_metadata_rows: u64 = 0;
-    {
-        let mut stmt = src_conn
-            .prepare("SELECT key, blockhash, value FROM metadata_table")
+        conn.execute_batch("RELEASE trie_values")
             .map_err(Error::SQLError)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(Error::SQLError)?;
-        for row in rows {
-            let (key, blockhash, value) = row.map_err(Error::SQLError)?;
-            let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(&key) else {
-                continue;
+        let missing_required_data_table_keys = SqliteConnection::count_data_keys_missing_from_main(
+            conn,
+            "src",
+            "SELECT key FROM trie_values",
+        )?;
+
+        let required_contract_ids =
+            filter_required_contracts(dst_db_path, &dst_tip, &all_contract_ids_ordered)?;
+
+        let mut missing_required_metadata_rows: u64 = 0;
+        SqliteConnection::visit_metadata_rows(&src_conn, |key, blockhash, value| {
+            let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(key) else {
+                return Ok(());
             };
             if !required_contract_ids.contains(contract_id) {
-                continue;
+                return Ok(());
             }
-            let exists: bool = dst_conn.query_row(
-                "SELECT COUNT(*) > 0 FROM metadata_table WHERE key = ?1 AND blockhash = ?2 AND value = ?3",
-                [key, blockhash, value],
-                |row| row.get(0),
-            )?;
-            if !exists {
+            if !SqliteConnection::metadata_row_exists(conn, key, blockhash, value)? {
                 missing_required_metadata_rows += 1;
             }
-        }
-    }
+            Ok(())
+        })?;
 
-    Ok(ClaritySideTableValidation {
-        required_data_keys_present: missing_required_data_table_keys == 0,
-        src_data_table_rows: src_data_rows,
-        dst_data_table_rows: dst_data_rows,
-        required_metadata_present: missing_required_metadata_rows == 0,
-        src_metadata_table_rows: src_meta_rows,
-        dst_metadata_table_rows: dst_meta_rows,
-        sample_contracts_checked,
-        sample_contracts_missing_in_trie,
-        sample_contracts_missing_in_data_table,
-        missing_required_data_table_keys,
-        missing_required_metadata_rows,
+        Ok(ClaritySideTableValidation {
+            required_data_keys_present: missing_required_data_table_keys == 0,
+            src_data_table_rows: src_data_rows,
+            dst_data_table_rows: dst_data_rows,
+            required_metadata_present: missing_required_metadata_rows == 0,
+            src_metadata_table_rows: src_meta_rows,
+            dst_metadata_table_rows: dst_meta_rows,
+            sample_contracts_checked,
+            sample_contracts_missing_in_trie,
+            sample_contracts_missing_in_data_table,
+            missing_required_data_table_keys,
+            missing_required_metadata_rows,
+        })
     })
 }
 

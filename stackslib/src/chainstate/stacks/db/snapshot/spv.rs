@@ -22,7 +22,7 @@ use super::common::{
     clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result, validate_copy_specs,
     with_offline_write_session, with_readonly_session, TableCopySpec,
 };
-use crate::burnchains::bitcoin::spv::BLOCK_DIFFICULTY_CHUNK_SIZE;
+use crate::burnchains::bitcoin::spv::{num_complete_chain_work_intervals, SpvClient};
 use crate::chainstate::stacks::index::Error;
 
 /// Tables required in all headers.sqlite versions.
@@ -78,6 +78,7 @@ pub fn copy_spv_headers(
 /// `headers` up to `burn_height`, `chain_work` for complete difficulty
 /// intervals only.
 fn spv_copy_specs(burn_height: u32) -> Vec<TableCopySpec> {
+    let complete_intervals = num_complete_chain_work_intervals(u64::from(burn_height));
     vec![
         TableCopySpec {
             table: "db_config",
@@ -90,8 +91,7 @@ fn spv_copy_specs(burn_height: u32) -> Vec<TableCopySpec> {
         TableCopySpec {
             table: "chain_work",
             source_sql: format!(
-                "SELECT * FROM src.chain_work \
-                 WHERE (interval + 1) * {BLOCK_DIFFICULTY_CHUNK_SIZE} - 1 <= {burn_height}"
+                "SELECT * FROM src.chain_work WHERE interval < {complete_intervals}"
             ),
         },
     ]
@@ -131,13 +131,8 @@ pub fn validate_spv_headers(
         let results = validate_copy_specs(conn, &spv_copy_specs(burn_height), &[])?;
 
         // No headers above burn_height in destination.
-        let extra_above: i64 = conn
-            .query_row(
-                &format!("SELECT COUNT(*) FROM headers WHERE height > {burn_height}"),
-                [],
-                |row| row.get(0),
-            )
-            .map_err(Error::SQLError)?;
+        let extra_above = SpvClient::count_headers_above(conn, u64::from(burn_height))
+            .map_err(|e| Error::CorruptionError(format!("cannot count SPV headers: {e}")))?;
         let no_extra_headers = extra_above == 0;
 
         Ok(SpvHeadersValidation {

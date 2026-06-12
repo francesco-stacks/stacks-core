@@ -4512,6 +4512,23 @@ pub struct SortitionTipCopyBoundary {
     pub anchor_block_height: u64,
 }
 
+impl SortitionTipCopyBoundary {
+    /// Check the boundary's internal invariants: the anchor must not sit
+    /// above the Stacks boundary, and both heights must be
+    /// SQL-representable.
+    pub fn validate(&self) -> Result<(), db_error> {
+        if self.anchor_block_height > self.max_stacks_height {
+            return Err(db_error::Other(format!(
+                "sortition tip rewrite anchor height {} exceeds Stacks boundary {}",
+                self.anchor_block_height, self.max_stacks_height
+            )));
+        }
+        u64_to_sql(self.max_stacks_height)?;
+        u64_to_sql(self.anchor_block_height)?;
+        Ok(())
+    }
+}
+
 // Querying methods
 impl SortitionDB {
     /// Get the canonical burn chain tip -- the tip of the longest burn chain we know about.
@@ -4531,10 +4548,8 @@ impl SortitionDB {
     }
 
     /// Get the burn header hash of the snapshot with the given sortition
-    /// ID, or `None` if no such snapshot exists. Used by the offline
-    /// snapshot copy to derive its canonical burn-hash set, so the
-    /// `snapshots` schema stays owned by this module. Returns the raw
-    /// stored TEXT, so the copy preserves the value byte-for-byte.
+    /// ID, or `None` if no such snapshot exists. Returns the raw stored
+    /// TEXT so callers can preserve the value byte-for-byte.
     pub(crate) fn get_snapshot_burn_header_hash(
         conn: &Connection,
         sortition_id: &SortitionId,
@@ -4596,8 +4611,77 @@ impl SortitionDB {
         )
     }
 
+    /// Whether every Stacks-tip memo row (in both memo tables) sits at or
+    /// below the boundary's Stacks height. A `None` boundary trivially
+    /// passes. Validation counterpart of
+    /// [`Self::stacks_tip_memo_copy_sql`]'s height rewrite.
+    pub(crate) fn stacks_tip_memos_within_boundary(
+        conn: &Connection,
+        boundary: Option<&SortitionTipCopyBoundary>,
+    ) -> Result<bool, db_error> {
+        let Some(boundary) = boundary else {
+            return Ok(true);
+        };
+        let max_height = u64_to_sql(boundary.max_stacks_height)?;
+        conn.query_row(
+            "SELECT COUNT(*) = 0 FROM ( \
+                 SELECT block_height FROM stacks_chain_tips WHERE block_height > ?1 \
+                 UNION ALL \
+                 SELECT block_height FROM stacks_chain_tips_by_burn_view WHERE block_height > ?1 \
+             )",
+            params![max_height],
+            |row| row.get(0),
+        )
+        .map_err(db_error::from)
+    }
+
+    /// Whether the Stacks-tip memo rows resolve exactly to the boundary's
+    /// anchor: the burn-view memo row for the anchor exists, and no memo
+    /// row for the anchor's burn view or consensus hash disagrees with it.
+    /// A `None` boundary trivially passes. Validation counterpart of
+    /// [`Self::stacks_tip_memo_copy_sql`]'s anchor rewrite.
+    pub(crate) fn stacks_tip_memos_match_boundary_anchor(
+        conn: &Connection,
+        boundary: Option<&SortitionTipCopyBoundary>,
+    ) -> Result<bool, db_error> {
+        let Some(boundary) = boundary else {
+            return Ok(true);
+        };
+        let anchor_height = u64_to_sql(boundary.anchor_block_height)?;
+        let anchor_ch = boundary.anchor_consensus_hash.to_string();
+        let anchor_burn_view_ch = boundary.anchor_burn_view_consensus_hash.to_string();
+        let anchor_bhh = boundary.anchor_block_hash.to_string();
+
+        let burn_view_anchor_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM stacks_chain_tips_by_burn_view \
+             WHERE consensus_hash = ?1 \
+               AND burn_view_consensus_hash = ?2 \
+               AND block_hash = ?3 \
+               AND block_height = ?4",
+            params![&anchor_ch, &anchor_burn_view_ch, &anchor_bhh, anchor_height],
+            |row| row.get(0),
+        )?;
+        let burn_view_mismatches: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM stacks_chain_tips_by_burn_view \
+             WHERE burn_view_consensus_hash = ?1 \
+               AND (consensus_hash != ?2 OR block_hash != ?3 OR block_height != ?4)",
+            params![&anchor_burn_view_ch, &anchor_ch, &anchor_bhh, anchor_height],
+            |row| row.get(0),
+        )?;
+        let legacy_mismatches: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM stacks_chain_tips \
+             WHERE consensus_hash = ?1 \
+               AND (block_hash != ?2 OR block_height != ?3)",
+            params![&anchor_ch, &anchor_bhh, anchor_height],
+            |row| row.get(0),
+        )?;
+
+        Ok(burn_view_anchor_rows > 0 && burn_view_mismatches == 0 && legacy_mismatches == 0)
+    }
+
     /// Get the distinct burn header hashes of all snapshots, forks included.
-    /// Only on a squashed sortition DB is this exactly the canonical burnchain
+    /// Only on a squashed sortition DB is this exactly the canonical
+    /// burnchain.
     pub(crate) fn get_all_snapshot_burn_header_hashes(
         conn: &Connection,
     ) -> Result<Vec<BurnchainHeaderHash>, db_error> {
@@ -7350,6 +7434,221 @@ pub mod tests {
         block_ops: &[BlockstackOperationType],
     ) -> BlockSnapshot {
         test_append_snapshot_with_winner(db, next_hash, block_ops, None, None)
+    }
+
+    // Raw-row test fixture writers. Each helper owns its table's column
+    // list so fixtures can't drift from the schema; values are raw
+    // TEXT/ints because fixtures use readable labels, not valid hashes
+    // (which the typed write paths would reject).
+
+    /// Insert a minimal `snapshots` row with the given identity columns;
+    /// every other column gets a fixed placeholder.
+    pub fn test_insert_snapshot_row(
+        conn: &Connection,
+        block_height: u32,
+        burn_header_hash: &str,
+        sortition_id: &str,
+        consensus_hash: &str,
+        index_root: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO snapshots (
+                block_height, burn_header_hash, sortition_id, parent_sortition_id,
+                burn_header_timestamp, parent_burn_header_hash, consensus_hash,
+                ops_hash, total_burn, sortition, sortition_hash,
+                winning_block_txid, winning_stacks_block_hash, index_root,
+                num_sortitions, stacks_block_accepted, stacks_block_height,
+                arrival_index, canonical_stacks_tip_height, canonical_stacks_tip_hash,
+                canonical_stacks_tip_consensus_hash, pox_valid,
+                accumulated_coinbase_ustx, pox_payouts, miner_pk_hash
+            ) VALUES (
+                ?1, ?2, ?3, 'parent_sort', 1000, 'parent_bhh', ?4,
+                'ops', '0', 1, 'shash', 'wbtxid', 'wsbh', ?5,
+                ?1, 0, 0, ?1, 0, 'csth', 'cstch', 1, '0', '[]', NULL
+            )",
+            params![
+                block_height,
+                burn_header_hash,
+                sortition_id,
+                consensus_hash,
+                index_root,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Rewrite a `snapshots` row's consensus hash (boundary-anchor fixtures).
+    pub fn test_set_snapshot_consensus_hash(
+        conn: &Connection,
+        sortition_id: &str,
+        consensus_hash: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "UPDATE snapshots SET consensus_hash = ?1 WHERE sortition_id = ?2",
+            params![consensus_hash, sortition_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a minimal `leader_keys` row.
+    pub fn test_insert_leader_key_row(
+        conn: &Connection,
+        txid: &str,
+        sortition_id: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO leader_keys (txid, vtxindex, block_height, burn_header_hash, \
+             sortition_id, consensus_hash, public_key, memo) \
+             VALUES (?1, 0, 1, 'bhh', ?2, 'ch', 'pk', 'memo')",
+            params![txid, sortition_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a minimal `block_commits` row.
+    pub fn test_insert_block_commit_row(
+        conn: &Connection,
+        txid: &str,
+        sortition_id: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO block_commits (txid, vtxindex, block_height, burn_header_hash, \
+             sortition_id, block_header_hash, new_seed, parent_block_ptr, parent_vtxindex, \
+             key_block_ptr, key_vtxindex, memo, commit_outs, burn_fee, sunset_burn, \
+             input, apparent_sender, burn_parent_modulus, punished) \
+             VALUES (?1, 0, 1, 'bhh', ?2, 'bhh', 'seed', 0, 0, 0, 0, '', '', '0', '0', \
+             'input', 'sender', 0, NULL)",
+            params![txid, sortition_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a minimal `block_commit_parents` row.
+    pub fn test_insert_block_commit_parent_row(
+        conn: &Connection,
+        block_commit_txid: &str,
+        block_commit_sortition_id: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO block_commit_parents (block_commit_txid, block_commit_sortition_id, \
+             parent_sortition_id) VALUES (?1, ?2, 'parent_sort')",
+            params![block_commit_txid, block_commit_sortition_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a minimal `stack_stx` row.
+    pub fn test_insert_stack_stx_row(
+        conn: &Connection,
+        txid: &str,
+        burn_header_hash: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO stack_stx (txid, vtxindex, block_height, burn_header_hash, \
+             sender_addr, reward_addr, stacked_ustx, num_cycles, signer_key, max_amount, auth_id) \
+             VALUES (?1, 0, 1, ?2, 'sender', 'reward', '1000', 1, NULL, NULL, NULL)",
+            params![txid, burn_header_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a minimal `transfer_stx` row.
+    pub fn test_insert_transfer_stx_row(
+        conn: &Connection,
+        txid: &str,
+        burn_header_hash: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO transfer_stx (txid, vtxindex, block_height, burn_header_hash, \
+             sender_addr, recipient_addr, transfered_ustx, memo) \
+             VALUES (?1, 0, 0, ?2, 's', 'r', '100', 'x')",
+            params![txid, burn_header_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Insert an empty `snapshot_transition_ops` row.
+    pub fn test_insert_snapshot_transition_ops_row(
+        conn: &Connection,
+        sortition_id: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO snapshot_transition_ops (sortition_id, accepted_ops, consumed_keys) \
+             VALUES (?1, '[]', '[]')",
+            params![sortition_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a `stacks_chain_tips` row.
+    pub fn test_insert_stacks_chain_tip_row(
+        conn: &Connection,
+        sortition_id: &str,
+        consensus_hash: &str,
+        block_hash: &str,
+        block_height: u64,
+    ) -> Result<(), db_error> {
+        conn.execute(
+            "INSERT INTO stacks_chain_tips (sortition_id, consensus_hash, block_hash, \
+             block_height) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                sortition_id,
+                consensus_hash,
+                block_hash,
+                u64_to_sql(block_height)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a `stacks_chain_tips_by_burn_view` row.
+    pub fn test_insert_stacks_chain_tip_by_burn_view_row(
+        conn: &Connection,
+        sortition_id: &str,
+        consensus_hash: &str,
+        burn_view_consensus_hash: &str,
+        block_hash: &str,
+        block_height: u64,
+    ) -> Result<(), db_error> {
+        conn.execute(
+            "INSERT INTO stacks_chain_tips_by_burn_view \
+             (sortition_id, consensus_hash, burn_view_consensus_hash, block_hash, block_height) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                sortition_id,
+                consensus_hash,
+                burn_view_consensus_hash,
+                block_hash,
+                u64_to_sql(block_height)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a minimal `missed_commits` row.
+    pub fn test_insert_missed_commit_row(
+        conn: &Connection,
+        txid: &str,
+        intended_sortition_id: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO missed_commits (txid, input, intended_sortition_id) \
+             VALUES (?1, 'input', ?2)",
+            params![txid, intended_sortition_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert an empty `preprocessed_reward_sets` row.
+    pub fn test_insert_preprocessed_reward_set_row(
+        conn: &Connection,
+        sortition_id: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO preprocessed_reward_sets (sortition_id, reward_set) VALUES (?1, '{}')",
+            params![sortition_id],
+        )?;
+        Ok(())
     }
 
     #[test]

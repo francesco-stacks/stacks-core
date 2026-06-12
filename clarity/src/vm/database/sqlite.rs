@@ -173,8 +173,7 @@ impl SqliteConnection {
     }
 
     /// Insert a `metadata_table` row verbatim: `key` is already in the
-    /// [`Self::make_metadata_key`] format. Used by the snapshot copy to
-    /// preserve source rows byte-for-byte.
+    /// [`Self::make_metadata_key`] format.
     pub fn insert_metadata_row(
         conn: &Connection,
         key: &str,
@@ -187,7 +186,6 @@ impl SqliteConnection {
     }
 
     /// Visit every `metadata_table` row on `conn` as `(key, blockhash, value)`.
-    /// Used by the snapshot copy.
     pub fn visit_metadata_rows<F>(conn: &Connection, mut visit: F) -> Result<(), rusqlite::Error>
     where
         F: FnMut(&str, &str, &str) -> Result<(), rusqlite::Error>,
@@ -218,11 +216,81 @@ impl SqliteConnection {
         Ok(())
     }
 
+    /// Visit every `data_table` row on `conn` as `(key, value)`.
+    pub fn visit_data_rows<F>(conn: &Connection, mut visit: F) -> Result<(), rusqlite::Error>
+    where
+        F: FnMut(&str, &str) -> Result<(), rusqlite::Error>,
+    {
+        let mut stmt = conn.prepare("SELECT key, value FROM data_table")?;
+        let mut rows = stmt.query(NO_PARAMS)?;
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            visit(&key, &value)?;
+        }
+        Ok(())
+    }
+
     /// Number of rows in `data_table`.
     pub fn count_data_rows(conn: &Connection) -> Result<u64, rusqlite::Error> {
         conn.query_row("SELECT COUNT(*) FROM data_table", NO_PARAMS, |row| {
             row.get(0)
         })
+    }
+
+    /// Number of rows in `metadata_table`.
+    pub fn count_metadata_rows(conn: &Connection) -> Result<u64, rusqlite::Error> {
+        conn.query_row("SELECT COUNT(*) FROM metadata_table", NO_PARAMS, |row| {
+            row.get(0)
+        })
+    }
+
+    /// Whether `data_table` holds a row for `key`.
+    pub fn data_row_exists(conn: &Connection, key: &str) -> Result<bool, rusqlite::Error> {
+        conn.query_row(
+            "SELECT 1 FROM data_table WHERE key = ?",
+            params![key],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+    }
+
+    /// Whether `metadata_table` holds exactly this `(key, blockhash, value)`
+    /// row.
+    pub fn metadata_row_exists(
+        conn: &Connection,
+        key: &str,
+        blockhash: &str,
+        value: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        conn.query_row(
+            "SELECT 1 FROM metadata_table WHERE key = ? AND blockhash = ? AND value = ?",
+            params![key, blockhash, value],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+    }
+
+    /// Count the keys yielded by `keys_sql` (a SELECT producing one TEXT
+    /// column) that exist in the ATTACHed `{src_schema}.data_table` but not
+    /// in `main`'s `data_table`. Both arguments are interpolated into SQL;
+    /// pass only trusted fixed fragments.
+    pub fn count_data_keys_missing_from_main(
+        conn: &Connection,
+        src_schema: &str,
+        keys_sql: &str,
+    ) -> Result<u64, rusqlite::Error> {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {src_schema}.data_table \
+                 WHERE key IN ({keys_sql}) \
+                   AND key NOT IN (SELECT key FROM data_table)"
+            ),
+            NO_PARAMS,
+            |row| row.get(0),
+        )
     }
 
     pub fn commit_metadata_to(

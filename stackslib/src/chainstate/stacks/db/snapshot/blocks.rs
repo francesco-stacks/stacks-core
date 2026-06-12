@@ -27,7 +27,9 @@ use super::common::{
 };
 use crate::chainstate::nakamoto::staging_blocks::{
     nakamoto_staging_block_columns, nakamoto_staging_block_metadata_columns,
-    NAKAMOTO_STAGING_BLOCK_COLUMNS,
+    nakamoto_staging_blocks_membership_predicate, nakamoto_staging_blocks_metadata_select,
+    nakamoto_staging_blocks_source_select, nakamoto_staging_copy_db_version,
+    nakamoto_staging_count_blob_mismatches,
 };
 use crate::chainstate::stacks::db::blocks::index_block_hash_to_rel_path;
 use crate::chainstate::stacks::index::Error;
@@ -113,43 +115,6 @@ impl Epoch2BlockFileValidation {
 /// staging tables (`staging_microblocks*`) come from the index DB and are
 /// classified in `index.rs`.
 pub(super) const NAKAMOTO_STAGING_TABLES: &[&str] = &["nakamoto_staging_blocks", "db_version"];
-
-fn nakamoto_staging_blocks_index_canonical_predicate(source_alias: &str) -> String {
-    format!(
-        "{source_alias}.index_block_hash IN (SELECT index_block_hash FROM idx.nakamoto_block_headers)"
-    )
-}
-
-/// Predicate selecting the staging rows the squash retains: every non-orphan
-/// canonical block, i.e. one present in the squashed index headers.
-fn nakamoto_staging_blocks_membership_predicate(source_alias: &str) -> String {
-    let canonical_by_index = nakamoto_staging_blocks_index_canonical_predicate(source_alias);
-    format!("{source_alias}.orphaned = 0 AND {canonical_by_index}")
-}
-
-/// Full projection of `src.nakamoto_staging_blocks`, derived from the
-/// schema-owned [`NAKAMOTO_STAGING_BLOCK_COLUMNS`] so its column order can
-/// never drift from the INSERT list built from the same array.
-fn nakamoto_staging_blocks_source_select(source_alias: &str) -> String {
-    let columns = NAKAMOTO_STAGING_BLOCK_COLUMNS
-        .iter()
-        .map(|col| format!("{source_alias}.{col}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("SELECT {columns} FROM src.nakamoto_staging_blocks {source_alias}")
-}
-
-/// Metadata-only projection of `src.nakamoto_staging_blocks` (every column
-/// except `data`), for validation comparisons that skip the blobs.
-fn nakamoto_staging_blocks_metadata_select(source_alias: &str) -> String {
-    let columns = NAKAMOTO_STAGING_BLOCK_COLUMNS
-        .iter()
-        .filter(|col| **col != "data")
-        .map(|col| format!("{source_alias}.{col}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("SELECT {columns} FROM src.nakamoto_staging_blocks {source_alias}")
-}
 
 /// Return the hashes of confirmed microblocks descending from `parent_ibh`.
 fn get_confirmed_microblock_hashes(
@@ -420,8 +385,8 @@ pub fn copy_nakamoto_staging_blocks(
         |conn| {
             clone_schemas_from_source(conn, NAKAMOTO_STAGING_TABLES)?;
 
-            conn.execute("INSERT INTO db_version SELECT * FROM src.db_version", [])
-                .map_err(Error::SQLError)?;
+            nakamoto_staging_copy_db_version(conn)
+                .map_err(|e| Error::CorruptionError(format!("cannot copy db_version: {e}")))?;
 
             let membership = nakamoto_staging_blocks_membership_predicate("s");
 
@@ -538,18 +503,9 @@ pub fn validate_nakamoto_staging_blocks(
                 .map_err(Error::SQLError)?
                 == 0;
 
-            let blob_bytes_match = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM nakamoto_staging_blocks n \
-             INNER JOIN src.nakamoto_staging_blocks s \
-               ON n.index_block_hash = s.index_block_hash \
-             WHERE s.orphaned = 0 \
-               AND n.data != s.data",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(Error::SQLError)?
-                == 0;
+            let blob_bytes_match = nakamoto_staging_count_blob_mismatches(conn).map_err(|e| {
+                Error::CorruptionError(format!("cannot compare staging block blobs: {e}"))
+            })? == 0;
 
             let db_version_match = full_row_except_match(
                 conn,

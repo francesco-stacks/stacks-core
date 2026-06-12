@@ -16,7 +16,7 @@
 //! SPV headers DB (headers.sqlite) copy/validate tests.
 
 use rstest::rstest;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use stacks_common::deps_common::bitcoin::blockdata::block::{BlockHeader, LoneBlockHeader};
 use stacks_common::deps_common::bitcoin::network::encodable::VarInt;
 use stacks_common::deps_common::bitcoin::util::hash::Sha256dHash;
@@ -88,11 +88,8 @@ fn seed_headers(client: &mut SpvClient, count: u32) {
 fn seed_chain_work(src_path: &std::path::Path, intervals: u32) {
     let conn = Connection::open(src_path).unwrap();
     for interval in 0..intervals {
-        conn.execute(
-            "INSERT INTO chain_work VALUES (?1, ?2)",
-            params![interval, format!("work_{interval}")],
-        )
-        .unwrap();
+        SpvClient::test_insert_chain_work(&conn, u64::from(interval), &format!("work_{interval}"))
+            .unwrap();
     }
 }
 

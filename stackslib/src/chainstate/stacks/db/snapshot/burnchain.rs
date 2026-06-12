@@ -23,6 +23,7 @@ use super::common::{
     clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result, validate_copy_specs,
     with_offline_write_session, with_readonly_session, TableCopySpec,
 };
+use crate::burnchains::db::BurnchainDB;
 use crate::chainstate::burn::db::sortdb::SortitionDB;
 use crate::chainstate::stacks::index::Error;
 use crate::util_lib::db::sqlite_open;
@@ -36,6 +37,10 @@ pub(super) const REQUIRED_TABLES: &[&str] = &[
     "overrides",
     "db_config",
 ];
+
+/// The canonical burn-hash set staged by [`populate_canonical_burn_hashes`],
+/// as a SELECT fragment.
+const CANONICAL_BURN_HASHES_SQL: &str = "SELECT burn_header_hash FROM canonical_burn_hashes";
 
 /// Row-count statistics returned by [`copy_burnchain_db`].
 #[derive(Debug, Clone)]
@@ -179,7 +184,7 @@ pub fn copy_burnchain_db(
 /// `anchor_blocks` derived from the copied commit metadata, and `overrides`
 /// derived from the copied anchor blocks.
 fn burnchain_copy_specs() -> Vec<TableCopySpec> {
-    let bhh = "SELECT burn_header_hash FROM canonical_burn_hashes";
+    let bhh = CANONICAL_BURN_HASHES_SQL;
     vec![
         TableCopySpec {
             table: "db_config",
@@ -244,15 +249,12 @@ fn copy_burnchain_db_inner(
     populate_canonical_burn_hashes(conn, canonical_hashes)?;
 
     // Completeness assertion: every canonical burn hash must exist in source.
-    let missing_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM canonical_burn_hashes \
-             WHERE burn_header_hash NOT IN \
-                 (SELECT block_hash FROM src.burnchain_db_block_headers)",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
+    let missing_count = BurnchainDB::count_canonical_burn_hashes_missing_from(
+        conn,
+        "src",
+        CANONICAL_BURN_HASHES_SQL,
+    )
+    .map_err(|e| Error::CorruptionError(format!("cannot check canonical burn hashes: {e}")))?;
     if missing_count > 0 {
         return Err(Error::CorruptionError(format!(
             "{missing_count} canonical burn hashes missing from source burnchain DB"
@@ -291,29 +293,23 @@ pub fn validate_burnchain_db(
 
             // Completeness: every canonical burn hash must be present in
             // the destination.
-            let missing_in_dst: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM canonical_burn_hashes \
-                     WHERE burn_header_hash NOT IN \
-                         (SELECT block_hash FROM burnchain_db_block_headers)",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(Error::SQLError)?;
+            let missing_in_dst = BurnchainDB::count_canonical_burn_hashes_missing_from(
+                conn,
+                "main",
+                CANONICAL_BURN_HASHES_SQL,
+            )
+            .map_err(|e| {
+                Error::CorruptionError(format!("cannot check canonical burn hashes: {e}"))
+            })?;
             let canonical_complete = missing_in_dst == 0;
 
             let results = validate_copy_specs(conn, &burnchain_copy_specs(), &[])?;
 
             // No non-canonical burn hashes in destination.
-            let extra_non_canonical: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM burnchain_db_block_headers \
-                     WHERE block_hash NOT IN \
-                         (SELECT burn_header_hash FROM canonical_burn_hashes)",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(Error::SQLError)?;
+            let extra_non_canonical =
+                BurnchainDB::count_non_canonical_headers(conn, CANONICAL_BURN_HASHES_SQL).map_err(
+                    |e| Error::CorruptionError(format!("cannot check non-canonical headers: {e}")),
+                )?;
             let no_extra_headers = extra_non_canonical == 0;
 
             Ok(BurnchainDbValidation {
