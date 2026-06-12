@@ -72,8 +72,7 @@ pub fn copy_clarity_side_tables(
             clone_schemas_from_source(conn, CLARITY_SIDE_TABLES)?;
 
             let t = Instant::now();
-            let src_data_count =
-                SqliteConnection::count_data_rows(&src_conn).map_err(Error::SQLError)?;
+            let src_data_count = SqliteConnection::count_data_rows(&src_conn)?;
             let needed_count = needed_keys.len() as u64;
             let pruned_count = src_data_count.saturating_sub(needed_count);
             info!(
@@ -135,8 +134,7 @@ fn copy_required_metadata_rows(
         SqliteConnection::insert_metadata_row(dst_conn, key, blockhash, value)?;
         copied += 1;
         Ok(())
-    })
-    .map_err(Error::SQLError)?;
+    })?;
     Ok((scanned, copied))
 }
 
@@ -152,8 +150,7 @@ fn scan_metadata_contract_ids(conn: &Connection) -> Result<Vec<String>, Error> {
             }
         }
         Ok(())
-    })
-    .map_err(Error::SQLError)?;
+    })?;
     Ok(ordered)
 }
 

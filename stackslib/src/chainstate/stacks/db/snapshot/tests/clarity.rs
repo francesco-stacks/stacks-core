@@ -240,6 +240,19 @@ fn test_squashed_clarity_marf_data_reads_work() {
         assert!(val2.is_some(), "clarity_key_2 should be readable");
         assert_eq!(val2.unwrap(), "clarity_val_2");
     }
+
+    // Stale overwritten values are pruned from the content-addressed
+    // data_table: only the tip value of clarity_key_1 survives.
+    let stale: i64 = rusqlite::Connection::open(&squashed_db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM data_table \
+             WHERE value LIKE 'clarity_val_1%' AND value != 'clarity_val_1_at_3'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0, "overwritten values must be pruned");
 }
 
 /// Contract metadata reads through `MarfedKV` work on the squashed MARF
@@ -250,7 +263,7 @@ fn test_squashed_clarity_marf_metadata_reads_work() {
     let src_dir = dir.path().join("src");
     let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
 
-    let squashed_db = squash_clarity_marf(
+    squash_clarity_marf(
         &src_dir,
         &dir.path().join("squashed"),
         blocks.last().unwrap(),
@@ -273,6 +286,46 @@ fn test_squashed_clarity_marf_metadata_reads_work() {
         assert!(md.is_some(), "metadata should be present");
         assert_eq!(md.unwrap(), "contract source code v0");
     }
+}
+
+/// Metadata rows for a contract absent from the squashed trie, and rows
+/// whose key is not in the metadata format, are not copied.
+#[test]
+fn test_metadata_exclusions() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
+
+    // Rogue rows in src: a contract with no trie commitment and a key
+    // outside the metadata format.
+    let src_conn = rusqlite::Connection::open(clarity_marf_db_path(&src_dir)).unwrap();
+    src_conn
+        .execute(
+            "INSERT INTO metadata_table (key, blockhash, value) VALUES \
+             ('clr-meta::ST000000000000000000002AMW42H.ghost::source', ?1, 'ghost'), \
+             ('not-a-metadata-key', ?1, 'junk')",
+            rusqlite::params![blocks[0]],
+        )
+        .unwrap();
+    drop(src_conn);
+
+    let squashed_db = squash_clarity_marf(
+        &src_dir,
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        3,
+    );
+
+    let rogue: i64 = rusqlite::Connection::open(&squashed_db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM metadata_table \
+             WHERE key LIKE '%ghost%' OR key = 'not-a-metadata-key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rogue, 0, "unrequired/malformed metadata must not be copied");
 }
 
 /// Extending the squashed MARF and the archival MARF from the squash
