@@ -16,11 +16,15 @@
 //! Burnchain DB (burnchain.sqlite) copy/validate tests.
 
 use rusqlite::{params, Connection};
+use stacks_common::types::chainstate::BurnchainHeaderHash;
 use tempfile::tempdir;
 
 use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
 use crate::burnchains::db::BurnchainDB;
-use crate::burnchains::Burnchain;
+use crate::burnchains::{Burnchain, PoxConstants};
+use crate::chainstate::burn::db::sortdb::tests::test_append_snapshot;
+use crate::chainstate::burn::db::sortdb::SortitionDB;
+use crate::core::{StacksEpoch, StacksEpochExtension};
 
 /// Drift guard: every table the burnchain migrations create must be
 /// classified, so a future migration can't silently drop one from the copy.
@@ -52,28 +56,40 @@ fn create_burnchain_db(path: &std::path::Path) -> Connection {
     Connection::open(path).unwrap()
 }
 
-/// Create a squashed sortition DB with canonical burn hashes in a
-/// `snapshots` table.
+/// Burn header hash of the squashed-sortition fixture's genesis snapshot.
+const GENESIS_BHH: BurnchainHeaderHash = BurnchainHeaderHash([0u8; 32]);
+
+/// A distinct burn header hash for fixture block `i`.
+fn fixture_bhh(i: u8) -> BurnchainHeaderHash {
+    BurnchainHeaderHash([i; 32])
+}
+
+/// Create a squashed-sortition stand-in through production write paths
+/// ([`SortitionDB::connect`] + [`test_append_snapshot`]), so the fixture
+/// cannot drift from what production actually writes: a real sortition DB
+/// whose canonical chain is the genesis snapshot ([`GENESIS_BHH`] at height
+/// 0) followed by `hashes` at heights 1... Returns its sqlite path.
 fn create_squashed_sortition(
-    path: &std::path::Path,
-    canonical_hashes: &[(u32, &str)], // (block_height, burn_header_hash)
-) -> Connection {
-    let conn = Connection::open(path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE snapshots (
-                block_height INTEGER NOT NULL,
-                burn_header_hash TEXT NOT NULL
-            )",
+    dir: &std::path::Path,
+    hashes: &[BurnchainHeaderHash],
+) -> std::path::PathBuf {
+    let db_dir = dir.join("sortition");
+    let mut db = SortitionDB::connect(
+        db_dir.to_str().unwrap(),
+        0,
+        &GENESIS_BHH,
+        0,
+        &StacksEpoch::unit_test_3_4(0),
+        PoxConstants::test_default(),
+        None,
+        true,
+        None,
     )
-    .unwrap();
-    for (height, hash) in canonical_hashes {
-        conn.execute(
-            "INSERT INTO snapshots (block_height, burn_header_hash) VALUES (?1, ?2)",
-            params![height, hash],
-        )
-        .unwrap();
+    .expect("sortition DB init failed");
+    for hash in hashes {
+        test_append_snapshot(&mut db, hash.clone(), &[]);
     }
-    conn
+    db_dir.join("marf.sqlite")
 }
 
 /// End-to-end burnchain copy: canonical headers, ops, and commit
@@ -83,18 +99,17 @@ fn test_burnchain_db_copy_and_validate() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src_burnchain.sqlite");
     let dst_path = dir.path().join("dst_burnchain.sqlite");
-    let sort_path = dir.path().join("sortition.sqlite");
 
     // Canonical hashes at heights 0, 1, 2.
-    let canonical = vec![(0, "hash_0"), (1, "hash_1"), (2, "hash_2")];
-    create_squashed_sortition(&sort_path, &canonical);
+    let canonical = [GENESIS_BHH, fixture_bhh(1), fixture_bhh(2)];
+    let sort_path = create_squashed_sortition(dir.path(), &canonical[1..]);
 
     let src = create_burnchain_db(&src_path);
     // Insert canonical block headers.
-    for (h, hash) in &canonical {
+    for (h, hash) in canonical.iter().enumerate() {
         src.execute(
             "INSERT INTO burnchain_db_block_headers VALUES (?1, ?2, ?3, 0, 0)",
-            params![h, hash, format!("parent_{hash}")],
+            params![h, hash.to_string(), format!("parent_{hash}")],
         )
         .unwrap();
     }
@@ -106,8 +121,8 @@ fn test_burnchain_db_copy_and_validate() {
     .unwrap();
     // Ops for canonical and non-canonical.
     src.execute(
-        "INSERT INTO burnchain_db_block_ops VALUES ('hash_1', 'op1', 'tx1')",
-        [],
+        "INSERT INTO burnchain_db_block_ops VALUES (?1, 'op1', 'tx1')",
+        params![fixture_bhh(1).to_string()],
     )
     .unwrap();
     src.execute(
@@ -118,8 +133,8 @@ fn test_burnchain_db_copy_and_validate() {
     // block_commit_metadata for canonical.
     src.execute(
             "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, anchor_block, anchor_block_descendant) \
-             VALUES ('hash_1', 'tx1', 1, 0, NULL, NULL)",
-            [],
+             VALUES (?1, 'tx1', 1, 0, NULL, NULL)",
+            params![fixture_bhh(1).to_string()],
         )
         .unwrap();
     // block_commit_metadata for non-canonical.
@@ -140,7 +155,7 @@ fn test_burnchain_db_copy_and_validate() {
     .unwrap();
 
     assert_eq!(stats.block_headers_rows, 3); // 3 canonical
-    assert_eq!(stats.block_ops_rows, 1); // only hash_1's op
+    assert_eq!(stats.block_ops_rows, 1); // only fixture_bhh(1)'s op
     assert_eq!(stats.block_commit_metadata_rows, 1); // only canonical
 
     let v = super::super::burnchain::validate_burnchain_db(
@@ -160,24 +175,24 @@ fn test_burnchain_db_excludes_non_canonical_fork() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
 
-    // Only hash_a is canonical at height 1.
-    create_squashed_sortition(&sort_path, &[(0, "genesis"), (1, "hash_a")]);
+    // Only fixture_bhh(0xa1) is canonical at height 1.
+    let hash_a = fixture_bhh(0xa1);
+    let sort_path = create_squashed_sortition(dir.path(), &[hash_a.clone()]);
 
     let src = create_burnchain_db(&src_path);
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'genesis', 'none', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
+        params![GENESIS_BHH.to_string()],
     )
     .unwrap();
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, 'hash_a', 'genesis', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (1, ?1, ?2, 0, 0)",
+        params![hash_a.to_string(), GENESIS_BHH.to_string()],
     )
     .unwrap();
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, 'hash_b', 'genesis', 0, 0)",
+        "INSERT INTO burnchain_db_block_headers VALUES (1, 'hash_b', 'parent_b', 0, 0)",
         [],
     )
     .unwrap();
@@ -212,14 +227,14 @@ fn test_burnchain_db_block_ops_follow_canonical_headers() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
 
-    create_squashed_sortition(&sort_path, &[(0, "canon")]);
+    // Only the genesis snapshot is canonical.
+    let sort_path = create_squashed_sortition(dir.path(), &[]);
 
     let src = create_burnchain_db(&src_path);
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'canon', 'none', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
+        params![GENESIS_BHH.to_string()],
     )
     .unwrap();
     src.execute(
@@ -228,8 +243,8 @@ fn test_burnchain_db_block_ops_follow_canonical_headers() {
     )
     .unwrap();
     src.execute(
-        "INSERT INTO burnchain_db_block_ops VALUES ('canon', 'op_c', 'tx_c')",
-        [],
+        "INSERT INTO burnchain_db_block_ops VALUES (?1, 'op_c', 'tx_c')",
+        params![GENESIS_BHH.to_string()],
     )
     .unwrap();
     src.execute(
@@ -263,19 +278,19 @@ fn test_burnchain_db_anchor_blocks_filtered() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
 
-    create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1")]);
+    let h1 = fixture_bhh(1);
+    let sort_path = create_squashed_sortition(dir.path(), &[h1.clone()]);
 
     let src = create_burnchain_db(&src_path);
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
+        params![GENESIS_BHH.to_string()],
     )
     .unwrap();
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, 'h1', 'h0', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (1, ?1, ?2, 0, 0)",
+        params![h1.to_string(), GENESIS_BHH.to_string()],
     )
     .unwrap();
     // Anchor block for cycle 1 (referenced by canonical commit).
@@ -287,8 +302,8 @@ fn test_burnchain_db_anchor_blocks_filtered() {
     // Canonical commit referencing anchor block cycle 1.
     src.execute(
             "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, anchor_block, anchor_block_descendant) \
-             VALUES ('h1', 'tx_a', 1, 0, 1, NULL)",
-            [],
+             VALUES (?1, 'tx_a', 1, 0, 1, NULL)",
+            params![h1.to_string()],
         )
         .unwrap();
     // Override for cycle 1 (should be copied) and cycle 99 (should not).
@@ -327,14 +342,13 @@ fn test_burnchain_db_validate_detects_non_canonical_leak() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
 
-    create_squashed_sortition(&sort_path, &[(0, "h0")]);
+    let sort_path = create_squashed_sortition(dir.path(), &[]);
 
     let src = create_burnchain_db(&src_path);
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
+        params![GENESIS_BHH.to_string()],
     )
     .unwrap();
     drop(src);
@@ -374,9 +388,8 @@ fn test_burnchain_db_missing_source_is_error() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("nonexistent.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
 
-    create_squashed_sortition(&sort_path, &[(0, "h0")]);
+    let sort_path = create_squashed_sortition(dir.path(), &[]);
 
     let result = super::super::burnchain::copy_burnchain_db(
         src_path.to_str().unwrap(),
@@ -395,15 +408,15 @@ fn test_burnchain_db_sortition_tip_mismatch_is_error() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
 
     // Sortition tip is at height 5.
-    create_squashed_sortition(&sort_path, &[(0, "h0"), (5, "h5")]);
+    let hashes: Vec<_> = (1..=5).map(fixture_bhh).collect();
+    let sort_path = create_squashed_sortition(dir.path(), &hashes);
 
     let src = create_burnchain_db(&src_path);
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
+        params![GENESIS_BHH.to_string()],
     )
     .unwrap();
     drop(src);
@@ -423,7 +436,6 @@ fn test_burnchain_db_sortition_tip_mismatch_is_error() {
 fn test_burnchain_db_fresh_output_dir() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
     // Nested non-existent directory.
     let dst_path = dir
         .path()
@@ -431,12 +443,12 @@ fn test_burnchain_db_fresh_output_dir() {
         .join("nested")
         .join("burnchain.sqlite");
 
-    create_squashed_sortition(&sort_path, &[(0, "h0")]);
+    let sort_path = create_squashed_sortition(dir.path(), &[]);
 
     let src = create_burnchain_db(&src_path);
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
+        params![GENESIS_BHH.to_string()],
     )
     .unwrap();
     drop(src);
@@ -460,21 +472,20 @@ fn test_burnchain_db_copy_fails_when_source_missing_canonical_hash() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
 
     // Sortition says heights 0, 1, 2 are canonical.
-    create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1"), (2, "h2")]);
+    let sort_path = create_squashed_sortition(dir.path(), &[fixture_bhh(1), fixture_bhh(2)]);
 
-    // But source burnchain.sqlite only has h0 and h1 - h2 is missing.
+    // But source burnchain.sqlite only has heights 0 and 1 - 2 is missing.
     let src = create_burnchain_db(&src_path);
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
+        params![GENESIS_BHH.to_string()],
     )
     .unwrap();
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, 'h1', 'h0', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (1, ?1, ?2, 0, 0)",
+        params![fixture_bhh(1).to_string(), GENESIS_BHH.to_string()],
     )
     .unwrap();
     drop(src);
@@ -498,19 +509,19 @@ fn test_burnchain_db_validate_detects_missing_canonical_hash() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
 
-    create_squashed_sortition(&sort_path, &[(0, "h0"), (1, "h1")]);
+    let h1 = fixture_bhh(1);
+    let sort_path = create_squashed_sortition(dir.path(), &[h1.clone()]);
 
     let src = create_burnchain_db(&src_path);
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (0, 'h0', 'none', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (0, ?1, 'none', 0, 0)",
+        params![GENESIS_BHH.to_string()],
     )
     .unwrap();
     src.execute(
-        "INSERT INTO burnchain_db_block_headers VALUES (1, 'h1', 'h0', 0, 0)",
-        [],
+        "INSERT INTO burnchain_db_block_headers VALUES (1, ?1, ?2, 0, 0)",
+        params![h1.to_string(), GENESIS_BHH.to_string()],
     )
     .unwrap();
     drop(src);
@@ -527,8 +538,8 @@ fn test_burnchain_db_validate_detects_missing_canonical_hash() {
     // Now delete h1 from the destination to simulate incomplete copy.
     let dst = Connection::open(&dst_path).unwrap();
     dst.execute(
-        "DELETE FROM burnchain_db_block_headers WHERE block_hash = 'h1'",
-        [],
+        "DELETE FROM burnchain_db_block_headers WHERE block_hash = ?1",
+        params![h1.to_string()],
     )
     .unwrap();
     drop(dst);
@@ -551,9 +562,8 @@ fn test_burnchain_db_missing_source_does_not_create_file() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("nonexistent_burnchain.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
-    let sort_path = dir.path().join("sort.sqlite");
 
-    create_squashed_sortition(&sort_path, &[(0, "h0")]);
+    let sort_path = create_squashed_sortition(dir.path(), &[]);
 
     assert!(!src_path.exists());
 

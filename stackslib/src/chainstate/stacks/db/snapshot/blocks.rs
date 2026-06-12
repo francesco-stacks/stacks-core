@@ -25,9 +25,14 @@ use super::common::{
     validate_copy_specs, with_indexes_dropped, with_offline_write_session, with_readonly_session,
     TableCopySpec,
 };
+use crate::chainstate::nakamoto::staging_blocks::{
+    nakamoto_staging_block_columns, nakamoto_staging_block_metadata_columns,
+    NAKAMOTO_STAGING_BLOCK_COLUMNS,
+};
 use crate::chainstate::stacks::db::blocks::index_block_hash_to_rel_path;
 use crate::chainstate::stacks::index::Error;
 use crate::core::EMPTY_MICROBLOCK_PARENT_HASH;
+use crate::util_lib::db::sqlite_open;
 
 /// Statistics for confirmed epoch-2 microblock stream copy.
 #[derive(Debug, Clone, Default)]
@@ -109,16 +114,6 @@ impl Epoch2BlockFileValidation {
 /// classified in `index.rs`.
 pub(super) const NAKAMOTO_STAGING_TABLES: &[&str] = &["nakamoto_staging_blocks", "db_version"];
 
-const NAKAMOTO_STAGING_BLOCK_COLUMNS: &str = "\
-    block_hash, consensus_hash, parent_block_id, is_tenure_start, \
-    burn_attachable, processed, orphaned, height, index_block_hash, \
-    processed_time, obtain_method, signing_weight, data";
-
-const NAKAMOTO_STAGING_BLOCK_METADATA_COLUMNS: &str = "\
-    block_hash, consensus_hash, parent_block_id, is_tenure_start, \
-    burn_attachable, processed, orphaned, height, index_block_hash, \
-    processed_time, obtain_method, signing_weight";
-
 fn nakamoto_staging_blocks_index_canonical_predicate(source_alias: &str) -> String {
     format!(
         "{source_alias}.index_block_hash IN (SELECT index_block_hash FROM idx.nakamoto_block_headers)"
@@ -132,43 +127,28 @@ fn nakamoto_staging_blocks_membership_predicate(source_alias: &str) -> String {
     format!("{source_alias}.orphaned = 0 AND {canonical_by_index}")
 }
 
+/// Full projection of `src.nakamoto_staging_blocks`, derived from the
+/// schema-owned [`NAKAMOTO_STAGING_BLOCK_COLUMNS`] so its column order can
+/// never drift from the INSERT list built from the same array.
 fn nakamoto_staging_blocks_source_select(source_alias: &str) -> String {
-    format!(
-        "SELECT {source_alias}.block_hash, \
-                {source_alias}.consensus_hash, \
-                {source_alias}.parent_block_id, \
-                {source_alias}.is_tenure_start, \
-                {source_alias}.burn_attachable, \
-                {source_alias}.processed, \
-                {source_alias}.orphaned, \
-                {source_alias}.height, \
-                {source_alias}.index_block_hash, \
-                {source_alias}.processed_time, \
-                {source_alias}.obtain_method, \
-                {source_alias}.signing_weight, \
-                {source_alias}.data \
-         FROM src.nakamoto_staging_blocks {source_alias}"
-    )
+    let columns = NAKAMOTO_STAGING_BLOCK_COLUMNS
+        .iter()
+        .map(|col| format!("{source_alias}.{col}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {columns} FROM src.nakamoto_staging_blocks {source_alias}")
 }
 
 /// Metadata-only projection of `src.nakamoto_staging_blocks` (every column
 /// except `data`), for validation comparisons that skip the blobs.
 fn nakamoto_staging_blocks_metadata_select(source_alias: &str) -> String {
-    format!(
-        "SELECT {source_alias}.block_hash, \
-                {source_alias}.consensus_hash, \
-                {source_alias}.parent_block_id, \
-                {source_alias}.is_tenure_start, \
-                {source_alias}.burn_attachable, \
-                {source_alias}.processed, \
-                {source_alias}.orphaned, \
-                {source_alias}.height, \
-                {source_alias}.index_block_hash, \
-                {source_alias}.processed_time, \
-                {source_alias}.obtain_method, \
-                {source_alias}.signing_weight \
-         FROM src.nakamoto_staging_blocks {source_alias}"
-    )
+    let columns = NAKAMOTO_STAGING_BLOCK_COLUMNS
+        .iter()
+        .filter(|col| **col != "data")
+        .map(|col| format!("{source_alias}.{col}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {columns} FROM src.nakamoto_staging_blocks {source_alias}")
 }
 
 /// Return the hashes of confirmed microblocks descending from `parent_ibh`.
@@ -351,11 +331,8 @@ pub fn copy_epoch2_block_files(
     src_blocks_dir: &str,
     dst_blocks_dir: &str,
 ) -> Result<Epoch2BlockFileCopyStats, Error> {
-    let conn = Connection::open_with_flags(
-        squashed_index_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(Error::SQLError)?;
+    let conn = sqlite_open(squashed_index_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false)
+        .map_err(Error::SQLError)?;
 
     let mut stmt = conn
         .prepare(
@@ -454,9 +431,10 @@ pub fn copy_nakamoto_staging_blocks(
             with_indexes_dropped(conn, "nakamoto_staging_blocks", |conn| {
                 conn.execute(
                     &format!(
-                        "INSERT INTO nakamoto_staging_blocks ({NAKAMOTO_STAGING_BLOCK_COLUMNS}) \
+                        "INSERT INTO nakamoto_staging_blocks ({}) \
                          {} \
                          WHERE {membership}",
+                        nakamoto_staging_block_columns(),
                         nakamoto_staging_blocks_source_select("s")
                     ),
                     [],
@@ -539,7 +517,8 @@ pub fn validate_nakamoto_staging_blocks(
             let metadata_match = full_row_except_match(
                 conn,
                 &format!(
-                    "SELECT {NAKAMOTO_STAGING_BLOCK_METADATA_COLUMNS} FROM nakamoto_staging_blocks"
+                    "SELECT {} FROM nakamoto_staging_blocks",
+                    nakamoto_staging_block_metadata_columns()
                 ),
                 &format!(
                     "{} WHERE {source_membership}",
@@ -607,11 +586,8 @@ pub fn validate_epoch2_block_files(
     src_blocks_dir: &str,
     dst_blocks_dir: &str,
 ) -> Result<Epoch2BlockFileValidation, Error> {
-    let conn = Connection::open_with_flags(
-        squashed_index_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(Error::SQLError)?;
+    let conn = sqlite_open(squashed_index_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false)
+        .map_err(Error::SQLError)?;
 
     let mut stmt = conn
         .prepare("SELECT index_block_hash, block_height FROM block_headers ORDER BY block_height")

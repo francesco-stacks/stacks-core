@@ -114,9 +114,7 @@ pub struct IndexSideTableValidation {
 
 impl IndexSideTableValidation {
     /// Every validation dimension as `(name, passed)` pairs. This is the
-    /// single source of truth for [`is_valid`](Self::is_valid) and for
-    /// diagnostics: a new dimension is wired into the overall verdict simply
-    /// by listing it here, so the verdict and the printout can't drift apart.
+    /// single source of truth for [`Self::is_valid`] and for diagnostics.
     pub fn checks(&self) -> [(&'static str, bool); 15] {
         [
             (

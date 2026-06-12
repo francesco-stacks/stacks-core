@@ -172,6 +172,59 @@ impl SqliteConnection {
         Ok(())
     }
 
+    /// Insert a `metadata_table` row verbatim: `key` is already in the
+    /// [`Self::make_metadata_key`] format. Used by the snapshot copy to
+    /// preserve source rows byte-for-byte.
+    pub fn insert_metadata_row(
+        conn: &Connection,
+        key: &str,
+        blockhash: &str,
+        value: &str,
+    ) -> Result<(), rusqlite::Error> {
+        conn.prepare_cached("INSERT INTO metadata_table (blockhash, key, value) VALUES (?, ?, ?)")?
+            .execute(params![blockhash, key, value])?;
+        Ok(())
+    }
+
+    /// Visit every `metadata_table` row on `conn` as `(key, blockhash, value)`.
+    /// Used by the snapshot copy.
+    pub fn visit_metadata_rows<F>(conn: &Connection, mut visit: F) -> Result<(), rusqlite::Error>
+    where
+        F: FnMut(&str, &str, &str) -> Result<(), rusqlite::Error>,
+    {
+        let mut stmt = conn.prepare("SELECT key, blockhash, value FROM metadata_table")?;
+        let mut rows = stmt.query(NO_PARAMS)?;
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            let blockhash: String = row.get(1)?;
+            let value: String = row.get(2)?;
+            visit(&key, &blockhash, &value)?;
+        }
+        Ok(())
+    }
+
+    /// Visit every `metadata_table` key on `conn` in ascending key order
+    /// (deterministic for scans that aggregate by contract).
+    pub fn visit_metadata_keys<F>(conn: &Connection, mut visit: F) -> Result<(), rusqlite::Error>
+    where
+        F: FnMut(&str) -> Result<(), rusqlite::Error>,
+    {
+        let mut stmt = conn.prepare("SELECT key FROM metadata_table ORDER BY key")?;
+        let mut rows = stmt.query(NO_PARAMS)?;
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            visit(&key)?;
+        }
+        Ok(())
+    }
+
+    /// Number of rows in `data_table`.
+    pub fn count_data_rows(conn: &Connection) -> Result<u64, rusqlite::Error> {
+        conn.query_row("SELECT COUNT(*) FROM data_table", NO_PARAMS, |row| {
+            row.get(0)
+        })
+    }
+
     pub fn commit_metadata_to(
         conn: &Connection,
         from: &StacksBlockId,

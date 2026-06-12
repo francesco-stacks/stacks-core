@@ -17,7 +17,7 @@
 //! streams, and the Nakamoto staging-blocks DB.
 
 use rstest::rstest;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 use stacks_common::util::hash::Sha512Trunc256Sum;
@@ -33,10 +33,29 @@ use crate::chainstate::stacks::{
     TransactionAuth, TransactionPayload, TransactionSpendingCondition, TransactionVersion,
 };
 use crate::core::EMPTY_MICROBLOCK_PARENT_HASH;
+use crate::util_lib::db::sqlite_open;
 
 /// End-to-end epoch-2 block file copy: genesis is skipped, the height-1
 /// file lands byte-identical at its hashed relative path, and validation
 /// passes.
+/// Create the fixture's squashed `index.sqlite` through [`sqlite_open`], so
+/// it is WAL like a production-created DB: the epoch2 block-file copy
+/// re-opens it with a read-only [`sqlite_open`], whose WAL pragma rejects
+/// non-WAL files.
+fn create_squashed_index_db(path: &std::path::Path) -> Connection {
+    let conn = sqlite_open(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        false,
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE block_headers (index_block_hash TEXT NOT NULL, block_height INTEGER NOT NULL)",
+    )
+    .unwrap();
+    conn
+}
+
 #[test]
 fn test_epoch2_block_file_copy_and_validate() {
     let dir = tempdir().unwrap();
@@ -45,11 +64,7 @@ fn test_epoch2_block_file_copy_and_validate() {
 
     // Create a squashed index.sqlite with 2 block headers (height 0 = genesis, height 1).
     let idx_path = dir.path().join("squashed_index.sqlite");
-    let conn = Connection::open(&idx_path).unwrap();
-    conn.execute_batch(
-            "CREATE TABLE block_headers (index_block_hash TEXT NOT NULL, block_height INTEGER NOT NULL)",
-        )
-        .unwrap();
+    let conn = create_squashed_index_db(&idx_path);
     conn.execute(
             "INSERT INTO block_headers VALUES ('0000000000000000000000000000000000000000000000000000000000000000', 0)",
             [],
@@ -108,11 +123,7 @@ fn test_epoch2_block_file_missing_source_is_error() {
 
     // Index with height-1 block but NO source file.
     let idx_path = dir.path().join("squashed_index.sqlite");
-    let conn = Connection::open(&idx_path).unwrap();
-    conn.execute_batch(
-            "CREATE TABLE block_headers (index_block_hash TEXT NOT NULL, block_height INTEGER NOT NULL)",
-        )
-        .unwrap();
+    let conn = create_squashed_index_db(&idx_path);
     let hash_hex = "aabbccdd00000000000000000000000000000000000000000000000000000001";
     conn.execute(
         "INSERT INTO block_headers VALUES (?1, 1)",
@@ -894,10 +905,7 @@ fn test_epoch2_file_validation_ignores_nakamoto_sqlite() {
 
     // Create a squashed index with one block at height 1.
     let idx_path = dir.path().join("squashed_index.sqlite");
-    let conn = Connection::open(&idx_path).unwrap();
-    conn.execute_batch(
-            "CREATE TABLE block_headers (index_block_hash TEXT NOT NULL, block_height INTEGER NOT NULL)",
-        ).unwrap();
+    let conn = create_squashed_index_db(&idx_path);
     conn.execute(
             "INSERT INTO block_headers VALUES ('0000000000000000000000000000000000000000000000000000000000000000', 0)",
             [],

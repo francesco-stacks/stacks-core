@@ -168,6 +168,39 @@ pub const NAKAMOTO_STAGING_DB_SCHEMA_5: &[&str] = &[
 
 pub const NAKAMOTO_STAGING_DB_SCHEMA_LATEST: u32 = 5;
 
+/// Columns of `nakamoto_staging_blocks`, in schema order.
+pub(crate) const NAKAMOTO_STAGING_BLOCK_COLUMNS: &[&str] = &[
+    "block_hash",
+    "consensus_hash",
+    "parent_block_id",
+    "is_tenure_start",
+    "burn_attachable",
+    "processed",
+    "orphaned",
+    "height",
+    "index_block_hash",
+    "processed_time",
+    "obtain_method",
+    "signing_weight",
+    "data",
+];
+
+/// Comma-joined [`NAKAMOTO_STAGING_BLOCK_COLUMNS`], for SQL column lists.
+pub(crate) fn nakamoto_staging_block_columns() -> String {
+    NAKAMOTO_STAGING_BLOCK_COLUMNS.join(", ")
+}
+
+/// [`nakamoto_staging_block_columns`] without the block payload (`data`),
+/// for row-metadata comparisons.
+pub(crate) fn nakamoto_staging_block_metadata_columns() -> String {
+    NAKAMOTO_STAGING_BLOCK_COLUMNS
+        .iter()
+        .filter(|col| **col != "data")
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub struct NakamotoStagingBlocksConn(rusqlite::Connection);
 
 impl Deref for NakamotoStagingBlocksConn {

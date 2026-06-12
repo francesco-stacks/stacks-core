@@ -19,7 +19,7 @@ use std::time::Instant;
 use clarity::vm::database::clarity_store::make_contract_hash_key;
 use clarity::vm::database::SqliteConnection;
 use clarity::vm::types::QualifiedContractIdentifier;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use stacks_common::types::chainstate::StacksBlockId;
 
 use super::common::{clone_schemas_from_source, with_indexes_dropped, with_offline_write_session};
@@ -27,6 +27,7 @@ use super::fork_storage::{collect_leaf_value_hashes, copy_leaf_referenced_rows};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{trie_sql, Error};
+use crate::util_lib::db::sqlite_open;
 
 /// Clarity side-storage tables copied by [`copy_clarity_side_tables`].
 pub(super) const CLARITY_SIDE_TABLES: &[&str] = &["data_table", "metadata_table"];
@@ -61,6 +62,8 @@ pub fn copy_clarity_side_tables(
 
     let required_contract_ids = resolve_required_contracts(src_db_path, &squashed_tip)?;
 
+    let src_conn = open_readonly_clarity_db(src_db_path)?;
+
     let stats = with_offline_write_session(
         dst_db_path,
         &[("src", src_db_path)],
@@ -69,9 +72,8 @@ pub fn copy_clarity_side_tables(
             clone_schemas_from_source(conn, CLARITY_SIDE_TABLES)?;
 
             let t = Instant::now();
-            let src_data_count: u64 = conn
-                .query_row("SELECT COUNT(*) FROM src.data_table", [], |row| row.get(0))
-                .map_err(Error::SQLError)?;
+            let src_data_count =
+                SqliteConnection::count_data_rows(&src_conn).map_err(Error::SQLError)?;
             let needed_count = needed_keys.len() as u64;
             let pruned_count = src_data_count.saturating_sub(needed_count);
             info!(
@@ -87,7 +89,7 @@ pub fn copy_clarity_side_tables(
             let t = Instant::now();
             let (metadata_scanned, metadata_rows) =
                 with_indexes_dropped(conn, "metadata_table", |conn| {
-                    copy_required_metadata_rows(conn, &required_contract_ids)
+                    copy_required_metadata_rows(&src_conn, conn, &required_contract_ids)
                 })?;
             info!(
                 "[clarity] metadata_table scan+filter: scanned {metadata_scanned}, \
@@ -106,48 +108,35 @@ pub fn copy_clarity_side_tables(
     Ok(stats)
 }
 
-/// Stream `src.metadata_table` into the destination `metadata_table`,
-/// keeping only rows whose contract id is in `required`. Rows whose key is
-/// not in the [`SqliteConnection`] metadata format are skipped.
+/// Open a read-only connection to the Clarity side-storage DB at `path`.
+fn open_readonly_clarity_db(path: &str) -> Result<Connection, Error> {
+    sqlite_open(path, OpenFlags::SQLITE_OPEN_READ_ONLY, false).map_err(Error::SQLError)
+}
+
+/// Stream the source `metadata_table` into the destination, keeping only
+/// rows whose contract id is in `required`. Rows whose key is not in the
+/// [`SqliteConnection`] metadata format are skipped.
 /// Returns `(scanned, copied)` row counts.
 fn copy_required_metadata_rows(
-    conn: &Connection,
+    src_conn: &Connection,
+    dst_conn: &Connection,
     required: &HashSet<String>,
 ) -> Result<(u64, u64), Error> {
-    let mut stmt = conn
-        .prepare("SELECT key, blockhash, value FROM src.metadata_table")
-        .map_err(Error::SQLError)?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(Error::SQLError)?;
-    let mut insert = conn
-        .prepare(
-            "INSERT INTO metadata_table (key, blockhash, value) \
-             VALUES (?1, ?2, ?3)",
-        )
-        .map_err(Error::SQLError)?;
     let mut scanned: u64 = 0;
     let mut copied: u64 = 0;
-    for row in rows {
+    SqliteConnection::visit_metadata_rows(src_conn, |key, blockhash, value| {
         scanned += 1;
-        let (key, blockhash, value) = row.map_err(Error::SQLError)?;
-        let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(&key) else {
-            continue;
+        let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(key) else {
+            return Ok(());
         };
         if !required.contains(contract_id) {
-            continue;
+            return Ok(());
         }
-        insert
-            .execute([key, blockhash, value])
-            .map_err(Error::SQLError)?;
+        SqliteConnection::insert_metadata_row(dst_conn, key, blockhash, value)?;
         copied += 1;
-    }
+        Ok(())
+    })
+    .map_err(Error::SQLError)?;
     Ok((scanned, copied))
 }
 
@@ -156,20 +145,15 @@ fn copy_required_metadata_rows(
 fn scan_metadata_contract_ids(conn: &Connection) -> Result<Vec<String>, Error> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut ordered: Vec<String> = Vec::new();
-    let mut stmt = conn
-        .prepare("SELECT key FROM metadata_table ORDER BY key")
-        .map_err(Error::SQLError)?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(Error::SQLError)?;
-    for row in rows {
-        let key = row.map_err(Error::SQLError)?;
-        if let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(&key) {
+    SqliteConnection::visit_metadata_keys(conn, |key| {
+        if let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(key) {
             if seen.insert(contract_id.to_string()) {
                 ordered.push(contract_id.to_string());
             }
         }
-    }
+        Ok(())
+    })
+    .map_err(Error::SQLError)?;
     Ok(ordered)
 }
 
@@ -205,11 +189,7 @@ fn resolve_required_contracts(
     squashed_tip: &StacksBlockId,
 ) -> Result<HashSet<String>, Error> {
     let t = Instant::now();
-    let src_conn = Connection::open_with_flags(
-        src_db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(Error::SQLError)?;
+    let src_conn = open_readonly_clarity_db(src_db_path)?;
     let contract_ids = scan_metadata_contract_ids(&src_conn)?;
     info!(
         "[clarity] contract ids in src.metadata_table: {} unique in {:?}",
@@ -249,17 +229,9 @@ pub fn validate_clarity_side_tables(
     src_db_path: &str,
     dst_db_path: &str,
 ) -> Result<ClaritySideTableValidation, Error> {
-    let src_conn = Connection::open_with_flags(
-        src_db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(Error::SQLError)?;
+    let src_conn = open_readonly_clarity_db(src_db_path)?;
 
-    let dst_conn = Connection::open_with_flags(
-        dst_db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(Error::SQLError)?;
+    let dst_conn = open_readonly_clarity_db(dst_db_path)?;
 
     let src_data_rows: u64 =
         src_conn.query_row("SELECT COUNT(*) FROM data_table", [], |row| row.get(0))?;

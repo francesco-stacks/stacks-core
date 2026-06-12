@@ -16,13 +16,16 @@
 use std::fs;
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
+use stacks_common::types::chainstate::BurnchainHeaderHash;
 
 use super::common::{
     clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result, validate_copy_specs,
     with_offline_write_session, with_readonly_session, TableCopySpec,
 };
+use crate::chainstate::burn::db::sortdb::SortitionDB;
 use crate::chainstate::stacks::index::Error;
+use crate::util_lib::db::sqlite_open;
 
 /// Tables required in all burnchain.sqlite versions.
 pub(super) const REQUIRED_TABLES: &[&str] = &[
@@ -70,19 +73,60 @@ impl BurnchainDbValidation {
     }
 }
 
-/// Build a temp table of canonical burn header hashes from the squashed
-/// sortition DB (ATTACHed as `sort`).
-fn populate_canonical_burn_hashes(conn: &Connection) -> Result<(), Error> {
+/// Open a read-only connection to the squashed sortition DB.
+fn open_squashed_sortition_db(squashed_sortition_path: &str) -> Result<Connection, Error> {
+    sqlite_open(
+        squashed_sortition_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        false,
+    )
+    .map_err(|e| {
+        Error::CorruptionError(format!(
+            "cannot open squashed sortition DB {squashed_sortition_path}: {e}"
+        ))
+    })
+}
+
+/// Read the canonical burn set (tip height plus all burn header hashes)
+/// from a squashed sortition DB connection via [`SortitionDB`] readers.
+fn read_squashed_sortition_canonical_set(
+    conn: &Connection,
+) -> Result<(u64, Vec<BurnchainHeaderHash>), Error> {
+    // Panics if `snapshots` is empty; a squashed sortition DB always holds
+    // at least the genesis snapshot.
+    let tip_height = SortitionDB::get_highest_known_burn_chain_tip(conn)
+        .map_err(|e| Error::CorruptionError(format!("cannot read squashed sortition tip: {e}")))?
+        .block_height;
+    let hashes = SortitionDB::get_all_snapshot_burn_header_hashes(conn).map_err(|e| {
+        Error::CorruptionError(format!("cannot read squashed sortition snapshots: {e}"))
+    })?;
+    Ok((tip_height, hashes))
+}
+
+/// Build a temp table of the canonical burn header hashes read from the
+/// squashed sortition DB.
+fn populate_canonical_burn_hashes(
+    conn: &Connection,
+    canonical_hashes: &[BurnchainHeaderHash],
+) -> Result<(), Error> {
     conn.execute_batch(
         "CREATE TEMP TABLE canonical_burn_hashes (burn_header_hash TEXT PRIMARY KEY)",
     )
     .map_err(Error::SQLError)?;
-    conn.execute(
-        "INSERT INTO canonical_burn_hashes (burn_header_hash) \
-         SELECT DISTINCT burn_header_hash FROM sort.snapshots",
-        [],
-    )
-    .map_err(Error::SQLError)?;
+    // A savepoint batches the inserts whether or not the session already
+    // holds an open transaction (the copy session does; the read-only
+    // validate session does not, and autocommit-per-row would be slow).
+    conn.execute_batch("SAVEPOINT canonical_burn_hashes")
+        .map_err(Error::SQLError)?;
+    let mut stmt = conn
+        .prepare("INSERT INTO canonical_burn_hashes (burn_header_hash) VALUES (?1)")
+        .map_err(Error::SQLError)?;
+    for hash in canonical_hashes {
+        stmt.execute([hash.to_string()]).map_err(Error::SQLError)?;
+    }
+    drop(stmt);
+    conn.execute_batch("RELEASE canonical_burn_hashes")
+        .map_err(Error::SQLError)?;
     Ok(())
 }
 
@@ -115,15 +159,18 @@ pub fn copy_burnchain_db(
         fs::create_dir_all(parent).map_err(Error::IOError)?;
     }
 
+    let sort_conn = open_squashed_sortition_db(squashed_sortition_path)?;
+    let (sortition_tip_height, canonical_hashes) =
+        read_squashed_sortition_canonical_set(&sort_conn)?;
+    drop(sort_conn);
+    assert_sortition_tip_height(sortition_tip_height, expected_burn_height)?;
+
     with_offline_write_session(
         dst_burnchain_db_path,
-        &[
-            ("src", src_burnchain_db_path),
-            ("sort", squashed_sortition_path),
-        ],
+        &[("src", src_burnchain_db_path)],
         // FK off must run before BEGIN IMMEDIATE; per-connection only.
         "PRAGMA foreign_keys = OFF;",
-        |conn| copy_burnchain_db_inner(conn, expected_burn_height),
+        |conn| copy_burnchain_db_inner(conn, &canonical_hashes),
     )
 }
 
@@ -174,19 +221,15 @@ fn burnchain_copy_specs() -> Vec<TableCopySpec> {
     ]
 }
 
-/// Consistency assertion: the squashed sortition DB's tip (ATTACHed as
-/// `sort`) must match the caller's expected burn height.
-fn assert_sortition_tip_height(conn: &Connection, expected_burn_height: u32) -> Result<(), Error> {
-    let actual_max_height: u32 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(block_height), 0) FROM sort.snapshots",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Error::SQLError)?;
-    if actual_max_height != expected_burn_height {
+/// Consistency assertion: the squashed sortition DB's tip must match the
+/// caller's expected burn height.
+fn assert_sortition_tip_height(
+    sortition_tip_height: u64,
+    expected_burn_height: u32,
+) -> Result<(), Error> {
+    if sortition_tip_height != u64::from(expected_burn_height) {
         return Err(Error::CorruptionError(format!(
-            "Sortition tip height mismatch: expected {expected_burn_height}, got {actual_max_height}"
+            "Sortition tip height mismatch: expected {expected_burn_height}, got {sortition_tip_height}"
         )));
     }
     Ok(())
@@ -194,14 +237,11 @@ fn assert_sortition_tip_height(conn: &Connection, expected_burn_height: u32) -> 
 
 fn copy_burnchain_db_inner(
     conn: &Connection,
-    expected_burn_height: u32,
+    canonical_hashes: &[BurnchainHeaderHash],
 ) -> Result<BurnchainDbCopyStats, Error> {
     clone_schemas_from_source(conn, REQUIRED_TABLES)?;
 
-    // Build canonical burn hash set from squashed sortition DB.
-    populate_canonical_burn_hashes(conn)?;
-
-    assert_sortition_tip_height(conn, expected_burn_height)?;
+    populate_canonical_burn_hashes(conn, canonical_hashes)?;
 
     // Completeness assertion: every canonical burn hash must exist in source.
     let missing_count: i64 = conn
@@ -237,15 +277,17 @@ pub fn validate_burnchain_db(
     squashed_sortition_path: &str,
     expected_burn_height: u32,
 ) -> Result<BurnchainDbValidation, Error> {
+    let sort_conn = open_squashed_sortition_db(squashed_sortition_path)?;
+    let (sortition_tip_height, canonical_hashes) =
+        read_squashed_sortition_canonical_set(&sort_conn)?;
+    drop(sort_conn);
+    assert_sortition_tip_height(sortition_tip_height, expected_burn_height)?;
+
     with_readonly_session(
         dst_burnchain_db_path,
-        &[
-            ("src", src_burnchain_db_path),
-            ("sort", squashed_sortition_path),
-        ],
+        &[("src", src_burnchain_db_path)],
         |conn| {
-            populate_canonical_burn_hashes(conn)?;
-            assert_sortition_tip_height(conn, expected_burn_height)?;
+            populate_canonical_burn_hashes(conn, &canonical_hashes)?;
 
             // Completeness: every canonical burn hash must be present in
             // the destination.

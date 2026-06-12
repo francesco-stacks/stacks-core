@@ -17,6 +17,9 @@
 
 use rstest::rstest;
 use rusqlite::{params, Connection};
+use stacks_common::deps_common::bitcoin::blockdata::block::{BlockHeader, LoneBlockHeader};
+use stacks_common::deps_common::bitcoin::network::encodable::VarInt;
+use stacks_common::deps_common::bitcoin::util::hash::Sha256dHash;
 use tempfile::tempdir;
 
 use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
@@ -28,7 +31,9 @@ use crate::burnchains::bitcoin::BitcoinNetworkType;
 #[test]
 fn test_no_unclassified_spv_tables() {
     let dir = tempdir().unwrap();
-    let conn = create_spv_headers_db(&dir.path().join("src.sqlite"));
+    let src_path = dir.path().join("src.sqlite");
+    let _client = create_spv_headers_db(&src_path);
+    let conn = Connection::open(&src_path).unwrap();
     let known: Vec<&str> = super::super::spv::REQUIRED_TABLES
         .iter()
         .chain(MARF_INFRA_TABLES.iter())
@@ -41,11 +46,10 @@ fn test_no_unclassified_spv_tables() {
     );
 }
 
-/// Create a source headers.sqlite via the production initializer
-/// ([`SpvClient::new`]), so the fixture always carries the current schema
-/// instead of replaying migrations by hand. Initialization seeds the
-/// regtest genesis header at height 0, so tests insert from height 1.
-fn create_spv_headers_db(path: &std::path::Path) -> Connection {
+/// Create a source headers.sqlite. Initialization seeds the
+/// regtest genesis header at height 0, so tests seed from height 1.
+/// Returns the client so headers go through the production write path.
+fn create_spv_headers_db(path: &std::path::Path) -> SpvClient {
     SpvClient::new(
         path.to_str().unwrap(),
         0,
@@ -54,8 +58,42 @@ fn create_spv_headers_db(path: &std::path::Path) -> Connection {
         true,
         false,
     )
-    .expect("SPV headers DB init failed");
-    Connection::open(path).unwrap()
+    .expect("SPV headers DB init failed")
+}
+
+/// A synthetic-but-real header for height `h`, with deterministic fields.
+fn fixture_header(h: u32) -> LoneBlockHeader {
+    LoneBlockHeader {
+        header: BlockHeader {
+            version: 1,
+            prev_blockhash: Sha256dHash::from_data(&h.wrapping_sub(1).to_le_bytes()),
+            merkle_root: Sha256dHash::from_data(&h.to_le_bytes()),
+            time: h,
+            bits: 545259519,
+            nonce: h,
+        },
+        tx_count: VarInt(0),
+    }
+}
+
+/// Seed headers at heights 1..=`count` through the SPV client's storage
+/// writer ([`SpvClient::test_write_block_headers`]; storage only, no
+/// contiguity validation).
+fn seed_headers(client: &mut SpvClient, count: u32) {
+    let headers = (1..=count).map(fixture_header).collect();
+    client.test_write_block_headers(1, headers).unwrap();
+}
+
+/// Seed `chain_work` interval rows.
+fn seed_chain_work(src_path: &std::path::Path, intervals: u32) {
+    let conn = Connection::open(src_path).unwrap();
+    for interval in 0..intervals {
+        conn.execute(
+            "INSERT INTO chain_work VALUES (?1, ?2)",
+            params![interval, format!("work_{interval}")],
+        )
+        .unwrap();
+    }
 }
 
 /// Headers are copied up to the burn height and `chain_work` only for
@@ -66,23 +104,12 @@ fn test_spv_headers_copy_and_validate() {
     let src_path = dir.path().join("src_headers.sqlite");
     let dst_path = dir.path().join("dst_headers.sqlite");
 
-    let src = create_spv_headers_db(&src_path);
-    // Insert headers at heights 0..=5000.
-    for h in 1..=5000u32 {
-        src.execute(
-            "INSERT INTO headers VALUES (1, 'prev', 'merkle', 0, 0, 0, ?1, ?2)",
-            params![h, format!("hash_{h}")],
-        )
-        .unwrap();
-    }
-    // Insert chain_work for intervals 0, 1, 2.
-    src.execute("INSERT INTO chain_work VALUES (0, 'work_0')", [])
-        .unwrap();
-    src.execute("INSERT INTO chain_work VALUES (1, 'work_1')", [])
-        .unwrap();
-    src.execute("INSERT INTO chain_work VALUES (2, 'work_2')", [])
-        .unwrap();
-    drop(src);
+    let mut client = create_spv_headers_db(&src_path);
+    // Headers at heights 0 (genesis) ..=5000.
+    seed_headers(&mut client, 5000);
+    drop(client);
+    // chain_work for intervals 0, 1, 2.
+    seed_chain_work(&src_path, 3);
 
     let stats = super::super::spv::copy_spv_headers(
         src_path.to_str().unwrap(),
@@ -127,22 +154,10 @@ fn test_spv_headers_chain_work_boundaries(
     let src_path = dir.path().join("src.sqlite");
     let dst_path = dir.path().join("dst.sqlite");
 
-    let src = create_spv_headers_db(&src_path);
-    for h in 1..=burn_height {
-        src.execute(
-            "INSERT INTO headers VALUES (1, 'p', 'm', 0, 0, 0, ?1, ?2)",
-            params![h, format!("h{h}")],
-        )
-        .unwrap();
-    }
-    for interval in 0..src_chain_work_intervals {
-        src.execute(
-            "INSERT INTO chain_work VALUES (?1, ?2)",
-            params![interval, format!("w{interval}")],
-        )
-        .unwrap();
-    }
-    drop(src);
+    let mut client = create_spv_headers_db(&src_path);
+    seed_headers(&mut client, burn_height);
+    drop(client);
+    seed_chain_work(&src_path, src_chain_work_intervals);
 
     let stats = super::super::spv::copy_spv_headers(
         src_path.to_str().unwrap(),
