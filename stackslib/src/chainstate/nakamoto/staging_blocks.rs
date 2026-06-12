@@ -169,7 +169,7 @@ pub const NAKAMOTO_STAGING_DB_SCHEMA_5: &[&str] = &[
 pub const NAKAMOTO_STAGING_DB_SCHEMA_LATEST: u32 = 5;
 
 /// Columns of `nakamoto_staging_blocks`, in schema order.
-pub(crate) const NAKAMOTO_STAGING_BLOCK_COLUMNS: &[&str] = &[
+const NAKAMOTO_STAGING_BLOCK_COLUMNS: &[&str] = &[
     "block_hash",
     "consensus_hash",
     "parent_block_id",
