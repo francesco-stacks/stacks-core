@@ -25,7 +25,7 @@ use super::common::{
 use crate::burnchains::bitcoin::spv::{num_complete_chain_work_intervals, SpvClient};
 use crate::chainstate::stacks::index::Error;
 
-/// Tables required in all headers.sqlite versions.
+/// Tables required for the current headers.sqlite schema.
 pub(super) const REQUIRED_TABLES: &[&str] = &["headers", "db_config", "chain_work"];
 
 /// Row-count statistics returned by [`copy_spv_headers`].
@@ -52,7 +52,8 @@ impl SpvHeadersValidation {
 
 /// Copy canonical SPV headers up to `burn_height` into a new destination.
 ///
-/// Returns an error if the source file does not exist.
+/// Returns an error if the source file does not exist, or if the
+/// destination already exists.
 pub fn copy_spv_headers(
     src_path: &str,
     dst_path: &str,
@@ -62,6 +63,12 @@ pub fn copy_spv_headers(
         return Err(Error::IOError(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("SPV headers source not found: {src_path}"),
+        )));
+    }
+    if Path::new(dst_path).exists() {
+        return Err(Error::IOError(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("SPV headers destination already exists: {dst_path}"),
         )));
     }
 

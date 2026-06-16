@@ -116,15 +116,16 @@ impl Epoch2BlockFileValidation {
 /// classified in `index.rs`.
 pub(super) const NAKAMOTO_STAGING_TABLES: &[&str] = &["nakamoto_staging_blocks", "db_version"];
 
-/// Return the hashes of confirmed microblocks descending from `parent_ibh`.
-fn get_confirmed_microblock_hashes(
+/// Return the `(sequence, microblock_hash)` rows of processed,
+/// non-orphaned microblocks descending from `parent_ibh`, up to `max_seq`.
+fn get_confirmed_microblock_stream(
     conn: &Connection,
     parent_ibh: &StacksBlockId,
     max_seq: u32,
-) -> Result<Vec<BlockHeaderHash>, Error> {
+) -> Result<Vec<(u32, BlockHeaderHash)>, Error> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT microblock_hash \
+            "SELECT sequence, microblock_hash \
              FROM src.staging_microblocks \
              WHERE index_block_hash = ?1 \
                AND sequence <= ?2 \
@@ -134,15 +135,15 @@ fn get_confirmed_microblock_hashes(
         )
         .map_err(Error::SQLError)?;
 
-    let hashes = stmt
+    let stream = stmt
         .query_map(params![parent_ibh, max_seq], |row| {
-            row.get::<_, BlockHeaderHash>(0)
+            Ok((row.get::<_, u32>(0)?, row.get::<_, BlockHeaderHash>(1)?))
         })
         .map_err(Error::SQLError)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(Error::SQLError)?;
 
-    Ok(hashes)
+    Ok(stream)
 }
 
 /// Enumerate canonical child blocks that reference a microblock stream.
@@ -189,20 +190,35 @@ fn derive_confirmed_microblock_set(
         }
 
         let parent_ibh = StacksBlockId::new(parent_ch, parent_bh);
-        let hashes = get_confirmed_microblock_hashes(conn, &parent_ibh, *parent_mblock_seq)?;
+        let stream = get_confirmed_microblock_stream(conn, &parent_ibh, *parent_mblock_seq)?;
 
-        if hashes.is_empty() {
+        // The stream is confirmed only if it is complete and ends at the
+        // child's referenced tip: one microblock per sequence 0..=seq,
+        // with `parent_mblock_hash` at the top. Gaps, a missing tip, or a
+        // tip hash mismatch mean this is not the stream the child
+        // confirmed, so it cannot be copied.
+        let confirmed = stream.len() == (*parent_mblock_seq as usize).saturating_add(1)
+            && stream
+                .iter()
+                .enumerate()
+                .all(|(i, (seq, _))| *seq as usize == i)
+            && stream
+                .last()
+                .is_some_and(|(_, hash)| hash == parent_mblock_hash);
+        if !confirmed {
             warn!(
-                "[microblocks] no confirmed microblocks found for parent {parent_ch}/{parent_bh} \
-                 (tip {parent_mblock_hash}, seq {parent_mblock_seq}), skipping stream"
+                "[microblocks] stream for parent {parent_ch}/{parent_bh} is incomplete or does \
+                 not end at tip {parent_mblock_hash} seq {parent_mblock_seq} ({} usable rows), \
+                 skipping stream",
+                stream.len()
             );
             stats.streams_skipped += 1;
             continue;
         }
 
         selected_parents.insert(parent_ibh);
-        for h in hashes {
-            selected_hashes.insert(h);
+        for (_, hash) in stream {
+            selected_hashes.insert(hash);
         }
         stats.streams_copied += 1;
     }
@@ -305,23 +321,22 @@ pub fn copy_epoch2_block_files(
              FROM block_headers ORDER BY block_height",
         )
         .map_err(Error::SQLError)?;
-
-    let rows: Vec<(StacksBlockId, u64)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(Error::SQLError)?
-        .collect::<Result<Vec<_>, _>>()
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, StacksBlockId>(0)?, row.get::<_, u64>(1)?))
+        })
         .map_err(Error::SQLError)?;
-    drop(stmt);
 
     let mut stats = Epoch2BlockFileCopyStats::default();
 
-    for (index_block_hash, block_height) in &rows {
-        if *block_height == 0 {
+    for row in rows {
+        let (index_block_hash, block_height) = row.map_err(Error::SQLError)?;
+        if block_height == 0 {
             stats.genesis_skipped += 1;
             continue;
         }
 
-        let rel_path = index_block_hash_to_rel_path(index_block_hash);
+        let rel_path = index_block_hash_to_rel_path(&index_block_hash);
         let src_path = Path::new(src_blocks_dir).join(&rel_path);
         let dst_path = Path::new(dst_blocks_dir).join(&rel_path);
 
@@ -548,24 +563,23 @@ pub fn validate_epoch2_block_files(
     let mut stmt = conn
         .prepare("SELECT index_block_hash, block_height FROM block_headers ORDER BY block_height")
         .map_err(Error::SQLError)?;
-
-    let rows: Vec<(StacksBlockId, u64)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(Error::SQLError)?
-        .collect::<Result<Vec<_>, _>>()
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, StacksBlockId>(0)?, row.get::<_, u64>(1)?))
+        })
         .map_err(Error::SQLError)?;
-    drop(stmt);
 
     let mut expected_files: HashSet<PathBuf> = HashSet::new();
     let mut all_files_present = true;
     let mut all_bytes_match = true;
 
-    for (index_block_hash, block_height) in &rows {
-        if *block_height == 0 {
+    for row in rows {
+        let (index_block_hash, block_height) = row.map_err(Error::SQLError)?;
+        if block_height == 0 {
             continue;
         }
 
-        let rel_path = index_block_hash_to_rel_path(index_block_hash);
+        let rel_path = index_block_hash_to_rel_path(&index_block_hash);
         let src_path = Path::new(src_blocks_dir).join(&rel_path);
         let dst_path = Path::new(dst_blocks_dir).join(&rel_path);
 

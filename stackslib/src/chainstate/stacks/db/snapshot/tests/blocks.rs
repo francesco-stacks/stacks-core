@@ -29,7 +29,9 @@ use super::{
     create_dest_db_with_canonical_blocks, create_source_db, insert_epoch2_block_header_with_ibh,
     insert_nakamoto_header,
 };
-use crate::chainstate::nakamoto::staging_blocks::test_insert_nakamoto_staging_block_row;
+use crate::chainstate::nakamoto::staging_blocks::{
+    test_insert_nakamoto_staging_block_row, NAKAMOTO_STAGING_DB_SCHEMA_LATEST,
+};
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::index::Error;
 use crate::chainstate::stacks::{
@@ -562,6 +564,90 @@ fn test_microblock_stream_unprocessed_skipped() {
     assert_eq!(stats.microblock_rows_copied, 0);
 }
 
+/// A stream whose referenced tip is absent (only seq 0 exists, the child
+/// confirms a tip at seq 1) is incomplete: it must be skipped, not
+/// partially copied.
+#[test]
+fn test_microblock_stream_missing_tip_skipped() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src_index.sqlite");
+    let dst_path = dir.path().join("dst_index.sqlite");
+
+    let src_conn = create_source_db(&src_path);
+
+    let parent_ch = ConsensusHash([0xDD; 20]);
+    let parent_bh = BlockHeaderHash([0xEE; 32]);
+    let parent_ibh = StacksBlockId::new(&parent_ch, &parent_bh);
+
+    // Only the seq-0 microblock exists; the seq-1 tip the child references
+    // was never stored.
+    let (mblock0_hash, mblock0_data) = make_test_microblock(0, &parent_bh);
+    let (mblock1_hash, _) = make_test_microblock(1, &mblock0_hash);
+    let imh0 = StacksBlockId::new(&parent_ch, &mblock0_hash);
+    insert_staging_microblock(
+        &src_conn,
+        &format!("{parent_bh}"),
+        &parent_ch,
+        &parent_ibh,
+        &mblock0_hash,
+        &parent_bh,
+        &imh0,
+        0,
+        1,
+        0,
+    );
+    insert_staging_microblock_data(&src_conn, &mblock0_hash, &mblock0_data);
+    drop(src_conn);
+
+    create_dest_db_with_canonical_blocks(&dst_path, &[]);
+    let dst_conn = Connection::open(&dst_path).unwrap();
+    dst_conn
+        .execute(
+            "ATTACH DATABASE ?1 AS src",
+            params![src_path.to_str().unwrap()],
+        )
+        .unwrap();
+    super::super::common::clone_schemas_from_source(
+        &dst_conn,
+        &[
+            "staging_blocks",
+            "staging_microblocks",
+            "staging_microblocks_data",
+        ],
+    )
+    .unwrap();
+    dst_conn.execute_batch("DETACH DATABASE src").unwrap();
+
+    let child_ch = ConsensusHash([0x11; 20]);
+    let child_bh = BlockHeaderHash([0x22; 32]);
+    let child_ibh = StacksBlockId::new(&child_ch, &child_bh);
+    insert_staging_block_with_microblock_parent(
+        &dst_conn,
+        &format!("{child_bh}"),
+        &format!("{child_ch}"),
+        &format!("{parent_ch}"),
+        &format!("{parent_bh}"),
+        &format!("{mblock1_hash}"),
+        1,
+        &format!("{child_ibh}"),
+        2,
+    );
+    drop(dst_conn);
+
+    let stats = super::super::blocks::copy_confirmed_epoch2_microblocks(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(stats.streams_copied, 0, "incomplete stream must be skipped");
+    assert_eq!(stats.streams_skipped, 1);
+    assert_eq!(
+        stats.microblock_rows_copied, 0,
+        "no partial stream may be copied"
+    );
+}
+
 /// Canonical staging rows are copied with data blobs, `obtain_method`,
 /// and `db_version` preserved; a row not in the squashed index headers is
 /// dropped, and validation passes.
@@ -648,7 +734,11 @@ fn test_nakamoto_copy_and_validate() {
     let dst_ver: i64 = dst_conn
         .query_row("SELECT MAX(version) FROM db_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(dst_ver, 5, "db_version should be 5 (latest migration)");
+    assert_eq!(
+        dst_ver,
+        i64::from(NAKAMOTO_STAGING_DB_SCHEMA_LATEST),
+        "db_version should be the latest migration"
+    );
     drop(dst_conn);
 
     // Validate.
