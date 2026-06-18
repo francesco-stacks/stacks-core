@@ -11,8 +11,8 @@ use crate::cli::{
     SquashRootsSection, TargetPaths,
 };
 use crate::util::{
-    compute_aggregate_checksum, compute_checksums, format_timestamp, sortition_open_opts_for_path,
-    squash_marf_open_opts,
+    compute_aggregate_checksum, compute_checksums, derive_expected_epoch2_block_rel_paths,
+    format_timestamp, sortition_open_opts_for_path, squash_marf_open_opts,
 };
 
 /// Squash metadata read from a just-squashed MARF DB.
@@ -103,12 +103,6 @@ pub fn read_snapshot_timestamp(sortition_out: &TargetPaths, sortition_marf_heigh
 
 /// Generate the GSS manifest. Only called for a complete GSS (all MARFs +
 /// blocks + bitcoin aux).
-///
-/// `copied_block_rel_paths` contains the relative paths (under
-/// `chainstate/blocks/`) of epoch-2.x block files and nakamoto.sqlite that
-/// were actually written during the copy step.  This is used to build the
-/// exact expected file set for checksum generation, avoiding the need to
-/// re-walk the blocks directory (which could include stale files).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_manifest(
     out_dir: &Path,
@@ -118,7 +112,6 @@ pub fn generate_manifest(
     stacks_height: u32,
     bitcoin_height: u32,
     blocks_section: BlocksSection,
-    copied_block_rel_paths: &[String],
 ) {
     let index_meta = read_squash_metadata::<StacksBlockId>(
         index_out.db.to_str().unwrap(),
@@ -241,14 +234,14 @@ pub fn generate_manifest(
     // `nakamoto.sqlite` is hashed individually; epoch-2 block files are
     // covered by one aggregate checksum to keep the manifest compact.
     expected.insert("chainstate/blocks/nakamoto.sqlite".to_string());
-    let epoch2_block_rel_paths: Vec<String> = copied_block_rel_paths
-        .iter()
-        .filter(|rel| rel.as_str() != "chainstate/blocks/nakamoto.sqlite")
-        .cloned()
-        .collect();
+    let epoch2_block_rel_paths =
+        derive_expected_epoch2_block_rel_paths(&index_out.db).unwrap_or_else(|e| {
+            eprintln!("Failed to derive epoch-2 block files from index.sqlite: {e}");
+            std::process::exit(1);
+        });
     if epoch2_block_rel_paths.len() as u64 != blocks_section.epoch2x_files {
         eprintln!(
-            "Manifest error: copied {} epoch-2 block files, expected {}",
+            "Manifest error: index lists {} epoch-2 block files, but the copy reported {}",
             epoch2_block_rel_paths.len(),
             blocks_section.epoch2x_files
         );

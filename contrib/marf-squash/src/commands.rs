@@ -228,7 +228,6 @@ pub fn run_squash(args: SquashArgs) {
     ensure_flag_requires("blocks", do_blocks, "index", do_index);
 
     let mut blocks_stats: Option<BlocksSection> = None;
-    let mut copied_block_rel_paths: Vec<String> = Vec::new();
 
     // These variables are needed by both the copy and validation phases for blocks.
     let src_blocks_dir = args.chainstate.join("chainstate/blocks");
@@ -327,14 +326,6 @@ pub fn run_squash(args: SquashArgs) {
             nakamoto_rows: nak_stats.rows_copied,
             nakamoto_bytes: nak_stats.total_blob_bytes,
         });
-
-        // Record copied block file paths for the expected-file whitelist.
-        // Epoch2x paths are relative to dst_blocks_dir; prefix with chainstate/blocks/.
-        for rel in &file_stats.copied_paths {
-            copied_block_rel_paths.push(format!("chainstate/blocks/{}", rel.replace('\\', "/")));
-        }
-        // Nakamoto staging DB.
-        copied_block_rel_paths.push("chainstate/blocks/nakamoto.sqlite".to_string());
     }
 
     // Bitcoin auxiliary files: burnchain.sqlite + headers.sqlite.
@@ -459,7 +450,6 @@ pub fn run_squash(args: SquashArgs) {
             stacks_height,
             squash_bitcoin_height,
             blocks_stats.unwrap(),
-            &copied_block_rel_paths,
         );
     }
 
