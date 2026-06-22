@@ -234,8 +234,8 @@ pub fn generate_manifest(
     // `nakamoto.sqlite` is hashed individually; epoch-2 block files are
     // covered by one aggregate checksum to keep the manifest compact.
     expected.insert("chainstate/blocks/nakamoto.sqlite".to_string());
-    let epoch2_block_rel_paths =
-        derive_expected_epoch2_block_rel_paths(&index_out.db).unwrap_or_else(|e| {
+    let epoch2_block_rel_paths = derive_expected_epoch2_block_rel_paths(&index_out.db)
+        .unwrap_or_else(|e| {
             eprintln!("Failed to derive epoch-2 block files from index.sqlite: {e}");
             std::process::exit(1);
         });

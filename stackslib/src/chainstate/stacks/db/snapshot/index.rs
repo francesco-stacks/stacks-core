@@ -16,19 +16,20 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use stacks_common::types::chainstate::StacksBlockId;
 
 use super::common::{
-    clone_schemas_from_source, copied_rows, dst_subset_of_src, execute_copy_specs, spec_result,
-    validate_copy_specs, with_offline_write_session, with_readonly_session, TableCopySpec,
+    assert_source_schema, clone_schemas_from_source, copied_rows, dst_subset_of_src,
+    execute_copy_specs, spec_result, validate_copy_specs, with_offline_write_session,
+    with_readonly_session, TableCopySpec, MARF_INFRA_TABLES,
 };
 use super::fork_storage::{
     collect_canonical_leaf_hashes, copy_canonical_fork_storage, validate_canonical_fork_storage,
 };
 use crate::burnchains::PoxConstants;
 use crate::chainstate::stacks::index::{trie_sql, Error, MARFValue};
-use crate::util_lib::db::table_exists;
+use crate::util_lib::db::{sqlite_open, table_exists};
 
 /// Tables copied (with canonical-filtered content) into the squashed index
 /// DB and validated row-for-row against the source.
@@ -71,6 +72,29 @@ fn all_required_tables() -> Vec<&'static str> {
         .chain(SCHEMA_ONLY_TABLES)
         .copied()
         .collect()
+}
+
+/// Every table the index snapshot accounts for: content-copied ([`COPIED_TABLES`]),
+/// schema-cloned but unpopulated ([`SCHEMA_ONLY_TABLES`]), or owned by the MARF
+/// squash itself ([`MARF_INFRA_TABLES`]).
+fn known_index_tables() -> Vec<&'static str> {
+    COPIED_TABLES
+        .iter()
+        .chain(SCHEMA_ONLY_TABLES)
+        .chain(MARF_INFRA_TABLES)
+        .copied()
+        .collect()
+}
+
+/// The index snapshot's source-schema guard (see [`assert_source_schema`]);
+/// `test_no_unclassified_source_tables` runs it against a fresh schema.
+pub(super) fn assert_source_tables_classified(src_conn: &Connection) -> Result<(), Error> {
+    assert_source_schema(
+        src_conn,
+        &known_index_tables(),
+        "index DB",
+        "COPIED_TABLES (to copy) or SCHEMA_ONLY_TABLES (to schema-clone only) in snapshot/index.rs",
+    )
 }
 
 /// Row-count statistics returned by [`copy_index_side_tables`].
@@ -331,6 +355,11 @@ pub fn copy_index_side_tables(
     first_burn_height: u64,
     reward_cycle_len: u64,
 ) -> Result<IndexSideTableStats, Error> {
+    // Reject an unrecognized source schema before any destination work.
+    let src_conn = sqlite_open(src_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false)?;
+    assert_source_tables_classified(&src_conn)?;
+    drop(src_conn);
+
     let leaf_hashes = collect_canonical_leaf_hashes::<StacksBlockId>(dst_path)?;
 
     with_offline_write_session(dst_path, &[("src", src_path)], "", |conn| {

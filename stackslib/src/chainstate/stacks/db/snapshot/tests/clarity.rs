@@ -19,17 +19,16 @@
 use std::path::PathBuf;
 
 use clarity::vm::database::clarity_store::make_contract_hash_key;
-use clarity::vm::database::{ClarityBackingStore, SqliteConnection};
+use clarity::vm::database::{ClarityBackingStore, MetadataRow, SqliteConnection};
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use tempfile::tempdir;
 
-use super::super::clarity::CLARITY_SIDE_TABLES;
-use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
+use super::super::clarity::assert_source_tables_classified;
 use super::super::{copy_clarity_side_tables, validate_clarity_side_tables};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
-use crate::chainstate::stacks::index::{ClarityMarfTrieId as _, MARFValue};
+use crate::chainstate::stacks::index::{ClarityMarfTrieId as _, Error, MARFValue};
 use crate::clarity_vm::clarity::ClarityMarfStoreTransaction as _;
 use crate::clarity_vm::database::marf::MarfedKV;
 
@@ -244,14 +243,14 @@ fn test_squashed_clarity_marf_data_reads_work() {
     // Stale overwritten values are pruned from the content-addressed
     // data_table: only the tip value of clarity_key_1 survives.
     let conn = rusqlite::Connection::open(&squashed_db).unwrap();
-    let mut stale = 0;
-    SqliteConnection::visit_data_rows(&conn, |_key, value| {
-        if value.starts_with("clarity_val_1") && value != "clarity_val_1_at_3" {
-            stale += 1;
-        }
-        Ok(())
-    })
-    .unwrap();
+    let stale: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM data_table \
+             WHERE value LIKE 'clarity_val_1%' AND value != 'clarity_val_1_at_3'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(stale, 0, "overwritten values must be pruned");
 }
 
@@ -288,29 +287,23 @@ fn test_squashed_clarity_marf_metadata_reads_work() {
     }
 }
 
-/// Metadata rows for a contract absent from the squashed trie, and rows
-/// whose key is not in the metadata format, are not copied.
+/// Metadata rows for a (well-formed) contract absent from the squashed trie
+/// are not copied.
 #[test]
 fn test_metadata_exclusions() {
     let dir = tempdir().unwrap();
     let src_dir = dir.path().join("src");
     let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
 
-    // Rogue rows in src: a contract with no trie commitment and a key
-    // outside the metadata format.
+    // A rogue but well-formed row in src: a contract with no trie commitment.
     let src_conn = rusqlite::Connection::open(clarity_marf_db_path(&src_dir)).unwrap();
     SqliteConnection::insert_metadata_row(
         &src_conn,
-        "clr-meta::ST000000000000000000002AMW42H.ghost::source",
-        &blocks[0].to_hex(),
-        "ghost",
-    )
-    .unwrap();
-    SqliteConnection::insert_metadata_row(
-        &src_conn,
-        "not-a-metadata-key",
-        &blocks[0].to_hex(),
-        "junk",
+        &MetadataRow {
+            key: "clr-meta::ST000000000000000000002AMW42H.ghost::source",
+            block_id: &blocks[0].to_hex(),
+            value: "ghost",
+        },
     )
     .unwrap();
     drop(src_conn);
@@ -324,14 +317,61 @@ fn test_metadata_exclusions() {
 
     let conn = rusqlite::Connection::open(&squashed_db).unwrap();
     let mut rogue = 0;
-    SqliteConnection::visit_metadata_keys(&conn, |key| {
-        if key.contains("ghost") || key == "not-a-metadata-key" {
+    SqliteConnection::visit_metadata_keys(&conn, |key| -> Result<(), rusqlite::Error> {
+        if key.contains("ghost") {
             rogue += 1;
         }
         Ok(())
     })
     .unwrap();
-    assert_eq!(rogue, 0, "unrequired/malformed metadata must not be copied");
+    assert_eq!(rogue, 0, "unrequired metadata must not be copied");
+}
+
+/// A `metadata_table` row whose key is not in the `clr-meta::` format is a
+/// corruption signal: the copy must fail loudly rather than silently drop it.
+#[test]
+fn test_malformed_metadata_key_is_corruption() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
+
+    let src_conn = rusqlite::Connection::open(clarity_marf_db_path(&src_dir)).unwrap();
+    SqliteConnection::insert_metadata_row(
+        &src_conn,
+        &MetadataRow {
+            key: "not-a-metadata-key",
+            block_id: &blocks[0].to_hex(),
+            value: "junk",
+        },
+    )
+    .unwrap();
+    drop(src_conn);
+
+    // Squash, then attempt the side-table copy directly so we can assert it errors
+    // (the squash_clarity_marf helper unwraps the copy).
+    let squashed_dir = dir.path().join("squashed");
+    std::fs::create_dir_all(&squashed_dir).unwrap();
+    let src_db = clarity_marf_db_path(&src_dir);
+    let dst_db = squashed_dir.join("marf.sqlite");
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    MARF::<StacksBlockId>::squash_to_path(
+        src_db.to_str().unwrap(),
+        dst_db.to_str().unwrap(),
+        open_opts,
+        blocks.last().unwrap(),
+        3,
+        "test",
+    )
+    .unwrap();
+
+    let err = copy_clarity_side_tables(src_db.to_str().unwrap(), dst_db.to_str().unwrap())
+        .expect_err("malformed metadata key must fail the copy");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("clr-meta"),
+        "expected a clr-meta format corruption error, got: {msg}"
+    );
 }
 
 /// Extending the squashed MARF and the archival MARF from the squash
@@ -539,25 +579,48 @@ fn test_copy_clarity_side_tables_with_double_colon_metadata_keys() {
     }
 }
 
+/// Drift guard for the Clarity MARF DB: every table must be either copied by
+/// `copy_clarity_side_tables` (data_table, metadata_table) or owned by the MARF
+/// trie itself (recreated by `MARF::squash_to_path`). Runs the exact production
+/// guard against a freshly-built schema, so the test and the runtime check
+/// cannot drift apart.
 #[test]
 fn test_no_unclassified_clarity_source_tables() {
-    // Drift guard for the Clarity MARF DB: every table must be either copied by
-    // `copy_clarity_side_tables` (data_table, metadata_table) or owned by the
-    // MARF trie itself (copied by `MARF::squash_to_path`).
     let dir = tempdir().unwrap();
     let src_dir = dir.path().join("src");
     build_clarity_marf(&src_dir, 2, "test-contract", "");
     let conn = rusqlite::Connection::open(clarity_marf_db_path(&src_dir)).unwrap();
 
-    let known: Vec<&str> = CLARITY_SIDE_TABLES
-        .iter()
-        .copied()
-        .chain(MARF_INFRA_TABLES.iter().copied())
-        .collect();
-    let extra = unclassified_tables(&conn, &known);
+    assert_source_tables_classified(&conn)
+        .expect("fresh production Clarity schema must be fully classified");
+}
+
+/// A source table the copy lists don't classify is rejected before any
+/// destination is produced — the runtime complement to the drift test.
+#[test]
+fn test_unclassified_source_table_is_rejected() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    build_clarity_marf(&src_dir, 2, "test-contract", "");
+    let src_db = clarity_marf_db_path(&src_dir);
+
+    let conn = rusqlite::Connection::open(&src_db).unwrap();
+    conn.execute_batch("CREATE TABLE surprise_table (x INTEGER)")
+        .unwrap();
+    drop(conn);
+
+    let dst_db = dir.path().join("squashed").join("marf.sqlite");
+    let err = copy_clarity_side_tables(src_db.to_str().unwrap(), dst_db.to_str().unwrap())
+        .expect_err("unclassified source table must be rejected");
+    match err {
+        Error::CorruptionError(msg) => assert!(
+            msg.contains("surprise_table"),
+            "error should name the offending table, got: {msg}"
+        ),
+        other => panic!("expected CorruptionError, got {other:?}"),
+    }
     assert!(
-        extra.is_empty(),
-        "unclassified Clarity source table(s) {extra:?}: handle each in \
-         copy_clarity_side_tables (chainstate/stacks/db/snapshot/clarity.rs)"
+        !dst_db.exists(),
+        "no destination should be produced when the source is rejected"
     );
 }

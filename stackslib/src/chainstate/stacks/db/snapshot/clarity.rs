@@ -17,14 +17,14 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use clarity::vm::database::clarity_store::make_contract_hash_key;
-use clarity::vm::database::SqliteConnection;
+use clarity::vm::database::{SqliteConnection, DATA_TABLE_NAME, METADATA_TABLE_NAME};
 use clarity::vm::types::QualifiedContractIdentifier;
 use rusqlite::{Connection, OpenFlags};
 use stacks_common::types::chainstate::StacksBlockId;
 
 use super::common::{
-    clone_schemas_from_source, with_indexes_dropped, with_offline_write_session,
-    with_readonly_session,
+    assert_source_schema, clone_schemas_from_source, with_indexes_dropped,
+    with_offline_write_session, with_readonly_session, MARF_INFRA_TABLES,
 };
 use super::fork_storage::{collect_leaf_value_hashes, copy_leaf_referenced_rows};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
@@ -33,7 +33,29 @@ use crate::chainstate::stacks::index::Error;
 use crate::util_lib::db::sqlite_open;
 
 /// Clarity side-storage tables copied by [`copy_clarity_side_tables`].
-pub(super) const CLARITY_SIDE_TABLES: &[&str] = &["data_table", "metadata_table"];
+pub(super) const CLARITY_SIDE_TABLES: &[&str] = &[DATA_TABLE_NAME, METADATA_TABLE_NAME];
+
+/// Every table the Clarity snapshot accounts for: side-storage copied by
+/// [`copy_clarity_side_tables`] ([`CLARITY_SIDE_TABLES`]) or owned by the MARF
+/// trie itself, recreated by [`MARF::squash_to_path`] ([`MARF_INFRA_TABLES`]).
+fn known_clarity_tables() -> Vec<&'static str> {
+    CLARITY_SIDE_TABLES
+        .iter()
+        .chain(MARF_INFRA_TABLES)
+        .copied()
+        .collect()
+}
+
+/// The clarity snapshot's source-schema guard (see [`assert_source_schema`]);
+/// `test_no_unclassified_clarity_source_tables` runs it against a fresh schema.
+pub(super) fn assert_source_tables_classified(src_conn: &Connection) -> Result<(), Error> {
+    assert_source_schema(
+        src_conn,
+        &known_clarity_tables(),
+        "clarity DB",
+        "CLARITY_SIDE_TABLES (to copy) in snapshot/clarity.rs",
+    )
+}
 
 /// Copy Clarity side-storage tables (`data_table`, `metadata_table`) from a
 /// source MARF database to a squashed MARF database.
@@ -52,6 +74,10 @@ pub fn copy_clarity_side_tables(
 ) -> Result<ClaritySideTableStats, Error> {
     let total_start = Instant::now();
 
+    // Reject an unrecognized source schema before any destination work.
+    let src_conn = open_readonly_clarity_db(src_db_path)?;
+    assert_source_tables_classified(&src_conn)?;
+
     // Walk the squashed trie before opening dst for writes. we need
     // the readonly MARF view, and `marf_sqlite_open` would fight the
     // writer's lock on dst.
@@ -64,8 +90,6 @@ pub fn copy_clarity_side_tables(
     );
 
     let required_contract_ids = resolve_required_contracts(src_db_path, &squashed_tip)?;
-
-    let src_conn = open_readonly_clarity_db(src_db_path)?;
 
     let stats = with_offline_write_session(
         dst_db_path,
@@ -86,11 +110,11 @@ pub fn copy_clarity_side_tables(
 
             // data_table is content-addressed (key = hex MARFValue), like
             // the index `__fork_storage`, so it shares the same stream-filter.
-            let data_rows = copy_leaf_referenced_rows(conn, "data_table", "key", &needed_keys)?;
+            let data_rows = copy_leaf_referenced_rows(conn, DATA_TABLE_NAME, "key", &needed_keys)?;
 
             let t = Instant::now();
             let (metadata_scanned, metadata_rows) =
-                with_indexes_dropped(conn, "metadata_table", |conn| {
+                with_indexes_dropped(conn, METADATA_TABLE_NAME, |conn| {
                     copy_required_metadata_rows(&src_conn, conn, &required_contract_ids)
                 })?;
             info!(
@@ -118,15 +142,16 @@ fn open_readonly_clarity_db(path: &str) -> Result<Connection, Error> {
 /// Open the MARF at `db_path` strictly read-only: contract probes must
 /// never take a write lock (the source may be a live node's file).
 fn open_readonly_marf(db_path: &str) -> Result<MARF<StacksBlockId>, Error> {
+    // Clarity MARF always stores external blobs, whether archival or squashed.
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
     let storage = TrieFileStorage::open_readonly(db_path, open_opts)?;
     Ok(MARF::from_storage(storage))
 }
 
-/// Stream the source `metadata_table` into the destination, keeping only
-/// rows whose contract id is in `required`. Rows whose key is not in the
-/// [`SqliteConnection`] metadata format are skipped.
-/// Returns `(scanned, copied)` row counts.
+/// Stream the source `metadata_table` into the destination, keeping only rows
+/// whose contract id is in `required`. Every key must be in the `clr-meta::`
+/// format (the only format any writer produces); a key that doesn't parse is
+/// treated as corruption. Returns `(scanned, copied)` row counts.
 fn copy_required_metadata_rows(
     src_conn: &Connection,
     dst_conn: &Connection,
@@ -134,31 +159,38 @@ fn copy_required_metadata_rows(
 ) -> Result<(u64, u64), Error> {
     let mut scanned: u64 = 0;
     let mut copied: u64 = 0;
-    SqliteConnection::visit_metadata_rows(src_conn, |key, blockhash, value| {
+    SqliteConnection::visit_metadata_rows(src_conn, |row| {
         scanned += 1;
-        let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(key) else {
-            return Ok(());
+        let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(row.key) else {
+            return Err(Error::CorruptionError(format!(
+                "metadata_table key is not in clr-meta:: format: {}",
+                row.key
+            )));
         };
         if !required.contains(contract_id) {
             return Ok(());
         }
-        SqliteConnection::insert_metadata_row(dst_conn, key, blockhash, value)?;
+        SqliteConnection::insert_metadata_row(dst_conn, row)?;
         copied += 1;
         Ok(())
     })?;
     Ok((scanned, copied))
 }
 
-/// The distinct contract ids appearing in `metadata_table` keys on `conn`.
-/// Scanned in key order so the result is deterministic across runs.
+/// The distinct contract ids appearing in `metadata_table` keys on `conn`,
+/// in the visitor's ascending key order. Every key must be in the
+/// `clr-meta::` format; a key that doesn't parse is corruption.
 fn scan_metadata_contract_ids(conn: &Connection) -> Result<Vec<String>, Error> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut ordered: Vec<String> = Vec::new();
     SqliteConnection::visit_metadata_keys(conn, |key| {
-        if let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(key) {
-            if seen.insert(contract_id.to_string()) {
-                ordered.push(contract_id.to_string());
-            }
+        let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(key) else {
+            return Err(Error::CorruptionError(format!(
+                "metadata_table key is not in clr-meta:: format: {key}"
+            )));
+        };
+        if seen.insert(contract_id.to_string()) {
+            ordered.push(contract_id.to_string());
         }
         Ok(())
     })?;
@@ -312,14 +344,15 @@ pub fn validate_clarity_side_tables(
             filter_required_contracts(dst_db_path, &dst_tip, &all_contract_ids_ordered)?;
 
         let mut missing_required_metadata_rows: u64 = 0;
-        SqliteConnection::visit_metadata_rows(&src_conn, |key, blockhash, value| {
-            let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(key) else {
+        SqliteConnection::visit_metadata_rows(&src_conn, |row| -> Result<(), Error> {
+            let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(row.key)
+            else {
                 return Ok(());
             };
             if !required_contract_ids.contains(contract_id) {
                 return Ok(());
             }
-            if !SqliteConnection::metadata_row_exists(conn, key, blockhash, value)? {
+            if !SqliteConnection::metadata_row_exists(conn, row.key, row.block_id, row.value)? {
                 missing_required_metadata_rows += 1;
             }
             Ok(())

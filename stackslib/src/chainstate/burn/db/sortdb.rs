@@ -52,6 +52,7 @@ use crate::chainstate::nakamoto::NakamotoChainState;
 use crate::chainstate::stacks::address::PoxAddress;
 use crate::chainstate::stacks::boot::PoxStartCycleInfo;
 use crate::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksChainState};
+use crate::chainstate::stacks::index::file::TrieFile;
 use crate::chainstate::stacks::index::marf::{
     test_override_marf_compression, MARFOpenOpts, MarfConnection, MARF,
 };
@@ -2718,8 +2719,10 @@ impl SortitionDB {
     /// * `marf_opts` - Configuration options for opening the MARF.
     ///
     /// # Behavior
-    /// Given a `marf_path` such as `burnchain/sortition/marf.sqlite`,
-    /// the MARF blobs are stored internally unless `marf.sqlite.blobs` exists.
+    /// The blob layout is detected from disk (external iff `marf.sqlite.blobs`
+    /// exists), not from `marf_opts.external_blobs`, which is ignored.
+    /// Creating a new DB via this function always forces internal blobs,
+    /// since the blobs file cannot exist yet.
     /// This function also enables SQLite foreign key enforcement.
     fn open_index(
         marf_path: &str,
@@ -2727,7 +2730,7 @@ impl SortitionDB {
     ) -> Result<MARF<SortitionId>, db_error> {
         test_debug!("Open MARF index at {}", marf_path);
         let mut open_opts = marf_opts.unwrap_or(MARFOpenOpts::default());
-        open_opts.external_blobs = std::path::Path::new(&format!("{marf_path}.blobs")).exists();
+        open_opts.external_blobs = TrieFile::exists(marf_path)?;
         test_override_marf_compression(&mut open_opts);
         let marf = MARF::from_path(marf_path, open_opts).map_err(|_e| db_error::Corruption)?;
         sql_pragma(marf.sqlite_conn(), "foreign_keys", &true)?;
@@ -4500,9 +4503,13 @@ impl SortitionDB {
 /// The squash anchors the Stacks MARF at the boundary tenure's FIRST block,
 /// but the fully-synced source already processed the whole tenure, so its
 /// `stacks_chain_tips*` memo rows for that burn view point at the tenure's
-/// LAST block. Copied verbatim, those memos would make a booting node treat
+/// LAST block. If copied in full, those memos would make a booting node treat
 /// the dropped intra-tenure descendants as already processed; rewriting them
 /// down to the anchor makes the node re-fetch and process them from peers.
+///
+/// Rows already at or below the boundary are copied verbatim;
+/// above-boundary rows are rewritten down to the anchor only
+/// when they belong to the anchor tenure, and dropped otherwise.
 #[derive(Debug, Clone)]
 pub struct SortitionTipCopyBoundary {
     pub max_stacks_height: u64,
@@ -4623,11 +4630,12 @@ impl SortitionDB {
             return Ok(true);
         };
         let max_height = u64_to_sql(boundary.max_stacks_height)?;
+        // Check if ANY above-boundary memo row exists.
         conn.query_row(
-            "SELECT COUNT(*) = 0 FROM ( \
-                 SELECT block_height FROM stacks_chain_tips WHERE block_height > ?1 \
+            "SELECT NOT EXISTS( \
+                 SELECT 1 FROM stacks_chain_tips WHERE block_height > ?1 \
                  UNION ALL \
-                 SELECT block_height FROM stacks_chain_tips_by_burn_view WHERE block_height > ?1 \
+                 SELECT 1 FROM stacks_chain_tips_by_burn_view WHERE block_height > ?1 \
              )",
             params![max_height],
             |row| row.get(0),
@@ -7562,6 +7570,37 @@ pub mod tests {
             "INSERT INTO transfer_stx (txid, vtxindex, block_height, burn_header_hash, \
              sender_addr, recipient_addr, transfered_ustx, memo) \
              VALUES (?1, 0, 0, ?2, 's', 'r', '100', 'x')",
+            params![txid, burn_header_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a minimal `delegate_stx` row.
+    pub fn test_insert_delegate_stx_row(
+        conn: &Connection,
+        txid: &str,
+        burn_header_hash: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO delegate_stx (txid, vtxindex, block_height, burn_header_hash, \
+             sender_addr, delegate_to, reward_addr, delegated_ustx, until_burn_height) \
+             VALUES (?1, 0, 0, ?2, 's', 'd', 'r', '100', NULL)",
+            params![txid, burn_header_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a minimal `vote_for_aggregate_key` row.
+    pub fn test_insert_vote_for_aggregate_key_row(
+        conn: &Connection,
+        txid: &str,
+        burn_header_hash: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO vote_for_aggregate_key (txid, vtxindex, block_height, \
+             burn_header_hash, sender_addr, aggregate_key, round, reward_cycle, \
+             signer_index, signer_key) \
+             VALUES (?1, 0, 0, ?2, 's', 'k', 0, 0, 0, 'sk')",
             params![txid, burn_header_hash],
         )?;
         Ok(())
