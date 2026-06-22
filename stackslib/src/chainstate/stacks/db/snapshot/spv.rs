@@ -16,17 +16,36 @@
 use std::fs;
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use super::common::{
-    clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result, validate_copy_specs,
-    with_offline_write_session, with_readonly_session, TableCopySpec,
+    assert_source_schema, clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result,
+    validate_copy_specs, with_offline_write_session, with_readonly_session, TableCopySpec,
 };
 use crate::burnchains::bitcoin::spv::{num_complete_chain_work_intervals, SpvClient};
 use crate::chainstate::stacks::index::Error;
+use crate::util_lib::db::sqlite_open;
 
 /// Tables required for the current headers.sqlite schema.
 pub(super) const REQUIRED_TABLES: &[&str] = &["headers", "db_config", "chain_work"];
+
+/// Every table the SPV headers snapshot accounts for. headers.sqlite is not
+/// MARF-backed, so unlike the other slices there are no MARF infra tables to
+/// exempt — the content-copied [`REQUIRED_TABLES`] are the whole schema.
+fn known_spv_tables() -> Vec<&'static str> {
+    REQUIRED_TABLES.to_vec()
+}
+
+/// The spv snapshot's source-schema guard (see [`assert_source_schema`]);
+/// `test_no_unclassified_spv_tables` runs it against a fresh schema.
+pub(super) fn assert_source_tables_classified(src_conn: &Connection) -> Result<(), Error> {
+    assert_source_schema(
+        src_conn,
+        &known_spv_tables(),
+        "headers.sqlite",
+        "REQUIRED_TABLES in snapshot/spv.rs",
+    )
+}
 
 /// Row-count statistics returned by [`copy_spv_headers`].
 #[derive(Debug, Clone)]
@@ -52,29 +71,25 @@ impl SpvHeadersValidation {
 
 /// Copy canonical SPV headers up to `burn_height` into a new destination.
 ///
-/// Returns an error if the source file does not exist, or if the
-/// destination already exists.
+/// Returns [`Error::DestinationExists`] if the destination already exists.
 pub fn copy_spv_headers(
     src_path: &str,
     dst_path: &str,
     burn_height: u64,
 ) -> Result<SpvHeadersCopyStats, Error> {
-    if !Path::new(src_path).exists() {
-        return Err(Error::IOError(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("SPV headers source not found: {src_path}"),
-        )));
-    }
     if Path::new(dst_path).exists() {
-        return Err(Error::IOError(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("SPV headers destination already exists: {dst_path}"),
-        )));
+        return Err(Error::DestinationExists(dst_path.to_string()));
     }
 
     if let Some(parent) = Path::new(dst_path).parent() {
-        fs::create_dir_all(parent).map_err(Error::IOError)?;
+        fs::create_dir_all(parent)?;
     }
+
+    // Reject an unrecognized source schema before any destination work.
+    // The copy session only ATTACHes src, so open it read-only here for the check.
+    let src_conn = sqlite_open(src_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false)?;
+    assert_source_tables_classified(&src_conn)?;
+    drop(src_conn);
 
     with_offline_write_session(dst_path, &[("src", src_path)], "", |conn| {
         copy_spv_headers_inner(conn, burn_height)
@@ -84,8 +99,8 @@ pub fn copy_spv_headers(
 /// Build the copy specs for the SPV headers DB: `db_config` verbatim,
 /// `headers` up to `burn_height`, `chain_work` for complete difficulty
 /// intervals only.
-fn spv_copy_specs(burn_height: u64) -> Vec<TableCopySpec> {
-    let complete_intervals = num_complete_chain_work_intervals(u64::from(burn_height));
+pub(super) fn spv_copy_specs(burn_height: u64) -> Vec<TableCopySpec> {
+    let complete_intervals = num_complete_chain_work_intervals(burn_height);
     vec![
         TableCopySpec {
             table: "db_config",
@@ -112,10 +127,16 @@ fn copy_spv_headers_inner(
 
     let results = execute_copy_specs(conn, &spv_copy_specs(burn_height))?;
 
-    Ok(SpvHeadersCopyStats {
+    let stats = SpvHeadersCopyStats {
         headers_rows: copied_rows(&results, "headers"),
         chain_work_rows: copied_rows(&results, "chain_work"),
-    })
+    };
+    info!(
+        "Copied SPV headers";
+        "headers_rows" => stats.headers_rows,
+        "chain_work_rows" => stats.chain_work_rows
+    );
+    Ok(stats)
 }
 
 /// Validate a copied headers.sqlite against its source.

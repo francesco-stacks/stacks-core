@@ -352,9 +352,9 @@ pub fn validate_burnchain_db(
                 anchor_blocks_match: spec_result(&results, "anchor_blocks"),
                 // `overrides` is schema-only (cloned, never row-copied), so the
                 // squashed dst must hold zero rows rather than matching a copy spec.
-                overrides_match: conn
-                    .query_row("SELECT COUNT(*) FROM overrides", [], |row| row.get::<_, i64>(0))?
-                    == 0,
+                overrides_match: conn.query_row("SELECT COUNT(*) FROM overrides", [], |row| {
+                    row.get::<_, i64>(0)
+                })? == 0,
                 db_config_match: spec_result(&results, "db_config"),
                 no_extra_headers,
                 canonical_complete,
