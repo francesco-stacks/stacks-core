@@ -14,8 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 use std::collections::HashSet;
 
-// `::clarity` disambiguates the crate from this module tree's own
-// `clarity` test module.
+// `::clarity` disambiguates the crate from a sibling `clarity` test module.
 use ::clarity::vm::costs::ExecutionCost;
 use rstest::rstest;
 use rusqlite::{params, Connection};

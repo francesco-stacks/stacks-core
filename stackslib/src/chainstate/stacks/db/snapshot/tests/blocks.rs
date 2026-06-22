@@ -13,25 +13,33 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Block-preservation tests: epoch-2 block files, confirmed microblock
+//! Block-preservation copy tests: epoch-2 block files, confirmed microblock
 //! streams, and the Nakamoto staging-blocks DB.
+
+use std::collections::HashSet;
+use std::path::Path;
 
 use rstest::rstest;
 use rusqlite::{params, Connection};
 use stacks_common::codec::StacksMessageCodec;
-use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
-use stacks_common::util::hash::Sha512Trunc256Sum;
-use stacks_common::util::secp256k1::MessageSignature;
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, ConsensusHash, StacksAddress, StacksBlockId,
+};
+use stacks_common::util::hash::{Hash160, MerkleTree, Sha512Trunc256Sum};
+use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PrivateKey, Secp256k1PublicKey};
 use tempfile::tempdir;
 
-use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
+use super::super::blocks::{
+    assert_source_tables_classified, copy_confirmed_epoch2_microblocks, copy_epoch2_block_files,
+    copy_nakamoto_staging_blocks, nakamoto_copy_specs, validate_epoch2_block_files,
+    validate_microblock_streams, validate_nakamoto_staging_blocks, NAKAMOTO_STAGING_TABLES,
+};
+use super::super::common::clone_schemas_from_source;
 use super::{
     create_dest_db_with_canonical_blocks, create_source_db, insert_epoch2_block_header_with_ibh,
     insert_nakamoto_header,
 };
-use crate::chainstate::nakamoto::staging_blocks::{
-    test_insert_nakamoto_staging_block_row, NAKAMOTO_STAGING_DB_SCHEMA_LATEST,
-};
+use crate::chainstate::nakamoto::staging_blocks::NAKAMOTO_STAGING_DB_SCHEMA_LATEST;
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::index::Error;
 use crate::chainstate::stacks::{
@@ -40,44 +48,60 @@ use crate::chainstate::stacks::{
 };
 use crate::core::EMPTY_MICROBLOCK_PARENT_HASH;
 
-/// All-zero `index_block_hash` of the fixtures' genesis header (height-0
-/// rows are skipped by the epoch-2 block file copy).
-const GENESIS_IBH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// Create a squashed index DB whose `block_headers` rows are the given
+/// `(index_block_hash, block_height)` pairs.
+fn create_block_headers_index(path: &Path, rows: &[(&str, u32)]) {
+    let conn = create_source_db(path);
+    for (i, (ibh, height)) in rows.iter().enumerate() {
+        insert_epoch2_block_header_with_ibh(&conn, *height, ibh, &format!("_{i}"));
+    }
+}
 
-/// Create the fixture's squashed `index.sqlite`. Must be WAL: the epoch2
-/// block-file copy re-opens it with a read-only `sqlite_open`, whose WAL
-/// pragma rejects non-WAL files.
-fn create_squashed_index_db(path: &std::path::Path) -> Connection {
-    create_source_db(path)
+/// Create a squashed index DB whose `nakamoto_block_headers` rows are
+/// headers seeded from the given labels, via the production writer.
+/// Returns each label's computed `index_block_hash` hex, for the staging
+/// fixtures that must join against it.
+fn create_nakamoto_headers_index(path: &Path, labels: &[&str]) -> Vec<String> {
+    let conn = create_source_db(path);
+    labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| insert_nakamoto_header(&conn, label, 100 + i as u32).to_hex())
+        .collect()
 }
 
 /// End-to-end epoch-2 block file copy: genesis is skipped, the height-1
-/// file lands byte-identical at its hashed relative path, and validation
-/// passes.
+/// file lands byte-identical at its hashed relative path.
 #[test]
-fn test_epoch2_block_file_copy_and_validate() {
+fn test_epoch2_block_file_copy() {
     let dir = tempdir().unwrap();
     let src_blocks_dir = dir.path().join("src_blocks");
     let dst_blocks_dir = dir.path().join("dst_blocks");
 
-    // Create a squashed index.sqlite with 2 block headers (height 0 = genesis, height 1).
+    // A squashed index with 2 block headers (height 0 = genesis; height 1 is
+    // a hex hash that maps to a known relative path).
     let idx_path = dir.path().join("squashed_index.sqlite");
-    let conn = create_squashed_index_db(&idx_path);
-    insert_epoch2_block_header_with_ibh(&conn, 0, GENESIS_IBH, "_genesis");
-    // Height 1 block: hex hash that maps to a known path.
     let hash_hex = "aabbccdd00000000000000000000000000000000000000000000000000000001";
-    insert_epoch2_block_header_with_ibh(&conn, 1, hash_hex, "1");
-    drop(conn);
+    create_block_headers_index(
+        &idx_path,
+        &[
+            (
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                0,
+            ),
+            (hash_hex, 1),
+        ],
+    );
 
     // Create source block file for height 1.
-    // index_block_hash_to_rel_path uses 2-byte (4 hex char) directory segments.
+    // StacksChainState::index_block_hash_to_rel_path uses 2-byte (4 hex char) directory segments.
     let rel = format!("aabb/ccdd/{hash_hex}");
     let src_file = src_blocks_dir.join(&rel);
     std::fs::create_dir_all(src_file.parent().unwrap()).unwrap();
     std::fs::write(&src_file, b"block data here").unwrap();
 
     // Copy.
-    let stats = super::super::blocks::copy_epoch2_block_files(
+    let stats = copy_epoch2_block_files(
         idx_path.to_str().unwrap(),
         src_blocks_dir.to_str().unwrap(),
         dst_blocks_dir.to_str().unwrap(),
@@ -93,8 +117,8 @@ fn test_epoch2_block_file_copy_and_validate() {
     assert!(dst_file.exists());
     assert_eq!(std::fs::read(&dst_file).unwrap(), b"block data here");
 
-    // Validate.
-    let v = super::super::blocks::validate_epoch2_block_files(
+    // The copied artifact passes validation.
+    let v = validate_epoch2_block_files(
         idx_path.to_str().unwrap(),
         src_blocks_dir.to_str().unwrap(),
         dst_blocks_dir.to_str().unwrap(),
@@ -113,14 +137,12 @@ fn test_epoch2_block_file_missing_source_is_error() {
 
     // Index with height-1 block but NO source file.
     let idx_path = dir.path().join("squashed_index.sqlite");
-    let conn = create_squashed_index_db(&idx_path);
     let hash_hex = "aabbccdd00000000000000000000000000000000000000000000000000000001";
-    insert_epoch2_block_header_with_ibh(&conn, 1, hash_hex, "1");
-    drop(conn);
+    create_block_headers_index(&idx_path, &[(hash_hex, 1)]);
 
     std::fs::create_dir_all(&src_blocks_dir).unwrap();
 
-    let err = super::super::blocks::copy_epoch2_block_files(
+    let err = copy_epoch2_block_files(
         idx_path.to_str().unwrap(),
         src_blocks_dir.to_str().unwrap(),
         dst_blocks_dir.to_str().unwrap(),
@@ -140,31 +162,72 @@ fn test_epoch2_block_file_missing_source_is_error() {
 
 /// Drift guard: every table the Nakamoto staging migrations create must
 /// be classified, so a future migration can't silently drop one from the
-/// copy.
+/// copy. Runs the exact production guard against a freshly-migrated schema,
+/// so the test and the runtime check cannot drift apart.
 #[test]
 fn test_no_unclassified_nakamoto_staging_tables() {
     let dir = tempdir().unwrap();
     let conn = create_source_nakamoto_db(&dir.path().join("src.sqlite"));
-    let known: Vec<&str> = super::super::blocks::NAKAMOTO_STAGING_TABLES
-        .iter()
-        .chain(MARF_INFRA_TABLES.iter())
-        .copied()
-        .collect();
-    let extra = unclassified_tables(&conn, &known);
+    assert_source_tables_classified(&conn)
+        .expect("fresh production Nakamoto staging schema must be fully classified");
+}
+
+/// Every cloned table (NAKAMOTO_STAGING_TABLES) must have a row-copy spec and vice versa,
+/// else it would be cloned but never populated (present-but-empty).
+#[test]
+fn test_nakamoto_copy_specs_match_staging_tables() {
+    let spec_tables: Vec<&str> = nakamoto_copy_specs().iter().map(|s| s.table).collect();
+    let spec_set: HashSet<&str> = spec_tables.iter().copied().collect();
+    assert_eq!(
+        spec_tables.len(),
+        spec_set.len(),
+        "duplicate table in nakamoto_copy_specs"
+    );
+    let staging_set: HashSet<&str> = NAKAMOTO_STAGING_TABLES.iter().copied().collect();
+    assert_eq!(
+        spec_set, staging_set,
+        "every NAKAMOTO_STAGING_TABLES entry must have exactly one copy spec (and vice versa); \
+         a cloned-but-uncopied table would be present-but-empty in the squash"
+    );
+}
+
+/// A source table the copy lists don't classify is rejected before any
+/// destination is produced — the runtime complement to the drift test.
+#[test]
+fn test_unclassified_source_table_is_rejected() {
+    let dir = tempdir().unwrap();
+    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
+    let conn = create_source_nakamoto_db(&src_nak_path);
+    conn.execute_batch("CREATE TABLE surprise_table (x INTEGER)")
+        .unwrap();
+    drop(conn);
+
+    let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
+    let idx_path = dir.path().join("squashed_index.sqlite");
+    create_nakamoto_headers_index(&idx_path, &["canonical_ibh_1"]);
+
+    let err = copy_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+    )
+    .expect_err("unclassified source table must be rejected");
+    match err {
+        Error::CorruptionError(msg) => assert!(
+            msg.contains("surprise_table"),
+            "error should name the offending table, got: {msg}"
+        ),
+        other => panic!("expected CorruptionError, got {other:?}"),
+    }
     assert!(
-        extra.is_empty(),
-        "unclassified Nakamoto staging table(s) {extra:?}: classify each in \
-         NAKAMOTO_STAGING_TABLES (snapshot/blocks.rs)"
+        !dst_nak_path.exists(),
+        "no destination should be produced when the source is rejected"
     );
 }
 
 /// Build a minimal serializable StacksMicroblock with the given sequence
 /// and prev_block, returning (block_hash, serialized_bytes).
-fn make_test_microblock(sequence: u16, prev_block: &BlockHeaderHash) -> (BlockHeaderHash, Vec<u8>) {
-    use stacks_common::types::chainstate::StacksAddress;
-    use stacks_common::util::hash::Hash160;
-    use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
-
+fn make_microblock(sequence: u16, prev_block: &BlockHeaderHash) -> (BlockHeaderHash, Vec<u8>) {
     // Create a minimal STX transfer transaction.
     let privk = Secp256k1PrivateKey::from_hex(
         "6d430bb91222408e7706c9001cfaeb91b08c2be6d5ac95779ab52c6b431950e001",
@@ -184,8 +247,7 @@ fn make_test_microblock(sequence: u16, prev_block: &BlockHeaderHash) -> (BlockHe
     // Use StacksMicroblock::first_unsigned for sequence 0,
     // or build with from_parent_unsigned for others.
     let txid_bytes = tx.txid().as_bytes().to_vec();
-    let merkle_tree =
-        stacks_common::util::hash::MerkleTree::<Sha512Trunc256Sum>::new(&[txid_bytes]);
+    let merkle_tree = MerkleTree::<Sha512Trunc256Sum>::new(&[txid_bytes]);
     let tx_merkle_root = merkle_tree.root();
 
     let header = StacksMicroblockHeader {
@@ -290,7 +352,7 @@ fn insert_staging_block_with_microblock_parent(
 /// ([`StacksChainState::open_nakamoto_staging_blocks`]), so the fixture
 /// always carries the current schema instead of replaying migrations by
 /// hand.
-fn create_source_nakamoto_db(path: &std::path::Path) -> Connection {
+fn create_source_nakamoto_db(path: &Path) -> Connection {
     // The first open instantiates the base schema only; migrations run on
     // subsequent opens, so a second open brings the DB to the current
     // version - exactly as node restarts do in production.
@@ -301,7 +363,7 @@ fn create_source_nakamoto_db(path: &std::path::Path) -> Connection {
     Connection::open(path).unwrap()
 }
 
-/// Insert a nakamoto_staging_blocks row.
+/// Insert a nakamoto_staging_blocks row
 fn insert_nakamoto_staging_block(
     conn: &Connection,
     block_hash: &str,
@@ -312,24 +374,30 @@ fn insert_nakamoto_staging_block(
     obtain_method: &str,
     data: &[u8],
 ) {
-    test_insert_nakamoto_staging_block_row(
-        conn,
-        block_hash,
-        consensus_hash,
-        parent_block_id,
-        height,
-        index_block_hash,
-        obtain_method,
-        data,
+    conn.execute(
+        "INSERT INTO nakamoto_staging_blocks \
+             (block_hash, consensus_hash, parent_block_id, is_tenure_start, \
+              burn_attachable, processed, orphaned, height, index_block_hash, \
+              processed_time, obtain_method, signing_weight, data) \
+             VALUES (?1, ?2, ?3, 1, 1, 1, 0, ?4, ?5, 0, ?6, 100, ?7)",
+        params![
+            block_hash,
+            consensus_hash,
+            parent_block_id,
+            height,
+            index_block_hash,
+            obtain_method,
+            data,
+        ],
     )
     .unwrap();
 }
 
 /// A confirmed 2-microblock stream referenced by a canonical child block
 /// is copied in full; an orphaned microblock of the same parent is left
-/// behind, and validation passes.
+/// behind.
 #[test]
-fn test_microblock_stream_copy_and_validate() {
+fn test_microblock_stream_copy() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src_index.sqlite");
     let dst_path = dir.path().join("dst_index.sqlite");
@@ -343,8 +411,8 @@ fn test_microblock_stream_copy_and_validate() {
     let parent_ibh = StacksBlockId::new(&parent_ch, &parent_bh);
 
     // Build a 2-microblock stream: mblock0 (seq=0, prev=parent_bh) -> mblock1 (seq=1, prev=mblock0_hash).
-    let (mblock0_hash, mblock0_data) = make_test_microblock(0, &parent_bh);
-    let (mblock1_hash, mblock1_data) = make_test_microblock(1, &mblock0_hash);
+    let (mblock0_hash, mblock0_data) = make_microblock(0, &parent_bh);
+    let (mblock1_hash, mblock1_data) = make_microblock(1, &mblock0_hash);
 
     // Insert microblock metadata and data into source.
     let imh0 = StacksBlockId::new(&parent_ch, &mblock0_hash);
@@ -378,7 +446,7 @@ fn test_microblock_stream_copy_and_validate() {
     insert_staging_microblock_data(&src_conn, &mblock1_hash, &mblock1_data);
 
     // Also insert an orphaned fork microblock that should NOT be copied.
-    let (fork_hash, fork_data) = make_test_microblock(0, &BlockHeaderHash([0xCC; 32]));
+    let (fork_hash, fork_data) = make_microblock(0, &BlockHeaderHash([0xCC; 32]));
     let fork_imh = StacksBlockId::new(&parent_ch, &fork_hash);
     insert_staging_microblock(
         &src_conn,
@@ -406,7 +474,7 @@ fn test_microblock_stream_copy_and_validate() {
             params![src_path.to_str().unwrap()],
         )
         .unwrap();
-    super::super::common::clone_schemas_from_source(
+    clone_schemas_from_source(
         &dst_conn,
         &[
             "staging_blocks",
@@ -454,33 +522,55 @@ fn test_microblock_stream_copy_and_validate() {
     drop(dst_conn);
 
     // Copy microblocks.
-    let stats = super::super::blocks::copy_confirmed_epoch2_microblocks(
-        src_path.to_str().unwrap(),
-        dst_path.to_str().unwrap(),
-    )
-    .unwrap();
+    let stats =
+        copy_confirmed_epoch2_microblocks(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .unwrap();
 
     assert_eq!(stats.streams_copied, 1);
     assert_eq!(stats.microblock_rows_copied, 2);
     assert!(stats.microblock_bytes_copied > 0);
 
-    // The fork microblock should NOT be in destination.
+    // The copied stream survives intact: ordered metadata and byte-identical
+    // data blobs.
     let dst_conn = Connection::open(&dst_path).unwrap();
-    let fork_count: i64 = dst_conn
+    let rows: Vec<(u32, BlockHeaderHash)> = dst_conn
+        .prepare("SELECT sequence, microblock_hash FROM staging_microblocks ORDER BY sequence")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows, vec![(0, mblock0_hash.clone()), (1, mblock1_hash)]);
+    let blob: Vec<u8> = dst_conn
         .query_row(
-            "SELECT COUNT(*) FROM staging_microblocks_data WHERE block_hash = ?1",
-            params![fork_hash],
+            "SELECT block_data FROM staging_microblocks_data WHERE block_hash = ?1",
+            params![mblock0_hash],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(fork_count, 0, "fork microblock should not be copied");
+    assert_eq!(
+        blob, mblock0_data,
+        "copied data blob must be byte-identical"
+    );
 
-    // Validate.
-    let v = super::super::blocks::validate_microblock_streams(
-        src_path.to_str().unwrap(),
-        dst_path.to_str().unwrap(),
-    )
-    .unwrap();
+    // Neither the fork microblock's metadata nor its data may be copied.
+    let (fork_meta, fork_data): (i64, i64) = dst_conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM staging_microblocks WHERE microblock_hash = ?1), \
+                    (SELECT COUNT(*) FROM staging_microblocks_data WHERE block_hash = ?1)",
+            params![fork_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (fork_meta, fork_data),
+        (0, 0),
+        "fork microblock should not be copied"
+    );
+
+    // The copied streams pass validation through the production validator.
+    let v = validate_microblock_streams(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+        .unwrap();
     assert!(v.is_valid(), "microblock validation should pass: {v:?}");
 }
 
@@ -499,7 +589,7 @@ fn test_microblock_stream_unprocessed_skipped() {
     let parent_ibh = StacksBlockId::new(&parent_ch, &parent_bh);
 
     // Build a 1-microblock stream where the microblock is NOT processed.
-    let (mblock0_hash, mblock0_data) = make_test_microblock(0, &parent_bh);
+    let (mblock0_hash, mblock0_data) = make_microblock(0, &parent_bh);
     let imh0 = StacksBlockId::new(&parent_ch, &mblock0_hash);
     insert_staging_microblock(
         &src_conn,
@@ -525,7 +615,7 @@ fn test_microblock_stream_unprocessed_skipped() {
             params![src_path.to_str().unwrap()],
         )
         .unwrap();
-    super::super::common::clone_schemas_from_source(
+    clone_schemas_from_source(
         &dst_conn,
         &[
             "staging_blocks",
@@ -553,11 +643,9 @@ fn test_microblock_stream_unprocessed_skipped() {
     drop(dst_conn);
 
     // Copy - stream should be skipped (not error).
-    let stats = super::super::blocks::copy_confirmed_epoch2_microblocks(
-        src_path.to_str().unwrap(),
-        dst_path.to_str().unwrap(),
-    )
-    .unwrap();
+    let stats =
+        copy_confirmed_epoch2_microblocks(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .unwrap();
 
     assert_eq!(stats.streams_copied, 0);
     assert_eq!(stats.streams_skipped, 1);
@@ -581,8 +669,8 @@ fn test_microblock_stream_missing_tip_skipped() {
 
     // Only the seq-0 microblock exists; the seq-1 tip the child references
     // was never stored.
-    let (mblock0_hash, mblock0_data) = make_test_microblock(0, &parent_bh);
-    let (mblock1_hash, _) = make_test_microblock(1, &mblock0_hash);
+    let (mblock0_hash, mblock0_data) = make_microblock(0, &parent_bh);
+    let (mblock1_hash, _) = make_microblock(1, &mblock0_hash);
     let imh0 = StacksBlockId::new(&parent_ch, &mblock0_hash);
     insert_staging_microblock(
         &src_conn,
@@ -607,7 +695,7 @@ fn test_microblock_stream_missing_tip_skipped() {
             params![src_path.to_str().unwrap()],
         )
         .unwrap();
-    super::super::common::clone_schemas_from_source(
+    clone_schemas_from_source(
         &dst_conn,
         &[
             "staging_blocks",
@@ -634,11 +722,9 @@ fn test_microblock_stream_missing_tip_skipped() {
     );
     drop(dst_conn);
 
-    let stats = super::super::blocks::copy_confirmed_epoch2_microblocks(
-        src_path.to_str().unwrap(),
-        dst_path.to_str().unwrap(),
-    )
-    .unwrap();
+    let stats =
+        copy_confirmed_epoch2_microblocks(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .unwrap();
 
     assert_eq!(stats.streams_copied, 0, "incomplete stream must be skipped");
     assert_eq!(stats.streams_skipped, 1);
@@ -650,29 +736,26 @@ fn test_microblock_stream_missing_tip_skipped() {
 
 /// Canonical staging rows are copied with data blobs, `obtain_method`,
 /// and `db_version` preserved; a row not in the squashed index headers is
-/// dropped, and validation passes.
+/// dropped.
 #[test]
-fn test_nakamoto_copy_and_validate() {
+fn test_nakamoto_copy() {
     let dir = tempdir().unwrap();
     let src_nak_path = dir.path().join("src_nakamoto.sqlite");
     let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
     let idx_path = dir.path().join("squashed_index.sqlite");
 
-    // Squashed index holding only the canonical blocks' headers.
-    let idx_conn = create_source_db(&idx_path);
-    let ibh_1 = insert_nakamoto_header(&idx_conn, "canonical_ibh_1", 100).to_hex();
-    let ibh_2 = insert_nakamoto_header(&idx_conn, "canonical_ibh_2", 101).to_hex();
-    drop(idx_conn);
+    // Squashed index with nakamoto_block_headers for canonical blocks only.
+    let ibhs = create_nakamoto_headers_index(&idx_path, &["canonical_ibh_1", "canonical_ibh_2"]);
 
     // Create source nakamoto.sqlite with canonical + non-canonical rows.
-    let src_conn = create_source_nakamoto_db(&src_nak_path);
+    let src_conn: Connection = create_source_nakamoto_db(&src_nak_path);
     insert_nakamoto_staging_block(
         &src_conn,
         "canonical_bh_1",
         "canonical_ch_1",
         "parent_1",
         100,
-        &ibh_1,
+        &ibhs[0],
         "Fetched",
         b"block_data_1",
     );
@@ -682,25 +765,25 @@ fn test_nakamoto_copy_and_validate() {
         "canonical_ch_2",
         "parent_2",
         101,
-        &ibh_2,
+        &ibhs[1],
         "Shadow",
         b"block_data_2",
     );
-    // Non-canonical block (not in index).
+    // Non-canonical block (not in the squashed index headers).
     insert_nakamoto_staging_block(
         &src_conn,
-        "orphan_bh",
-        "orphan_ch",
+        "noncanon_bh",
+        "noncanon_ch",
         "parent_x",
         100,
-        "orphan_ibh",
+        "noncanon_ibh",
         "Fetched",
-        b"orphan_data",
+        b"noncanon_data",
     );
     drop(src_conn);
 
     // Copy.
-    let stats = super::super::blocks::copy_nakamoto_staging_blocks(
+    let stats = copy_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
@@ -708,17 +791,31 @@ fn test_nakamoto_copy_and_validate() {
     .unwrap();
 
     assert_eq!(stats.rows_copied, 2);
+    assert_eq!(
+        stats.total_blob_bytes,
+        (b"block_data_1".len() + b"block_data_2".len()) as u64
+    );
 
-    // Verify orphan not copied.
+    // Verify the non-canonical row is not copied.
     let dst_conn = Connection::open(&dst_nak_path).unwrap();
-    let orphan_count: i64 = dst_conn
+    let noncanon_count: i64 = dst_conn
         .query_row(
-            "SELECT COUNT(*) FROM nakamoto_staging_blocks WHERE block_hash = 'orphan_bh'",
+            "SELECT COUNT(*) FROM nakamoto_staging_blocks WHERE block_hash = 'noncanon_bh'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(orphan_count, 0, "orphan should not be copied");
+    assert_eq!(noncanon_count, 0, "non-canonical row should not be copied");
+
+    // Verify the data blob is byte-identical.
+    let data: Vec<u8> = dst_conn
+        .query_row(
+            "SELECT data FROM nakamoto_staging_blocks WHERE block_hash = 'canonical_bh_1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(data, b"block_data_1");
 
     // Verify obtain_method preserved.
     let method: String = dst_conn
@@ -741,8 +838,8 @@ fn test_nakamoto_copy_and_validate() {
     );
     drop(dst_conn);
 
-    // Validate.
-    let v = super::super::blocks::validate_nakamoto_staging_blocks(
+    // The copied artifact passes validation, including db_version and schema.
+    let v = validate_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
@@ -753,10 +850,54 @@ fn test_nakamoto_copy_and_validate() {
     assert!(v.schema_match, "schema should match");
 }
 
+/// The copy writes into a NEW destination only: a pre-existing
+/// `nakamoto.sqlite` (e.g. left over from a prior failed squash) is an
+/// error, never appended to or overwritten.
+#[test]
+fn test_nakamoto_copy_existing_destination_is_error() {
+    let dir = tempdir().unwrap();
+    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
+    let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
+    let idx_path = dir.path().join("squashed_index.sqlite");
+
+    let ibhs = create_nakamoto_headers_index(&idx_path, &["canonical_ibh_1"]);
+    let src_conn = create_source_nakamoto_db(&src_nak_path);
+    insert_nakamoto_staging_block(
+        &src_conn,
+        "canonical_bh_1",
+        "canonical_ch_1",
+        "parent_1",
+        100,
+        &ibhs[0],
+        "Fetched",
+        b"block_data_1",
+    );
+    drop(src_conn);
+
+    // A stale destination left over from a prior run must not be touched.
+    std::fs::write(&dst_nak_path, b"stale data").unwrap();
+
+    let err = copy_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+    )
+    .expect_err("existing destination should error");
+    assert!(
+        matches!(err, Error::DestinationExists(_)),
+        "expected DestinationExists, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&dst_nak_path).unwrap(),
+        b"stale data",
+        "existing destination must be left untouched"
+    );
+}
+
 /// The squash boundary lives entirely in the squashed index: a staging
 /// row is retained iff its index_block_hash is in
 /// idx.nakamoto_block_headers (<=H). A block above H, or an in-index but
-/// orphaned block, must be neither copied nor accepted by validation.
+/// orphaned block, must not be copied.
 #[test]
 fn test_nakamoto_copy_excludes_post_boundary_blocks() {
     let dir = tempdir().unwrap();
@@ -766,25 +907,22 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
 
     // Squashed index stops at H: ibh_a, ibh_h, and the in-index orphan --
     // NOT the post-boundary block.
-    let idx_conn = create_source_db(&idx_path);
-    let ibh_a = insert_nakamoto_header(&idx_conn, "ibh_a", 100).to_hex();
-    let ibh_h = insert_nakamoto_header(&idx_conn, "ibh_h", 101).to_hex();
-    let ibh_orphan = insert_nakamoto_header(&idx_conn, "ibh_orphan", 101).to_hex();
-    drop(idx_conn);
+    let ibhs = create_nakamoto_headers_index(&idx_path, &["ibh_a", "ibh_h", "ibh_orphan"]);
+    let (ibh_a, ibh_h, ibh_orphan) = (&ibhs[0], &ibhs[1], &ibhs[2]);
 
     // Source: two <=H canonical blocks plus one post-boundary (H+1) child of H.
     let src_conn = create_source_nakamoto_db(&src_nak_path);
     insert_nakamoto_staging_block(
-        &src_conn, "bh_a", "ch_a", "parent_a", 100, &ibh_a, "Fetched", b"data_a",
+        &src_conn, "bh_a", "ch_a", "parent_a", 100, ibh_a, "Fetched", b"data_a",
     );
     insert_nakamoto_staging_block(
-        &src_conn, "bh_h", "ch_h", &ibh_a, 101, &ibh_h, "Fetched", b"data_h",
+        &src_conn, "bh_h", "ch_h", ibh_a, 101, ibh_h, "Fetched", b"data_h",
     );
     insert_nakamoto_staging_block(
         &src_conn,
         "bh_post",
         "ch_post",
-        &ibh_h,
+        ibh_h,
         102,
         "ibh_post",
         "Fetched",
@@ -797,9 +935,9 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
         &src_conn,
         "bh_orphan",
         "ch_orphan",
-        &ibh_a,
+        ibh_a,
         101,
-        &ibh_orphan,
+        ibh_orphan,
         "Fetched",
         b"data_orphan",
     );
@@ -812,7 +950,7 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
     drop(src_conn);
 
     // Copy: only the two <=H blocks are retained.
-    let stats = super::super::blocks::copy_nakamoto_staging_blocks(
+    let stats = copy_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
@@ -843,7 +981,7 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
     drop(dst_conn);
 
     // The clean <=H-only artifact validates.
-    let v = super::super::blocks::validate_nakamoto_staging_blocks(
+    let v = validate_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
@@ -857,7 +995,7 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
         &dst_conn,
         "bh_post",
         "ch_post",
-        &ibh_h,
+        ibh_h,
         102,
         "ibh_post",
         "Fetched",
@@ -865,7 +1003,7 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
     );
     drop(dst_conn);
 
-    let v = super::super::blocks::validate_nakamoto_staging_blocks(
+    let v = validate_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
@@ -901,18 +1039,15 @@ fn test_nakamoto_validate_detects_drift(
     let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
     let idx_path = dir.path().join("squashed_index.sqlite");
 
-    // Create matching source and destination with one canonical row.
-    let idx_conn = create_source_db(&idx_path);
-    let ibh1 = insert_nakamoto_header(&idx_conn, "ibh1", 100).to_hex();
-    drop(idx_conn);
-
+    // Matching source and destination with one canonical row.
+    let ibhs = create_nakamoto_headers_index(&idx_path, &["ibh1"]);
     let src_conn = create_source_nakamoto_db(&src_nak_path);
     insert_nakamoto_staging_block(
-        &src_conn, "bh1", "ch1", "p1", 100, &ibh1, "Fetched", b"data1",
+        &src_conn, "bh1", "ch1", "p1", 100, &ibhs[0], "Fetched", b"data1",
     );
     drop(src_conn);
 
-    super::super::blocks::copy_nakamoto_staging_blocks(
+    copy_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
@@ -923,7 +1058,7 @@ fn test_nakamoto_validate_detects_drift(
     dst_conn.execute_batch(tamper_sql).unwrap();
     drop(dst_conn);
 
-    let v = super::super::blocks::validate_nakamoto_staging_blocks(
+    let v = validate_nakamoto_staging_blocks(
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
         idx_path.to_str().unwrap(),
@@ -942,35 +1077,40 @@ fn test_epoch2_file_validation_ignores_nakamoto_sqlite() {
     let src_blocks_dir = dir.path().join("src_blocks");
     let dst_blocks_dir = dir.path().join("dst_blocks");
 
-    // Create a squashed index with one block at height 1.
+    // Squashed index with genesis (height 0) and one height-1 block.
     let idx_path = dir.path().join("squashed_index.sqlite");
-    let conn = create_squashed_index_db(&idx_path);
-    insert_epoch2_block_header_with_ibh(&conn, 0, GENESIS_IBH, "_genesis");
     let hash_hex = "aabbccdd00000000000000000000000000000000000000000000000000000001";
-    insert_epoch2_block_header_with_ibh(&conn, 1, hash_hex, "1");
-    drop(conn);
+    create_block_headers_index(
+        &idx_path,
+        &[
+            (
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                0,
+            ),
+            (hash_hex, 1),
+        ],
+    );
 
-    // Create source + dest block files.
-    // index_block_hash_to_rel_path uses 2-byte (4 hex char) directory segments.
+    // Source block file for height 1.
     let rel = format!("aabb/ccdd/{hash_hex}");
     let src_file = src_blocks_dir.join(&rel);
     std::fs::create_dir_all(src_file.parent().unwrap()).unwrap();
     std::fs::write(&src_file, b"block data").unwrap();
 
-    super::super::blocks::copy_epoch2_block_files(
+    copy_epoch2_block_files(
         idx_path.to_str().unwrap(),
         src_blocks_dir.to_str().unwrap(),
         dst_blocks_dir.to_str().unwrap(),
     )
     .unwrap();
 
-    // Plant nakamoto.sqlite and sidecar files in destination blocks dir.
+    // Plant nakamoto.sqlite and its WAL sidecars in the destination blocks dir.
     std::fs::write(dst_blocks_dir.join("nakamoto.sqlite"), b"fake db").unwrap();
     std::fs::write(dst_blocks_dir.join("nakamoto.sqlite-journal"), b"journal").unwrap();
     std::fs::write(dst_blocks_dir.join("nakamoto.sqlite-wal"), b"wal").unwrap();
 
-    // Validate should still pass - nakamoto files are not "extra" epoch-2 files.
-    let v = super::super::blocks::validate_epoch2_block_files(
+    // Validation still passes: nakamoto files are not "extra" epoch-2 files.
+    let v = validate_epoch2_block_files(
         idx_path.to_str().unwrap(),
         src_blocks_dir.to_str().unwrap(),
         dst_blocks_dir.to_str().unwrap(),

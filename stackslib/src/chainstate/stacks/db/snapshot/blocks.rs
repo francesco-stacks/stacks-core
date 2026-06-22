@@ -21,17 +21,15 @@ use rusqlite::{params, Connection, OpenFlags};
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 
 use super::common::{
-    clone_schemas_from_source, copied_rows, execute_copy_specs, full_row_except_match, spec_result,
-    validate_copy_specs, with_indexes_dropped, with_offline_write_session, with_readonly_session,
-    TableCopySpec,
+    assert_source_schema, clone_schemas_from_source, copied_rows, execute_copy_specs,
+    full_row_except_match, spec_result, validate_copy_specs, with_offline_write_session,
+    with_readonly_session, TableCopySpec,
 };
 use crate::chainstate::nakamoto::staging_blocks::{
-    nakamoto_staging_block_columns, nakamoto_staging_block_metadata_columns,
-    nakamoto_staging_blocks_membership_predicate, nakamoto_staging_blocks_metadata_select,
-    nakamoto_staging_blocks_source_select, nakamoto_staging_copy_db_version,
-    nakamoto_staging_count_blob_mismatches,
+    nakamoto_staging_block_metadata_columns, nakamoto_staging_blocks_membership_predicate,
+    nakamoto_staging_blocks_metadata_select, nakamoto_staging_count_blob_mismatches,
 };
-use crate::chainstate::stacks::db::blocks::index_block_hash_to_rel_path;
+use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::index::Error;
 use crate::core::EMPTY_MICROBLOCK_PARENT_HASH;
 use crate::util_lib::db::sqlite_open;
@@ -51,7 +49,6 @@ pub struct Epoch2BlockFileCopyStats {
     pub files_copied: u64,
     pub total_bytes: u64,
     pub genesis_skipped: u64,
-    pub copied_paths: Vec<String>,
 }
 
 /// Statistics for nakamoto staging block copy.
@@ -116,6 +113,23 @@ impl Epoch2BlockFileValidation {
 /// classified in `index.rs`.
 pub(super) const NAKAMOTO_STAGING_TABLES: &[&str] = &["nakamoto_staging_blocks", "db_version"];
 
+/// Every table the Nakamoto staging snapshot accounts for. nakamoto.sqlite is not
+/// MARF-backed, so unlike the other slices no MARF infra tables are exempted.
+fn known_nakamoto_staging_tables() -> Vec<&'static str> {
+    NAKAMOTO_STAGING_TABLES.to_vec()
+}
+
+/// The blocks snapshot's source-schema guard (see [`assert_source_schema`]);
+/// `test_no_unclassified_nakamoto_staging_tables` runs it against a fresh schema.
+pub(super) fn assert_source_tables_classified(src_conn: &Connection) -> Result<(), Error> {
+    assert_source_schema(
+        src_conn,
+        &known_nakamoto_staging_tables(),
+        "Nakamoto staging DB",
+        "NAKAMOTO_STAGING_TABLES in snapshot/blocks.rs",
+    )
+}
+
 /// Return the `(sequence, microblock_hash)` rows of processed,
 /// non-orphaned microblocks descending from `parent_ibh`, up to `max_seq`.
 fn get_confirmed_microblock_stream(
@@ -123,25 +137,21 @@ fn get_confirmed_microblock_stream(
     parent_ibh: &StacksBlockId,
     max_seq: u32,
 ) -> Result<Vec<(u32, BlockHeaderHash)>, Error> {
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT sequence, microblock_hash \
+    let mut stmt = conn.prepare_cached(
+        "SELECT sequence, microblock_hash \
              FROM src.staging_microblocks \
              WHERE index_block_hash = ?1 \
                AND sequence <= ?2 \
                AND processed = 1 \
                AND orphaned = 0 \
              ORDER BY sequence ASC",
-        )
-        .map_err(Error::SQLError)?;
+    )?;
 
     let stream = stmt
         .query_map(params![parent_ibh, max_seq], |row| {
             Ok((row.get::<_, u32>(0)?, row.get::<_, BlockHeaderHash>(1)?))
-        })
-        .map_err(Error::SQLError)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Error::SQLError)?;
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(stream)
 }
@@ -158,13 +168,11 @@ fn derive_confirmed_microblock_set(
     ),
     Error,
 > {
-    let mut stmt = conn
-        .prepare(
-            "SELECT parent_consensus_hash, parent_anchored_block_hash, \
+    let mut stmt = conn.prepare(
+        "SELECT parent_consensus_hash, parent_anchored_block_hash, \
                     parent_microblock_hash, parent_microblock_seq \
              FROM staging_blocks",
-        )
-        .map_err(Error::SQLError)?;
+    )?;
 
     let children: Vec<(ConsensusHash, BlockHeaderHash, BlockHeaderHash, u32)> = stmt
         .query_map([], |row| {
@@ -174,10 +182,8 @@ fn derive_confirmed_microblock_set(
                 row.get::<_, BlockHeaderHash>(2)?,
                 row.get::<_, u32>(3)?,
             ))
-        })
-        .map_err(Error::SQLError)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Error::SQLError)?;
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
 
     let mut selected_hashes: HashSet<BlockHeaderHash> = HashSet::new();
@@ -235,23 +241,19 @@ fn populate_microblock_temp_tables(
     conn.execute_batch(
         "CREATE TEMP TABLE selected_microblocks (hash TEXT NOT NULL PRIMARY KEY); \
          CREATE TEMP TABLE selected_parents (ibh TEXT NOT NULL PRIMARY KEY);",
-    )
-    .map_err(Error::SQLError)?;
+    )?;
 
     {
-        let mut ins_hash = conn
-            .prepare("INSERT INTO temp.selected_microblocks (hash) VALUES (?1)")
-            .map_err(Error::SQLError)?;
+        let mut ins_hash =
+            conn.prepare("INSERT INTO temp.selected_microblocks (hash) VALUES (?1)")?;
         for h in selected_hashes {
-            ins_hash.execute(params![h]).map_err(Error::SQLError)?;
+            ins_hash.execute(params![h])?;
         }
     }
     {
-        let mut ins_parent = conn
-            .prepare("INSERT INTO temp.selected_parents (ibh) VALUES (?1)")
-            .map_err(Error::SQLError)?;
+        let mut ins_parent = conn.prepare("INSERT INTO temp.selected_parents (ibh) VALUES (?1)")?;
         for p in selected_parents {
-            ins_parent.execute(params![p]).map_err(Error::SQLError)?;
+            ins_parent.execute(params![p])?;
         }
     }
 
@@ -279,7 +281,13 @@ fn microblock_copy_specs() -> Vec<TableCopySpec> {
     ]
 }
 
-/// Copy confirmed canonical epoch-2 microblock streams.
+/// Copy confirmed canonical epoch-2 microblock streams into the squashed index.
+///
+/// `dst_index_path` is the squashed `index.sqlite` already created by the index copy step.
+/// The streams copied are bounded entirely by its `staging_blocks`: a source stream is copied
+/// only when a child block there confirms it. This function has no independent notion of the
+/// squash boundary H, so that index must already be scoped to H -- passing a full or stale
+/// index would copy post-boundary streams into the artifact.
 pub fn copy_confirmed_epoch2_microblocks(
     src_index_path: &str,
     dst_index_path: &str,
@@ -293,50 +301,48 @@ pub fn copy_confirmed_epoch2_microblocks(
             let results = execute_copy_specs(conn, &microblock_copy_specs())?;
             stats.microblock_rows_copied = copied_rows(&results, "staging_microblocks");
 
-            stats.microblock_bytes_copied = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(LENGTH(block_data)), 0) FROM staging_microblocks_data",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(Error::SQLError)?;
+            stats.microblock_bytes_copied = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(block_data)), 0) FROM staging_microblocks_data",
+                [],
+                |row| row.get(0),
+            )?;
         }
 
         Ok(stats)
     })
 }
 
-/// Copy canonical epoch 2.x block flat files.
+/// Copy canonical epoch 2.x block flat files into `dst_blocks_dir`.
+///
+/// Reads the canonical block set from `squashed_index_path` and copies each
+/// block's flat file from `src_blocks_dir`; `dst_blocks_dir` is created by the
+/// caller. A canonical block whose source file is missing is source corruption.
 pub fn copy_epoch2_block_files(
     squashed_index_path: &str,
     src_blocks_dir: &str,
     dst_blocks_dir: &str,
 ) -> Result<Epoch2BlockFileCopyStats, Error> {
-    let conn = sqlite_open(squashed_index_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false)
-        .map_err(Error::SQLError)?;
+    let conn = sqlite_open(squashed_index_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false)?;
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT index_block_hash, block_height \
+    let mut stmt = conn.prepare(
+        "SELECT index_block_hash, block_height \
              FROM block_headers ORDER BY block_height",
-        )
-        .map_err(Error::SQLError)?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, StacksBlockId>(0)?, row.get::<_, u64>(1)?))
-        })
-        .map_err(Error::SQLError)?;
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, StacksBlockId>(0)?, row.get::<_, u64>(1)?))
+    })?;
 
     let mut stats = Epoch2BlockFileCopyStats::default();
 
     for row in rows {
-        let (index_block_hash, block_height) = row.map_err(Error::SQLError)?;
+        let (index_block_hash, block_height) = row?;
         if block_height == 0 {
             stats.genesis_skipped += 1;
             continue;
         }
 
-        let rel_path = index_block_hash_to_rel_path(&index_block_hash);
+        let rel_path = StacksChainState::index_block_hash_to_rel_path(&index_block_hash);
         let src_path = Path::new(src_blocks_dir).join(&rel_path);
         let dst_path = Path::new(dst_blocks_dir).join(&rel_path);
 
@@ -349,27 +355,13 @@ pub fn copy_epoch2_block_files(
         }
 
         if let Some(parent) = dst_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                Error::CorruptionError(format!(
-                    "Failed to create directory {}: {e:?}",
-                    parent.display(),
-                ))
-            })?;
+            fs::create_dir_all(parent)?;
         }
 
-        let bytes_copied = fs::copy(&src_path, &dst_path).map_err(|e| {
-            Error::CorruptionError(format!(
-                "Failed to copy block file {} -> {}: {e:?}",
-                src_path.display(),
-                dst_path.display(),
-            ))
-        })?;
+        let bytes_copied = fs::copy(&src_path, &dst_path)?;
 
         stats.files_copied += 1;
         stats.total_bytes += bytes_copied;
-        stats
-            .copied_paths
-            .push(rel_path.to_string_lossy().into_owned());
 
         if stats.files_copied % 1000 == 0 {
             info!(
@@ -382,17 +374,49 @@ pub fn copy_epoch2_block_files(
     Ok(stats)
 }
 
+/// Copy specs for the Nakamoto staging DB.
+pub(super) fn nakamoto_copy_specs() -> Vec<TableCopySpec> {
+    vec![
+        TableCopySpec {
+            table: "db_version",
+            source_sql: "SELECT * FROM src.db_version".into(),
+        },
+        TableCopySpec {
+            table: "nakamoto_staging_blocks",
+            source_sql: "SELECT s.* FROM src.nakamoto_staging_blocks s \
+                 WHERE s.orphaned = 0 \
+                 AND s.index_block_hash IN \
+                 (SELECT index_block_hash FROM idx.nakamoto_block_headers)"
+                .into(),
+        },
+    ]
+}
+
 /// Create and populate `nakamoto.sqlite` with canonical `nakamoto_staging_blocks` rows.
 ///
 /// The retained set is bounded entirely by `squashed_index_path`: a non-orphan row is kept
 /// iff its `index_block_hash` is in that index's `nakamoto_block_headers`. This function has no
 /// independent notion of the squash boundary H, so the index must already be scoped to H
 /// -- passing a full or stale index would copy post-boundary rows into the artifact.
+///
+/// Returns an error if `dst_nakamoto_path` already exists.
 pub fn copy_nakamoto_staging_blocks(
     src_nakamoto_path: &str,
     dst_nakamoto_path: &str,
     squashed_index_path: &str,
 ) -> Result<NakamotoBlockCopyStats, Error> {
+    // Reject an unrecognized source schema before any destination work.
+    let src_conn = sqlite_open(src_nakamoto_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false)?;
+    assert_source_tables_classified(&src_conn)?;
+    drop(src_conn);
+
+    if Path::new(dst_nakamoto_path).exists() {
+        return Err(Error::DestinationExists(dst_nakamoto_path.to_string()));
+    }
+    if let Some(parent) = Path::new(dst_nakamoto_path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+
     with_offline_write_session(
         dst_nakamoto_path,
         &[("src", src_nakamoto_path), ("idx", squashed_index_path)],
@@ -400,42 +424,18 @@ pub fn copy_nakamoto_staging_blocks(
         |conn| {
             clone_schemas_from_source(conn, NAKAMOTO_STAGING_TABLES)?;
 
-            nakamoto_staging_copy_db_version(conn)
-                .map_err(|e| Error::CorruptionError(format!("cannot copy db_version: {e}")))?;
+            let results = execute_copy_specs(conn, &nakamoto_copy_specs())?;
 
-            let membership = nakamoto_staging_blocks_membership_predicate("s");
+            let total_blob_bytes: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM nakamoto_staging_blocks",
+                [],
+                |row| row.get(0),
+            )?;
 
-            // The membership filter also drops orphans: an in-index block should
-            // never be orphaned, but `set_block_orphaned` cascades via
-            // parent_block_id, so the filter keeps non-canonical rows out.
-            with_indexes_dropped(conn, "nakamoto_staging_blocks", |conn| {
-                conn.execute(
-                    &format!(
-                        "INSERT INTO nakamoto_staging_blocks ({}) \
-                         {} \
-                         WHERE {membership}",
-                        nakamoto_staging_block_columns(),
-                        nakamoto_staging_blocks_source_select("s")
-                    ),
-                    [],
-                )
-                .map_err(Error::SQLError)?;
-                Ok(())
-            })?;
-
-            let stats: NakamotoBlockCopyStats = conn
-                .query_row(
-                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM nakamoto_staging_blocks",
-                    [],
-                    |row| {
-                        Ok(NakamotoBlockCopyStats {
-                            rows_copied: row.get::<_, i64>(0)? as u64,
-                            total_blob_bytes: row.get::<_, i64>(1)? as u64,
-                        })
-                    },
-                )
-                .map_err(Error::SQLError)?;
-            Ok(stats)
+            Ok(NakamotoBlockCopyStats {
+                rows_copied: copied_rows(&results, "nakamoto_staging_blocks"),
+                total_blob_bytes: total_blob_bytes as u64,
+            })
         },
     )
 }
@@ -579,7 +579,7 @@ pub fn validate_epoch2_block_files(
             continue;
         }
 
-        let rel_path = index_block_hash_to_rel_path(&index_block_hash);
+        let rel_path = StacksChainState::index_block_hash_to_rel_path(&index_block_hash);
         let src_path = Path::new(src_blocks_dir).join(&rel_path);
         let dst_path = Path::new(dst_blocks_dir).join(&rel_path);
 
