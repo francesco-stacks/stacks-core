@@ -57,7 +57,7 @@ impl SpvHeadersValidation {
 pub fn copy_spv_headers(
     src_path: &str,
     dst_path: &str,
-    burn_height: u32,
+    burn_height: u64,
 ) -> Result<SpvHeadersCopyStats, Error> {
     if !Path::new(src_path).exists() {
         return Err(Error::IOError(std::io::Error::new(
@@ -84,7 +84,7 @@ pub fn copy_spv_headers(
 /// Build the copy specs for the SPV headers DB: `db_config` verbatim,
 /// `headers` up to `burn_height`, `chain_work` for complete difficulty
 /// intervals only.
-fn spv_copy_specs(burn_height: u32) -> Vec<TableCopySpec> {
+fn spv_copy_specs(burn_height: u64) -> Vec<TableCopySpec> {
     let complete_intervals = num_complete_chain_work_intervals(u64::from(burn_height));
     vec![
         TableCopySpec {
@@ -106,7 +106,7 @@ fn spv_copy_specs(burn_height: u32) -> Vec<TableCopySpec> {
 
 fn copy_spv_headers_inner(
     conn: &Connection,
-    burn_height: u32,
+    burn_height: u64,
 ) -> Result<SpvHeadersCopyStats, Error> {
     clone_schemas_from_source(conn, REQUIRED_TABLES)?;
 
@@ -122,7 +122,7 @@ fn copy_spv_headers_inner(
 pub fn validate_spv_headers(
     src_path: &str,
     dst_path: &str,
-    burn_height: u32,
+    burn_height: u64,
 ) -> Result<SpvHeadersValidation, Error> {
     if !Path::new(src_path).exists() {
         return Err(Error::IOError(std::io::Error::new(

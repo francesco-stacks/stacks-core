@@ -13,43 +13,88 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Burnchain DB (burnchain.sqlite) copy/validate tests.
+//! Burnchain DB (burnchain.sqlite) copy tests.
+
+use std::collections::HashSet;
+use std::path::Path;
 
 use rusqlite::{params, Connection};
 use stacks_common::types::chainstate::BurnchainHeaderHash;
 use tempfile::tempdir;
 
-use super::super::common::{unclassified_tables, MARF_INFRA_TABLES};
+use super::super::burnchain::{
+    assert_source_tables_classified, burnchain_copy_specs, copy_burnchain_db,
+    validate_burnchain_db, COPIED_TABLES,
+};
 use crate::burnchains::db::BurnchainDB;
 use crate::burnchains::{Burnchain, PoxConstants};
 use crate::chainstate::burn::db::sortdb::tests::test_append_snapshot;
 use crate::chainstate::burn::db::sortdb::SortitionDB;
+use crate::chainstate::stacks::index::Error;
 use crate::core::{StacksEpoch, StacksEpochExtension};
 
-/// Drift guard: every table the burnchain migrations create must be
-/// classified, so a future migration can't silently drop one from the copy.
+/// Drift guard: a freshly built production burnchain schema must be fully
+/// classified, so a future migration can't silently drop a table from the copy.
 #[test]
 fn test_no_unclassified_burnchain_tables() {
     let dir = tempdir().unwrap();
     let conn = create_burnchain_db(&dir.path().join("src.sqlite"));
-    let known: Vec<&str> = super::super::burnchain::REQUIRED_TABLES
-        .iter()
-        .chain(MARF_INFRA_TABLES.iter())
-        .copied()
-        .collect();
-    let extra = unclassified_tables(&conn, &known);
+    assert_source_tables_classified(&conn)
+        .expect("fresh production burnchain schema must be fully classified");
+}
+
+/// A source table the copy lists don't classify is rejected before any
+/// destination is produced — the runtime complement to the drift test.
+#[test]
+fn test_unclassified_source_table_is_rejected() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src.sqlite");
+    let dst_path = dir.path().join("dst.sqlite");
+
+    let sort_path = create_squashed_sortition(dir.path(), &[]);
+
+    let src = create_burnchain_db(&src_path);
+    src.execute_batch("CREATE TABLE surprise_table (x INTEGER)")
+        .unwrap();
+    drop(src);
+
+    let err = copy_burnchain_db(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        sort_path.to_str().unwrap(),
+        0,
+    )
+    .expect_err("unclassified source table should error");
+    match err {
+        Error::CorruptionError(msg) => assert!(
+            msg.contains("surprise_table"),
+            "error should name the unknown table, got: {msg}"
+        ),
+        other => panic!("expected CorruptionError, got {other:?}"),
+    }
     assert!(
-        extra.is_empty(),
-        "unclassified burnchain table(s) {extra:?}: classify each in REQUIRED_TABLES \
-         (snapshot/burnchain.rs)"
+        !dst_path.exists(),
+        "destination must not be produced when the source schema is rejected"
     );
+}
+
+/// Every cloned table (`COPIED_TABLES`) must have a row-copy spec and vice versa,
+/// else it would be cloned but never populated (present-but-empty).
+#[test]
+fn test_copy_specs_match_copied_tables() {
+    let copied: HashSet<&str> = COPIED_TABLES.iter().copied().collect();
+
+    let specs: Vec<&str> = burnchain_copy_specs().iter().map(|s| s.table).collect();
+    let spec_set: HashSet<&str> = specs.iter().copied().collect();
+    assert_eq!(specs.len(), spec_set.len(), "duplicate spec tables");
+    assert_eq!(spec_set, copied);
 }
 
 /// Create a burnchain.sqlite source via the production initializer
 /// ([`BurnchainDB::connect`]), so the fixture always carries the current
 /// schema instead of replaying migrations by hand. `connect` also seeds
 /// the regtest first-block header.
-fn create_burnchain_db(path: &std::path::Path) -> Connection {
+fn create_burnchain_db(path: &Path) -> Connection {
     let burnchain = Burnchain::regtest(":memory:");
     let _db = BurnchainDB::connect(path.to_str().unwrap(), &burnchain, true)
         .expect("burnchain DB init failed");
@@ -69,10 +114,7 @@ fn fixture_bhh(i: u8) -> BurnchainHeaderHash {
 /// cannot drift from what production actually writes: a real sortition DB
 /// whose canonical chain is the genesis snapshot ([`GENESIS_BHH`] at height
 /// 0) followed by `hashes` at heights 1... Returns its sqlite path.
-fn create_squashed_sortition(
-    dir: &std::path::Path,
-    hashes: &[BurnchainHeaderHash],
-) -> std::path::PathBuf {
+fn create_squashed_sortition(dir: &Path, hashes: &[BurnchainHeaderHash]) -> std::path::PathBuf {
     let db_dir = dir.join("sortition");
     let mut db = SortitionDB::connect(
         db_dir.to_str().unwrap(),
@@ -93,7 +135,7 @@ fn create_squashed_sortition(
 }
 
 /// End-to-end burnchain copy: canonical headers, ops, and commit
-/// metadata are copied, fork rows are dropped, and validation passes.
+/// metadata are copied verbatim; fork rows are dropped; validation passes.
 #[test]
 fn test_burnchain_db_copy_and_validate() {
     let dir = tempdir().unwrap();
@@ -103,6 +145,7 @@ fn test_burnchain_db_copy_and_validate() {
     // Canonical hashes at heights 0, 1, 2.
     let canonical = [GENESIS_BHH, fixture_bhh(1), fixture_bhh(2)];
     let sort_path = create_squashed_sortition(dir.path(), &canonical[1..]);
+    let hash_1 = fixture_bhh(1).to_string();
 
     let src = create_burnchain_db(&src_path);
     // Insert canonical block headers.
@@ -118,24 +161,16 @@ fn test_burnchain_db_copy_and_validate() {
     // Insert a non-canonical block at height 1.
     BurnchainDB::test_insert_block_header_row(&src, 1, "fork_hash_1", "parent_fork").unwrap();
     // Ops for canonical and non-canonical.
-    BurnchainDB::test_insert_block_ops_row(&src, &fixture_bhh(1).to_string(), "op1", "tx1")
-        .unwrap();
+    BurnchainDB::test_insert_block_ops_row(&src, &hash_1, "op1", "tx1").unwrap();
     BurnchainDB::test_insert_block_ops_row(&src, "fork_hash_1", "op_fork", "tx_fork").unwrap();
     // block_commit_metadata for canonical.
-    BurnchainDB::test_insert_block_commit_metadata_row(
-        &src,
-        &fixture_bhh(1).to_string(),
-        "tx1",
-        1,
-        None,
-    )
-    .unwrap();
+    BurnchainDB::test_insert_block_commit_metadata_row(&src, &hash_1, "tx1", 1, None).unwrap();
     // block_commit_metadata for non-canonical.
     BurnchainDB::test_insert_block_commit_metadata_row(&src, "fork_hash_1", "tx_fork", 1, None)
         .unwrap();
     drop(src);
 
-    let stats = super::super::burnchain::copy_burnchain_db(
+    let stats = copy_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -147,7 +182,7 @@ fn test_burnchain_db_copy_and_validate() {
     assert_eq!(stats.block_ops_rows, 1); // only fixture_bhh(1)'s op
     assert_eq!(stats.block_commit_metadata_rows, 1); // only canonical
 
-    let v = super::super::burnchain::validate_burnchain_db(
+    let v = validate_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -155,6 +190,39 @@ fn test_burnchain_db_copy_and_validate() {
     )
     .unwrap();
     assert!(v.is_valid(), "validation failed: {v:?}");
+}
+/// The copy writes into a NEW destination only: a pre-existing
+/// `burnchain.sqlite` (e.g. left over from a prior failed squash) is an
+/// error, never appended to or overwritten.
+#[test]
+fn test_burnchain_db_existing_destination_is_error() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src.sqlite");
+    let dst_path = dir.path().join("dst.sqlite");
+
+    let sort_path = create_squashed_sortition(dir.path(), &[fixture_bhh(1)]);
+    let src = create_burnchain_db(&src_path);
+    drop(src);
+
+    // A stale destination left over from a prior run must not be touched.
+    std::fs::write(&dst_path, b"stale data").unwrap();
+
+    let err = copy_burnchain_db(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        sort_path.to_str().unwrap(),
+        1,
+    )
+    .expect_err("existing destination should error");
+    assert!(
+        matches!(err, Error::DestinationExists(_)),
+        "expected DestinationExists, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&dst_path).unwrap(),
+        b"stale data",
+        "existing destination must be left untouched"
+    );
 }
 
 /// Two headers at the same height: only the one whose hash is in the
@@ -181,7 +249,7 @@ fn test_burnchain_db_excludes_non_canonical_fork() {
     BurnchainDB::test_insert_block_header_row(&src, 1, "hash_b", "parent_b").unwrap();
     drop(src);
 
-    let stats = super::super::burnchain::copy_burnchain_db(
+    let stats = copy_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -221,7 +289,7 @@ fn test_burnchain_db_block_ops_follow_canonical_headers() {
     BurnchainDB::test_insert_block_ops_row(&src, "fork", "op_f", "tx_f").unwrap();
     drop(src);
 
-    let stats = super::super::burnchain::copy_burnchain_db(
+    let stats = copy_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -265,7 +333,7 @@ fn test_burnchain_db_anchor_blocks_filtered() {
     BurnchainDB::test_insert_override_row(&src, 99, "map_99").unwrap();
     drop(src);
 
-    let stats = super::super::burnchain::copy_burnchain_db(
+    let stats = copy_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -274,17 +342,26 @@ fn test_burnchain_db_anchor_blocks_filtered() {
     .unwrap();
 
     assert_eq!(stats.anchor_blocks_rows, 1);
-    assert_eq!(stats.overrides_rows, 1);
 
     let dst = Connection::open(&dst_path).unwrap();
     let cycle: i64 = dst
         .query_row("SELECT reward_cycle FROM anchor_blocks", [], |r| r.get(0))
         .unwrap();
     assert_eq!(cycle, 1);
-    let override_map: String = dst
-        .query_row("SELECT affirmation_map FROM overrides", [], |r| r.get(0))
+    // `overrides` is schema-only: the table exists in the dst, but no rows are
+    // copied -- not even for a canonical reward cycle.
+    let override_rows: i64 = dst
+        .query_row("SELECT COUNT(*) FROM overrides", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(override_map, "map_1");
+    assert_eq!(override_rows, 0, "overrides must not be row-copied");
+    let anchor99: i64 = dst
+        .query_row(
+            "SELECT COUNT(*) FROM anchor_blocks WHERE reward_cycle = 99",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(anchor99, 0, "unreferenced anchor block must not be copied");
 }
 
 /// A non-canonical header injected into the destination must fail
@@ -302,7 +379,7 @@ fn test_burnchain_db_validate_detects_non_canonical_leak() {
     drop(src);
 
     // Copy normally first.
-    super::super::burnchain::copy_burnchain_db(
+    copy_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -315,7 +392,7 @@ fn test_burnchain_db_validate_detects_non_canonical_leak() {
     BurnchainDB::test_insert_block_header_row(&dst, 0, "rogue", "none").unwrap();
     drop(dst);
 
-    let v = super::super::burnchain::validate_burnchain_db(
+    let v = validate_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -326,7 +403,8 @@ fn test_burnchain_db_validate_detects_non_canonical_leak() {
     assert!(!v.no_extra_headers);
 }
 
-/// A missing source burnchain.sqlite is an error.
+/// A missing source burnchain.sqlite is an error, and the read-only
+/// ATTACH must not create the source file as a side effect.
 #[test]
 fn test_burnchain_db_missing_source_is_error() {
     let dir = tempdir().unwrap();
@@ -335,14 +413,17 @@ fn test_burnchain_db_missing_source_is_error() {
 
     let sort_path = create_squashed_sortition(dir.path(), &[]);
 
-    let result = super::super::burnchain::copy_burnchain_db(
+    let result = copy_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
         0,
     );
-    // Should error because the source file does not exist.
-    assert!(result.is_err());
+    assert!(result.is_err(), "missing source should error");
+    assert!(
+        !src_path.exists(),
+        "missing source must not be created by ATTACH"
+    );
 }
 
 /// A sortition tip height that disagrees with the caller's expected burn
@@ -362,7 +443,7 @@ fn test_burnchain_db_sortition_tip_mismatch_is_error() {
     drop(src);
 
     // Pass expected_burn_height=10, but sortition tip is 5.
-    let result = super::super::burnchain::copy_burnchain_db(
+    let result = copy_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -389,7 +470,7 @@ fn test_burnchain_db_fresh_output_dir() {
     BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
     drop(src);
 
-    let stats = super::super::burnchain::copy_burnchain_db(
+    let stats = copy_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -424,7 +505,7 @@ fn test_burnchain_db_copy_fails_when_source_missing_canonical_hash() {
     .unwrap();
     drop(src);
 
-    let result = super::super::burnchain::copy_burnchain_db(
+    let result = copy_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -454,7 +535,7 @@ fn test_burnchain_db_validate_detects_missing_canonical_hash() {
     drop(src);
 
     // Copy normally (source has all canonical hashes).
-    super::super::burnchain::copy_burnchain_db(
+    copy_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -471,7 +552,7 @@ fn test_burnchain_db_validate_detects_missing_canonical_hash() {
     .unwrap();
     drop(dst);
 
-    let v = super::super::burnchain::validate_burnchain_db(
+    let v = validate_burnchain_db(
         src_path.to_str().unwrap(),
         dst_path.to_str().unwrap(),
         sort_path.to_str().unwrap(),
@@ -480,30 +561,4 @@ fn test_burnchain_db_validate_detects_missing_canonical_hash() {
     .unwrap();
     assert!(!v.is_valid(), "should detect missing canonical hash: {v:?}");
     assert!(!v.canonical_complete);
-}
-
-/// The read-only ATTACH of a missing source must not create the file as
-/// a side effect.
-#[test]
-fn test_burnchain_db_missing_source_does_not_create_file() {
-    let dir = tempdir().unwrap();
-    let src_path = dir.path().join("nonexistent_burnchain.sqlite");
-    let dst_path = dir.path().join("dst.sqlite");
-
-    let sort_path = create_squashed_sortition(dir.path(), &[]);
-
-    assert!(!src_path.exists());
-
-    let result = super::super::burnchain::copy_burnchain_db(
-        src_path.to_str().unwrap(),
-        dst_path.to_str().unwrap(),
-        sort_path.to_str().unwrap(),
-        0,
-    );
-    assert!(result.is_err());
-    // Source path must not have been created by ATTACH.
-    assert!(
-        !src_path.exists(),
-        "missing source must not be created by ATTACH"
-    );
 }

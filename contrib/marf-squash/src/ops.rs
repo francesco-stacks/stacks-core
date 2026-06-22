@@ -486,7 +486,7 @@ pub fn validate_bitcoin_aux_files(
     squashed_sort: &Path,
     src_hdr: &Path,
     dst_hdr: &Path,
-    bitcoin_height: u32,
+    bitcoin_height: u64,
 ) -> bool {
     println!("Validating Bitcoin auxiliary files...");
     let mut valid = true;
@@ -550,7 +550,7 @@ pub fn copy_bitcoin_aux_files(
     squashed_sort: &Path,
     src_hdr: &Path,
     dst_hdr: &Path,
-    bitcoin_height: u32,
+    bitcoin_height: u64,
 ) {
     println!("Copying burnchain.sqlite (canonical only)...");
     match copy_burnchain_db(
@@ -561,12 +561,11 @@ pub fn copy_bitcoin_aux_files(
     ) {
         Ok(bc_stats) => {
             println!(
-                "  block_headers={}, block_ops={}, commit_metadata={}, anchor_blocks={}, overrides={}",
+                "  block_headers={}, block_ops={}, commit_metadata={}, anchor_blocks={}",
                 bc_stats.block_headers_rows,
                 bc_stats.block_ops_rows,
                 bc_stats.block_commit_metadata_rows,
                 bc_stats.anchor_blocks_rows,
-                bc_stats.overrides_rows,
             );
         }
         Err(e) => die_with_cleanup(

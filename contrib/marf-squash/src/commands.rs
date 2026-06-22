@@ -346,7 +346,7 @@ pub fn run_squash(args: SquashArgs) {
             &squashed_sort,
             &src_hdr,
             &dst_hdr,
-            squash_bitcoin_height,
+            u64::from(squash_bitcoin_height),
         );
     }
 
@@ -427,7 +427,7 @@ pub fn run_squash(args: SquashArgs) {
                 &squashed_sort,
                 &src_hdr,
                 &dst_hdr,
-                squash_bitcoin_height,
+                u64::from(squash_bitcoin_height),
             )
         {
             all_valid = false;
@@ -610,7 +610,7 @@ pub fn run_validate(args: ValidateArgs) {
             &squashed_sort,
             &src_hdr,
             &dst_hdr,
-            squash_bitcoin_height,
+            u64::from(squash_bitcoin_height),
         ) {
             all_valid = false;
         }

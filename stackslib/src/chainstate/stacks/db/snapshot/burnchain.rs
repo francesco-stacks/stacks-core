@@ -20,23 +20,55 @@ use rusqlite::{Connection, OpenFlags};
 use stacks_common::types::chainstate::BurnchainHeaderHash;
 
 use super::common::{
-    clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result, validate_copy_specs,
-    with_offline_write_session, with_readonly_session, TableCopySpec,
+    assert_source_schema, clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result,
+    validate_copy_specs, with_offline_write_session, with_readonly_session, TableCopySpec,
 };
 use crate::burnchains::db::BurnchainDB;
 use crate::chainstate::burn::db::sortdb::SortitionDB;
 use crate::chainstate::stacks::index::Error;
 use crate::util_lib::db::sqlite_open;
 
-/// Tables required in all burnchain.sqlite versions.
-pub(super) const REQUIRED_TABLES: &[&str] = &[
+/// Tables copied (with canonical-filtered content) into the squashed burnchain DB.
+pub(super) const COPIED_TABLES: &[&str] = &[
     "burnchain_db_block_headers",
     "burnchain_db_block_ops",
     "block_commit_metadata",
     "anchor_blocks",
-    "overrides",
     "db_config",
 ];
+
+/// Tables the burnchain copy clones for schema fidelity but does not populate.
+/// `overrides` (reward-cycle affirmation-map overrides) is never read or written
+/// by any production path, so it is intentionally schema-only: cloning its schema
+/// keeps the dst complete and drift-guarded without copying rows.
+pub(super) const SCHEMA_ONLY_TABLES: &[&str] = &["overrides"];
+
+/// Every table whose schema must exist in the squashed dst (copied + schema-only).
+fn all_required_tables() -> Vec<&'static str> {
+    COPIED_TABLES
+        .iter()
+        .chain(SCHEMA_ONLY_TABLES)
+        .copied()
+        .collect()
+}
+
+/// Every table the snapshot recognizes in a source `burnchain.sqlite`: the
+/// row-copied tables plus the schema-only ones. burnchain.sqlite is not
+/// MARF-backed, so there are no MARF infra tables to exempt.
+fn known_burnchain_tables() -> Vec<&'static str> {
+    all_required_tables()
+}
+
+/// The burnchain snapshot's source-schema guard (see [`assert_source_schema`]);
+/// `test_no_unclassified_burnchain_tables` runs it against a fresh schema.
+pub(super) fn assert_source_tables_classified(src_conn: &Connection) -> Result<(), Error> {
+    assert_source_schema(
+        src_conn,
+        &known_burnchain_tables(),
+        "burnchain DB",
+        "COPIED_TABLES (to copy) or SCHEMA_ONLY_TABLES (to skip) in snapshot/burnchain.rs",
+    )
+}
 
 /// The canonical burn-hash set staged by [`populate_canonical_burn_hashes`],
 /// as a SELECT fragment.
@@ -49,7 +81,6 @@ pub struct BurnchainDbCopyStats {
     pub block_ops_rows: u64,
     pub block_commit_metadata_rows: u64,
     pub anchor_blocks_rows: u64,
-    pub overrides_rows: u64,
 }
 
 /// Validation result for a copied burnchain.sqlite.
@@ -116,27 +147,26 @@ fn populate_canonical_burn_hashes(
 ) -> Result<(), Error> {
     conn.execute_batch(
         "CREATE TEMP TABLE canonical_burn_hashes (burn_header_hash TEXT PRIMARY KEY)",
-    )
-    .map_err(Error::SQLError)?;
+    )?;
     // A savepoint batches the inserts whether or not the session already
-    // holds an open transaction (the copy session does; the read-only
-    // validate session does not, and autocommit-per-row would be slow).
-    conn.execute_batch("SAVEPOINT canonical_burn_hashes")
-        .map_err(Error::SQLError)?;
-    let mut stmt = conn
-        .prepare("INSERT INTO canonical_burn_hashes (burn_header_hash) VALUES (?1)")
-        .map_err(Error::SQLError)?;
+    // holds an open transaction (the copy session does, and
+    // autocommit-per-row would be slow).
+    conn.execute_batch("SAVEPOINT canonical_burn_hashes")?;
+    let mut stmt =
+        conn.prepare("INSERT INTO canonical_burn_hashes (burn_header_hash) VALUES (?1)")?;
     for hash in canonical_hashes {
-        stmt.execute([hash.to_string()]).map_err(Error::SQLError)?;
+        stmt.execute([hash.to_string()])?;
     }
     drop(stmt);
-    conn.execute_batch("RELEASE canonical_burn_hashes")
-        .map_err(Error::SQLError)?;
+    conn.execute_batch("RELEASE canonical_burn_hashes")?;
     Ok(())
 }
 
 /// Copy canonical rows from source `burnchain.sqlite` into a new destination,
 /// using the squashed sortition DB as the authoritative canonical set.
+///
+/// Returns an error if a required source is missing or if the destination
+/// already exists.
 ///
 /// Preserves dependency-ordered copy:
 /// 1. Canonical headers and ops (burn_header_hash filtered)
@@ -147,21 +177,23 @@ pub fn copy_burnchain_db(
     src_burnchain_db_path: &str,
     dst_burnchain_db_path: &str,
     squashed_sortition_path: &str,
-    expected_burn_height: u32,
+    expected_burn_height: u64,
 ) -> Result<BurnchainDbCopyStats, Error> {
-    if !Path::new(src_burnchain_db_path).exists() {
-        return Err(Error::CorruptionError(format!(
-            "Source burnchain DB not found: {src_burnchain_db_path}"
-        )));
-    }
-    if !Path::new(squashed_sortition_path).exists() {
-        return Err(Error::CorruptionError(format!(
-            "Squashed sortition DB not found: {squashed_sortition_path}"
-        )));
+    if Path::new(dst_burnchain_db_path).exists() {
+        return Err(Error::DestinationExists(dst_burnchain_db_path.to_string()));
     }
 
+    // Reject an unrecognized source schema before any destination work.
+    let src_conn = sqlite_open(
+        src_burnchain_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        false,
+    )?;
+    assert_source_tables_classified(&src_conn)?;
+    drop(src_conn);
+
     if let Some(parent) = Path::new(dst_burnchain_db_path).parent() {
-        fs::create_dir_all(parent).map_err(Error::IOError)?;
+        fs::create_dir_all(parent)?;
     }
 
     let sort_conn = open_squashed_sortition_db(squashed_sortition_path)?;
@@ -183,7 +215,7 @@ pub fn copy_burnchain_db(
 /// canonical headers and ops (burn-hash filtered), commit metadata,
 /// `anchor_blocks` derived from the copied commit metadata, and `overrides`
 /// derived from the copied anchor blocks.
-fn burnchain_copy_specs() -> Vec<TableCopySpec> {
+pub(super) fn burnchain_copy_specs() -> Vec<TableCopySpec> {
     let bhh = CANONICAL_BURN_HASHES_SQL;
     vec![
         TableCopySpec {
@@ -217,12 +249,6 @@ fn burnchain_copy_specs() -> Vec<TableCopySpec> {
                  )"
             .into(),
         },
-        TableCopySpec {
-            table: "overrides",
-            source_sql: "SELECT * FROM src.overrides \
-                 WHERE reward_cycle IN (SELECT reward_cycle FROM anchor_blocks)"
-                .into(),
-        },
     ]
 }
 
@@ -230,9 +256,9 @@ fn burnchain_copy_specs() -> Vec<TableCopySpec> {
 /// caller's expected burn height.
 fn assert_sortition_tip_height(
     sortition_tip_height: u64,
-    expected_burn_height: u32,
+    expected_burn_height: u64,
 ) -> Result<(), Error> {
-    if sortition_tip_height != u64::from(expected_burn_height) {
+    if sortition_tip_height != expected_burn_height {
         return Err(Error::CorruptionError(format!(
             "Sortition tip height mismatch: expected {expected_burn_height}, got {sortition_tip_height}"
         )));
@@ -244,7 +270,7 @@ fn copy_burnchain_db_inner(
     conn: &Connection,
     canonical_hashes: &[BurnchainHeaderHash],
 ) -> Result<BurnchainDbCopyStats, Error> {
-    clone_schemas_from_source(conn, REQUIRED_TABLES)?;
+    clone_schemas_from_source(conn, &all_required_tables())?;
 
     populate_canonical_burn_hashes(conn, canonical_hashes)?;
 
@@ -263,13 +289,20 @@ fn copy_burnchain_db_inner(
 
     let results = execute_copy_specs(conn, &burnchain_copy_specs())?;
 
-    Ok(BurnchainDbCopyStats {
+    let stats = BurnchainDbCopyStats {
         block_headers_rows: copied_rows(&results, "burnchain_db_block_headers"),
         block_ops_rows: copied_rows(&results, "burnchain_db_block_ops"),
         block_commit_metadata_rows: copied_rows(&results, "block_commit_metadata"),
         anchor_blocks_rows: copied_rows(&results, "anchor_blocks"),
-        overrides_rows: copied_rows(&results, "overrides"),
-    })
+    };
+    info!(
+        "Copied burnchain DB";
+        "block_headers_rows" => stats.block_headers_rows,
+        "block_ops_rows" => stats.block_ops_rows,
+        "block_commit_metadata_rows" => stats.block_commit_metadata_rows,
+        "anchor_blocks_rows" => stats.anchor_blocks_rows
+    );
+    Ok(stats)
 }
 
 /// Validate a copied burnchain.sqlite against its source.
@@ -277,7 +310,7 @@ pub fn validate_burnchain_db(
     src_burnchain_db_path: &str,
     dst_burnchain_db_path: &str,
     squashed_sortition_path: &str,
-    expected_burn_height: u32,
+    expected_burn_height: u64,
 ) -> Result<BurnchainDbValidation, Error> {
     let sort_conn = open_squashed_sortition_db(squashed_sortition_path)?;
     let (sortition_tip_height, canonical_hashes) =
@@ -317,7 +350,11 @@ pub fn validate_burnchain_db(
                 block_ops_match: spec_result(&results, "burnchain_db_block_ops"),
                 block_commit_metadata_match: spec_result(&results, "block_commit_metadata"),
                 anchor_blocks_match: spec_result(&results, "anchor_blocks"),
-                overrides_match: spec_result(&results, "overrides"),
+                // `overrides` is schema-only (cloned, never row-copied), so the
+                // squashed dst must hold zero rows rather than matching a copy spec.
+                overrides_match: conn
+                    .query_row("SELECT COUNT(*) FROM overrides", [], |row| row.get::<_, i64>(0))?
+                    == 0,
                 db_config_match: spec_result(&results, "db_config"),
                 no_extra_headers,
                 canonical_complete,
