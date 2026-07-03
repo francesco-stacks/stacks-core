@@ -1,8 +1,21 @@
-use std::collections::BTreeMap;
+// Copyright (C) 2026 Stacks Open Internet Foundation
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
 
 /// Offline squashing CLI for Index, Clarity, and Sortition MARF snapshots.
 #[derive(Parser, Debug)]
@@ -17,11 +30,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Create squashed MARFs and validate against the source.
+    /// Create squashed MARFs from a source chainstate and validate them against it.
     Squash(SquashArgs),
     /// Validate squashed MARFs against a source chainstate.
     Validate(ValidateArgs),
-    /// Verify a standalone GSS directory's integrity and optionally check WSCP checkpoint.
+    /// Verify a standalone PCS directory's integrity and optionally check a WSCP checkpoint.
     Verify(VerifyArgs),
 }
 
@@ -55,11 +68,11 @@ pub struct SquashArgs {
     #[arg(long)]
     pub all: bool,
     /// Copy canonical block data (epoch 2.x files, confirmed microblocks, nakamoto.sqlite).
-    /// Requires --index (or --all).
+    /// Requires --index (is implied by --all).
     #[arg(long)]
     pub blocks: bool,
     /// Copy Bitcoin auxiliary files (burnchain.sqlite + headers.sqlite).
-    /// Requires --sortition (or --all).
+    /// Requires --sortition (is implied by --all).
     #[arg(long)]
     pub bitcoin: bool,
     /// Skip validation to speed up size measurements.
@@ -115,102 +128,13 @@ pub struct ValidateArgs {
     pub full: bool,
 }
 
-/// Arguments for standalone GSS verification.
+/// Arguments for standalone PCS verification.
 #[derive(Parser, Debug)]
 pub struct VerifyArgs {
-    /// Path to a GSS directory (must contain GSS_manifest.toml).
+    /// Path to a PCS directory (must contain PCS_manifest.toml).
     #[arg(long, value_name = "DIR")]
-    pub gss_dir: PathBuf,
+    pub pcs_dir: PathBuf,
     /// Path to a TOML file with trusted WSCP checkpoint hashes.
     #[arg(long, value_name = "FILE")]
     pub checkpoint_file: Option<PathBuf>,
 }
-
-/// Trusted WSCP checkpoint file format.
-#[derive(Deserialize)]
-pub struct CheckpointFile {
-    pub stacks_height: u32,
-    pub bitcoin_height: u32,
-    pub clarity_squash_root_node_hash: String,
-    pub index_squash_root_node_hash: String,
-    pub sortition_squash_root_node_hash: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct TargetPaths {
-    pub db: PathBuf,
-    pub blobs: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChainstatePaths {
-    pub clarity: TargetPaths,
-    pub index: TargetPaths,
-    pub sortition: TargetPaths,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SquashManifest {
-    pub snapshot: SnapshotSection,
-    pub roots: RootsSection,
-    pub squash_roots: SquashRootsSection,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blocks: Option<BlocksSection>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub checksums: Option<ChecksumsSection>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SnapshotSection {
-    pub version: u32,
-    pub stacks_height: u32,
-    pub bitcoin_height: u32,
-    pub block_hash: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bitcoin_block_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<String>,
-    pub chain_id: u32,
-    pub mainnet: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct RootsSection {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub clarity_archival_marf_root_hash: Option<String>,
-    pub index_archival_marf_root_hash: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sortition_archival_marf_root_hash: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SquashRootsSection {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub clarity_squash_root_node_hash: Option<String>,
-    pub index_squash_root_node_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sortition_squash_root_node_hash: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct BlocksSection {
-    pub epoch2x_files: u64,
-    pub epoch2x_bytes: u64,
-    pub epoch2x_microblock_rows: u64,
-    pub epoch2x_microblock_bytes: u64,
-    pub nakamoto_rows: u64,
-    pub nakamoto_bytes: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ChecksumsSection {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub epoch2_block_archive_hash: Option<String>,
-    pub files: BTreeMap<String, String>,
-}
-
-/// Manifest file names.
-pub const GSS_MANIFEST: &str = "GSS_manifest.toml";
-
-/// File extensions that indicate SQLite sidecars (WAL, SHM, journal).
-pub const SQLITE_SIDECAR_EXTENSIONS: &[&str] = &["sqlite-wal", "sqlite-shm", "sqlite-journal"];

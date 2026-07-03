@@ -207,9 +207,9 @@ fn test_unclassified_source_table_is_rejected() {
     create_nakamoto_headers_index(&idx_path, &["canonical_ibh_1"]);
 
     let err = copy_nakamoto_staging_blocks(
+        idx_path.to_str().unwrap(),
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
-        idx_path.to_str().unwrap(),
     )
     .expect_err("unclassified source table must be rejected");
     match err {
@@ -784,9 +784,9 @@ fn test_nakamoto_copy() {
 
     // Copy.
     let stats = copy_nakamoto_staging_blocks(
+        idx_path.to_str().unwrap(),
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
-        idx_path.to_str().unwrap(),
     )
     .unwrap();
 
@@ -878,9 +878,9 @@ fn test_nakamoto_copy_existing_destination_is_error() {
     std::fs::write(&dst_nak_path, b"stale data").unwrap();
 
     let err = copy_nakamoto_staging_blocks(
+        idx_path.to_str().unwrap(),
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
-        idx_path.to_str().unwrap(),
     )
     .expect_err("existing destination should error");
     assert!(
@@ -951,9 +951,9 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
 
     // Copy: only the two <=H blocks are retained.
     let stats = copy_nakamoto_staging_blocks(
+        idx_path.to_str().unwrap(),
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
-        idx_path.to_str().unwrap(),
     )
     .unwrap();
     assert_eq!(stats.rows_copied, 2, "only <=H blocks should be copied");
@@ -1048,9 +1048,9 @@ fn test_nakamoto_validate_detects_drift(
     drop(src_conn);
 
     copy_nakamoto_staging_blocks(
+        idx_path.to_str().unwrap(),
         src_nak_path.to_str().unwrap(),
         dst_nak_path.to_str().unwrap(),
-        idx_path.to_str().unwrap(),
     )
     .unwrap();
 

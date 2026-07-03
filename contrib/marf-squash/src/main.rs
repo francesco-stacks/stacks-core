@@ -1,8 +1,28 @@
+// Copyright (C) 2026 Stacks Open Internet Foundation
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+mod checksums;
 mod cli;
 mod commands;
+mod config;
+mod db;
+mod layout;
 mod manifest;
 mod ops;
-mod util;
+mod targets;
+mod validate;
 mod verify;
 
 use clap::Parser;
@@ -24,23 +44,23 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::Parser;
+    use rstest::rstest;
     use stacks_common::types::chainstate::{SortitionId, StacksBlockId};
-    use stackslib::chainstate::stacks::index::marf::{MARF, MarfConnection};
+    use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, MarfConnection};
     use stackslib::chainstate::stacks::index::{MARFValue, MarfTrieId, trie_sql};
 
-    use crate::cli::{
-        BlocksSection, ChecksumsSection, Cli, Command, GSS_MANIFEST, RootsSection, SnapshotSection,
-        SquashManifest, SquashRootsSection, ValidateArgs,
+    use crate::checksums::{compute_aggregate_checksum, compute_checksums, sha256_file};
+    use crate::cli::{Cli, Command, ValidateArgs};
+    use crate::layout::{PCS_MANIFEST, epoch2_block_rel_path};
+    use crate::manifest::{
+        BlocksSection, ChecksumsSection, RootsSection, SnapshotSection, SquashManifest,
+        SquashRootsSection,
     };
-    use crate::util::{
-        compute_aggregate_checksum, compute_checksums, epoch2_block_rel_path, sha256_file,
-        squash_marf_open_opts,
-    };
-    use crate::verify::{validate_checkpoint_hash, verify_gss};
+    use crate::verify::{validate_checkpoint_hash, verify_pcs};
 
     //  Helpers
 
-    fn create_test_gss_dir(dir: &std::path::Path, files: &[&str]) {
+    fn create_test_pcs_dir(dir: &std::path::Path, files: &[&str]) {
         for f in files {
             let path = dir.join(f);
             if let Some(parent) = path.parent() {
@@ -84,7 +104,15 @@ mod tests {
             checksums,
         };
         let toml_str = toml::to_string(&manifest).unwrap();
-        std::fs::write(dir.join(GSS_MANIFEST), toml_str).unwrap();
+        std::fs::write(dir.join(PCS_MANIFEST), toml_str).unwrap();
+    }
+
+    /// Open-opts for the fixture MARFs: external blobs, so the `.blobs` sidecars
+    /// required of a full PCS exist on disk.
+    fn fixture_marf_open_opts() -> MARFOpenOpts {
+        let mut open_opts = MARFOpenOpts::default();
+        open_opts.external_blobs = true;
+        open_opts
     }
 
     fn write_test_marf<T: MarfTrieId>(
@@ -97,7 +125,7 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
 
-        let open_opts = squash_marf_open_opts();
+        let open_opts = fixture_marf_open_opts();
         let mut marf = MARF::from_path(db_path.to_str().unwrap(), open_opts.clone()).unwrap();
         let tip = T::from_bytes([block_byte; 32]);
         let mut tx = marf.begin_tx().unwrap();
@@ -113,7 +141,7 @@ mod tests {
         format!("0x{root}")
     }
 
-    fn create_full_gss_fixture(dir: &std::path::Path) -> (String, String, String) {
+    fn create_full_pcs_fixture(dir: &std::path::Path) -> (String, String, String) {
         let clarity_root = write_test_marf::<StacksBlockId>(
             &dir.join("chainstate/vm/clarity/marf.sqlite"),
             0x11,
@@ -133,7 +161,7 @@ mod tests {
             "sortition-value",
         );
 
-        create_test_gss_dir(
+        create_test_pcs_dir(
             dir,
             &[
                 "burnchain/burnchain.sqlite",
@@ -204,15 +232,21 @@ mod tests {
             }),
         };
         let toml_str = toml::to_string(&manifest).unwrap();
-        std::fs::write(dir.join(GSS_MANIFEST), toml_str).unwrap();
+        std::fs::write(dir.join(PCS_MANIFEST), toml_str).unwrap();
 
         (clarity_root, index_root, sortition_root)
     }
 
     //  CLI parsing
 
-    #[test]
-    fn test_parse_squash_args_ok() {
+    /// Parse `squash` argv over (selected target flag) → expected
+    /// `(clarity, index, sortition)` flag values. `--chainstate`,
+    /// `--tenure-start-bitcoin-height`, and `--out-dir` are fixed and asserted in
+    /// every case.
+    #[rstest]
+    #[case("--index", (false, true, false))]
+    #[case("--sortition", (false, false, true))]
+    fn test_parse_squash_args(#[case] target_flag: &str, #[case] expected: (bool, bool, bool)) {
         let args = vec![
             "marf-squash",
             "squash",
@@ -222,7 +256,7 @@ mod tests {
             "869704",
             "--out-dir",
             "/tmp/out",
-            "--index",
+            target_flag,
         ]
         .into_iter()
         .map(String::from);
@@ -232,34 +266,10 @@ mod tests {
             Command::Squash(args) => {
                 assert_eq!(args.chainstate, PathBuf::from("/tmp/chainstate"));
                 assert_eq!(args.tenure_start_bitcoin_height, 869704);
-                assert!(args.index);
-            }
-            _ => panic!("expected squash command"),
-        }
-    }
-
-    #[test]
-    fn test_parse_squash_args_sortition() {
-        let args = vec![
-            "marf-squash",
-            "squash",
-            "--chainstate",
-            "/tmp/chainstate",
-            "--tenure-start-bitcoin-height",
-            "869704",
-            "--out-dir",
-            "/tmp/out",
-            "--sortition",
-        ]
-        .into_iter()
-        .map(String::from);
-
-        let cli = Cli::try_parse_from(args).unwrap();
-        match cli.command {
-            Command::Squash(args) => {
-                assert!(args.sortition);
-                assert!(!args.clarity);
-                assert!(!args.index);
+                let (clarity, index, sortition) = expected;
+                assert_eq!(args.clarity, clarity);
+                assert_eq!(args.index, index);
+                assert_eq!(args.sortition, sortition);
             }
             _ => panic!("expected squash command"),
         }
@@ -298,13 +308,14 @@ mod tests {
             _ => panic!("expected validate command"),
         }
     }
+
     #[test]
     fn test_parse_verify_args_ok() {
         let args = vec![
             "marf-squash",
             "verify",
-            "--gss-dir",
-            "/tmp/gss",
+            "--pcs-dir",
+            "/tmp/pcs",
             "--checkpoint-file",
             "/tmp/checkpoint.toml",
         ]
@@ -314,7 +325,7 @@ mod tests {
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Command::Verify(args) => {
-                assert_eq!(args.gss_dir, PathBuf::from("/tmp/gss"));
+                assert_eq!(args.pcs_dir, PathBuf::from("/tmp/pcs"));
                 assert_eq!(
                     args.checkpoint_file,
                     Some(PathBuf::from("/tmp/checkpoint.toml"))
@@ -326,14 +337,14 @@ mod tests {
 
     #[test]
     fn test_parse_verify_args_no_checkpoint() {
-        let args = vec!["marf-squash", "verify", "--gss-dir", "/tmp/gss"]
+        let args = vec!["marf-squash", "verify", "--pcs-dir", "/tmp/pcs"]
             .into_iter()
             .map(String::from);
 
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Command::Verify(args) => {
-                assert_eq!(args.gss_dir, PathBuf::from("/tmp/gss"));
+                assert_eq!(args.pcs_dir, PathBuf::from("/tmp/pcs"));
                 assert!(args.checkpoint_file.is_none());
             }
             _ => panic!("expected verify command"),
@@ -346,8 +357,8 @@ mod tests {
     fn test_compute_checksums_clean_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        create_test_gss_dir(dir, &["a.sqlite", "sub/b.sqlite"]);
-        std::fs::write(dir.join(GSS_MANIFEST), "dummy").unwrap();
+        create_test_pcs_dir(dir, &["a.sqlite", "sub/b.sqlite"]);
+        std::fs::write(dir.join(PCS_MANIFEST), "dummy").unwrap();
 
         let checksums = compute_checksums(dir, None, None).unwrap();
         assert_eq!(checksums.len(), 2);
@@ -361,7 +372,7 @@ mod tests {
     fn test_compute_checksums_ignores_sqlite_sidecars() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        create_test_gss_dir(dir, &["a.sqlite", "a.sqlite-wal"]);
+        create_test_pcs_dir(dir, &["a.sqlite", "a.sqlite-wal"]);
 
         let checksums = compute_checksums(dir, None, None).unwrap();
         assert_eq!(checksums.len(), 1);
@@ -372,7 +383,7 @@ mod tests {
     fn test_manifest_rejects_symlinks() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        create_test_gss_dir(dir, &["a.sqlite"]);
+        create_test_pcs_dir(dir, &["a.sqlite"]);
         #[cfg(unix)]
         std::os::unix::fs::symlink(dir.join("a.sqlite"), dir.join("link.sqlite")).unwrap();
 
@@ -388,7 +399,7 @@ mod tests {
     fn test_manifest_rejects_extra_file_in_outdir() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        create_test_gss_dir(dir, &["expected.sqlite", "stale.sqlite"]);
+        create_test_pcs_dir(dir, &["expected.sqlite", "stale.sqlite"]);
 
         let mut expected = std::collections::HashSet::new();
         expected.insert("expected.sqlite".to_string());
@@ -447,23 +458,23 @@ mod tests {
         assert!(err.contains("non-hex"), "got: {err}");
     }
 
-    //  End-to-end verify_gss
+    //  End-to-end verify_pcs
 
     #[test]
-    fn test_verify_gss_end_to_end_valid() {
+    fn test_verify_pcs_end_to_end_valid() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        create_full_gss_fixture(dir);
+        create_full_pcs_fixture(dir);
 
-        let result = verify_gss(dir, None);
+        let result = verify_pcs(dir, None);
         assert!(result.is_ok(), "expected pass, got: {result:?}");
     }
 
     #[test]
-    fn test_verify_gss_rejects_partial_gss() {
+    fn test_verify_pcs_rejects_partial_pcs() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        create_test_gss_dir(dir, &["data.sqlite"]);
+        create_test_pcs_dir(dir, &["data.sqlite"]);
 
         let hash = sha256_file(&dir.join("data.sqlite")).unwrap();
         let mut files = BTreeMap::new();
@@ -477,24 +488,24 @@ mod tests {
             no_squash_roots(),
         );
 
-        let result = verify_gss(dir, None);
+        let result = verify_pcs(dir, None);
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(
             errors
                 .iter()
                 .any(|e: &String| e.contains("[blocks] section")),
-            "expected full-GSS error, got: {errors:?}"
+            "expected full-PCS error, got: {errors:?}"
         );
     }
 
     #[test]
-    fn test_verify_gss_rejects_missing_checksums() {
+    fn test_verify_pcs_rejects_missing_checksums() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         write_manifest_toml(dir, None, no_squash_roots());
 
-        let result = verify_gss(dir, None);
+        let result = verify_pcs(dir, None);
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(
@@ -504,10 +515,10 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_gss_checkpoint_mismatch() {
+    fn test_verify_pcs_checkpoint_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let (clarity_root, index_root, _sortition_root) = create_full_gss_fixture(dir);
+        let (clarity_root, index_root, _sortition_root) = create_full_pcs_fixture(dir);
 
         let cp_toml = format!(
             r#"
@@ -521,7 +532,7 @@ sortition_squash_root_node_hash = "0xccccccccccccccccccccccccccccccccccccccccccc
         let cp_path = dir.join("checkpoint.toml");
         std::fs::write(&cp_path, cp_toml).unwrap();
 
-        let result = verify_gss(dir, Some(&cp_path));
+        let result = verify_pcs(dir, Some(&cp_path));
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(
