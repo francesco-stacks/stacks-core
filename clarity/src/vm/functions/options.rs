@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use super::args::name_atom;
 use crate::vm::Value::CallableContract;
 use crate::vm::contexts::{ExecutionState, InvocationContext, LocalContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
@@ -177,12 +178,7 @@ fn special_match_opt(
         )))?;
     }
 
-    let bind_name = args[0]
-        .match_atom()
-        .ok_or_else(|| {
-            RuntimeCheckErrorKind::Unreachable("Bad match option syntax: expected name".to_string())
-        })?
-        .clone();
+    let bind_name = name_atom(&args[0], "Bad match option syntax: expected name")?.clone();
     let some_branch = &args[1];
     let none_branch = &args[2];
 
@@ -214,23 +210,9 @@ fn special_match_resp(
         )))?;
     }
 
-    let ok_bind_name = args[0]
-        .match_atom()
-        .ok_or_else(|| {
-            RuntimeCheckErrorKind::Unreachable(
-                "Bad match response syntax: expected name".to_string(),
-            )
-        })?
-        .clone();
+    let ok_bind_name = name_atom(&args[0], "Bad match response syntax: expected name")?.clone();
     let ok_branch = &args[1];
-    let err_bind_name = args[2]
-        .match_atom()
-        .ok_or_else(|| {
-            RuntimeCheckErrorKind::Unreachable(
-                "Bad match response syntax: expected name".to_string(),
-            )
-        })?
-        .clone();
+    let err_bind_name = name_atom(&args[2], "Bad match response syntax: expected name")?.clone();
     let err_branch = &args[3];
 
     if input.committed {
@@ -337,5 +319,92 @@ pub fn native_default_to(default: Value, input: Value) -> Result<Value, VmExecut
         _ => Err(
             RuntimeCheckErrorKind::Unreachable(format!("Expected option value: {input}")).into(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use stacks_common::types::StacksEpochId;
+
+    use super::special_match;
+    use crate::vm::errors::{RuntimeCheckErrorKind, VmExecutionError};
+    use crate::vm::functions::test_support::special_fn_env;
+    use crate::vm::tests::test_clarity_versions;
+    use crate::vm::{ClarityName, ClarityVersion, SymbolicExpression, Value};
+
+    fn unreachable_err(msg: &str) -> VmExecutionError {
+        VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(msg.to_string()))
+    }
+
+    /// Characterization: locks the exact match-binding syntax errors, including
+    /// the arity guard's dynamic message and both response binding positions.
+    #[apply(test_clarity_versions)]
+    fn match_binding_unreachable_paths(
+        #[case] version: ClarityVersion,
+        #[case] epoch: StacksEpochId,
+    ) {
+        special_fn_env().run(
+            version,
+            epoch,
+            |_| (),
+            |exec_state, invoke_ctx, context| {
+                let non_atom = || SymbolicExpression::atom_value(Value::UInt(9));
+                let some_input =
+                    || SymbolicExpression::atom_value(Value::some(Value::UInt(1)).unwrap());
+                let ok_input =
+                    || SymbolicExpression::atom_value(Value::okay(Value::UInt(1)).unwrap());
+
+                // Option: non-atom bind name.
+                let err = special_match(
+                    &[some_input(), non_atom(), non_atom(), non_atom()],
+                    exec_state,
+                    invoke_ctx,
+                    context,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    err,
+                    unreachable_err("Bad match option syntax: expected name")
+                );
+
+                // Option: arity guard fires before the bind-name parse.
+                let err =
+                    special_match(&[some_input(), non_atom()], exec_state, invoke_ctx, context)
+                        .unwrap_err();
+                assert_eq!(err, unreachable_err("Bad match option syntax: args 1 != 3"));
+
+                // Response: non-atom ok-binding name.
+                let err = special_match(
+                    &[ok_input(), non_atom(), non_atom(), non_atom(), non_atom()],
+                    exec_state,
+                    invoke_ctx,
+                    context,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    err,
+                    unreachable_err("Bad match response syntax: expected name")
+                );
+
+                // Response: non-atom err-binding name (ok name valid).
+                let err = special_match(
+                    &[
+                        ok_input(),
+                        SymbolicExpression::atom(ClarityName::from_literal("x")),
+                        non_atom(),
+                        non_atom(),
+                        non_atom(),
+                    ],
+                    exec_state,
+                    invoke_ctx,
+                    context,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    err,
+                    unreachable_err("Bad match response syntax: expected name")
+                );
+            },
+        );
     }
 }

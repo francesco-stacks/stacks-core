@@ -20,6 +20,7 @@ use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 
+use super::args::{ContractContextExt, ensure_not_read_only, name_atom};
 use crate::vm::callables::DefineType;
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
@@ -73,11 +74,7 @@ pub fn special_contract_call(
     //   is checked in callables::DefinedFunction::execute_apply.
     runtime_cost(ClarityCostFunction::ContractCall, exec_state, 0)?;
 
-    let function_name = args[1]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let function_name = name_atom(&args[1], "Expected name")?;
     let rest_args_slice = &args[2..];
     let rest_args_len = rest_args_slice.len();
     let mut rest_args = Vec::with_capacity(rest_args_len);
@@ -291,21 +288,11 @@ pub fn special_fetch_variable_v200(
 ) -> Result<Value, VmExecutionError> {
     check_argument_count(1, args)?;
 
-    let var_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let var_name = name_atom(&args[0], "Expected name")?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_var
-        .get(var_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such data variable: {var_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_var_checked(var_name)?;
 
     runtime_cost(
         ClarityCostFunction::FetchVar,
@@ -330,21 +317,11 @@ pub fn special_fetch_variable_v205(
 ) -> Result<Value, VmExecutionError> {
     check_argument_count(1, args)?;
 
-    let var_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let var_name = name_atom(&args[0], "Expected name")?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_var
-        .get(var_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such data variable: {var_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_var_checked(var_name)?;
 
     let epoch = *exec_state.epoch();
     let result = exec_state
@@ -368,31 +345,17 @@ pub fn special_set_variable_v200(
     invoke_ctx: &InvocationContext,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    if exec_state.global_context.is_read_only() {
-        return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
-        );
-    }
+    ensure_not_read_only(exec_state)?;
 
     check_argument_count(2, args)?;
 
     let value = eval(&args[1], exec_state, invoke_ctx, context)?;
 
-    let var_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let var_name = name_atom(&args[0], "Expected name")?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_var
-        .get(var_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such data variable: {var_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_var_checked(var_name)?;
 
     runtime_cost(
         ClarityCostFunction::SetVar,
@@ -419,31 +382,17 @@ pub fn special_set_variable_v205(
     invoke_ctx: &InvocationContext,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    if exec_state.global_context.is_read_only() {
-        return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
-        );
-    }
+    ensure_not_read_only(exec_state)?;
 
     check_argument_count(2, args)?;
 
     let value = eval(&args[1], exec_state, invoke_ctx, context)?;
 
-    let var_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let var_name = name_atom(&args[0], "Expected name")?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_var
-        .get(var_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such data variable: {var_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_var_checked(var_name)?;
 
     let value = value.clone_with_cost(exec_state)?;
     let epoch = *exec_state.epoch();
@@ -472,23 +421,13 @@ pub fn special_fetch_entry_v200(
 ) -> Result<Value, VmExecutionError> {
     check_argument_count(2, args)?;
 
-    let map_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let map_name = name_atom(&args[0], "Expected name")?;
 
     let key = eval(&args[1], exec_state, invoke_ctx, context)?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_map
-        .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such map: {map_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_map_checked(map_name)?;
 
     runtime_cost(
         ClarityCostFunction::FetchEntry,
@@ -516,23 +455,13 @@ pub fn special_fetch_entry_v205(
 ) -> Result<Value, VmExecutionError> {
     check_argument_count(2, args)?;
 
-    let map_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let map_name = name_atom(&args[0], "Expected name")?;
 
     let key = eval(&args[1], exec_state, invoke_ctx, context)?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_map
-        .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such map: {map_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_map_checked(map_name)?;
 
     let epoch = *exec_state.epoch();
     let result = exec_state.global_context.database.fetch_entry_with_size(
@@ -598,11 +527,7 @@ pub fn special_set_entry_v200(
     invoke_ctx: &InvocationContext,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    if exec_state.global_context.is_read_only() {
-        return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
-        );
-    }
+    ensure_not_read_only(exec_state)?;
 
     check_argument_count(3, args)?;
 
@@ -610,21 +535,11 @@ pub fn special_set_entry_v200(
 
     let value = eval(&args[2], exec_state, invoke_ctx, context)?;
 
-    let map_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let map_name = name_atom(&args[0], "Expected name")?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_map
-        .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such map: {map_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_map_checked(map_name)?;
 
     runtime_cost(
         ClarityCostFunction::SetEntry,
@@ -653,11 +568,7 @@ pub fn special_set_entry_v205(
     invoke_ctx: &InvocationContext,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    if exec_state.global_context.is_read_only() {
-        return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
-        );
-    }
+    ensure_not_read_only(exec_state)?;
 
     check_argument_count(3, args)?;
 
@@ -665,21 +576,11 @@ pub fn special_set_entry_v205(
 
     let value = eval(&args[2], exec_state, invoke_ctx, context)?;
 
-    let map_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let map_name = name_atom(&args[0], "Expected name")?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_map
-        .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such map: {map_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_map_checked(map_name)?;
 
     let key = key.clone_with_cost(exec_state)?;
     let value = value.clone_with_cost(exec_state)?;
@@ -707,11 +608,7 @@ pub fn special_insert_entry_v200(
     invoke_ctx: &InvocationContext,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    if exec_state.global_context.is_read_only() {
-        return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
-        );
-    }
+    ensure_not_read_only(exec_state)?;
 
     check_argument_count(3, args)?;
 
@@ -719,21 +616,11 @@ pub fn special_insert_entry_v200(
 
     let value = eval(&args[2], exec_state, invoke_ctx, context)?;
 
-    let map_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let map_name = name_atom(&args[0], "Expected name")?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_map
-        .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such map: {map_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_map_checked(map_name)?;
 
     runtime_cost(
         ClarityCostFunction::SetEntry,
@@ -763,11 +650,7 @@ pub fn special_insert_entry_v205(
     invoke_ctx: &InvocationContext,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    if exec_state.global_context.is_read_only() {
-        return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
-        );
-    }
+    ensure_not_read_only(exec_state)?;
 
     check_argument_count(3, args)?;
 
@@ -775,21 +658,11 @@ pub fn special_insert_entry_v205(
 
     let value = eval(&args[2], exec_state, invoke_ctx, context)?;
 
-    let map_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let map_name = name_atom(&args[0], "Expected name")?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_map
-        .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such map: {map_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_map_checked(map_name)?;
 
     let key = key.clone_with_cost(exec_state)?;
     let value = value.clone_with_cost(exec_state)?;
@@ -817,31 +690,17 @@ pub fn special_delete_entry_v200(
     invoke_ctx: &InvocationContext,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    if exec_state.global_context.is_read_only() {
-        return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
-        );
-    }
+    ensure_not_read_only(exec_state)?;
 
     check_argument_count(2, args)?;
 
     let key = eval(&args[1], exec_state, invoke_ctx, context)?;
 
-    let map_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let map_name = name_atom(&args[0], "Expected name")?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_map
-        .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such map: {map_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_map_checked(map_name)?;
 
     runtime_cost(
         ClarityCostFunction::SetEntry,
@@ -867,31 +726,17 @@ pub fn special_delete_entry_v205(
     invoke_ctx: &InvocationContext,
     context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    if exec_state.global_context.is_read_only() {
-        return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
-        );
-    }
+    ensure_not_read_only(exec_state)?;
 
     check_argument_count(2, args)?;
 
     let key = eval(&args[1], exec_state, invoke_ctx, context)?;
 
-    let map_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let map_name = name_atom(&args[0], "Expected name")?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
-    let data_types = invoke_ctx
-        .contract_context
-        .meta_data_map
-        .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-            "No such map: {map_name}"
-        )))?;
+    let data_types = invoke_ctx.contract_context.data_map_checked(map_name)?;
 
     let epoch = *exec_state.epoch();
     let result = exec_state.global_context.database.delete_entry(
@@ -1451,4 +1296,187 @@ pub fn special_contract_hash(
     Ok(Value::okay(Value::buff_from(
         contract_hash.as_bytes().to_vec(),
     )?)?)
+}
+
+#[cfg(test)]
+mod test {
+    use stacks_common::types::StacksEpochId;
+
+    use super::{
+        special_contract_call, special_delete_entry_v200, special_delete_entry_v205,
+        special_fetch_entry_v200, special_fetch_entry_v205, special_fetch_variable_v200,
+        special_fetch_variable_v205, special_insert_entry_v200, special_insert_entry_v205,
+        special_set_entry_v200, special_set_entry_v205, special_set_variable_v200,
+        special_set_variable_v205,
+    };
+    use crate::vm::errors::{RuntimeCheckErrorKind, VmExecutionError};
+    use crate::vm::functions::test_support::special_fn_env;
+    use crate::vm::tests::test_clarity_versions;
+    use crate::vm::{ClarityName, ClarityVersion, SymbolicExpression, Value};
+
+    fn unreachable_err(msg: &str) -> VmExecutionError {
+        VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(msg.to_string()))
+    }
+
+    /// Characterization: locks the exact runtime errors and precedence of the
+    /// data-var functions' analysis-guaranteed paths. Note the ordering asymmetry:
+    /// var-get matches the name atom before anything else, while var-set evaluates
+    /// its value argument BEFORE matching the name atom.
+    #[apply(test_clarity_versions)]
+    fn var_ops_unreachable_paths(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {
+        special_fn_env().run(
+            version,
+            epoch,
+            |_| (),
+            |exec_state, invoke_ctx, context| {
+                for f in [special_fetch_variable_v200, special_fetch_variable_v205] {
+                    let args = [SymbolicExpression::atom_value(Value::UInt(1))];
+                    let err = f(&args, exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("Expected name"));
+
+                    let args = [SymbolicExpression::atom(ClarityName::from_literal(
+                        "cursor",
+                    ))];
+                    let err = f(&args, exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("No such data variable: cursor"));
+                }
+
+                for f in [special_set_variable_v200, special_set_variable_v205] {
+                    // The value argument is evaluated BEFORE the name atom is matched:
+                    // with both malformed, the eval error wins.
+                    let args = [
+                        SymbolicExpression::atom_value(Value::UInt(1)),
+                        SymbolicExpression::atom(ClarityName::from_literal("shadow")),
+                    ];
+                    let err = f(&args, exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("Undefined variable: shadow"));
+
+                    let args = [
+                        SymbolicExpression::atom_value(Value::UInt(1)),
+                        SymbolicExpression::atom_value(Value::UInt(2)),
+                    ];
+                    let err = f(&args, exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("Expected name"));
+
+                    let args = [
+                        SymbolicExpression::atom(ClarityName::from_literal("cursor")),
+                        SymbolicExpression::atom_value(Value::UInt(2)),
+                    ];
+                    let err = f(&args, exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("No such data variable: cursor"));
+                }
+            },
+        );
+    }
+
+    /// Characterization: locks the exact runtime errors and precedence of the
+    /// data-map functions' analysis-guaranteed paths. map-get? matches the name
+    /// atom BEFORE evaluating the key; the writers (set/insert/delete) evaluate
+    /// key (and value) BEFORE matching the name atom.
+    #[apply(test_clarity_versions)]
+    fn map_ops_unreachable_paths(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {
+        special_fn_env().run(
+            version,
+            epoch,
+            |_| (),
+            |exec_state, invoke_ctx, context| {
+                let undefined = || SymbolicExpression::atom(ClarityName::from_literal("shadow"));
+                let non_atom = || SymbolicExpression::atom_value(Value::UInt(1));
+                let name = || SymbolicExpression::atom(ClarityName::from_literal("kv"));
+                let val = || SymbolicExpression::atom_value(Value::UInt(2));
+
+                for f in [special_fetch_entry_v200, special_fetch_entry_v205] {
+                    // Readers: name atom is matched BEFORE the key is evaluated.
+                    let err =
+                        f(&[non_atom(), undefined()], exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("Expected name"));
+
+                    let err = f(&[name(), val()], exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("No such map: kv"));
+                }
+
+                // Writers: key/value are evaluated BEFORE the name atom is matched.
+                for f in [special_set_entry_v200, special_set_entry_v205] {
+                    let err = f(
+                        &[non_atom(), undefined(), val()],
+                        exec_state,
+                        invoke_ctx,
+                        context,
+                    )
+                    .unwrap_err();
+                    assert_eq!(err, unreachable_err("Undefined variable: shadow"));
+
+                    let err = f(&[non_atom(), val(), val()], exec_state, invoke_ctx, context)
+                        .unwrap_err();
+                    assert_eq!(err, unreachable_err("Expected name"));
+
+                    let err =
+                        f(&[name(), val(), val()], exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("No such map: kv"));
+                }
+                for f in [special_insert_entry_v200, special_insert_entry_v205] {
+                    let err = f(
+                        &[non_atom(), undefined(), val()],
+                        exec_state,
+                        invoke_ctx,
+                        context,
+                    )
+                    .unwrap_err();
+                    assert_eq!(err, unreachable_err("Undefined variable: shadow"));
+
+                    let err =
+                        f(&[name(), val(), val()], exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("No such map: kv"));
+                }
+                for f in [special_delete_entry_v200, special_delete_entry_v205] {
+                    let err =
+                        f(&[non_atom(), undefined()], exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("Undefined variable: shadow"));
+
+                    let err = f(&[name(), val()], exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("No such map: kv"));
+                }
+
+                // contract-call?: the function-name atom (args[1]) is matched before the
+                // callee expression (args[0]) is inspected.
+                let err = special_contract_call(
+                    &[non_atom(), non_atom()],
+                    exec_state,
+                    invoke_ctx,
+                    context,
+                )
+                .unwrap_err();
+                assert_eq!(err, unreachable_err("Expected name"));
+            },
+        );
+    }
+
+    /// Characterization: the writers' read-only guard fires before everything,
+    /// including the argument-count check.
+    #[apply(test_clarity_versions)]
+    fn write_guard_precedes_argument_count(
+        #[case] version: ClarityVersion,
+        #[case] epoch: StacksEpochId,
+    ) {
+        special_fn_env().run_read_only(
+            version,
+            epoch,
+            |_| (),
+            |exec_state, invoke_ctx, context| {
+                for f in [
+                    special_set_variable_v200,
+                    special_set_variable_v205,
+                    special_set_entry_v200,
+                    special_set_entry_v205,
+                    special_insert_entry_v200,
+                    special_insert_entry_v205,
+                    special_delete_entry_v200,
+                    special_delete_entry_v205,
+                ] {
+                    let err = f(&[], exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("Write attempted in read-only"));
+                }
+            },
+        );
+    }
 }

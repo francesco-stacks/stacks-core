@@ -53,6 +53,9 @@ macro_rules! switch_on_global_epoch {
 use super::errors::VmInternalError;
 use crate::vm::ClarityVersion;
 
+mod args;
+#[cfg(test)]
+mod args_differential;
 mod arithmetic;
 mod assets;
 pub(crate) mod bitcoin;
@@ -67,6 +70,8 @@ mod options;
 mod post_conditions;
 pub mod principals;
 mod sequences;
+#[cfg(test)]
+mod test_support;
 pub mod tuples;
 
 define_versioned_named_enum_with_max!(NativeFunctions(ClarityVersion) {

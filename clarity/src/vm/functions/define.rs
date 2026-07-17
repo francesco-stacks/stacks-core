@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use super::args::name_atom;
 use crate::vm::callables::{DefineType, DefinedFunction};
 use crate::vm::contexts::{ContractContext, ExecutionState, InvocationContext, LocalContext};
 use crate::vm::errors::{
@@ -158,11 +159,7 @@ fn handle_define_function(
                 "Define function bad signature".to_string(),
             ))?;
 
-    let function_name = function_symbol
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let function_name = name_atom(function_symbol, "Expected name")?;
 
     check_legal_define(function_name, invoke_ctx.contract_context)?;
 
@@ -512,20 +509,16 @@ pub fn evaluate_define(
 mod test {
     use clarity_types::Value;
     use clarity_types::representations::SymbolicExpression;
-    use clarity_types::types::QualifiedContractIdentifier;
-    use stacks_common::consts::CHAIN_ID_TESTNET;
     use stacks_common::types::StacksEpochId;
 
+    use crate::vm::ClarityVersion;
     use crate::vm::analysis::errors::RuntimeCheckErrorKind;
     use crate::vm::analysis::type_checker::v2_1::MAX_FUNCTION_PARAMETERS;
     use crate::vm::callables::DefineType;
-    use crate::vm::contexts::{ExecutionState, GlobalContext, InvocationContext};
-    use crate::vm::costs::LimitedCostTracker;
-    use crate::vm::database::MemoryBackingStore;
     use crate::vm::errors::VmExecutionError;
     use crate::vm::functions::define::{handle_define_function, handle_define_trait};
+    use crate::vm::functions::test_support::special_fn_env;
     use crate::vm::tests::test_clarity_versions;
-    use crate::vm::{CallStack, ClarityVersion, ContractContext, LocalContext};
 
     #[apply(test_clarity_versions)]
     fn bad_syntax_binding_define_function(
@@ -543,46 +536,27 @@ mod test {
 
         let body = SymbolicExpression::atom_value(Value::UInt(1));
 
-        let mut marf = MemoryBackingStore::new();
-        let mut global_context = GlobalContext::new(
-            false,
-            CHAIN_ID_TESTNET,
-            marf.as_clarity_db(),
-            LimitedCostTracker::new_free(),
+        special_fn_env().run(
+            version,
             epoch,
-        );
+            |_| (),
+            |exec_state, invoke_ctx, _context| {
+                let err = handle_define_function(
+                    &bad_signature,
+                    &body,
+                    exec_state,
+                    invoke_ctx,
+                    DefineType::Public,
+                )
+                .unwrap_err();
 
-        let contract_context =
-            ContractContext::new(QualifiedContractIdentifier::transient(), version);
-
-        let context = LocalContext::new();
-        let mut call_stack = CallStack::new();
-
-        let mut exec_state = ExecutionState {
-            global_context: &mut global_context,
-            call_stack: &mut call_stack,
-        };
-        let invoke_ctx = InvocationContext {
-            contract_context: &contract_context,
-            sender: None,
-            caller: None,
-            sponsor: None,
-        };
-
-        let err = handle_define_function(
-            &bad_signature,
-            &body,
-            &mut exec_state,
-            &invoke_ctx,
-            DefineType::Public,
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "Bad syntax binding: NotList(Eval, 0)".to_string()
-            )),
-            err,
+                assert_eq!(
+                    VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
+                        "Bad syntax binding: NotList(Eval, 0)".to_string()
+                    )),
+                    err,
+                );
+            },
         );
     }
 
@@ -616,44 +590,26 @@ mod test {
         // This is the `( (f (...) (response ...)) )` wrapper
         let trait_body = vec![SymbolicExpression::list(vec![method])];
 
-        let mut marf = MemoryBackingStore::new();
-        let mut global_context = GlobalContext::new(
-            false,
-            CHAIN_ID_TESTNET,
-            marf.as_clarity_db(),
-            LimitedCostTracker::new_free(),
+        special_fn_env().run(
+            version,
             epoch,
-        );
+            |_| (),
+            |exec_state, invoke_ctx, _context| {
+                let err = handle_define_trait(
+                    &ClarityName::from_literal("bad-trait"),
+                    &trait_body,
+                    exec_state,
+                    invoke_ctx,
+                )
+                .unwrap_err();
 
-        let contract_context =
-            ContractContext::new(QualifiedContractIdentifier::transient(), version);
-
-        let mut call_stack = CallStack::new();
-
-        let mut exec_state = ExecutionState {
-            global_context: &mut global_context,
-            call_stack: &mut call_stack,
-        };
-        let invoke_ctx = InvocationContext {
-            contract_context: &contract_context,
-            sender: None,
-            caller: None,
-            sponsor: None,
-        };
-
-        let err = handle_define_trait(
-            &ClarityName::from_literal("bad-trait"),
-            &trait_body,
-            &mut exec_state,
-            &invoke_ctx,
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "Too many function params: found 257, allowed 256".to_string()
-            )),
-            err
+                assert_eq!(
+                    VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
+                        "Too many function params: found 257, allowed 256".to_string()
+                    )),
+                    err
+                );
+            },
         );
     }
 }

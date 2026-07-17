@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use super::args::name_atom;
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
 use crate::vm::costs::runtime_cost;
@@ -58,11 +59,7 @@ pub fn tuple_get(
     //    if the tuple argument is an option type, then return option(field-name).
     check_argument_count(2, args)?;
 
-    let arg_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let arg_name = name_atom(&args[0], "Expected name")?;
 
     let value = eval(&args[1], exec_state, invoke_ctx, context)?;
 
@@ -139,4 +136,41 @@ pub fn tuple_merge(
         combined.type_signature.checked_value_size()?;
     }
     Ok(Value::Tuple(combined))
+}
+
+#[cfg(test)]
+mod test {
+    use stacks_common::types::StacksEpochId;
+
+    use super::tuple_get;
+    use crate::vm::errors::{RuntimeCheckErrorKind, VmExecutionError};
+    use crate::vm::functions::test_support::special_fn_env;
+    use crate::vm::tests::test_clarity_versions;
+    use crate::vm::{ClarityVersion, SymbolicExpression, Value};
+
+    fn unreachable_err(msg: &str) -> VmExecutionError {
+        VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(msg.to_string()))
+    }
+
+    /// Characterization: locks tuple-get's exact "Expected name" error for a
+    /// non-atom field-name argument.
+    #[apply(test_clarity_versions)]
+    fn tuple_get_name_unreachable_path(
+        #[case] version: ClarityVersion,
+        #[case] epoch: StacksEpochId,
+    ) {
+        special_fn_env().run(
+            version,
+            epoch,
+            |_| (),
+            |exec_state, invoke_ctx, context| {
+                let args = [
+                    SymbolicExpression::atom_value(Value::UInt(1)),
+                    SymbolicExpression::atom_value(Value::UInt(2)),
+                ];
+                let err = tuple_get(&args, exec_state, invoke_ctx, context).unwrap_err();
+                assert_eq!(err, unreachable_err("Expected name"));
+            },
+        );
+    }
 }

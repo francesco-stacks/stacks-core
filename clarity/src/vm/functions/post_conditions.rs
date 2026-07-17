@@ -19,6 +19,7 @@ use clarity_types::ClarityName;
 use clarity_types::types::{AssetIdentifier, PrincipalData, StandardPrincipalData};
 use stacks_common::types::StacksEpochId;
 
+use super::args::{list_exprs, name_atom};
 use crate::vm::analysis::type_checker::v2_1::natives::post_conditions::MAX_ALLOWANCES;
 use crate::vm::contexts::{AssetMap, ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
@@ -118,21 +119,13 @@ fn eval_allowance(
     invoke_ctx: &InvocationContext,
     context: &LocalContext,
 ) -> Result<Allowance, VmExecutionError> {
-    let list = allowance_expr
-        .match_list()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Non functional application".to_string(),
-        ))?;
+    let list = list_exprs(allowance_expr, "Non functional application")?;
     let (name_expr, rest) = list
         .split_first()
         .ok_or(RuntimeCheckErrorKind::Unreachable(
             "Non functional application".to_string(),
         ))?;
-    let name = name_expr
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Bad function name".to_string(),
-        ))?;
+    let name = name_atom(name_expr, "Bad function name")?;
     let Some(ref native_function) = NativeFunctions::lookup_by_name_at_version(
         name,
         invoke_ctx.contract_context.get_clarity_version(),
@@ -294,11 +287,10 @@ pub fn special_restrict_assets(
     check_arguments_at_least(3, args)?;
 
     let asset_owner_expr = &args[0];
-    let allowance_list = args[1]
-        .match_list()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected list of allowances: for restrict-assets? as argument 2".to_string(),
-        ))?;
+    let allowance_list = list_exprs(
+        &args[1],
+        "Expected list of allowances: for restrict-assets? as argument 2",
+    )?;
     let body_exprs = &args[2..];
 
     let asset_owner =
@@ -444,11 +436,10 @@ pub fn special_as_contract(
     // arg2..n => body
     check_arguments_at_least(2, args)?;
 
-    let allowance_list = args[0]
-        .match_list()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected list of allowances: for as-contract? as argument 1".to_string(),
-        ))?;
+    let allowance_list = list_exprs(
+        &args[0],
+        "Expected list of allowances: for as-contract? as argument 1",
+    )?;
     let body_exprs = &args[1..];
 
     runtime_cost(

@@ -19,6 +19,7 @@ use std::cmp;
 use clarity_types::types::RetainValuesError;
 use stacks_common::types::StacksEpochId;
 
+use super::args::name_atom;
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
 use crate::vm::costs::{CostOverflowingMath, runtime_cost};
@@ -74,11 +75,7 @@ pub fn special_filter(
 
     runtime_cost(ClarityCostFunction::Filter, exec_state, 0)?;
 
-    let function_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let function_name = name_atom(&args[0], "Expected name")?;
 
     let mut sequence =
         eval(&args[1], exec_state, invoke_ctx, context)?.clone_with_cost(exec_state)?;
@@ -145,11 +142,7 @@ pub fn special_fold(
 
     runtime_cost(ClarityCostFunction::Fold, exec_state, 0)?;
 
-    let function_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let function_name = name_atom(&args[0], "Expected name")?;
 
     let function = lookup_function(function_name, exec_state, invoke_ctx)?;
     let sequence = eval(&args[1], exec_state, invoke_ctx, context)?.clone_with_cost(exec_state)?;
@@ -225,11 +218,7 @@ pub fn special_map_v200(
 
     runtime_cost(ClarityCostFunction::Map, exec_state, args.len())?;
 
-    let function_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let function_name = name_atom(&args[0], "Expected name")?;
     let function = lookup_function(function_name, exec_state, invoke_ctx)?;
 
     // Let's consider a function f (f a b c ...)
@@ -302,11 +291,7 @@ pub fn special_map_v400(
 
     runtime_cost(ClarityCostFunction::Map, exec_state, args.len())?;
 
-    let function_name = args[0]
-        .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+    let function_name = name_atom(&args[0], "Expected name")?;
     let function = lookup_function(function_name, exec_state, invoke_ctx)?;
 
     // Evaluate each sequence argument into an iterator and record its length.
@@ -842,4 +827,56 @@ pub fn special_replace_at(
     }
     let new_element = new_element.clone_with_cost(exec_state)?;
     Ok(data.replace_at(exec_state.epoch(), index, new_element)?)
+}
+
+#[cfg(test)]
+mod test {
+    use stacks_common::types::StacksEpochId;
+
+    use super::{special_filter, special_fold, special_map_v200, special_map_v400};
+    use crate::vm::errors::{RuntimeCheckErrorKind, VmExecutionError};
+    use crate::vm::functions::test_support::special_fn_env;
+    use crate::vm::tests::test_clarity_versions;
+    use crate::vm::{ClarityVersion, SymbolicExpression, Value};
+
+    fn unreachable_err(msg: &str) -> VmExecutionError {
+        VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(msg.to_string()))
+    }
+
+    /// Characterization: locks the exact "Expected name" errors of the
+    /// higher-order functions' analysis-guaranteed step-function name parse.
+    #[apply(test_clarity_versions)]
+    fn hof_function_name_unreachable_paths(
+        #[case] version: ClarityVersion,
+        #[case] epoch: StacksEpochId,
+    ) {
+        special_fn_env().run(
+            version,
+            epoch,
+            |_| (),
+            |exec_state, invoke_ctx, context| {
+                let non_atom = || SymbolicExpression::atom_value(Value::UInt(1));
+
+                let err =
+                    special_filter(&[non_atom(), non_atom()], exec_state, invoke_ctx, context)
+                        .unwrap_err();
+                assert_eq!(err, unreachable_err("Expected name"));
+
+                let err = special_fold(
+                    &[non_atom(), non_atom(), non_atom()],
+                    exec_state,
+                    invoke_ctx,
+                    context,
+                )
+                .unwrap_err();
+                assert_eq!(err, unreachable_err("Expected name"));
+
+                for f in [special_map_v200, special_map_v400] {
+                    let err =
+                        f(&[non_atom(), non_atom()], exec_state, invoke_ctx, context).unwrap_err();
+                    assert_eq!(err, unreachable_err("Expected name"));
+                }
+            },
+        );
+    }
 }
