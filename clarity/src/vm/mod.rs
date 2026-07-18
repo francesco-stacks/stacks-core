@@ -30,6 +30,7 @@ pub mod representations;
 
 pub mod callables;
 pub mod functions;
+pub mod lowered;
 pub mod time_tracker;
 pub mod variables;
 

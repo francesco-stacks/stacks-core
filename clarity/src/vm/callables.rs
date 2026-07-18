@@ -28,6 +28,7 @@ use crate::vm::contexts::{ContractContext, ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
 use crate::vm::costs::runtime_cost;
 use crate::vm::errors::{RuntimeCheckErrorKind, VmExecutionError, check_argument_count};
+use crate::vm::lowered::eval_lowered;
 use crate::vm::representations::SymbolicExpression;
 use crate::vm::types::{
     CallableData, ListData, ListTypeData, OptionalData, PrincipalData, ResponseData, SequenceData,
@@ -430,6 +431,10 @@ impl DefinedFunction {
 
     pub fn get_arg_types(&self) -> &Vec<TypeSignature> {
         &self.arg_types
+    }
+
+    pub fn get_body(&self) -> &SymbolicExpression {
+        &self.body
     }
 
     pub fn canonicalize_types(&mut self, epoch: &StacksEpochId) {
