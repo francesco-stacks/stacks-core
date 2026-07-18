@@ -125,6 +125,16 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Audit the typed-IR lowering pass (clarity::vm::lowered) over every
+    /// contract in a Clarity metadata database; reports totality, typed-path
+    /// node coverage, and the histogram of un-lowered form heads
+    #[command(name = "clarity-lowering-audit")]
+    ClarityLoweringAudit {
+        /// Path to the Clarity sqlite database (e.g. <chainstate>/vm/clarity/marf.sqlite)
+        #[arg(value_name = "CLARITY_DB_PATH")]
+        clarity_db_path: String,
+    },
+
     // ================ Decode Commands ================
     /// Decode a Bitcoin block header from SPV data
     #[command(name = "decode-bitcoin-header")]

@@ -349,6 +349,16 @@ fn main() {
     let common_opts = build_common_opts(&cli);
 
     match cli.command {
+        Command::ClarityLoweringAudit { clarity_db_path } => {
+            match stacks_inspect::lowering_audit::run(&clarity_db_path) {
+                Ok(()) => process::exit(0),
+                Err(e) => {
+                    eprintln!("clarity-lowering-audit failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+
         // Decode Commands
         Command::DecodeBitcoinHeader {
             block_height,
