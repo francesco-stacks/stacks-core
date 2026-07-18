@@ -390,6 +390,11 @@ pub struct ContractContext {
     /// after deployment, when their values are frozen.
     #[serde(skip)]
     pub is_deploying: bool,
+    /// Typed lowered IR for this contract's function bodies. In-memory only
+    /// (never persisted); populated whenever a contract is materialized at
+    /// load or deploy. See `vm::lowered`.
+    #[serde(skip)]
+    pub lowered: Option<std::sync::Arc<crate::vm::lowered::LoweredContract>>,
 }
 
 pub struct LocalContext<'a> {
@@ -2164,6 +2169,7 @@ impl ContractContext {
             meta_ft: HashMap::new(),
             clarity_version,
             is_deploying: false,
+            lowered: None,
         }
     }
 

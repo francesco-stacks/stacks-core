@@ -60,6 +60,9 @@ impl Contract {
         )?;
 
         contract_context.is_deploying = false;
+        contract_context.lowered = Some(Arc::new(crate::vm::lowered::lower_contract(
+            &contract_context,
+        )));
         Ok(Contract {
             contract_context: Arc::new(contract_context),
         })

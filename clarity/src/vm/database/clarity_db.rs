@@ -915,6 +915,10 @@ impl<'a> ClarityDatabase<'a> {
         let epoch = self.get_clarity_epoch_version()?;
         contract_context.canonicalize_types(&epoch)?;
 
+        contract_context.lowered = Some(std::sync::Arc::new(crate::vm::lowered::lower_contract(
+            &contract_context,
+        )));
+
         Ok(contract_context.into())
     }
 

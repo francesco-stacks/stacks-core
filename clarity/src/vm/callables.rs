@@ -347,7 +347,25 @@ impl DefinedFunction {
             }
         }
 
-        let result = eval(&self.body, exec_state, invoke_ctx, &context);
+        // Bodies of contracts materialized through the load/deploy paths run
+        // on the typed lowered IR. Legacy eval handles the rest: Opaque
+        // subtrees (inside eval_lowered), hook-attached tooling (eval hooks
+        // fire per node only on the legacy walker), and contexts built
+        // without lowering (deploy-time eval_all, hand-built test contexts).
+        let lowered_body = if exec_state.global_context.eval_hooks.is_none() {
+            invoke_ctx
+                .contract_context
+                .lowered
+                .as_ref()
+                .and_then(|lowered| lowered.functions.get(&self.name))
+        } else {
+            None
+        };
+        let result = if let Some(lowered_body) = lowered_body {
+            eval_lowered(lowered_body, exec_state, invoke_ctx, &context)
+        } else {
+            eval(&self.body, exec_state, invoke_ctx, &context)
+        };
 
         // if the error wasn't actually an error, but a function return,
         //    pull that out and return it.

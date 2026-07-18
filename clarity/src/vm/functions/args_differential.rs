@@ -22,8 +22,10 @@
 //! conversion). Each proptest drives
 //! the legacy and converted implementations with the same randomized argument
 //! expressions in fresh, identical environments and asserts an identical
-//! `Result` and identical emitted events. Delete the legacy copies when the
-//! conversion PR merges.
+//! `Result` and identical emitted events. These are PERMANENT behavioral
+//! fixtures, not scaffolding: the lowered evaluator (`vm::lowered::eval`)
+//! hand-replicates several of these cores, so the frozen legacy copies are
+//! the drift alarm for every future edit to either side.
 //!
 //! Cost-charge ORDER is not asserted here: with `MemoryBackingStore` only a
 //! free tracker is available, and recording charge sequences would need
