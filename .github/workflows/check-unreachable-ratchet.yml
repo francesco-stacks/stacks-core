@@ -1,0 +1,37 @@
+# Ratchet check for RuntimeCheckErrorKind::Unreachable boilerplate in the
+# Clarity VM's runtime functions. See contrib/tools/check-unreachable-ratchet.sh.
+
+name: "Check: Unreachable ratchet"
+
+on:
+  pull_request:
+    paths:
+      - "clarity/src/vm/functions/**"
+      - "contrib/tools/check-unreachable-ratchet.sh"
+      - "contrib/tools/unreachable-ratchet-baseline.txt"
+      - ".github/workflows/check-unreachable-ratchet.yml"
+
+# Set default permissions
+permissions:
+  contents: read
+
+# Set default shell
+defaults:
+  run:
+    shell: bash
+
+# Configure concurrency
+concurrency:
+  group: unreachable-ratchet-${{ github.head_ref || github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  check-ratchet:
+    name: Check Unreachable ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the latest code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run ratchet check
+        run: ./contrib/tools/check-unreachable-ratchet.sh
