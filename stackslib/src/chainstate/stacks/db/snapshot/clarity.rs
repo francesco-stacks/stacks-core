@@ -24,7 +24,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 
 use super::common::{
     assert_source_schema, clone_schemas_from_source, with_indexes_dropped,
-    with_offline_write_session, MARF_INFRA_TABLES,
+    with_offline_write_session, with_readonly_session, MARF_INFRA_TABLES,
 };
 use super::fork_storage::{collect_leaf_value_hashes, copy_leaf_referenced_rows};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
@@ -256,4 +256,155 @@ pub struct ClaritySideTableStats {
     pub data_table_rows: u64,
     /// Number of rows copied into `metadata_table`.
     pub metadata_table_rows: u64,
+}
+
+/// Validate that a squashed Clarity MARF's side tables match the source.
+///
+/// Checks:
+/// - All trie-referenced `data_table` keys are present in the destination.
+/// - All required `metadata_table` rows (exhaustive across all contracts) are present.
+/// - A diagnostic sample of contracts is reported for troubleshooting.
+pub fn validate_clarity_side_tables(
+    src_db_path: &str,
+    dst_db_path: &str,
+) -> Result<ClaritySideTableValidation, Error> {
+    // The squashed trie's tip anchors every contract probe below; its
+    // leaves are the data keys the dst must retain.
+    let (dst_tip, needed_keys) = collect_leaf_value_hashes::<StacksBlockId>(dst_db_path)?;
+
+    let src_conn = open_readonly_clarity_db(src_db_path)?;
+
+    with_readonly_session(dst_db_path, &[("src", src_db_path)], |conn| {
+        let src_data_rows = SqliteConnection::count_data_rows(&src_conn)?;
+        let dst_data_rows = SqliteConnection::count_data_rows(conn)?;
+        let src_meta_rows = SqliteConnection::count_metadata_rows(&src_conn)?;
+        let dst_meta_rows = SqliteConnection::count_metadata_rows(conn)?;
+
+        const SAMPLE_CONTRACT_LIMIT: usize = 20;
+        let all_contract_ids_ordered = scan_metadata_contract_ids(&src_conn)?;
+
+        let sample_contract_ids: Vec<&str> = all_contract_ids_ordered
+            .iter()
+            .take(SAMPLE_CONTRACT_LIMIT)
+            .map(|s| s.as_str())
+            .collect();
+
+        let mut sample_contracts_checked: u64 = 0;
+        let mut sample_contracts_missing_in_trie: u64 = 0;
+        let mut sample_contracts_missing_in_data_table: u64 = 0;
+
+        if !sample_contract_ids.is_empty() {
+            let mut marf = open_readonly_marf(dst_db_path)?;
+
+            for contract_id in sample_contract_ids.iter() {
+                sample_contracts_checked += 1;
+                let contract = QualifiedContractIdentifier::parse(contract_id).map_err(|e| {
+                    Error::CorruptionError(format!(
+                        "Failed to parse contract identifier '{contract_id}': {e:?}"
+                    ))
+                })?;
+                let key = make_contract_hash_key(&contract);
+                let trie_value = marf.get(&dst_tip, &key)?;
+                let Some(trie_value) = trie_value else {
+                    sample_contracts_missing_in_trie += 1;
+                    continue;
+                };
+
+                if !SqliteConnection::data_row_exists(conn, &trie_value.to_hex())? {
+                    sample_contracts_missing_in_data_table += 1;
+                }
+            }
+        }
+
+        // Stage the trie-referenced keys in a temp table for the data_table
+        // comparison. The savepoint batches the inserts (the read-only
+        // session holds no transaction, and autocommit-per-row would be
+        // slow).
+        conn.execute_batch("CREATE TEMP TABLE trie_values (key TEXT PRIMARY KEY)")
+            .map_err(Error::SQLError)?;
+        conn.execute_batch("SAVEPOINT trie_values")
+            .map_err(Error::SQLError)?;
+        {
+            let mut stmt = conn
+                .prepare("INSERT INTO trie_values (key) VALUES (?1)")
+                .map_err(Error::SQLError)?;
+            for key in needed_keys.iter() {
+                stmt.execute([key.to_hex()]).map_err(Error::SQLError)?;
+            }
+        }
+        conn.execute_batch("RELEASE trie_values")
+            .map_err(Error::SQLError)?;
+        let missing_required_data_table_keys = SqliteConnection::count_data_keys_missing_from_main(
+            conn,
+            "src",
+            "SELECT key FROM trie_values",
+        )?;
+
+        let required_contract_ids =
+            filter_required_contracts(dst_db_path, &dst_tip, &all_contract_ids_ordered)?;
+
+        let mut missing_required_metadata_rows: u64 = 0;
+        SqliteConnection::visit_metadata_rows(&src_conn, |row| -> Result<(), Error> {
+            let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(row.key)
+            else {
+                return Ok(());
+            };
+            if !required_contract_ids.contains(contract_id) {
+                return Ok(());
+            }
+            if !SqliteConnection::metadata_row_exists(conn, row.key, row.block_id, row.value)? {
+                missing_required_metadata_rows += 1;
+            }
+            Ok(())
+        })?;
+
+        Ok(ClaritySideTableValidation {
+            required_data_keys_present: missing_required_data_table_keys == 0,
+            src_data_table_rows: src_data_rows,
+            dst_data_table_rows: dst_data_rows,
+            required_metadata_present: missing_required_metadata_rows == 0,
+            src_metadata_table_rows: src_meta_rows,
+            dst_metadata_table_rows: dst_meta_rows,
+            sample_contracts_checked,
+            sample_contracts_missing_in_trie,
+            sample_contracts_missing_in_data_table,
+            missing_required_data_table_keys,
+            missing_required_metadata_rows,
+        })
+    })
+}
+
+/// Validation results for Clarity side tables.
+#[derive(Debug, Clone)]
+pub struct ClaritySideTableValidation {
+    /// All trie-referenced data_table keys are present in the destination.
+    pub required_data_keys_present: bool,
+    /// Source `data_table` row count.
+    pub src_data_table_rows: u64,
+    /// Destination `data_table` row count.
+    pub dst_data_table_rows: u64,
+    /// All required metadata rows (for contracts with trie commitments) are
+    /// present in the destination. Checked exhaustively over all contracts.
+    pub required_metadata_present: bool,
+    /// Source `metadata_table` row count.
+    pub src_metadata_table_rows: u64,
+    /// Destination `metadata_table` row count.
+    pub dst_metadata_table_rows: u64,
+    /// Number of contract identifiers sampled from metadata_table (diagnostic).
+    pub sample_contracts_checked: u64,
+    /// Sampled contracts missing from the trie (diagnostic, should be 0).
+    pub sample_contracts_missing_in_trie: u64,
+    /// Sampled contracts whose trie values are missing from data_table (diagnostic, should be 0).
+    pub sample_contracts_missing_in_data_table: u64,
+    /// Required data_table keys missing from destination (should be 0).
+    pub missing_required_data_table_keys: u64,
+    /// Required metadata rows missing from destination (should be 0).
+    pub missing_required_metadata_rows: u64,
+}
+
+impl ClaritySideTableValidation {
+    /// Returns `true` if all required data and metadata are present.
+    pub fn is_valid(&self) -> bool {
+        self.required_data_keys_present && self.required_metadata_present
+    }
 }

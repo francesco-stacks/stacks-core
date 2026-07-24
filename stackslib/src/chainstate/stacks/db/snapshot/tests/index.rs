@@ -17,11 +17,13 @@
 
 use std::collections::HashSet;
 
+use rstest::rstest;
 use rusqlite::{params, Connection};
 use tempfile::tempdir;
 
 use super::super::index::{
-    assert_source_tables_classified, copy_index_side_tables, index_copy_specs, COPIED_TABLES,
+    assert_source_tables_classified, copy_index_side_tables, index_copy_specs,
+    validate_index_side_tables, COPIED_TABLES,
 };
 use super::{
     append_canonical_block, assert_corruption_containing, create_dest_db_with_canonical_blocks,
@@ -160,6 +162,15 @@ fn test_copy_index_side_tables_round_trip() {
         (version.as_str(), mainnet, chain_id),
         (CHAINSTATE_VERSION, 0, 1)
     );
+
+    // Validate.
+    let validation =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+    assert!(
+        validation.is_valid(),
+        "validation should pass: {validation:?}"
+    );
 }
 
 /// Two blocks at the same height - one canonical, one fork: only the
@@ -204,6 +215,15 @@ fn test_copy_excludes_fork_rows() {
         .unwrap();
     assert_eq!(bh, 1, "only the canonical block_header is copied");
     assert_eq!(tx, 1, "only the canonical transaction is copied");
+
+    // Validate passes - fork rows excluded.
+    let validation =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+    assert!(
+        validation.is_valid(),
+        "validation should pass without fork rows: {validation:?}"
+    );
 }
 
 /// Insert an epoch-2 `staging_blocks` row with the given
@@ -480,4 +500,341 @@ fn test_unclassified_source_table_is_rejected() {
         !dst_path.exists(),
         "no destination should be produced when the source is rejected"
     );
+}
+
+/// A transaction row injected for a block outside the canonical set
+/// must fail validation.
+#[test]
+fn test_validate_index_side_tables_detects_extra_rows() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src_index.sqlite");
+    let conn = create_source_db(&src_path);
+
+    // Insert one block + transaction.
+    insert_epoch2_block_header(&conn, 1, "1");
+    insert_transaction(&conn, 1, "ibh1");
+    // Canonical Nakamoto tip (squashing requires an epoch 3.4+ src).
+    let tip_id = insert_nakamoto_header(&conn, "tip", 2);
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_index.sqlite");
+    let dst = create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
+    append_canonical_block(&dst, &tip_id);
+    drop(dst);
+
+    let _stats =
+        copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+
+    // Inject a transaction for a block NOT in the canonical set.
+    {
+        let conn = Connection::open(&dst_path).unwrap();
+        conn.execute(
+            "INSERT INTO transactions VALUES (99, 'tx_bad', ?1, '0x00', 'ok')",
+            params![hex_id("ibh_UNKNOWN")],
+        )
+        .unwrap();
+    }
+
+    let validation =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+
+    assert!(
+        !validation.transactions_match,
+        "extra non-canonical transaction row should be detected"
+    );
+    assert!(!validation.is_valid(), "validation must fail");
+}
+
+/// `signer_stats` is a non-consensus counter table: after the squash the
+/// source keeps incrementing `blocks_signed` for existing
+/// `(public_key, reward_cycle)` pairs. Validation only requires dst keys
+/// to be a subset of src keys, so drifted counters still pass.
+#[test]
+fn test_signer_stats_validates_with_source_drift() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src_index.sqlite");
+    let conn = create_source_db(&src_path);
+
+    insert_epoch2_block_header(&conn, 1, "1");
+    // Nakamoto header so derive_max_reward_cycle can compute a cycle.
+    let tip_id = insert_nakamoto_header(&conn, "tip", 10);
+    conn.execute(
+        "INSERT INTO signer_stats (public_key, reward_cycle, blocks_signed) \
+         VALUES ('pk1', 1, 5), ('pk2', 1, 3)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_index.sqlite");
+    let dst = create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
+    append_canonical_block(&dst, &tip_id);
+    drop(dst);
+
+    // first_burn_height=0, reward_cycle_len=1 → cycle = 10, covering reward_cycle=1.
+    let _stats =
+        copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+
+    // Simulate source drift: increment blocks_signed counters.
+    {
+        let src_conn = Connection::open(&src_path).unwrap();
+        src_conn
+            .execute("UPDATE signer_stats SET blocks_signed = 100", [])
+            .unwrap();
+    }
+
+    let validation =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+
+    assert!(
+        validation.signer_stats_match,
+        "signer_stats should pass with drifted counter values"
+    );
+    assert!(
+        validation.is_valid(),
+        "overall validation should pass: {validation:?}"
+    );
+}
+
+/// Destination tampering with `signer_stats` must fail validation: a
+/// fabricated `(public_key, reward_cycle)` key that does not exist in the
+/// source, or a counter inflated past the source's (`blocks_signed` only
+/// grows).
+#[rstest]
+#[case::fabricated_key(
+    "INSERT INTO signer_stats (public_key, reward_cycle, blocks_signed) \
+     VALUES ('pk_FAKE', 1, 99)"
+)]
+#[case::inflated_counter("UPDATE signer_stats SET blocks_signed = 999 WHERE public_key = 'pk1'")]
+fn test_signer_stats_detects_tampering(#[case] tamper_sql: &str) {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src_index.sqlite");
+    let conn = create_source_db(&src_path);
+
+    insert_epoch2_block_header(&conn, 1, "1");
+    let tip_id = insert_nakamoto_header(&conn, "tip", 10);
+    conn.execute(
+        "INSERT INTO signer_stats (public_key, reward_cycle, blocks_signed) \
+         VALUES ('pk1', 1, 5)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_index.sqlite");
+    let dst = create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
+    append_canonical_block(&dst, &tip_id);
+    drop(dst);
+
+    let _stats =
+        copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+
+    {
+        let dst_conn = Connection::open(&dst_path).unwrap();
+        dst_conn.execute(tamper_sql, []).unwrap();
+    }
+
+    let validation =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+
+    assert!(
+        !validation.signer_stats_match,
+        "signer_stats should fail after tampering"
+    );
+    assert!(!validation.is_valid());
+}
+
+/// `matured_rewards` is a non-consensus cache: after the squash, new
+/// source blocks mature rewards of older canonical blocks, adding rows
+/// that match the canonical filter. Validation only checks
+/// dst ⊆ filtered-src, so source growth still passes.
+#[test]
+fn test_matured_rewards_validates_with_source_growth() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src_index.sqlite");
+    let conn = create_source_db(&src_path);
+
+    insert_epoch2_block_header(&conn, 1, "1");
+    let tip_id = insert_nakamoto_header(&conn, "tip", 10);
+    conn.execute(
+        "INSERT INTO matured_rewards (address, recipient, vtxindex, coinbase, \
+             tx_fees_anchored, tx_fees_streamed_confirmed, tx_fees_streamed_produced, \
+             child_index_block_hash, parent_index_block_hash) \
+         VALUES ('addr1', NULL, 0, '100', '0', '0', '0', ?1, 'pibh0')",
+        params![hex_id("ibh1")],
+    )
+    .unwrap();
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_index.sqlite");
+    let dst = create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
+    append_canonical_block(&dst, &tip_id);
+    drop(dst);
+
+    let _stats =
+        copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+
+    // Simulate source growth: add a new matured_rewards row for a canonical block.
+    {
+        let src_conn = Connection::open(&src_path).unwrap();
+        src_conn
+            .execute(
+                "INSERT INTO matured_rewards (address, recipient, vtxindex, coinbase, \
+                     tx_fees_anchored, tx_fees_streamed_confirmed, tx_fees_streamed_produced, \
+                     child_index_block_hash, parent_index_block_hash) \
+                 VALUES ('addr2', NULL, 0, '0', '0', '0', '0', ?1, 'pibh0')",
+                params![hex_id("ibh1")],
+            )
+            .unwrap();
+    }
+
+    let validation =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+
+    assert!(
+        validation.matured_rewards_match,
+        "matured_rewards should pass when source has grown"
+    );
+    assert!(
+        validation.is_valid(),
+        "overall validation should pass: {validation:?}"
+    );
+}
+
+/// A destination `matured_rewards` row absent from the filtered source
+/// must fail validation.
+#[test]
+fn test_matured_rewards_detects_fabricated_rows() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src_index.sqlite");
+    let conn = create_source_db(&src_path);
+
+    insert_epoch2_block_header(&conn, 1, "1");
+    let tip_id = insert_nakamoto_header(&conn, "tip", 10);
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_index.sqlite");
+    let dst = create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
+    append_canonical_block(&dst, &tip_id);
+    drop(dst);
+
+    let _stats =
+        copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+
+    // Inject a fabricated matured_rewards row.
+    {
+        let dst_conn = Connection::open(&dst_path).unwrap();
+        dst_conn
+            .execute(
+                "INSERT INTO matured_rewards (address, recipient, vtxindex, coinbase, \
+                     tx_fees_anchored, tx_fees_streamed_confirmed, tx_fees_streamed_produced, \
+                     child_index_block_hash, parent_index_block_hash) \
+                 VALUES ('addr_FAKE', NULL, 0, '999', '0', '0', '0', ?1, 'pibh0')",
+                params![hex_id("ibh1")],
+            )
+            .unwrap();
+    }
+
+    let validation =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+
+    assert!(
+        !validation.matured_rewards_match,
+        "matured_rewards should fail with fabricated row"
+    );
+    assert!(!validation.is_valid());
+}
+
+/// `staging_microblocks_data` is schema-cloned by the index copy but
+/// populated by the separate block-preservation phase. Index validation
+/// must NOT assert it empty, otherwise a `--blocks`/`--all` run that
+/// preserved microblocks would fail spuriously.
+#[test]
+fn test_index_validation_allows_populated_staging_microblocks() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src.sqlite");
+    let conn = create_source_db(&src_path);
+    insert_epoch2_block_header(&conn, 1, "1");
+    // Canonical Nakamoto tip (squashing requires an epoch 3.4+ src).
+    let tip_id = insert_nakamoto_header(&conn, "tip", 2);
+    drop(conn);
+
+    let dst_path = dir.path().join("dst.sqlite");
+    let dst = create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
+    append_canonical_block(&dst, &tip_id);
+    drop(dst);
+    copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1).unwrap();
+
+    // Simulate block preservation writing microblock data into the squashed dst.
+    let dst = Connection::open(&dst_path).unwrap();
+    dst.execute(
+        "INSERT INTO staging_microblocks_data (block_hash, block_data) VALUES ('mb1', X'00')",
+        [],
+    )
+    .unwrap();
+    drop(dst);
+
+    let validation =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+    assert!(
+        validation.expected_tables_empty,
+        "populated staging_microblocks_data must not fail index validation: {validation:?}"
+    );
+    assert!(validation.is_valid(), "{validation:?}");
+}
+
+/// A corrupted `staging_blocks` column in the destination flips
+/// `staging_blocks_match` from passing to failing.
+#[test]
+fn test_staging_blocks_validation_detects_drift() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src.sqlite");
+    let conn = create_source_db(&src_path);
+
+    insert_epoch2_block_header(&conn, 1, "1");
+    insert_epoch2_staging_block(&conn, "1", 1, 1, 0);
+    // Canonical Nakamoto tip (squashing requires an epoch 3.4+ src).
+    let tip_id = insert_nakamoto_header(&conn, "tip", 2);
+    drop(conn);
+
+    let dst_path = dir.path().join("dst.sqlite");
+    let dst = create_dest_db_with_canonical_blocks(&dst_path, &["ibh1"]);
+    append_canonical_block(&dst, &tip_id);
+    drop(dst);
+
+    copy_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1).unwrap();
+
+    // Validation should pass initially.
+    let v =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+    assert!(v.staging_blocks_match);
+
+    // Now corrupt a column in destination staging_blocks.
+    let dst_conn = Connection::open(&dst_path).unwrap();
+    dst_conn
+        .execute(
+            "UPDATE staging_blocks SET parent_consensus_hash = 'corrupted' \
+                 WHERE index_block_hash = ?1",
+            params![hex_id("ibh1")],
+        )
+        .unwrap();
+    drop(dst_conn);
+
+    // Validation should now fail.
+    let v =
+        validate_index_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 0, 1)
+            .unwrap();
+    assert!(!v.staging_blocks_match, "should detect column drift: {v:?}");
 }

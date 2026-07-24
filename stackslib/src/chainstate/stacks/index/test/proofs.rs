@@ -75,7 +75,13 @@ fn verifier_catches_stale_proof() {
     // the verifier should not allow a proof from k1 to old_v from block_2
     let triepath_2 = TrieHash::from_key(&k1);
     let marf_value_2 = MARFValue::from_value(&old_v);
-    assert!(!proof_2.verify(&triepath_2, &marf_value_2, &root_hash_2, &root_to_block));
+    assert!(!proof_2.verify(
+        &triepath_2,
+        &marf_value_2,
+        &root_hash_2,
+        &root_to_block,
+        &HashSet::new(),
+    ));
 
     // create a proof from the previous block to the old value.
     // It should succeed
@@ -86,7 +92,13 @@ fn verifier_catches_stale_proof() {
     // the verifier should allow a proof from k1 to old_v from block_1
     let triepath_1 = TrieHash::from_key(&k1);
     let marf_value_1 = MARFValue::from_value(&old_v);
-    assert!(proof_1.verify(&triepath_1, &marf_value_1, &root_hash_1, &root_to_block));
+    assert!(proof_1.verify(
+        &triepath_1,
+        &marf_value_1,
+        &root_hash_1,
+        &root_to_block,
+        &HashSet::new(),
+    ));
 }
 
 #[test]
@@ -176,7 +188,13 @@ fn ncc_verifier_catches_stale_proof() {
     };
 
     println!("DEBUG: verify(another_v)");
-    assert!(proof_5.verify(&triepath_4, &marf_value_4, &root_hash_5, &root_to_block));
+    assert!(proof_5.verify(
+        &triepath_4,
+        &marf_value_4,
+        &root_hash_5,
+        &root_to_block,
+        &HashSet::new(),
+    ));
 
     // prepare a proof for the wrong root hash i.e. block2 instead of block5.
     // Should fail
@@ -193,5 +211,11 @@ fn ncc_verifier_catches_stale_proof() {
     };
 
     println!("DEBUG: verify(old_v)");
-    assert!(!proof_5.verify(&triepath_4, &marf_value_4, &root_hash_5, &root_to_block));
+    assert!(!proof_5.verify(
+        &triepath_4,
+        &marf_value_4,
+        &root_hash_5,
+        &root_to_block,
+        &HashSet::new(),
+    ));
 }

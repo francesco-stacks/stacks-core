@@ -19,6 +19,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use rstest::rstest;
 use rusqlite::{params, Connection};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
@@ -30,7 +31,8 @@ use tempfile::tempdir;
 
 use super::super::blocks::{
     assert_source_tables_classified, copy_confirmed_epoch2_microblocks, copy_epoch2_block_files,
-    copy_nakamoto_staging_blocks, nakamoto_copy_specs, NAKAMOTO_STAGING_TABLES,
+    copy_nakamoto_staging_blocks, nakamoto_copy_specs, validate_epoch2_block_files,
+    validate_microblock_streams, validate_nakamoto_staging_blocks, NAKAMOTO_STAGING_TABLES,
 };
 use super::super::common::clone_schemas_from_source;
 use super::{
@@ -114,6 +116,15 @@ fn test_epoch2_block_file_copy() {
     let dst_file = dst_blocks_dir.join(&rel);
     assert!(dst_file.exists());
     assert_eq!(std::fs::read(&dst_file).unwrap(), b"block data here");
+
+    // The copied artifact passes validation.
+    let v = validate_epoch2_block_files(
+        idx_path.to_str().unwrap(),
+        src_blocks_dir.to_str().unwrap(),
+        dst_blocks_dir.to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(v.is_valid(), "validation should pass: {v:?}");
 }
 
 /// A canonical block whose flat file is missing from the source archive
@@ -556,6 +567,11 @@ fn test_microblock_stream_copy() {
         (0, 0),
         "fork microblock should not be copied"
     );
+
+    // The copied streams pass validation through the production validator.
+    let v = validate_microblock_streams(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+        .unwrap();
+    assert!(v.is_valid(), "microblock validation should pass: {v:?}");
 }
 
 /// A stream whose microblocks are unprocessed cannot be confirmed: it is
@@ -821,6 +837,17 @@ fn test_nakamoto_copy() {
         "db_version should be the latest migration"
     );
     drop(dst_conn);
+
+    // The copied artifact passes validation, including db_version and schema.
+    let v = validate_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(v.is_valid(), "nakamoto validation should pass: {v:?}");
+    assert!(v.db_version_match, "db_version should match");
+    assert!(v.schema_match, "schema should match");
 }
 
 /// The copy writes into a NEW destination only: a pre-existing
@@ -952,4 +979,146 @@ fn test_nakamoto_copy_excludes_post_boundary_blocks() {
         "in-index but orphaned block must not be copied"
     );
     drop(dst_conn);
+
+    // The clean <=H-only artifact validates.
+    let v = validate_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(v.is_valid(), "<=H-only artifact should validate: {v:?}");
+
+    // If a post-boundary block leaks into the destination, validation rejects it.
+    let dst_conn = Connection::open(&dst_nak_path).unwrap();
+    insert_nakamoto_staging_block(
+        &dst_conn,
+        "bh_post",
+        "ch_post",
+        ibh_h,
+        102,
+        "ibh_post",
+        "Fetched",
+        b"data_post",
+    );
+    drop(dst_conn);
+
+    let v = validate_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !v.no_extra_blocks,
+        "leaked post-boundary block must register as an extra row"
+    );
+    assert!(
+        !v.is_valid(),
+        "validation must fail when a post-boundary block leaks in"
+    );
+}
+
+/// Destination drift after the copy must fail validation: a tampered
+/// `db_version`, or an extra index breaking the `sqlite_master` schema
+/// comparison.
+#[rstest]
+#[case::db_version_drift("UPDATE db_version SET version = 99", false, true)]
+#[case::schema_drift(
+    "CREATE INDEX extra_idx ON nakamoto_staging_blocks(height)",
+    true,
+    false
+)]
+fn test_nakamoto_validate_detects_drift(
+    #[case] tamper_sql: &str,
+    #[case] expected_db_version_match: bool,
+    #[case] expected_schema_match: bool,
+) {
+    let dir = tempdir().unwrap();
+    let src_nak_path = dir.path().join("src_nakamoto.sqlite");
+    let dst_nak_path = dir.path().join("dst_nakamoto.sqlite");
+    let idx_path = dir.path().join("squashed_index.sqlite");
+
+    // Matching source and destination with one canonical row.
+    let ibhs = create_nakamoto_headers_index(&idx_path, &["ibh1"]);
+    let src_conn = create_source_nakamoto_db(&src_nak_path);
+    insert_nakamoto_staging_block(
+        &src_conn, "bh1", "ch1", "p1", 100, &ibhs[0], "Fetched", b"data1",
+    );
+    drop(src_conn);
+
+    copy_nakamoto_staging_blocks(
+        idx_path.to_str().unwrap(),
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+    )
+    .unwrap();
+
+    let dst_conn = Connection::open(&dst_nak_path).unwrap();
+    dst_conn.execute_batch(tamper_sql).unwrap();
+    drop(dst_conn);
+
+    let v = validate_nakamoto_staging_blocks(
+        src_nak_path.to_str().unwrap(),
+        dst_nak_path.to_str().unwrap(),
+        idx_path.to_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v.db_version_match, expected_db_version_match);
+    assert_eq!(v.schema_match, expected_schema_match);
+    assert!(!v.is_valid(), "overall validation should fail");
+}
+
+/// `nakamoto.sqlite` and its journal sidecars live in the blocks dir but
+/// are not epoch-2 files: the extra-file walk must ignore them.
+#[test]
+fn test_epoch2_file_validation_ignores_nakamoto_sqlite() {
+    let dir = tempdir().unwrap();
+    let src_blocks_dir = dir.path().join("src_blocks");
+    let dst_blocks_dir = dir.path().join("dst_blocks");
+
+    // Squashed index with genesis (height 0) and one height-1 block.
+    let idx_path = dir.path().join("squashed_index.sqlite");
+    let hash_hex = "aabbccdd00000000000000000000000000000000000000000000000000000001";
+    create_block_headers_index(
+        &idx_path,
+        &[
+            (
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                0,
+            ),
+            (hash_hex, 1),
+        ],
+    );
+
+    // Source block file for height 1.
+    let rel = format!("aabb/ccdd/{hash_hex}");
+    let src_file = src_blocks_dir.join(&rel);
+    std::fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+    std::fs::write(&src_file, b"block data").unwrap();
+
+    copy_epoch2_block_files(
+        idx_path.to_str().unwrap(),
+        src_blocks_dir.to_str().unwrap(),
+        dst_blocks_dir.to_str().unwrap(),
+    )
+    .unwrap();
+
+    // Plant nakamoto.sqlite and its WAL sidecars in the destination blocks dir.
+    std::fs::write(dst_blocks_dir.join("nakamoto.sqlite"), b"fake db").unwrap();
+    std::fs::write(dst_blocks_dir.join("nakamoto.sqlite-journal"), b"journal").unwrap();
+    std::fs::write(dst_blocks_dir.join("nakamoto.sqlite-wal"), b"wal").unwrap();
+
+    // Validation still passes: nakamoto files are not "extra" epoch-2 files.
+    let v = validate_epoch2_block_files(
+        idx_path.to_str().unwrap(),
+        src_blocks_dir.to_str().unwrap(),
+        dst_blocks_dir.to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        v.is_valid(),
+        "nakamoto.sqlite sidecars should not cause validation failure: {v:?}"
+    );
+    assert!(v.no_extra_files, "no_extra_files should be true");
 }

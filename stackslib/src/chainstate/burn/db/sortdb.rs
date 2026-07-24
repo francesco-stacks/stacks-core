@@ -4714,6 +4714,50 @@ impl SortitionDB {
         .map_err(db_error::from)
     }
 
+    /// Whether the Stacks-tip memo rows resolve exactly to the boundary's
+    /// anchor: the burn-view memo row for the anchor exists, and no memo
+    /// row for the anchor's burn view or consensus hash disagrees with it.
+    /// A `None` boundary trivially passes. Validation counterpart of
+    /// [`Self::stacks_tip_memo_copy_sql`]'s anchor rewrite.
+    pub(crate) fn stacks_tip_memos_match_boundary_anchor(
+        conn: &Connection,
+        boundary: Option<&SortitionTipCopyBoundary>,
+    ) -> Result<bool, db_error> {
+        let Some(boundary) = boundary else {
+            return Ok(true);
+        };
+        let anchor_height = u64_to_sql(boundary.anchor_block_height)?;
+        let anchor_ch = boundary.anchor_consensus_hash.to_string();
+        let anchor_burn_view_ch = boundary.anchor_burn_view_consensus_hash.to_string();
+        let anchor_bhh = boundary.anchor_block_hash.to_string();
+
+        let burn_view_anchor_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM stacks_chain_tips_by_burn_view \
+             WHERE consensus_hash = ?1 \
+               AND burn_view_consensus_hash = ?2 \
+               AND block_hash = ?3 \
+               AND block_height = ?4",
+            params![&anchor_ch, &anchor_burn_view_ch, &anchor_bhh, anchor_height],
+            |row| row.get(0),
+        )?;
+        let burn_view_mismatches: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM stacks_chain_tips_by_burn_view \
+             WHERE burn_view_consensus_hash = ?1 \
+               AND (consensus_hash != ?2 OR block_hash != ?3 OR block_height != ?4)",
+            params![&anchor_burn_view_ch, &anchor_ch, &anchor_bhh, anchor_height],
+            |row| row.get(0),
+        )?;
+        let legacy_mismatches: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM stacks_chain_tips \
+             WHERE consensus_hash = ?1 \
+               AND (block_hash != ?2 OR block_height != ?3)",
+            params![&anchor_ch, &anchor_bhh, anchor_height],
+            |row| row.get(0),
+        )?;
+
+        Ok(burn_view_anchor_rows > 0 && burn_view_mismatches == 0 && legacy_mismatches == 0)
+    }
+
     /// Get the canonical burn chain tip -- the tip of the longest burn chain we know about.
     /// Break ties deterministically by ordering on burnchain block hash.
     pub fn get_canonical_chain_tip_bhh(conn: &Connection) -> Result<BurnchainHeaderHash, db_error> {

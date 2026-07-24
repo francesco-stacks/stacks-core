@@ -19,10 +19,13 @@ use rusqlite::{params, Connection, OpenFlags};
 use stacks_common::types::chainstate::SortitionId;
 
 use super::common::{
-    assert_source_schema, clone_schemas_from_source, copied_rows, execute_copy_specs,
-    with_offline_write_session, TableCopySpec, MARF_INFRA_TABLES,
+    assert_source_schema, clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result,
+    validate_copy_specs, with_offline_write_session, with_readonly_session, TableCopySpec,
+    MARF_INFRA_TABLES,
 };
-use super::fork_storage::{collect_canonical_leaf_hashes, copy_canonical_fork_storage};
+use super::fork_storage::{
+    collect_canonical_leaf_hashes, copy_canonical_fork_storage, validate_canonical_fork_storage,
+};
 use crate::chainstate::burn::db::sortdb::SortitionDB;
 pub use crate::chainstate::burn::db::sortdb::SortitionTipCopyBoundary;
 use crate::chainstate::stacks::index::{trie_sql, Error, MARFValue};
@@ -94,6 +97,90 @@ pub struct SortitionSideTableStats {
     pub epochs_rows: u64,
     pub db_config_rows: u64,
     pub fork_storage_rows: u64,
+}
+
+/// Validation result for sortition side tables in a squashed DB.
+///
+/// See [`validate_sortition_side_tables`] for the trust boundary - this checks
+/// consistency with the destination-declared canonical set, not independent
+/// canonicality. MARF trie validation must be done separately.
+#[derive(Debug, Clone)]
+pub struct SortitionSideTableValidation {
+    pub snapshots_match: bool,
+    pub leader_keys_match: bool,
+    pub block_commits_match: bool,
+    pub block_commit_parents_match: bool,
+    pub snapshot_transition_ops_match: bool,
+    pub stacks_chain_tips_match: bool,
+    pub stacks_chain_tips_by_burn_view_match: bool,
+    /// No copied sortition tip memo row points past the copied Stacks MARF
+    /// boundary.
+    pub stacks_chain_tips_within_stacks_boundary: bool,
+    /// The copied burn-view tip row resolves exactly to the selected Stacks
+    /// anchor when a Stacks boundary rewrite is requested.
+    pub stacks_chain_tips_anchor_match: bool,
+    pub preprocessed_reward_sets_match: bool,
+    pub missed_commits_match: bool,
+    pub stack_stx_match: bool,
+    pub transfer_stx_match: bool,
+    pub delegate_stx_match: bool,
+    pub vote_for_aggregate_key_match: bool,
+    pub epochs_match: bool,
+    pub db_config_match: bool,
+    pub fork_storage_match: bool,
+}
+
+impl SortitionSideTableValidation {
+    /// Every validation dimension as `(name, passed)` pairs: the single
+    /// source of truth for [`is_valid`](Self::is_valid) and for diagnostics,
+    /// so the verdict and the printout can't drift apart.
+    pub fn checks(&self) -> [(&'static str, bool); 18] {
+        [
+            ("snapshots_match", self.snapshots_match),
+            ("leader_keys_match", self.leader_keys_match),
+            ("block_commits_match", self.block_commits_match),
+            (
+                "block_commit_parents_match",
+                self.block_commit_parents_match,
+            ),
+            (
+                "snapshot_transition_ops_match",
+                self.snapshot_transition_ops_match,
+            ),
+            ("stacks_chain_tips_match", self.stacks_chain_tips_match),
+            (
+                "stacks_chain_tips_by_burn_view_match",
+                self.stacks_chain_tips_by_burn_view_match,
+            ),
+            (
+                "stacks_chain_tips_within_stacks_boundary",
+                self.stacks_chain_tips_within_stacks_boundary,
+            ),
+            (
+                "stacks_chain_tips_anchor_match",
+                self.stacks_chain_tips_anchor_match,
+            ),
+            (
+                "preprocessed_reward_sets_match",
+                self.preprocessed_reward_sets_match,
+            ),
+            ("missed_commits_match", self.missed_commits_match),
+            ("stack_stx_match", self.stack_stx_match),
+            ("transfer_stx_match", self.transfer_stx_match),
+            ("delegate_stx_match", self.delegate_stx_match),
+            (
+                "vote_for_aggregate_key_match",
+                self.vote_for_aggregate_key_match,
+            ),
+            ("epochs_match", self.epochs_match),
+            ("db_config_match", self.db_config_match),
+            ("fork_storage_match", self.fork_storage_match),
+        ]
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.checks().iter().all(|(_, ok)| *ok)
+    }
 }
 
 /// Build temp tables for the canonical sortition set and canonical burn
@@ -355,4 +442,83 @@ fn copy_sortition_tables_inner(
         "fork_storage_rows" => stats.fork_storage_rows
     );
     Ok(stats)
+}
+
+/// Validate that the squashed sortition DB has the correct side tables by
+/// comparing against the source using full-row EXCEPT queries.
+///
+/// Applies the same canonical-set guards as the copy (via
+/// [`populate_canonical_sortitions`]), so an empty `marf_squashed_blocks` or
+/// a canonical sortition_id absent from `src.snapshots` is a
+/// `CorruptionError` here too - validation is never more lenient than the
+/// copy that produced the dst.
+///
+/// # Trust boundary
+///
+/// This validator checks that side-table rows are consistent with the canonical
+/// set declared by the destination's `marf_squashed_blocks` metadata, which
+/// was populated during the MARF squash by walking the canonical tip. It does NOT
+/// independently re-derive the canonical chain from the source MARF - that is the
+/// job of `validate_squashed_at_height` on the MARF trie itself. The guards
+/// catch fabricated sortition IDs (IDs not present anywhere in the source),
+/// but cannot detect a coherent wrong-fork canonical set where all IDs exist
+/// in the source but are from a non-canonical fork. Full canonicality
+/// assurance requires validating the squashed MARF trie first, then using
+/// this function to verify side-table consistency.
+pub fn validate_sortition_side_tables(
+    src_path: &str,
+    dst_path: &str,
+) -> Result<SortitionSideTableValidation, Error> {
+    validate_sortition_side_tables_with_boundary(src_path, dst_path, None)
+}
+
+pub fn validate_sortition_side_tables_with_boundary(
+    src_path: &str,
+    dst_path: &str,
+    stacks_boundary: Option<&SortitionTipCopyBoundary>,
+) -> Result<SortitionSideTableValidation, Error> {
+    validate_tip_boundary(stacks_boundary)?;
+    let src_conn =
+        sqlite_open(src_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false).map_err(Error::SQLError)?;
+    with_readonly_session(dst_path, &[("src", src_path)], |conn| {
+        let fork_storage_match = validate_canonical_fork_storage::<SortitionId>(conn, dst_path)?;
+
+        // Same guarded path as the copy: rejects an empty canonical set and
+        // canonical ids absent from src.
+        populate_canonical_sortitions(&src_conn, conn)?;
+
+        let results = validate_copy_specs(conn, &sortition_copy_specs(stacks_boundary), &[])?;
+        let stacks_chain_tips_within_stacks_boundary =
+            SortitionDB::stacks_tip_memos_within_boundary(conn, stacks_boundary).map_err(|e| {
+                Error::CorruptionError(format!("cannot check sortition tip boundary: {e}"))
+            })?;
+        let stacks_chain_tips_anchor_match =
+            SortitionDB::stacks_tip_memos_match_boundary_anchor(conn, stacks_boundary).map_err(
+                |e| Error::CorruptionError(format!("cannot check sortition tip anchor: {e}")),
+            )?;
+
+        Ok(SortitionSideTableValidation {
+            snapshots_match: spec_result(&results, "snapshots"),
+            leader_keys_match: spec_result(&results, "leader_keys"),
+            block_commits_match: spec_result(&results, "block_commits"),
+            block_commit_parents_match: spec_result(&results, "block_commit_parents"),
+            snapshot_transition_ops_match: spec_result(&results, "snapshot_transition_ops"),
+            stacks_chain_tips_match: spec_result(&results, "stacks_chain_tips"),
+            stacks_chain_tips_by_burn_view_match: spec_result(
+                &results,
+                "stacks_chain_tips_by_burn_view",
+            ),
+            stacks_chain_tips_within_stacks_boundary,
+            stacks_chain_tips_anchor_match,
+            preprocessed_reward_sets_match: spec_result(&results, "preprocessed_reward_sets"),
+            missed_commits_match: spec_result(&results, "missed_commits"),
+            stack_stx_match: spec_result(&results, "stack_stx"),
+            transfer_stx_match: spec_result(&results, "transfer_stx"),
+            delegate_stx_match: spec_result(&results, "delegate_stx"),
+            vote_for_aggregate_key_match: spec_result(&results, "vote_for_aggregate_key"),
+            epochs_match: spec_result(&results, "epochs"),
+            db_config_match: spec_result(&results, "db_config"),
+            fork_storage_match,
+        })
+    })
 }

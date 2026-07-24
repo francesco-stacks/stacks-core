@@ -27,8 +27,8 @@
 mod blocks;
 mod burnchain;
 mod clarity;
-pub(crate) mod common;
-pub(crate) mod fork_storage;
+mod common;
+mod fork_storage;
 mod index;
 mod sortition;
 mod spv;
@@ -38,13 +38,24 @@ mod tests;
 
 pub use blocks::{
     copy_confirmed_epoch2_microblocks, copy_epoch2_block_files, copy_nakamoto_staging_blocks,
-    Epoch2BlockFileCopyStats, Epoch2MicroblockCopyStats, NakamotoBlockCopyStats,
+    validate_epoch2_block_files, validate_microblock_streams, validate_nakamoto_staging_blocks,
+    Epoch2BlockFileCopyStats, Epoch2BlockFileValidation, Epoch2MicroblockCopyStats,
+    MicroblockValidation, NakamotoBlockCopyStats, NakamotoBlockValidation,
 };
-pub use burnchain::{copy_burnchain_db, BurnchainDbCopyStats};
-pub use clarity::{copy_clarity_side_tables, ClaritySideTableStats};
-pub use index::{copy_index_side_tables, IndexSideTableStats};
+pub use burnchain::{
+    copy_burnchain_db, validate_burnchain_db, BurnchainDbCopyStats, BurnchainDbValidation,
+};
+pub use clarity::{
+    copy_clarity_side_tables, validate_clarity_side_tables, ClaritySideTableStats,
+    ClaritySideTableValidation,
+};
+pub use index::{
+    copy_index_side_tables, validate_index_side_tables, IndexSideTableStats,
+    IndexSideTableValidation,
+};
 pub use sortition::{
-    copy_sortition_side_tables, copy_sortition_side_tables_with_boundary, SortitionSideTableStats,
-    SortitionTipCopyBoundary,
+    copy_sortition_side_tables, copy_sortition_side_tables_with_boundary,
+    validate_sortition_side_tables, validate_sortition_side_tables_with_boundary,
+    SortitionSideTableStats, SortitionSideTableValidation, SortitionTipCopyBoundary,
 };
-pub use spv::{copy_spv_headers, SpvHeadersCopyStats};
+pub use spv::{copy_spv_headers, validate_spv_headers, SpvHeadersCopyStats, SpvHeadersValidation};

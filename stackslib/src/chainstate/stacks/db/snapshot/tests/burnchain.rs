@@ -24,7 +24,8 @@ use stacks_common::types::chainstate::BurnchainHeaderHash;
 use tempfile::tempdir;
 
 use super::super::burnchain::{
-    assert_source_tables_classified, burnchain_copy_specs, copy_burnchain_db, COPIED_TABLES,
+    assert_source_tables_classified, burnchain_copy_specs, copy_burnchain_db,
+    validate_burnchain_db, COPIED_TABLES,
 };
 use crate::burnchains::db::BurnchainDB;
 use crate::burnchains::{Burnchain, PoxConstants};
@@ -135,9 +136,9 @@ fn create_squashed_sortition(dir: &Path, hashes: &[BurnchainHeaderHash]) -> std:
 }
 
 /// End-to-end burnchain copy: canonical headers, ops, and commit
-/// metadata are copied verbatim; fork rows are dropped.
+/// metadata are copied verbatim; fork rows are dropped; validation passes.
 #[test]
-fn test_burnchain_db_copy() {
+fn test_burnchain_db_copy_and_validate() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src_burnchain.sqlite");
     let dst_path = dir.path().join("dst_burnchain.sqlite");
@@ -182,69 +183,15 @@ fn test_burnchain_db_copy() {
     assert_eq!(stats.block_ops_rows, 1); // only fixture_bhh(1)'s op
     assert_eq!(stats.block_commit_metadata_rows, 1); // only canonical
 
-    // Copied rows carry their full source content, and the fork rows are
-    // absent by key.
-    let dst = Connection::open(&dst_path).unwrap();
-    let header: (u64, String, String, u64, u64) = dst
-        .query_row(
-            "SELECT block_height, block_hash, parent_block_hash, num_txs, timestamp \
-             FROM burnchain_db_block_headers WHERE block_hash = ?1",
-            params![hash_1],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        header,
-        (1, hash_1.clone(), format!("parent_{hash_1}"), 0, 0)
-    );
-    let op: (String, String, String) = dst
-        .query_row(
-            "SELECT block_hash, op, txid FROM burnchain_db_block_ops",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(op, (hash_1.clone(), "op1".into(), "tx1".into()));
-    let commit: (String, String, u64, u64) = dst
-        .query_row(
-            "SELECT burn_block_hash, txid, block_height, vtxindex FROM block_commit_metadata",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(commit, (hash_1.clone(), "tx1".into(), 1, 0));
-    let version: u64 = dst
-        .query_row(
-            "SELECT MAX(CAST(version AS INTEGER)) FROM db_config",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        version,
-        u64::from(BurnchainDB::SCHEMA_VERSION),
-        "db_config copied verbatim"
-    );
-    let fork_rows: i64 = dst
-        .query_row(
-            "SELECT (SELECT COUNT(*) FROM burnchain_db_block_headers WHERE block_hash = 'fork_hash_1') \
-             + (SELECT COUNT(*) FROM burnchain_db_block_ops WHERE block_hash = 'fork_hash_1') \
-             + (SELECT COUNT(*) FROM block_commit_metadata WHERE burn_block_hash = 'fork_hash_1')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(fork_rows, 0, "fork rows must be absent by key");
+    let v = validate_burnchain_db(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        sort_path.to_str().unwrap(),
+        2,
+    )
+    .unwrap();
+    assert!(v.is_valid(), "validation failed: {v:?}");
 }
-
 /// The copy writes into a NEW destination only: a pre-existing
 /// `burnchain.sqlite` (e.g. left over from a prior failed squash) is an
 /// error, never appended to or overwritten.
@@ -418,6 +365,45 @@ fn test_burnchain_db_anchor_blocks_filtered() {
     assert_eq!(anchor99, 0, "unreferenced anchor block must not be copied");
 }
 
+/// A non-canonical header injected into the destination must fail
+/// validation (`no_extra_headers`).
+#[test]
+fn test_burnchain_db_validate_detects_non_canonical_leak() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src.sqlite");
+    let dst_path = dir.path().join("dst.sqlite");
+
+    let sort_path = create_squashed_sortition(dir.path(), &[]);
+
+    let src = create_burnchain_db(&src_path);
+    BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
+    drop(src);
+
+    // Copy normally first.
+    copy_burnchain_db(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        sort_path.to_str().unwrap(),
+        0,
+    )
+    .unwrap();
+
+    // Inject a non-canonical row into the destination.
+    let dst = Connection::open(&dst_path).unwrap();
+    BurnchainDB::test_insert_block_header_row(&dst, 0, "rogue", "none").unwrap();
+    drop(dst);
+
+    let v = validate_burnchain_db(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        sort_path.to_str().unwrap(),
+        0,
+    )
+    .unwrap();
+    assert!(!v.is_valid(), "should detect non-canonical leak");
+    assert!(!v.no_extra_headers);
+}
+
 /// A missing source burnchain.sqlite is an error, and the read-only
 /// ATTACH must not create the source file as a side effect.
 #[test]
@@ -530,4 +516,50 @@ fn test_burnchain_db_copy_fails_when_source_missing_canonical_hash() {
         result.is_err(),
         "should fail when source is missing a canonical burn hash"
     );
+}
+
+/// A canonical header deleted from the destination must fail validation
+/// (`canonical_complete`).
+#[test]
+fn test_burnchain_db_validate_detects_missing_canonical_hash() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("src.sqlite");
+    let dst_path = dir.path().join("dst.sqlite");
+
+    let h1 = fixture_bhh(1);
+    let sort_path = create_squashed_sortition(dir.path(), &[h1.clone()]);
+
+    let src = create_burnchain_db(&src_path);
+    BurnchainDB::test_insert_block_header_row(&src, 0, &GENESIS_BHH.to_string(), "none").unwrap();
+    BurnchainDB::test_insert_block_header_row(&src, 1, &h1.to_string(), &GENESIS_BHH.to_string())
+        .unwrap();
+    drop(src);
+
+    // Copy normally (source has all canonical hashes).
+    copy_burnchain_db(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        sort_path.to_str().unwrap(),
+        1,
+    )
+    .unwrap();
+
+    // Now delete h1 from the destination to simulate incomplete copy.
+    let dst = Connection::open(&dst_path).unwrap();
+    dst.execute(
+        "DELETE FROM burnchain_db_block_headers WHERE block_hash = ?1",
+        params![h1.to_string()],
+    )
+    .unwrap();
+    drop(dst);
+
+    let v = validate_burnchain_db(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        sort_path.to_str().unwrap(),
+        1,
+    )
+    .unwrap();
+    assert!(!v.is_valid(), "should detect missing canonical hash: {v:?}");
+    assert!(!v.canonical_complete);
 }

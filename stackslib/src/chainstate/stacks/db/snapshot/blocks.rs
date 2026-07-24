@@ -15,14 +15,19 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 
 use super::common::{
     assert_source_schema, clone_schemas_from_source, copied_rows, execute_copy_specs,
-    with_offline_write_session, TableCopySpec,
+    full_row_except_match, spec_result, validate_copy_specs, with_offline_write_session,
+    with_readonly_session, TableCopySpec,
+};
+use crate::chainstate::nakamoto::staging_blocks::{
+    nakamoto_staging_block_metadata_columns, nakamoto_staging_blocks_membership_predicate,
+    nakamoto_staging_blocks_metadata_select, nakamoto_staging_count_blob_mismatches,
 };
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::index::Error;
@@ -51,6 +56,56 @@ pub struct Epoch2BlockFileCopyStats {
 pub struct NakamotoBlockCopyStats {
     pub rows_copied: u64,
     pub total_blob_bytes: u64,
+}
+
+/// Validation result for confirmed microblock streams in the squashed index DB.
+#[derive(Debug, Clone)]
+pub struct MicroblockValidation {
+    pub staging_microblocks_match: bool,
+    pub staging_microblocks_data_match: bool,
+    pub staging_microblocks_no_extra_rows: bool,
+}
+
+impl MicroblockValidation {
+    pub fn is_valid(&self) -> bool {
+        self.staging_microblocks_match
+            && self.staging_microblocks_data_match
+            && self.staging_microblocks_no_extra_rows
+    }
+}
+
+/// Validation result for nakamoto staging blocks.
+#[derive(Debug, Clone)]
+pub struct NakamotoBlockValidation {
+    pub metadata_match: bool,
+    pub no_extra_blocks: bool,
+    pub blob_bytes_match: bool,
+    pub db_version_match: bool,
+    pub schema_match: bool,
+}
+
+impl NakamotoBlockValidation {
+    pub fn is_valid(&self) -> bool {
+        self.metadata_match
+            && self.no_extra_blocks
+            && self.blob_bytes_match
+            && self.db_version_match
+            && self.schema_match
+    }
+}
+
+/// Validation result for epoch 2.x block files.
+#[derive(Debug, Clone)]
+pub struct Epoch2BlockFileValidation {
+    pub all_files_present: bool,
+    pub no_extra_files: bool,
+    pub all_bytes_match: bool,
+}
+
+impl Epoch2BlockFileValidation {
+    pub fn is_valid(&self) -> bool {
+        self.all_files_present && self.no_extra_files && self.all_bytes_match
+    }
 }
 
 /// Tables copied from the source Nakamoto staging-blocks DB. The index-side
@@ -385,4 +440,224 @@ pub fn copy_nakamoto_staging_blocks(
             })
         },
     )
+}
+
+/// Validate confirmed microblock streams.
+pub fn validate_microblock_streams(
+    src_index_path: &str,
+    dst_index_path: &str,
+) -> Result<MicroblockValidation, Error> {
+    with_readonly_session(dst_index_path, &[("src", src_index_path)], |conn| {
+        let (selected_hashes, selected_parents, _stats) = derive_confirmed_microblock_set(conn)?;
+        populate_microblock_temp_tables(conn, &selected_hashes, &selected_parents)?;
+
+        let results = validate_copy_specs(conn, &microblock_copy_specs(), &[])?;
+
+        let staging_microblocks_no_extra_rows = conn
+            .query_row(
+                "SELECT COUNT(*) FROM staging_microblocks \
+                 WHERE microblock_hash NOT IN (SELECT hash FROM temp.selected_microblocks)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(Error::SQLError)?
+            == 0
+            && conn
+                .query_row(
+                    "SELECT COUNT(*) FROM staging_microblocks_data \
+                     WHERE block_hash NOT IN (SELECT hash FROM temp.selected_microblocks)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Error::SQLError)?
+                == 0;
+
+        Ok(MicroblockValidation {
+            staging_microblocks_match: spec_result(&results, "staging_microblocks"),
+            staging_microblocks_data_match: spec_result(&results, "staging_microblocks_data"),
+            staging_microblocks_no_extra_rows,
+        })
+    })
+}
+
+/// Validate nakamoto staging blocks.
+pub fn validate_nakamoto_staging_blocks(
+    src_nakamoto_path: &str,
+    dst_nakamoto_path: &str,
+    squashed_index_path: &str,
+) -> Result<NakamotoBlockValidation, Error> {
+    with_readonly_session(
+        dst_nakamoto_path,
+        &[("src", src_nakamoto_path), ("idx", squashed_index_path)],
+        |conn| {
+            let source_membership = nakamoto_staging_blocks_membership_predicate("s");
+            let dest_membership =
+                nakamoto_staging_blocks_membership_predicate("nakamoto_staging_blocks");
+
+            // The dst must hold exactly the membership the copy produced: the canonical
+            // blocks in the index headers -- no forks or orphans.
+            let metadata_match = full_row_except_match(
+                conn,
+                &format!(
+                    "SELECT {} FROM nakamoto_staging_blocks",
+                    nakamoto_staging_block_metadata_columns()
+                ),
+                &format!(
+                    "{} WHERE {source_membership}",
+                    nakamoto_staging_blocks_metadata_select("s")
+                ),
+            )?;
+
+            let no_extra_blocks = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM nakamoto_staging_blocks \
+                 WHERE NOT ({dest_membership})"
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Error::SQLError)?
+                == 0;
+
+            let blob_bytes_match = nakamoto_staging_count_blob_mismatches(conn).map_err(|e| {
+                Error::CorruptionError(format!("cannot compare staging block blobs: {e}"))
+            })? == 0;
+
+            let db_version_match = full_row_except_match(
+                conn,
+                "SELECT * FROM db_version",
+                "SELECT * FROM src.db_version",
+            )?;
+
+            let schema_match = full_row_except_match(
+                conn,
+                "SELECT type, name, tbl_name, \
+                REPLACE(REPLACE(sql, 'IF NOT EXISTS ', ''), 'IF NOT EXISTS', '') \
+         FROM sqlite_master \
+         WHERE type IN ('table', 'index') AND sql IS NOT NULL",
+                "SELECT type, name, tbl_name, \
+                REPLACE(REPLACE(sql, 'IF NOT EXISTS ', ''), 'IF NOT EXISTS', '') \
+         FROM src.sqlite_master \
+         WHERE type IN ('table', 'index') AND sql IS NOT NULL",
+            )?;
+
+            Ok(NakamotoBlockValidation {
+                metadata_match,
+                no_extra_blocks,
+                blob_bytes_match,
+                db_version_match,
+                schema_match,
+            })
+        },
+    )
+}
+
+/// Validate epoch 2.x block files.
+pub fn validate_epoch2_block_files(
+    squashed_index_path: &str,
+    src_blocks_dir: &str,
+    dst_blocks_dir: &str,
+) -> Result<Epoch2BlockFileValidation, Error> {
+    let conn = sqlite_open(squashed_index_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false)
+        .map_err(Error::SQLError)?;
+
+    let mut stmt = conn
+        .prepare("SELECT index_block_hash, block_height FROM block_headers ORDER BY block_height")
+        .map_err(Error::SQLError)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, StacksBlockId>(0)?, row.get::<_, u64>(1)?))
+        })
+        .map_err(Error::SQLError)?;
+
+    let mut expected_files: HashSet<PathBuf> = HashSet::new();
+    let mut all_files_present = true;
+    let mut all_bytes_match = true;
+
+    for row in rows {
+        let (index_block_hash, block_height) = row.map_err(Error::SQLError)?;
+        if block_height == 0 {
+            continue;
+        }
+
+        let rel_path = StacksChainState::index_block_hash_to_rel_path(&index_block_hash);
+        let src_path = Path::new(src_blocks_dir).join(&rel_path);
+        let dst_path = Path::new(dst_blocks_dir).join(&rel_path);
+
+        if !src_path.exists() {
+            return Err(Error::CorruptionError(format!(
+                "Missing source epoch-2 block file for height {block_height} hash {index_block_hash}: {}. \
+                 Validation requires a complete source archive.",
+                src_path.display()
+            )));
+        }
+
+        expected_files.insert(rel_path);
+
+        if !dst_path.exists() {
+            all_files_present = false;
+            continue;
+        }
+
+        let src_bytes = fs::read(&src_path).map_err(|e| {
+            Error::CorruptionError(format!("Failed to read {}: {e:?}", src_path.display()))
+        })?;
+        let dst_bytes = fs::read(&dst_path).map_err(|e| {
+            Error::CorruptionError(format!("Failed to read {}: {e:?}", dst_path.display()))
+        })?;
+        if src_bytes != dst_bytes {
+            all_bytes_match = false;
+        }
+    }
+
+    // Walk destination directory to find extra files.
+    let mut no_extra_files = true;
+    let dst_root = Path::new(dst_blocks_dir);
+    if dst_root.exists() {
+        let mut dirs_to_visit = vec![dst_root.to_path_buf()];
+        while let Some(dir) = dirs_to_visit.pop() {
+            let entries = fs::read_dir(&dir).map_err(|e| {
+                Error::CorruptionError(format!("Failed to read dir {}: {e:?}", dir.display()))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    Error::CorruptionError(format!("Failed to read dir entry: {e:?}"))
+                })?;
+                let ft = entry.file_type().map_err(|e| {
+                    Error::CorruptionError(format!("Failed to get file type: {e:?}"))
+                })?;
+                if ft.is_dir() {
+                    dirs_to_visit.push(entry.path());
+                } else if ft.is_file() {
+                    let rel = entry
+                        .path()
+                        .strip_prefix(dst_root)
+                        .unwrap_or(&entry.path())
+                        .to_path_buf();
+                    let fname = entry.file_name();
+                    if fname == "nakamoto.sqlite"
+                        || fname == "nakamoto.sqlite-journal"
+                        || fname == "nakamoto.sqlite-wal"
+                        || fname == "nakamoto.sqlite-shm"
+                    {
+                        continue;
+                    }
+                    if !expected_files.contains(&rel) {
+                        no_extra_files = false;
+                        break;
+                    }
+                }
+            }
+            if !no_extra_files {
+                break;
+            }
+        }
+    }
+
+    Ok(Epoch2BlockFileValidation {
+        all_files_present,
+        no_extra_files,
+        all_bytes_match,
+    })
 }

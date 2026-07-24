@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Sortition side-table copy tests.
+//! Sortition side-table copy/validate tests.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -28,8 +28,8 @@ use tempfile::tempdir;
 
 use super::super::sortition::{
     assert_source_tables_classified, copy_sortition_side_tables,
-    copy_sortition_side_tables_with_boundary, sortition_copy_specs, SortitionTipCopyBoundary,
-    REQUIRED_TABLES,
+    copy_sortition_side_tables_with_boundary, sortition_copy_specs, validate_sortition_side_tables,
+    validate_sortition_side_tables_with_boundary, SortitionTipCopyBoundary, REQUIRED_TABLES,
 };
 use super::{hex_id, label_block_id};
 use crate::burnchains::PoxConstants;
@@ -283,6 +283,16 @@ fn test_sortition_copy_excludes_fork_data() {
         )
         .unwrap();
     assert_eq!(fork_rows, 0, "fork rows must be absent by key");
+    drop(dst_conn);
+
+    // Validate passes on the canonical-only copy.
+    let validation =
+        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .unwrap();
+    assert!(
+        validation.is_valid(),
+        "validation should pass: {validation:?}"
+    );
 }
 
 /// burn_header_hash-keyed tables (`stack_stx`, `transfer_stx`, ...) must
@@ -348,6 +358,16 @@ fn test_sortition_burn_header_hash_filtering() {
             .unwrap();
         assert_eq!((canon_rows, fork_rows), (1, 0), "{table}");
     }
+    drop(dst_conn);
+
+    // Validate passes on the canonical-only copy.
+    let validation =
+        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .unwrap();
+    assert!(
+        validation.is_valid(),
+        "validation should pass: {validation:?}"
+    );
 }
 
 /// A destination claiming a canonical sortition_id absent from
@@ -441,6 +461,16 @@ fn test_sortition_stacks_chain_tips_by_burn_view_copied() {
             ("ch_sort_0".into(), "ch_sort_0".into(), "bh_0".into(), 0),
             ("ch_sort_1".into(), "ch_sort_1".into(), "bh_1".into(), 1),
         ]
+    );
+    drop(dst_conn);
+
+    // Validate passes on the canonical-only copy.
+    let validation =
+        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .unwrap();
+    assert!(
+        validation.is_valid(),
+        "validation should pass: {validation:?}"
     );
 }
 
@@ -650,6 +680,16 @@ fn test_sortition_copy_with_production_seeded_source() {
             .unwrap();
         assert_eq!(count, 0, "fork snapshot must not be copied");
     }
+    drop(dst_conn);
+
+    // Validate passes on the canonical-only copy.
+    let validation =
+        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .unwrap();
+    assert!(
+        validation.is_valid(),
+        "validation should pass: {validation:?}"
+    );
 }
 
 /// Drift guard: every table the sortition migrations create must be
@@ -711,4 +751,228 @@ fn test_unclassified_source_table_is_rejected() {
         !dst_path.exists(),
         "no destination should be produced when the source is rejected"
     );
+}
+
+/// A corrupted non-key column in a copied `snapshots` row must fail
+/// validation (full-row compare, not count-only).
+#[test]
+fn test_sortition_validate_detects_payload_corruption() {
+    let dir = tempdir().unwrap();
+    let (conn, src_path) = create_sortition_source_db(dir.path());
+
+    insert_snapshot(&conn, "sort_0", "bhh_0", 0);
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_sort.sqlite");
+    create_sortition_dest_db(&dst_path, &["sort_0"]);
+
+    let _stats =
+        copy_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap()).unwrap();
+
+    // Corrupt a non-key column in the destination snapshots table.
+    {
+        let conn = Connection::open(&dst_path).unwrap();
+        conn.execute(
+            "UPDATE snapshots SET burn_header_timestamp = 9999 WHERE sortition_id = ?1",
+            params![hex_id("sort_0")],
+        )
+        .unwrap();
+    }
+
+    let validation =
+        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .unwrap();
+
+    assert!(
+        !validation.snapshots_match,
+        "payload corruption should be detected"
+    );
+    assert!(!validation.is_valid(), "validation must fail");
+}
+
+/// A `leader_keys` row injected into the destination with no source
+/// counterpart must fail validation.
+#[test]
+fn test_sortition_validate_detects_extra_rows() {
+    let dir = tempdir().unwrap();
+    let (conn, src_path) = create_sortition_source_db(dir.path());
+
+    insert_snapshot(&conn, "sort_0", "bhh_0", 0);
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_sort.sqlite");
+    create_sortition_dest_db(&dst_path, &["sort_0"]);
+
+    let _stats =
+        copy_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap()).unwrap();
+
+    // Inject an extra leader_keys row in destination that doesn't exist in source.
+    {
+        let conn = Connection::open(&dst_path).unwrap();
+        test_insert_leader_key_row(&conn, "extra_tx", &hex_id("sort_0")).unwrap();
+    }
+
+    let validation =
+        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .unwrap();
+
+    assert!(
+        !validation.leader_keys_match,
+        "extra rows should be detected"
+    );
+    assert!(!validation.is_valid(), "validation must fail");
+}
+
+/// The validator applies the same canonical-set guards as the copy: a
+/// destination claiming a sortition_id absent from `src.snapshots` is a
+/// corruption error, not merely a failed check (validation must never be
+/// more lenient than the copy).
+#[test]
+fn test_sortition_validation_rejects_fabricated_canonical_set() {
+    let dir = tempdir().unwrap();
+    let (conn, src_path) = create_sortition_source_db(dir.path());
+
+    insert_snapshot(&conn, "sort_0", "bhh_0", 0);
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_sort.sqlite");
+    create_sortition_dest_db(&dst_path, &["sort_0", "sort_fake"]);
+
+    let err =
+        validate_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap())
+            .expect_err("validation must reject fabricated canonical sortition");
+    match err {
+        Error::CorruptionError(msg) => assert!(
+            msg.contains("canonical sortition") && msg.contains("absent from src.snapshots"),
+            "unexpected corruption message: {msg}"
+        ),
+        other => panic!("expected CorruptionError, got {other:?}"),
+    }
+}
+
+/// Sortition tip memo rows pointing above the Stacks boundary are
+/// rewritten down to the anchor in both memo tables, and boundary
+/// validation accepts the result.
+#[test]
+fn test_sortition_tip_copy_rewrites_rows_above_stacks_boundary() {
+    let dir = tempdir().unwrap();
+    let (conn, src_path) = create_sortition_source_db(dir.path());
+
+    insert_snapshot(&conn, "sort_0", "bhh_0", 0);
+    insert_snapshot(&conn, "sort_1", "bhh_1", 1);
+
+    let boundary = sortition_test_tip_boundary(10);
+    let anchor_ch = boundary.anchor_consensus_hash.to_string();
+    let anchor_burn_view_ch = boundary.anchor_burn_view_consensus_hash.to_string();
+    let anchor_bhh = boundary.anchor_block_hash.to_string();
+    let source_tip_bhh = BlockHeaderHash([0x33; 32]).to_string();
+
+    test_set_snapshot_consensus_hash(&conn, &hex_id("sort_1"), &anchor_burn_view_ch).unwrap();
+    test_insert_stacks_chain_tip_row(&conn, &hex_id("sort_1"), &anchor_ch, &source_tip_bhh, 20)
+        .unwrap();
+    test_insert_stacks_chain_tip_by_burn_view_row(
+        &conn,
+        &hex_id("sort_1"),
+        &anchor_ch,
+        &anchor_burn_view_ch,
+        &source_tip_bhh,
+        20,
+    )
+    .unwrap();
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_sort.sqlite");
+    create_sortition_dest_db(&dst_path, &["sort_0", "sort_1"]);
+
+    copy_sortition_side_tables_with_boundary(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        Some(&boundary),
+    )
+    .unwrap();
+
+    let dst_conn = Connection::open(&dst_path).unwrap();
+    let old_tip: (String, String, i64) = dst_conn
+        .query_row(
+            "SELECT consensus_hash, block_hash, block_height FROM stacks_chain_tips \
+             WHERE sortition_id = ?1",
+            params![hex_id("sort_1")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(old_tip, (anchor_ch.clone(), anchor_bhh.clone(), 10));
+
+    let burn_view_tip: (String, String, String, i64) = dst_conn
+        .query_row(
+            "SELECT consensus_hash, burn_view_consensus_hash, block_hash, block_height \
+             FROM stacks_chain_tips_by_burn_view WHERE sortition_id = ?1",
+            params![hex_id("sort_1")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        burn_view_tip,
+        (anchor_ch, anchor_burn_view_ch, anchor_bhh, 10)
+    );
+    drop(dst_conn);
+
+    let validation = validate_sortition_side_tables_with_boundary(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        Some(&boundary),
+    )
+    .unwrap();
+    assert!(
+        validation.stacks_chain_tips_within_stacks_boundary,
+        "rewritten tips must be within the Stacks boundary"
+    );
+    assert!(
+        validation.is_valid(),
+        "validation should accept rewritten sortition tips: {validation:?}"
+    );
+}
+
+/// A copy without the boundary rewrite leaves tips above the Stacks
+/// boundary; boundary validation must reject them.
+#[test]
+fn test_sortition_validation_rejects_tip_above_stacks_boundary() {
+    let dir = tempdir().unwrap();
+    let (conn, src_path) = create_sortition_source_db(dir.path());
+
+    insert_snapshot(&conn, "sort_0", "bhh_0", 0);
+    insert_snapshot(&conn, "sort_1", "bhh_1", 1);
+
+    let boundary = sortition_test_tip_boundary(10);
+    let anchor_ch = boundary.anchor_consensus_hash.to_string();
+    let anchor_burn_view_ch = boundary.anchor_burn_view_consensus_hash.to_string();
+    let source_tip_bhh = BlockHeaderHash([0x33; 32]).to_string();
+
+    test_set_snapshot_consensus_hash(&conn, &hex_id("sort_1"), &anchor_burn_view_ch).unwrap();
+    test_insert_stacks_chain_tip_by_burn_view_row(
+        &conn,
+        &hex_id("sort_1"),
+        &anchor_ch,
+        &anchor_burn_view_ch,
+        &source_tip_bhh,
+        20,
+    )
+    .unwrap();
+    drop(conn);
+
+    let dst_path = dir.path().join("dst_sort.sqlite");
+    create_sortition_dest_db(&dst_path, &["sort_0", "sort_1"]);
+
+    copy_sortition_side_tables(src_path.to_str().unwrap(), dst_path.to_str().unwrap()).unwrap();
+
+    let validation = validate_sortition_side_tables_with_boundary(
+        src_path.to_str().unwrap(),
+        dst_path.to_str().unwrap(),
+        Some(&boundary),
+    )
+    .unwrap();
+    assert!(
+        !validation.stacks_chain_tips_within_stacks_boundary,
+        "validation must reject copied sortition tips beyond the Stacks boundary"
+    );
+    assert!(!validation.is_valid(), "validation must fail");
 }

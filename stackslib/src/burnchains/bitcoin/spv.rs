@@ -914,6 +914,16 @@ impl SpvClient {
         Ok(())
     }
 
+    /// Count `headers` rows above `burn_height` on `conn`.
+    pub(crate) fn count_headers_above(conn: &DBConn, burn_height: u64) -> Result<u64, btc_error> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM headers WHERE height > ?1",
+            &[&u64_to_sql(burn_height)?],
+            |row| row.get(0),
+        )
+        .map_err(|e| btc_error::from(db_error::SqliteError(e)))
+    }
+
     #[cfg(test)]
     pub fn test_write_block_headers(
         &mut self,

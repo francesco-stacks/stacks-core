@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! SPV headers DB (headers.sqlite) copy tests.
+//! SPV headers DB (headers.sqlite) copy/validate tests.
 
 use std::collections::HashSet;
 
@@ -25,9 +25,10 @@ use stacks_common::deps_common::bitcoin::util::hash::Sha256dHash;
 use tempfile::tempdir;
 
 use super::super::spv::{
-    assert_source_tables_classified, copy_spv_headers, spv_copy_specs, REQUIRED_TABLES,
+    assert_source_tables_classified, copy_spv_headers, spv_copy_specs, validate_spv_headers,
+    REQUIRED_TABLES,
 };
-use crate::burnchains::bitcoin::spv::{SpvClient, BLOCK_DIFFICULTY_CHUNK_SIZE, SPV_DB_VERSION};
+use crate::burnchains::bitcoin::spv::{SpvClient, BLOCK_DIFFICULTY_CHUNK_SIZE};
 use crate::burnchains::bitcoin::BitcoinNetworkType;
 use crate::chainstate::stacks::index::Error;
 
@@ -154,9 +155,9 @@ fn seed_chain_work(src_path: &std::path::Path, intervals: u32) {
 }
 
 /// Headers are copied up to the burn height and `chain_work` only for
-/// complete 2016-block intervals.
+/// complete 2016-block intervals; validation passes.
 #[test]
-fn test_spv_headers_copy() {
+fn test_spv_headers_copy_and_validate() {
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("src_headers.sqlite");
     let dst_path = dir.path().join("dst_headers.sqlite");
@@ -178,38 +179,9 @@ fn test_spv_headers_copy() {
     // Interval 2: (2+1)*2016-1=6047 <= 4500 ✗
     assert_eq!(stats.chain_work_rows, 2);
 
-    // The destination holds exactly the boundary content: the last header is
-    // height 4500 with its source hash, nothing above it, the two complete
-    // chain_work intervals, and the source db_config version.
-    let src = Connection::open(&src_path).unwrap();
-    let src_tip_hash: String = src
-        .query_row("SELECT hash FROM headers WHERE height = 4500", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let dst = Connection::open(&dst_path).unwrap();
-    let (count, max_height, tip_hash): (i64, u32, String) = dst
-        .query_row(
-            "SELECT COUNT(*), MAX(height), \
-                    (SELECT hash FROM headers ORDER BY height DESC LIMIT 1) \
-             FROM headers",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!((count, max_height, tip_hash), (4501, 4500, src_tip_hash));
-    let work: Vec<(u32, String)> = dst
-        .prepare("SELECT interval, work FROM chain_work ORDER BY interval")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(work, vec![(0, "work_0".into()), (1, "work_1".into())]);
-    let version: String = dst
-        .query_row("SELECT version FROM db_config", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, SPV_DB_VERSION);
+    let v =
+        validate_spv_headers(src_path.to_str().unwrap(), dst_path.to_str().unwrap(), 4500).unwrap();
+    assert!(v.is_valid(), "validation failed: {v:?}");
 }
 
 /// End-to-end round trip: a copied headers.sqlite must be consumable through

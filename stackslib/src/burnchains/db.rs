@@ -262,7 +262,7 @@ CREATE TABLE IF NOT EXISTS block_commit_metadata (
     block_height INTEGER NOT NULL,
     -- index into the list of transactions in this block at which this block-commit can be found
     vtxindex INTEGER NOT NULL,
-    
+
     -- ID of this block-commit's affirmation map
     affirmation_id INTEGER NOT NULL,
     -- if not NULL, this block-commit is an anchor block, and this value is the reward cycle for which it is an anchor block
@@ -958,6 +958,25 @@ impl BurnchainDB {
                 "SELECT COUNT(*) FROM ({canonical_sql}) \
                  WHERE burn_header_hash NOT IN \
                      (SELECT block_hash FROM {headers_schema}.burnchain_db_block_headers)"
+            ),
+            NO_PARAMS,
+            |row| row.get(0),
+        )
+        .map_err(DBError::from)
+    }
+
+    /// Count `burnchain_db_block_headers` rows (main schema) whose hash is
+    /// not in `canonical_sql`: non-canonical leakage in a squashed copy.
+    /// `canonical_sql` is interpolated into SQL; pass only trusted fixed
+    /// fragments.
+    pub(crate) fn count_non_canonical_headers(
+        conn: &Connection,
+        canonical_sql: &str,
+    ) -> Result<u64, DBError> {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM burnchain_db_block_headers \
+                 WHERE block_hash NOT IN ({canonical_sql})"
             ),
             NO_PARAMS,
             |row| row.get(0),

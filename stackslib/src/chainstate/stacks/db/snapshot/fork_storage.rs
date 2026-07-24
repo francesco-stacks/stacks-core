@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use rusqlite::{params, Connection};
 
-use super::common::clone_schemas_from_source;
+use super::common::{clone_schemas_from_source, full_row_except_match};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
 use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
 use crate::chainstate::stacks::index::{trie_sql, Error, MARFValue, MarfTrieId};
@@ -99,6 +99,35 @@ pub fn copy_canonical_fork_storage(
 
     clone_schemas_from_source(conn, &["__fork_storage"])?;
     copy_leaf_referenced_rows(conn, "__fork_storage", "value_hash", leaf_hashes)
+}
+
+/// Validate that `main.__fork_storage` holds exactly the rows of the
+/// ATTACHed `src.__fork_storage` whose `value_hash` is referenced by a
+/// leaf of the squashed MARF at `dst_path`.
+pub fn validate_canonical_fork_storage<T: MarfTrieId>(
+    conn: &Connection,
+    dst_path: &str,
+) -> Result<bool, Error> {
+    let leaf_hashes = collect_canonical_leaf_hashes::<T>(dst_path)?;
+    conn.execute_batch("CREATE TEMP TABLE val_fork_leaf_values (value_hash TEXT PRIMARY KEY)")
+        .map_err(Error::SQLError)?;
+    {
+        let mut stmt = conn
+            .prepare("INSERT INTO val_fork_leaf_values (value_hash) VALUES (?1)")
+            .map_err(Error::SQLError)?;
+        for hash in &leaf_hashes {
+            stmt.execute([hash.to_hex()]).map_err(Error::SQLError)?;
+        }
+    }
+    let ok = full_row_except_match(
+        conn,
+        "SELECT * FROM __fork_storage",
+        "SELECT f.* FROM src.__fork_storage f \
+         INNER JOIN val_fork_leaf_values lv ON f.value_hash = lv.value_hash",
+    )?;
+    conn.execute_batch("DROP TABLE val_fork_leaf_values")
+        .map_err(Error::SQLError)?;
+    Ok(ok)
 }
 
 /// Stream-copy a content-addressed `(key_col, value)` table from the ATTACHed

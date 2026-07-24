@@ -423,6 +423,32 @@ pub fn bulk_read_block_entries<T: MarfTrieId>(
     Ok(result)
 }
 
+/// Count how many `marf_data` rows have a blob offset/length that differs
+/// from the expected values.  Used by validation to check that all
+/// historical entries share the same shared squash trie storage.
+///
+/// Returns the number of mismatched rows (should be 0 for a correct squash).
+pub fn count_blob_offset_mismatches<T: MarfTrieId>(
+    conn: &Connection,
+    expected_offset: u64,
+    expected_length: u64,
+    tip_block_hash: &T,
+) -> Result<u64, Error> {
+    let count: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM marf_data \
+         WHERE (external_offset != ?1 OR external_length != ?2) \
+         AND block_hash != ?3 \
+         AND unconfirmed = 0",
+        params![
+            u64_to_sql(expected_offset)?,
+            u64_to_sql(expected_length)?,
+            tip_block_hash
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 /// Bulk-update all confirmed `marf_data` entries to share the same blob
 /// offset and length. Called during squash finalization.
 pub fn bulk_update_blob_offsets(

@@ -30,8 +30,12 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Create squashed MARFs from a source chainstate.
+    /// Create squashed MARFs from a source chainstate and validate them against it.
     Squash(SquashArgs),
+    /// Validate squashed MARFs against a source chainstate.
+    Validate(ValidateArgs),
+    /// Verify a standalone PCS directory's integrity and optionally check a WSCP checkpoint.
+    Verify(VerifyArgs),
 }
 
 /// Arguments for generating squashed MARFs.
@@ -71,8 +75,66 @@ pub struct SquashArgs {
     /// Requires --sortition (is implied by --all).
     #[arg(long)]
     pub bitcoin: bool,
+    /// Skip validation to speed up size measurements.
+    #[arg(long = "skip-validate")]
+    pub skip_validate: bool,
     /// Path to the node config TOML file. Used to extract PoX constants
     /// Required for testnet.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
+    /// Run full leaf-by-leaf comparison (slow, O(leaf_count)).
+    /// By default, validation uses the fast hash-based check.
+    #[arg(long)]
+    pub full: bool,
+}
+
+/// Arguments for validating squashed MARFs against a source.
+#[derive(Parser, Debug)]
+pub struct ValidateArgs {
+    /// Path to the source chainstate folder.
+    #[arg(long = "source-chainstate", value_name = "DIR")]
+    pub source_chainstate: PathBuf,
+    /// Path to the squashed chainstate folder.
+    #[arg(long = "squashed-chainstate", value_name = "DIR")]
+    pub squashed_chainstate: PathBuf,
+    /// Bitcoin block height where the Nakamoto tenure started.
+    #[arg(long, value_name = "HEIGHT")]
+    pub tenure_start_bitcoin_height: u32,
+    /// Validate the Clarity MARF.
+    #[arg(long)]
+    pub clarity: bool,
+    /// Validate the Index MARF.
+    #[arg(long)]
+    pub index: bool,
+    /// Validate the Sortition MARF.
+    #[arg(long)]
+    pub sortition: bool,
+    /// Validate all three MARFs and auxiliary data (blocks + bitcoin).
+    #[arg(long)]
+    pub all: bool,
+    /// Validate block data (epoch 2.x files, confirmed microblocks, nakamoto.sqlite).
+    #[arg(long)]
+    pub blocks: bool,
+    /// Validate Bitcoin auxiliary files (burnchain.sqlite + headers.sqlite).
+    #[arg(long)]
+    pub bitcoin: bool,
+    /// Path to the node config TOML file. Used to extract PoX constants
+    /// Required for testnet.
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
+    /// Run full leaf-by-leaf comparison (slow, O(leaf_count)).
+    /// By default, validation uses the fast hash-based check.
+    #[arg(long)]
+    pub full: bool,
+}
+
+/// Arguments for standalone PCS verification.
+#[derive(Parser, Debug)]
+pub struct VerifyArgs {
+    /// Path to a PCS directory (must contain PCS_manifest.toml).
+    #[arg(long, value_name = "DIR")]
+    pub pcs_dir: PathBuf,
+    /// Path to a TOML file with trusted WSCP checkpoint hashes.
+    #[arg(long, value_name = "FILE")]
+    pub checkpoint_file: Option<PathBuf>,
 }

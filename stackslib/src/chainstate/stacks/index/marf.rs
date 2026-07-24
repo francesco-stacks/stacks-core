@@ -24,7 +24,7 @@ use rusqlite::{Connection, Transaction};
 use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
-pub use super::squash::SquashStats;
+pub use super::squash::{SquashStats, SquashValidationStats};
 use super::storage::ReopenedTrieStorageConnection;
 use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
 use crate::chainstate::stacks::index::node::{
@@ -211,10 +211,6 @@ pub trait MarfConnection<T: MarfTrieId> {
         key: &str,
     ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
         self.with_conn(|conn| {
-            // Squash-aware proofs are not currently supported.
-            if conn.is_squashed() {
-                return Err(Error::UnsupportedOnSquashedMarf("get_with_proof"));
-            }
             let marf_value = match MARF::get_by_key(conn, block_hash, key)? {
                 None => return Ok(None),
                 Some(x) => x,
@@ -230,10 +226,6 @@ pub trait MarfConnection<T: MarfTrieId> {
         hash: &TrieHash,
     ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
         self.with_conn(|conn| {
-            // Squash-aware proofs are not currently supported.
-            if conn.is_squashed() {
-                return Err(Error::UnsupportedOnSquashedMarf("get_with_proof_from_hash"));
-            }
             let marf_value = match MARF::get_by_path(conn, block_hash, hash)? {
                 None => return Ok(None),
                 Some(x) => x,
@@ -1545,10 +1537,6 @@ impl<T: MarfTrieId> MARF<T> {
         key: &str,
     ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
         let mut conn = self.storage.connection();
-        // Squash-aware proofs are not currently supported.
-        if conn.is_squashed() {
-            return Err(Error::UnsupportedOnSquashedMarf("get_with_proof"));
-        }
         let marf_value = match MARF::get_by_key(&mut conn, block_hash, key)? {
             None => return Ok(None),
             Some(x) => x,
@@ -1563,10 +1551,6 @@ impl<T: MarfTrieId> MARF<T> {
         path: &TrieHash,
     ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
         let mut conn = self.storage.connection();
-        // Squash-aware proofs are not currently supported.
-        if conn.is_squashed() {
-            return Err(Error::UnsupportedOnSquashedMarf("get_with_proof_from_hash"));
-        }
         let marf_value = match MARF::get_by_path(&mut conn, block_hash, path)? {
             None => return Ok(None),
             Some(x) => x,
@@ -1742,6 +1726,21 @@ impl<T: MarfTrieId> MARF<T> {
     /// Get open chain tip block height
     pub fn get_open_chain_tip_height(&self) -> Option<u32> {
         self.open_chain_tip.as_ref().map(|x| x.height)
+    }
+
+    /// Build the set of trusted squash trie root-node hashes from this
+    /// MARF's squash metadata.  Returns an empty set for archival
+    /// (non-squashed) MARFs.
+    #[cfg(test)]
+    pub fn trusted_squash_node_hashes(&self) -> std::collections::HashSet<TrieHash> {
+        let mut set = std::collections::HashSet::new();
+        if let Some(info) = self.storage.squash_info() {
+            let h = info.squash_root_node_hash;
+            if h != TrieHash::from_data(&[]) {
+                set.insert(h);
+            }
+        }
+        set
     }
 
     /// Access internal storage

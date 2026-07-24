@@ -20,8 +20,8 @@ use rusqlite::{Connection, OpenFlags};
 use stacks_common::types::chainstate::BurnchainHeaderHash;
 
 use super::common::{
-    assert_source_schema, clone_schemas_from_source, copied_rows, execute_copy_specs,
-    with_offline_write_session, TableCopySpec,
+    assert_source_schema, clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result,
+    validate_copy_specs, with_offline_write_session, with_readonly_session, TableCopySpec,
 };
 use crate::burnchains::db::BurnchainDB;
 use crate::chainstate::burn::db::sortdb::SortitionDB;
@@ -76,6 +76,32 @@ pub struct BurnchainDbCopyStats {
     pub anchor_blocks_rows: u64,
 }
 
+/// Validation result for a copied burnchain.sqlite.
+#[derive(Debug, Clone)]
+pub struct BurnchainDbValidation {
+    pub block_headers_match: bool,
+    pub block_ops_match: bool,
+    pub block_commit_metadata_match: bool,
+    pub anchor_blocks_match: bool,
+    pub overrides_match: bool,
+    pub db_config_match: bool,
+    pub no_extra_headers: bool,
+    pub canonical_complete: bool,
+}
+
+impl BurnchainDbValidation {
+    pub fn is_valid(&self) -> bool {
+        self.block_headers_match
+            && self.block_ops_match
+            && self.block_commit_metadata_match
+            && self.anchor_blocks_match
+            && self.overrides_match
+            && self.db_config_match
+            && self.no_extra_headers
+            && self.canonical_complete
+    }
+}
+
 /// Open a read-only connection to the squashed sortition DB.
 fn open_squashed_sortition_db(squashed_sortition_path: &str) -> Result<Connection, Error> {
     sqlite_open(
@@ -91,8 +117,7 @@ fn open_squashed_sortition_db(squashed_sortition_path: &str) -> Result<Connectio
 }
 
 /// Read the canonical burn set (tip height plus all burn header hashes)
-/// from a squashed sortition DB connection via [`SortitionDB`] readers, so
-/// this module never queries sortition-owned tables directly.
+/// from a squashed sortition DB connection via [`SortitionDB`] readers.
 fn read_squashed_sortition_canonical_set(
     conn: &Connection,
 ) -> Result<(u64, Vec<BurnchainHeaderHash>), Error> {
@@ -269,4 +294,62 @@ fn copy_burnchain_db_inner(
         "anchor_blocks_rows" => stats.anchor_blocks_rows
     );
     Ok(stats)
+}
+
+/// Validate a copied burnchain.sqlite against its source.
+pub fn validate_burnchain_db(
+    src_burnchain_db_path: &str,
+    dst_burnchain_db_path: &str,
+    squashed_sortition_path: &str,
+    expected_burn_height: u64,
+) -> Result<BurnchainDbValidation, Error> {
+    let sort_conn = open_squashed_sortition_db(squashed_sortition_path)?;
+    let (sortition_tip_height, canonical_hashes) =
+        read_squashed_sortition_canonical_set(&sort_conn)?;
+    drop(sort_conn);
+    assert_sortition_tip_height(sortition_tip_height, expected_burn_height)?;
+
+    with_readonly_session(
+        dst_burnchain_db_path,
+        &[("src", src_burnchain_db_path)],
+        |conn| {
+            populate_canonical_burn_hashes(conn, &canonical_hashes)?;
+
+            // Completeness: every canonical burn hash must be present in
+            // the destination.
+            let missing_in_dst = BurnchainDB::count_canonical_burn_hashes_missing_from(
+                conn,
+                "main",
+                CANONICAL_BURN_HASHES_SQL,
+            )
+            .map_err(|e| {
+                Error::CorruptionError(format!("cannot check canonical burn hashes: {e}"))
+            })?;
+            let canonical_complete = missing_in_dst == 0;
+
+            let results = validate_copy_specs(conn, &burnchain_copy_specs(), &[])?;
+
+            // No non-canonical burn hashes in destination.
+            let extra_non_canonical =
+                BurnchainDB::count_non_canonical_headers(conn, CANONICAL_BURN_HASHES_SQL).map_err(
+                    |e| Error::CorruptionError(format!("cannot check non-canonical headers: {e}")),
+                )?;
+            let no_extra_headers = extra_non_canonical == 0;
+
+            Ok(BurnchainDbValidation {
+                block_headers_match: spec_result(&results, "burnchain_db_block_headers"),
+                block_ops_match: spec_result(&results, "burnchain_db_block_ops"),
+                block_commit_metadata_match: spec_result(&results, "block_commit_metadata"),
+                anchor_blocks_match: spec_result(&results, "anchor_blocks"),
+                // `overrides` is schema-only (cloned, never row-copied), so the
+                // squashed dst must hold zero rows rather than matching a copy spec.
+                overrides_match: conn.query_row("SELECT COUNT(*) FROM overrides", [], |row| {
+                    row.get::<_, i64>(0)
+                })? == 0,
+                db_config_match: spec_result(&results, "db_config"),
+                no_extra_headers,
+                canonical_complete,
+            })
+        },
+    )
 }

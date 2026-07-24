@@ -14,7 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Clarity MARF squash + side-table (`data_table`, `metadata_table`)
-//! copy tests.
+//! copy/validate tests.
 
 use std::path::PathBuf;
 
@@ -25,7 +25,7 @@ use stacks_common::util::hash::Sha512Trunc256Sum;
 use tempfile::tempdir;
 
 use super::super::clarity::assert_source_tables_classified;
-use super::super::copy_clarity_side_tables;
+use super::super::{copy_clarity_side_tables, validate_clarity_side_tables};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId as _, Error, MARFValue};
@@ -143,21 +143,44 @@ fn squash_clarity_marf(
         copy_clarity_side_tables(src_db.to_str().unwrap(), dst_db.to_str().unwrap()).unwrap();
     assert!(stats.data_table_rows > 0, "Expected data_table rows > 0");
 
-    // The destination holds exactly the copied row counts.
-    let dst_conn = rusqlite::Connection::open(&dst_db).unwrap();
-    let (data_rows, meta_rows): (u64, u64) = dst_conn
-        .query_row(
-            "SELECT (SELECT COUNT(*) FROM data_table), (SELECT COUNT(*) FROM metadata_table)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        (data_rows, meta_rows),
-        (stats.data_table_rows, stats.metadata_table_rows)
+    dst_db
+}
+
+/// End-to-end squash + side-table copy of a Clarity MARF: every
+/// trie-referenced data key and required metadata row is present in the
+/// destination.
+#[test]
+fn test_copy_clarity_side_tables_round_trip() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
+
+    let squashed_db = squash_clarity_marf(
+        &src_dir,
+        &dir.path().join("squashed"),
+        blocks.last().unwrap(),
+        3,
     );
 
-    dst_db
+    // Validate side tables.
+    let validation = validate_clarity_side_tables(
+        clarity_marf_db_path(&src_dir).to_str().unwrap(),
+        squashed_db.to_str().unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        validation.required_data_keys_present,
+        "missing required data_table keys"
+    );
+    assert!(
+        validation.required_metadata_present,
+        "missing required metadata rows"
+    );
+    assert_eq!(validation.sample_contracts_missing_in_trie, 0);
+    assert_eq!(validation.sample_contracts_missing_in_data_table, 0);
+    assert_eq!(validation.missing_required_data_table_keys, 0);
+    assert_eq!(validation.missing_required_metadata_rows, 0);
 }
 
 /// `SqliteConnection::check_schema` accepts the squashed Clarity DB
@@ -456,6 +479,47 @@ fn test_mismatched_clarity_db_causes_data_read_failure() {
     );
 }
 
+/// Validation against the true source detects side tables copied from a
+/// different MARF.
+#[test]
+fn test_validate_clarity_side_tables_detects_mismatch() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    let other_dir = dir.path().join("other");
+
+    let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
+    let _other_blocks = build_clarity_marf(&other_dir, 4, "other-contract", "_other");
+
+    // Squash source, but copy side tables from other.
+    let squashed_dir = dir.path().join("squashed");
+    std::fs::create_dir_all(&squashed_dir).unwrap();
+    let src_db = clarity_marf_db_path(&src_dir);
+    let dst_db = squashed_dir.join("marf.sqlite");
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    MARF::<StacksBlockId>::squash_to_path(
+        src_db.to_str().unwrap(),
+        dst_db.to_str().unwrap(),
+        open_opts,
+        blocks.last().unwrap(),
+        3,
+        "test",
+    )
+    .unwrap();
+
+    let other_db = clarity_marf_db_path(&other_dir);
+    copy_clarity_side_tables(other_db.to_str().unwrap(), dst_db.to_str().unwrap()).unwrap();
+
+    let validation =
+        validate_clarity_side_tables(src_db.to_str().unwrap(), dst_db.to_str().unwrap()).unwrap();
+
+    assert!(
+        validation.missing_required_data_table_keys > 0
+            || validation.missing_required_metadata_rows > 0,
+        "expected validation to detect mismatch between trie and data_table"
+    );
+}
+
 /// Metadata keys containing `::` split on the first separator only: the
 /// copy keeps them, and they remain readable after the squash.
 #[test]
@@ -467,14 +531,35 @@ fn test_copy_clarity_side_tables_with_double_colon_metadata_keys() {
     let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
     assert!(!blocks.is_empty());
 
-    squash_clarity_marf(
+    let squashed_db = squash_clarity_marf(
         &src_dir,
         &dir.path().join("squashed"),
         blocks.last().unwrap(),
         3,
     );
 
-    // Verify the metadata with "::" keys is readable.
+    // Validate side tables - this would previously fail with a
+    // CorruptionError("Failed to parse contract identifier ...").
+    let validation = validate_clarity_side_tables(
+        clarity_marf_db_path(&src_dir).to_str().unwrap(),
+        squashed_db.to_str().unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        validation.required_data_keys_present,
+        "missing required data_table keys"
+    );
+    assert!(
+        validation.required_metadata_present,
+        "missing required metadata rows"
+    );
+    assert_eq!(validation.sample_contracts_missing_in_trie, 0);
+    assert_eq!(validation.sample_contracts_missing_in_data_table, 0);
+    assert_eq!(validation.missing_required_data_table_keys, 0);
+    assert_eq!(validation.missing_required_metadata_rows, 0);
+
+    // Also verify the metadata with "::" keys is readable.
     let squashed_dir = dir.path().join("squashed");
     let mut kv = MarfedKV::open(squashed_dir.to_str().unwrap(), Some(&blocks[3]), None).unwrap();
     {

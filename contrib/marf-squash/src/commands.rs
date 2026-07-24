@@ -15,13 +15,14 @@
 
 use std::path::{Path, PathBuf};
 
+use stackslib::burnchains::PoxConstants;
 use stackslib::chainstate::stacks::db::snapshot::{
     Epoch2BlockFileCopyStats, Epoch2MicroblockCopyStats, NakamotoBlockCopyStats,
     SortitionTipCopyBoundary, copy_confirmed_epoch2_microblocks, copy_epoch2_block_files,
     copy_nakamoto_staging_blocks,
 };
 
-use crate::cli::SquashArgs;
+use crate::cli::{SquashArgs, ValidateArgs, VerifyArgs};
 use crate::config::{build_pox_constants, enforce_minimum_tenure_height};
 use crate::db::{DbConfig, read_db_config, read_marf_open_opts};
 use crate::layout::{
@@ -34,11 +35,14 @@ use crate::ops::{
     BitcoinAuxFiles, SideTableMode, SquashJob, copy_bitcoin_aux_files, squash_and_copy_one,
 };
 use crate::targets::{CanonicalSquashTargets, SquashTargetQuery, resolve_canonical_squash_targets};
+use crate::validate::{ValidateJob, validate_bitcoin_aux_files, validate_block_data, validate_one};
+use crate::verify::verify_pcs;
 
-/// The resolved set of squash targets for one `squash` invocation. `--all`
-/// selects all five; `from_args` validates that at least one target is selected
-/// and that the `blocks ⇒ index` and `bitcoin ⇒ sortition` dependencies hold, so
-/// an invalid flag combo is rejected before any output is created.
+/// The resolved set of targets for one `squash` or `validate` invocation.
+/// `--all` selects all five; the constructors validate that at least one target
+/// is selected and that the `blocks ⇒ index` and `bitcoin ⇒ sortition`
+/// dependencies hold, so an invalid flag combo is rejected before any output is
+/// created.
 pub struct SquashPlan {
     pub clarity: bool,
     pub index: bool,
@@ -48,15 +52,22 @@ pub struct SquashPlan {
 }
 
 impl SquashPlan {
-    /// Resolve the selected targets from the CLI flags, applying `--all` and
-    /// validating the selection. Exits on an empty or invalid flag combo.
-    pub fn from_args(args: &SquashArgs) -> Self {
+    /// Resolve the selected targets from the raw target flags, applying `all`
+    /// and validating the selection. Exits on an empty or invalid flag combo.
+    fn from_flags(
+        clarity: bool,
+        index: bool,
+        sortition: bool,
+        blocks: bool,
+        bitcoin: bool,
+        all: bool,
+    ) -> Self {
         let plan = SquashPlan {
-            clarity: args.clarity || args.all,
-            index: args.index || args.all,
-            sortition: args.sortition || args.all,
-            blocks: args.blocks || args.all,
-            bitcoin: args.bitcoin || args.all,
+            clarity: clarity || all,
+            index: index || all,
+            sortition: sortition || all,
+            blocks: blocks || all,
+            bitcoin: bitcoin || all,
         };
         if !plan.has_any_target() {
             eprintln!(
@@ -69,6 +80,30 @@ impl SquashPlan {
         ensure_flag_requires("blocks", plan.blocks, "index", plan.index);
         ensure_flag_requires("bitcoin", plan.bitcoin, "sortition", plan.sortition);
         plan
+    }
+
+    /// Resolve the selected targets from the `squash` CLI flags.
+    pub fn from_args(args: &SquashArgs) -> Self {
+        Self::from_flags(
+            args.clarity,
+            args.index,
+            args.sortition,
+            args.blocks,
+            args.bitcoin,
+            args.all,
+        )
+    }
+
+    /// Resolve the selected targets from the `validate` CLI flags.
+    pub fn from_validate_args(args: &ValidateArgs) -> Self {
+        Self::from_flags(
+            args.clarity,
+            args.index,
+            args.sortition,
+            args.blocks,
+            args.bitcoin,
+            args.all,
+        )
     }
 
     /// Whether at least one target is selected.
@@ -196,7 +231,7 @@ fn squash_marfs(
     paths: &ChainstatePaths,
     out_root: &Path,
     targets: &CanonicalSquashTargets,
-    pox: &stackslib::burnchains::PoxConstants,
+    pox: &PoxConstants,
 ) -> SquashOutputs {
     let stacks_tip = &targets.stacks_tip;
     let stacks_height = targets.stacks_height;
@@ -403,13 +438,120 @@ fn copy_bitcoin_aux(args: &SquashArgs, out_root: &Path, squash_bitcoin_height: u
     });
 }
 
+/// Validate the squashed tree at `squashed_root` against the source chainstate
+/// at `source_root`: each selected MARF (trie + side tables), the block data,
+/// and the Bitcoin auxiliary files. Exits if any selected target is invalid.
+/// Used both post-squash and by the standalone `validate` subcommand.
+fn validate_all(
+    plan: &SquashPlan,
+    source_root: &Path,
+    squashed_root: &Path,
+    targets: &CanonicalSquashTargets,
+    pox: &PoxConstants,
+    full: bool,
+) {
+    let source = chainstate_paths(source_root);
+    let squashed = chainstate_paths(squashed_root);
+    let mut all_valid = true;
+
+    if plan.clarity
+        && !validate_one(ValidateJob {
+            label: "clarity",
+            source: &source.clarity,
+            squashed: &squashed.clarity,
+            tip: &targets.stacks_tip,
+            squash_height: targets.stacks_height,
+            full,
+            side_table_mode: SideTableMode::Clarity,
+            open_opts: read_marf_open_opts(&source.clarity.db),
+        })
+    {
+        all_valid = false;
+    }
+
+    if plan.index
+        && !validate_one(ValidateJob {
+            label: "index",
+            source: &source.index,
+            squashed: &squashed.index,
+            tip: &targets.stacks_tip,
+            squash_height: targets.stacks_height,
+            full,
+            side_table_mode: SideTableMode::Index {
+                first_bitcoin_height: targets.first_bitcoin_height,
+                reward_cycle_len: pox.reward_cycle_length,
+            },
+            open_opts: read_marf_open_opts(&source.index.db),
+        })
+    {
+        all_valid = false;
+    }
+
+    if plan.sortition
+        && !validate_one(ValidateJob {
+            label: "sortition",
+            source: &source.sortition,
+            squashed: &squashed.sortition,
+            tip: &targets.sortition_canonical_tip,
+            squash_height: targets.sortition_marf_height,
+            full,
+            side_table_mode: SideTableMode::Sortition {
+                stacks_tip_boundary: sortition_tip_copy_boundary(targets),
+            },
+            open_opts: read_marf_open_opts(&source.sortition.db),
+        })
+    {
+        all_valid = false;
+    }
+
+    if plan.blocks {
+        let src_blocks_dir = source_root.join(BLOCKS_DIR_REL);
+        let dst_blocks_dir = squashed_root.join(BLOCKS_DIR_REL);
+        let src_nakamoto = source_root.join(NAKAMOTO_DB_REL);
+        let dst_nakamoto = squashed_root.join(NAKAMOTO_DB_REL);
+        if !validate_block_data(
+            source.index.db.to_str().unwrap(),
+            squashed.index.db.to_str().unwrap(),
+            &src_blocks_dir,
+            &dst_blocks_dir,
+            &src_nakamoto,
+            &dst_nakamoto,
+        ) {
+            all_valid = false;
+        }
+    }
+
+    if plan.bitcoin {
+        let src_bc_db = source_root.join(BURNCHAIN_DB_REL);
+        let dst_bc_db = squashed_root.join(BURNCHAIN_DB_REL);
+        let squashed_sort = squashed_root.join(SORTITION_MARF_REL);
+        let src_hdr = source_root.join(HEADERS_DB_REL);
+        let dst_hdr = squashed_root.join(HEADERS_DB_REL);
+        if !validate_bitcoin_aux_files(BitcoinAuxFiles {
+            src_bc_db: &src_bc_db,
+            dst_bc_db: &dst_bc_db,
+            squashed_sort: &squashed_sort,
+            src_hdr: &src_hdr,
+            dst_hdr: &dst_hdr,
+            bitcoin_height: u64::from(targets.squash_bitcoin_height),
+        }) {
+            all_valid = false;
+        }
+    }
+
+    if !all_valid {
+        eprintln!("Validation failed for one or more targets");
+        std::process::exit(1);
+    }
+}
+
 /// Resolve the canonical squash targets from the source chainstate/sortition
 /// DBs and log the resolved boundary. Exits on resolution failure.
 fn resolve_targets(
     paths: &ChainstatePaths,
     tenure_start_bitcoin_height: u32,
     db_config: &DbConfig,
-    pox: &stackslib::burnchains::PoxConstants,
+    pox: &PoxConstants,
 ) -> CanonicalSquashTargets {
     // Derive chainstate root: paths.index.db = ".../chainstate/vm/index.sqlite"
     let chainstate_root = paths
@@ -453,7 +595,8 @@ fn resolve_targets(
 }
 
 /// Run the `squash` subcommand: resolve the boundary, squash the selected MARFs,
-/// copy block/Bitcoin data, and write the manifest for a full PCS. Exits on error.
+/// copy block/Bitcoin data, validate the output against the source (unless
+/// `--skip-validate`), and write the manifest for a full PCS. Exits on error.
 pub fn run_squash(args: SquashArgs) {
     let plan = SquashPlan::from_args(&args);
 
@@ -496,6 +639,20 @@ pub fn run_squash(args: SquashArgs) {
         copy_bitcoin_aux(&args, &out_root, squash_bitcoin_height);
     }
 
+    // Phase 4: validate the squashed output against the source. Runs before the
+    // manifest so an invalid output is never blessed with one.
+    if !args.skip_validate {
+        println!("--- Validation phase ---");
+        validate_all(
+            &plan,
+            &args.chainstate,
+            &out_root,
+            &targets,
+            &pox,
+            args.full,
+        );
+    }
+
     // Generate manifest only for a complete PCS (all MARFs + blocks + bitcoin aux).
     if plan.is_full_pcs() {
         let sort_paths = outputs.sortition.unwrap();
@@ -515,10 +672,59 @@ pub fn run_squash(args: SquashArgs) {
 
     eprintln!(
         "Squash complete. Output: {}\n  \
-         - Boot: set the node's working_dir = \"{}\"",
+         - Boot: set the node's working_dir = \"{}\"\n  \
+         - Re-validate/verify: pass this output path as --squashed-chainstate / --pcs-dir",
         out_root.display(),
         args.out_dir.display()
     );
+}
+
+/// Run the `validate` subcommand: resolve the boundary from the source
+/// chainstate, then validate the squashed tree against it. Exits on error or
+/// any failed check.
+pub fn run_validate(args: ValidateArgs) {
+    let plan = SquashPlan::from_validate_args(&args);
+
+    let source_paths = chainstate_paths(&args.source_chainstate);
+    let tenure_start_bitcoin_height = args.tenure_start_bitcoin_height;
+    let db_config = read_db_config(&source_paths.index.db);
+
+    let pox = build_pox_constants(db_config.mainnet, args.config.as_deref());
+
+    // A squashed snapshot is only usable from epoch 3.4 onwards.
+    enforce_minimum_tenure_height(
+        tenure_start_bitcoin_height,
+        db_config.mainnet,
+        args.config.as_deref(),
+    );
+
+    let targets = resolve_targets(&source_paths, tenure_start_bitcoin_height, &db_config, &pox);
+
+    validate_all(
+        &plan,
+        &args.source_chainstate,
+        &args.squashed_chainstate,
+        &targets,
+        &pox,
+        args.full,
+    );
+}
+
+/// Run the `verify` subcommand: consumer-side offline verification of a
+/// standalone PCS directory. Exits with failure if any level fails.
+pub fn run_verify(args: VerifyArgs) {
+    match verify_pcs(&args.pcs_dir, args.checkpoint_file.as_deref()) {
+        Ok(()) => {
+            println!("Verification passed.");
+        }
+        Err(errors) => {
+            for e in &errors {
+                eprintln!("  {e}");
+            }
+            eprintln!("Verification FAILED.");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -545,7 +751,9 @@ mod tests {
             all,
             blocks,
             bitcoin,
+            skip_validate: false,
             config: None,
+            full: false,
         }
     }
 

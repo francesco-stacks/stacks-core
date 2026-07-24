@@ -16,7 +16,7 @@
 use std::time::Instant;
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::chainstate::stacks::index::Error;
 
@@ -82,6 +82,31 @@ pub fn clone_schemas_from_source(conn: &Connection, tables: &[&str]) -> Result<(
     Ok(())
 }
 
+/// Check bidirectional full-row EXCEPT equality: each result set must be a
+/// subset of the other. Returns true if the two result sets are identical.
+pub fn full_row_except_match(
+    conn: &Connection,
+    dst_sql: &str,
+    src_sql: &str,
+) -> Result<bool, Error> {
+    Ok(dst_subset_of_src(conn, dst_sql, src_sql)? && dst_subset_of_src(conn, src_sql, dst_sql)?)
+}
+
+/// One-directional subset check: every row in `dst_sql` must exist in
+/// `src_sql`, but `src_sql` may contain additional rows. Use this for
+/// non-consensus tables that grow after the snapshot (e.g. signer_stats,
+/// matured_rewards).
+pub fn dst_subset_of_src(conn: &Connection, dst_sql: &str, src_sql: &str) -> Result<bool, Error> {
+    let extra_in_dst: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM ({dst_sql} EXCEPT {src_sql})"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::SQLError)?;
+    Ok(extra_in_dst == 0)
+}
+
 /// Execute copy specs inside the current transaction, dropping each
 /// table's secondary indexes around the bulk INSERT and rebuilding
 /// them once at the end (one rebuild vs N per-row B-tree updates).
@@ -110,6 +135,30 @@ pub fn execute_copy_specs(
     Ok(results)
 }
 
+/// Validate executed copy specs: for each spec, the destination table must
+/// hold exactly the spec's filtered source rows. Specs in `skip` are left to
+/// the caller (tables whose source legitimately drifts after the snapshot
+/// and need a custom comparison). Returns `(table, matched)` pairs.
+pub fn validate_copy_specs(
+    conn: &Connection,
+    specs: &[TableCopySpec],
+    skip: &[&str],
+) -> Result<Vec<(&'static str, bool)>, Error> {
+    let mut results = Vec::with_capacity(specs.len());
+    for spec in specs {
+        if skip.contains(&spec.table) {
+            continue;
+        }
+        let matched = full_row_except_match(
+            conn,
+            &format!("SELECT * FROM {}", spec.table),
+            &spec.source_sql,
+        )?;
+        results.push((spec.table, matched));
+    }
+    Ok(results)
+}
+
 /// Look up the rows-copied count for `table` in [`execute_copy_specs`]
 /// results. Panics if `table` had no spec: that is a bug in the caller's
 /// spec list, not a data error.
@@ -121,14 +170,22 @@ pub fn copied_rows(results: &[(&'static str, u64)], table: &str) -> u64 {
         .unwrap_or_else(|| panic!("BUG: no copy-spec result for `{table}`"))
 }
 
+/// Look up the match verdict for `table` in [`validate_copy_specs`]
+/// results. Panics if `table` had no spec: that is a bug in the caller's
+/// spec list, not a data error.
+pub fn spec_result<T: Copy>(results: &[(&'static str, T)], table: &str) -> T {
+    results
+        .iter()
+        .find(|(t, _)| *t == table)
+        .map(|(_, value)| *value)
+        .unwrap_or_else(|| panic!("BUG: no copy-spec result for `{table}`"))
+}
+
 /// Collect every user-defined index on `main.table` along with its
 /// CREATE statement so the caller can drop and later rebuild them.
 /// Excludes `sqlite_autoindex_*` (those have `sql IS NULL` and are
 /// recreated implicitly with the table).
-pub(crate) fn collect_user_indexes(
-    conn: &Connection,
-    table: &str,
-) -> Result<Vec<(String, String)>, Error> {
+fn collect_user_indexes(conn: &Connection, table: &str) -> Result<Vec<(String, String)>, Error> {
     let mut stmt = conn
         .prepare(
             "SELECT name, sql FROM sqlite_master \
@@ -238,6 +295,31 @@ where
     conn.execute_batch("PRAGMA main.journal_mode = WAL;")
         .map_err(Error::SQLError)?;
     Ok(value)
+}
+
+/// Open `db_path` read-only, ATTACH each source read-only via a
+/// `file:<path>?mode=ro` URI, and run `body`. For validators: nothing is
+/// written, so there is no transaction, and the connection - with its
+/// attachments and any TEMP tables `body` created - is discarded on return.
+pub fn with_readonly_session<F, T>(
+    db_path: &str,
+    attachments: &[(&'static str, &str)],
+    body: F,
+) -> Result<T, Error>
+where
+    F: FnOnce(&Connection) -> Result<T, Error>,
+{
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(Error::SQLError)?;
+    for (alias, path) in attachments {
+        let uri = format!("file:{}?mode=ro", percent_encode_path(path));
+        conn.execute(&format!("ATTACH DATABASE ?1 AS {alias}"), params![uri])
+            .map_err(Error::SQLError)?;
+    }
+    body(&conn)
 }
 
 /// Drop user-defined indexes on `main.table` while `body` bulk-loads

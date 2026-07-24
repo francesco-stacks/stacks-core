@@ -19,10 +19,10 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
 
 use super::common::{
-    assert_source_schema, clone_schemas_from_source, copied_rows, execute_copy_specs,
-    with_offline_write_session, TableCopySpec,
+    assert_source_schema, clone_schemas_from_source, copied_rows, execute_copy_specs, spec_result,
+    validate_copy_specs, with_offline_write_session, with_readonly_session, TableCopySpec,
 };
-use crate::burnchains::bitcoin::spv::num_complete_chain_work_intervals;
+use crate::burnchains::bitcoin::spv::{num_complete_chain_work_intervals, SpvClient};
 use crate::chainstate::stacks::index::Error;
 use crate::util_lib::db::sqlite_open;
 
@@ -52,6 +52,21 @@ pub(super) fn assert_source_tables_classified(src_conn: &Connection) -> Result<(
 pub struct SpvHeadersCopyStats {
     pub headers_rows: u64,
     pub chain_work_rows: u64,
+}
+
+/// Validation result for a copied headers.sqlite.
+#[derive(Debug, Clone)]
+pub struct SpvHeadersValidation {
+    pub headers_match: bool,
+    pub chain_work_match: bool,
+    pub db_config_match: bool,
+    pub no_extra_headers: bool,
+}
+
+impl SpvHeadersValidation {
+    pub fn is_valid(&self) -> bool {
+        self.headers_match && self.chain_work_match && self.db_config_match && self.no_extra_headers
+    }
 }
 
 /// Copy canonical SPV headers up to `burn_height` into a new destination.
@@ -122,4 +137,37 @@ fn copy_spv_headers_inner(
         "chain_work_rows" => stats.chain_work_rows
     );
     Ok(stats)
+}
+
+/// Validate a copied headers.sqlite against its source.
+pub fn validate_spv_headers(
+    src_path: &str,
+    dst_path: &str,
+    burn_height: u64,
+) -> Result<SpvHeadersValidation, Error> {
+    if !Path::new(src_path).exists() {
+        return Err(Error::IOError(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("SPV headers source not found: {src_path}"),
+        )));
+    }
+    if !Path::new(dst_path).exists() {
+        return Err(Error::NotFoundError);
+    }
+
+    with_readonly_session(dst_path, &[("src", src_path)], |conn| {
+        let results = validate_copy_specs(conn, &spv_copy_specs(burn_height), &[])?;
+
+        // No headers above burn_height in destination.
+        let extra_above = SpvClient::count_headers_above(conn, u64::from(burn_height))
+            .map_err(|e| Error::CorruptionError(format!("cannot count SPV headers: {e}")))?;
+        let no_extra_headers = extra_above == 0;
+
+        Ok(SpvHeadersValidation {
+            headers_match: spec_result(&results, "headers"),
+            chain_work_match: spec_result(&results, "chain_work"),
+            db_config_match: spec_result(&results, "db_config"),
+            no_extra_headers,
+        })
+    })
 }
