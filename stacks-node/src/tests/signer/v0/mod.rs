@@ -111,7 +111,7 @@ use crate::tests::nakamoto_integrations::{
 use crate::tests::neon_integrations::{
     get_account, get_chain_info, get_chain_info_opt, get_sortition_info, get_sortition_info_ch,
     next_block_and_wait, run_until_burnchain_height, submit_tx, submit_tx_fallible, test_observer,
-    wait_for_tenure_change_tx, TestProxy,
+    wait_for_runloop, wait_for_tenure_change_tx, TestProxy,
 };
 use crate::tests::signer::commands::*;
 use crate::tests::signer::SpawnedSignerTrait;
@@ -1185,11 +1185,14 @@ impl MultipleMinerTest {
         let rl2_stopper = run_loop_2.get_termination_switch();
         let rl2_coord_channels = run_loop_2.coordinator_channels();
         let rl2_counters = run_loop_2.counters();
+        let rl2_blocks_processed = rl2_counters.blocks_processed.clone();
 
         let rl2_thread = thread::Builder::new()
             .name("run_loop_2".into())
             .spawn(move || run_loop_2.start(None, 0))
             .unwrap();
+
+        wait_for_runloop(&rl2_blocks_processed);
 
         MultipleMinerTest {
             signer_test,
