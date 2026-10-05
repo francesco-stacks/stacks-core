@@ -16,6 +16,7 @@
 
 pub mod analysis_costs;
 pub mod ast;
+pub mod contract_storage;
 pub mod contracts;
 pub mod costs;
 pub mod ephemeral;
@@ -28,4 +29,5 @@ pub mod utils;
 
 mod contract_storage_baseline;
 mod contract_storage_fixtures;
+
 mod contract_storage_pox_baseline;

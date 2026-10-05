@@ -43,6 +43,7 @@ use stacks::chainstate::stacks::{
     CoinbasePayload, StacksBlock, StacksMicroblock, StacksTransaction, StacksTransactionSigner,
     TransactionAnchorMode, TransactionPayload, TransactionVersion,
 };
+use stacks::clarity_vm::database::marf::ContractStorageMigration;
 use stacks::core::mempool::MemPoolDB;
 use stacks::core::{EpochList, STACKS_EPOCH_2_1_MARKER};
 use stacks::cost_estimates::metrics::UnitMetric;
@@ -331,12 +332,13 @@ impl Node {
             get_bulk_initial_names: Some(Box::new(move || get_names(use_test_genesis_data))),
         };
 
-        let chain_state_result = StacksChainState::open_and_exec(
+        let chain_state_result = StacksChainState::open_and_exec_with_migration(
             config.is_mainnet(),
             config.burnchain.chain_id,
             &config.get_chainstate_path_str(),
             Some(&mut boot_data),
             Some(config.node.get_marf_opts()),
+            ContractStorageMigration::Allow,
         );
 
         let (chain_state, receipts) = match chain_state_result {

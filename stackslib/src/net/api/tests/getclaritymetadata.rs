@@ -110,8 +110,11 @@ fn test_try_parse_invalid_store_type() {
     handler.restart();
 }
 
-#[test]
-fn test_try_parse_invalid_contract_metadata_var_name() {
+#[rstest::rstest]
+#[case("vm-metadata::9::contract-invalid-key")]
+#[case("vm-metadata::9::contract-header")]
+#[case("vm-metadata::9::contract-header-v2")]
+fn test_try_parse_invalid_contract_metadata_var_name(#[case] key: &str) {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 33333);
     let mut http = StacksHttp::new(addr, &ConnectionOptions::default());
 
@@ -119,7 +122,7 @@ fn test_try_parse_invalid_contract_metadata_var_name() {
         addr.into(),
         StacksAddress::from_string("ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R").unwrap(),
         "hello-world".try_into().unwrap(),
-        "vm-metadata::9::contract-invalid-key".to_string(),
+        key.to_string(),
         TipRequest::SpecificTip(StacksBlockId([0x22; 32])),
     );
     assert_eq!(
@@ -283,7 +286,64 @@ fn test_try_make_response() {
     );
     requests.push(request);
 
+    // The executable metadata endpoint retains its historical shape after splitting.
+    requests.push(StacksHttpRequest::new_getclaritymetadata(
+        addr.into(),
+        StacksAddress::from_string("ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R").unwrap(),
+        "hello-world".try_into().unwrap(),
+        "vm-metadata::9::contract".to_string(),
+        TipRequest::UseLatestAnchoredTip,
+    ));
     let mut responses = test_rpc(function_name!(), requests);
+    let serialized = responses
+        .pop()
+        .unwrap()
+        .decode_clarity_metadata_response()
+        .unwrap();
+    let context: serde_json::Value = serde_json::from_str(&serialized.data).unwrap();
+    assert!(context["contract_context"]["functions"].is_object());
+    assert!(context["contract_context"]["variables"].is_object());
+    let actual: std::collections::BTreeSet<_> = context["contract_context"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected = std::collections::BTreeSet::from([
+        "contract_identifier",
+        "variables",
+        "functions",
+        "defined_traits",
+        "implemented_traits",
+        "persisted_names",
+        "meta_data_map",
+        "meta_data_var",
+        "meta_nft",
+        "meta_ft",
+        "data_size",
+        "clarity_version",
+    ]);
+    assert_eq!(actual, expected);
+    // Preserve the legacy field order, which a parsed JSON object cannot test.
+    let mut last = 0;
+    for field in [
+        "contract_identifier",
+        "variables",
+        "functions",
+        "defined_traits",
+        "implemented_traits",
+        "persisted_names",
+        "meta_data_map",
+        "meta_data_var",
+        "meta_nft",
+        "meta_ft",
+        "data_size",
+        "clarity_version",
+    ] {
+        let position = serialized.data.find(&format!("\"{field}\":")).unwrap();
+        assert!(position > last, "RPC field out of order: {field}");
+        last = position;
+    }
 
     // unknwnon data var
     let response = responses.remove(0);

@@ -60,6 +60,11 @@ header-indexed-get <BLOCK_ID_HASH> <KEY> [--state-dir <DIR> | --marf-path <PATH>
 marf-get <MARF_PATH> <TIP_HASH> <CONSENSUS_HASH> <KEY>
     Get a value from the MARF database
 
+migrate-contract-storage [--standalone] <PATH>
+    Explicitly convert executable metadata in an existing node chainstate directory
+    (or standalone Clarity marf.sqlite with --standalone)
+    Older builds cannot read the converted database
+
 deserialize-db <DB_PATH> <BYTE_PREFIX>
     Deserialize values from Clarity database filtered by byte prefix
 
@@ -69,6 +74,15 @@ check-deser-data <CHECK_FILE>
 get-ancestors <DB_PATH> <BLOCK_HASH> <CONSENSUS_HASH>
     Trace block ancestry through staging database
 ```
+
+Commands that open Clarity chainstate require its executable storage migration
+to be complete. They refuse legacy or interrupted migrations without converting
+the database. Node startup performs migration automatically. For inspection with
+a new build, clone the chainstate first and run `migrate-contract-storage` on the
+clone's chainstate directory (containing `vm/index.sqlite` and `vm/clarity/marf.sqlite`).
+The node schema version advances before conversion to prevent unsafe downgrade.
+Use `--standalone` only for Clarity databases without a node header database.
+Keep the original for use with older builds.
 
 ### Nakamoto Commands
 

@@ -1438,8 +1438,10 @@ fn test_deep_type_nesting() {
 /// 2. Create a second block with 21 transactions:
 ///    - 20 transactions that call the contract (should fail with MemoryBalanceExceeded)
 ///    - 1 transaction that is expected to succeed
-#[test]
-fn test_memory_balance_exceeded_multiple_calls() {
+#[rstest::rstest]
+#[case(StacksEpochId::Epoch40)]
+#[case(StacksEpochId::Epoch41)]
+fn test_memory_balance_exceeded_multiple_calls(#[case] epoch: StacksEpochId) {
     // Generate the same contract code as chainstate_error_memory_balance_exceeded_during_contract_call
     let contract_name = "memory-test-contract";
     let contract_code = {
@@ -1494,11 +1496,16 @@ fn test_memory_balance_exceeded_multiple_calls() {
         transactions: call_transactions,
     };
 
-    // Create epoch blocks map - both blocks in the latest epoch
+    // Preserve the original memory reservation in both epochs despite selective loading.
     let mut epoch_blocks = HashMap::new();
-    epoch_blocks.insert(StacksEpochId::latest(), vec![block1, block2]);
+    epoch_blocks.insert(epoch, vec![block1, block2]);
 
-    let result = ConsensusTest::new(function_name!(), vec![], epoch_blocks).run();
+    let result = ConsensusTest::new(
+        &format!("{}-{epoch}", function_name!()),
+        vec![],
+        epoch_blocks,
+    )
+    .run();
     if let ExpectedResult::Success(expected_block_output) = &result[0] {
         assert_eq!(expected_block_output.transactions.len(), 1);
         assert_eq!(
@@ -1513,7 +1520,6 @@ fn test_memory_balance_exceeded_multiple_calls() {
     }
     if let ExpectedResult::Success(expected_block_output) = &result[1] {
         assert_eq!(expected_block_output.transactions.len(), 21);
-        let expected_vm_error = Some("MemoryBalanceExceeded(100665664, 100000000)");
         let expected_failure_return_type = ClarityValue::Response(ResponseData {
             committed: false,
             data: Box::new(ClarityValue::Optional(OptionalData { data: None })),
@@ -1521,7 +1527,10 @@ fn test_memory_balance_exceeded_multiple_calls() {
 
         for transaction in &expected_block_output.transactions[..20] {
             assert_eq!(transaction.return_type, expected_failure_return_type);
-            assert_eq!(transaction.vm_error.as_deref(), expected_vm_error);
+            assert_eq!(
+                transaction.vm_error.as_deref(),
+                Some("MemoryBalanceExceeded(100665664, 100000000)")
+            );
         }
         assert_eq!(
             expected_block_output.transactions[20].return_type,

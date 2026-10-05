@@ -717,7 +717,7 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
         let contract = self
             .global_context
             .database
-            .get_contract(contract_identifier)
+            .get_contract_for_expression(contract_identifier, &parsed[0])
             .or_else(|e| {
                 self.global_context.roll_back()?;
                 Err(e)
@@ -841,19 +841,28 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
         read_only: bool,
         allow_private: bool,
     ) -> Result<Value, VmExecutionError> {
-        let contract_size = self
-            .global_context
-            .database
-            .get_contract_size(contract_identifier)?;
-        runtime_cost(ClarityCostFunction::LoadContract, self, contract_size)?;
-
-        self.global_context.add_memory(contract_size)?;
+        let mut contract_size = 0;
+        let global = &mut self.global_context;
+        let contract =
+            global
+                .database
+                .load_contract_for_call(contract_identifier, tx_name, |size| {
+                    runtime_cost(
+                        ClarityCostFunction::LoadContract,
+                        &mut global.cost_track,
+                        size,
+                    )?;
+                    global.cost_track.add_memory(size)?;
+                    // Release only a successfully reserved amount, including when decoding fails.
+                    contract_size = size;
+                    Ok(())
+                });
 
         // NOTE: When contract caching is used, then the memory counters here will drop the
         // `contract_size` after the contract execution has completed, but the contracts will remain
         // in the cache (up to the cache eviction policy's limits).
         finally_drop_memory!(self.global_context, contract_size; {
-            let contract = self.global_context.database.get_contract(contract_identifier)?;
+            let contract = contract?;
 
             let func = contract.lookup_function(tx_name)
                 .ok_or_else(|| { RuntimeCheckErrorKind::UndefinedFunction(tx_name.to_string()) })?;
@@ -1784,6 +1793,7 @@ impl ContractContext {
     /// Canonicalize the types for the specified epoch. Only functions and
     /// defined traits are exposed externally, so other types are not
     /// canonicalized.
+    #[cfg(any(test, feature = "testing"))]
     pub fn canonicalize_types(&mut self, epoch: &StacksEpochId) -> Result<(), VmExecutionError> {
         for function in self.functions.values_mut() {
             function.canonicalize_types(epoch);

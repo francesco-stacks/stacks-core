@@ -13332,6 +13332,7 @@ fn test_sip_031_activation() {
         |conn| {
             conn.with_clarity_db_readonly(|db| {
                 db.has_contract(&boot_code_id(SIP_031_NAME, naka_conf.is_mainnet()))
+                    .unwrap()
             })
         },
     );
@@ -14541,6 +14542,7 @@ fn test_epoch_3_3_activation() {
         |conn| {
             conn.with_clarity_db_readonly(|db| {
                 db.has_contract(&boot_code_id(COSTS_4_NAME, naka_conf.is_mainnet()))
+                    .unwrap()
             })
         },
     );

@@ -25,6 +25,7 @@ use crate::vm::callables::DefineType;
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
 use crate::vm::costs::{CostTracker, MemoryConsumer, constants as cost_constants, runtime_cost};
+use crate::vm::database::clarity_db::TraitCheck;
 use crate::vm::errors::{
     RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError, check_argument_count,
     check_arguments_at_least,
@@ -149,66 +150,66 @@ pub fn special_contract_call(
                     let contract_to_check = exec_state
                         .global_context
                         .database
-                        .get_contract(&contract_identifier)
+                        .get_contract_for_trait_check(
+                            &contract_identifier,
+                            function_name,
+                            &trait_identifier,
+                        )
                         .map_err(|_e| {
                             RuntimeCheckErrorKind::NoSuchContract(contract_identifier.to_string())
                         })?;
 
-                    // Attempt to short circuit the dynamic dispatch checks:
-                    // If the contract is explicitely implementing the trait with `impl-trait`,
-                    // then we can simply rely on the analysis performed at publish time.
-                    if contract_to_check.is_explicitly_implementing_trait(&trait_identifier) {
-                        (contract_identifier.clone(), None)
-                    } else {
-                        // Load the contract that defines the trait.
-                        let contract_defining_trait = exec_state
-                            .global_context
-                            .database
-                            .get_contract(&trait_identifier.contract_identifier)
-                            .map_err(|_e| {
-                                RuntimeCheckErrorKind::NoSuchContract(
-                                    trait_identifier.contract_identifier.to_string(),
-                                )
-                            })?;
+                    match contract_to_check {
+                        TraitCheck::Explicit => (contract_identifier.clone(), None),
+                        TraitCheck::NeedsSignatureCheck(function_to_check) => {
+                            // Load the contract that defines the trait.
+                            let contract_defining_trait = exec_state
+                                .global_context
+                                .database
+                                .get_contract_metadata(&trait_identifier.contract_identifier)
+                                .map_err(|_e| {
+                                    RuntimeCheckErrorKind::NoSuchContract(
+                                        trait_identifier.contract_identifier.to_string(),
+                                    )
+                                })?;
 
-                        // Retrieve the function that will be invoked
-                        let function_to_check = contract_to_check
-                            .lookup_function(function_name)
-                            .ok_or_else(|| {
+                            // Retrieve the function that will be invoked
+                            let function_to_check = function_to_check.ok_or_else(|| {
                                 RuntimeCheckErrorKind::BadTraitImplementation(
                                     trait_identifier.name.to_string(),
                                     function_name.to_string(),
                                 )
                             })?;
 
-                        // Check read/write compatibility
-                        if exec_state.global_context.is_read_only() {
-                            return Err(RuntimeCheckErrorKind::Unreachable(
-                                "Trait based contract call in read-only".into(),
-                            )
-                            .into());
-                        }
+                            // Check read/write compatibility
+                            if exec_state.global_context.is_read_only() {
+                                return Err(RuntimeCheckErrorKind::Unreachable(
+                                    "Trait based contract call in read-only".into(),
+                                )
+                                .into());
+                            }
 
-                        // Check visibility
-                        if function_to_check.define_type == DefineType::Private {
-                            return Err(RuntimeCheckErrorKind::NoSuchPublicFunction(
-                                contract_identifier.to_string(),
-                                function_name.to_string(),
-                            )
-                            .into());
-                        }
+                            // Check visibility
+                            if function_to_check.define_type == DefineType::Private {
+                                return Err(RuntimeCheckErrorKind::NoSuchPublicFunction(
+                                    contract_identifier.to_string(),
+                                    function_name.to_string(),
+                                )
+                                .into());
+                            }
 
-                        let expected_sig = function_to_check.check_trait_expectations(
-                            exec_state.epoch(),
-                            &contract_defining_trait,
-                            &trait_identifier,
-                        )?;
-                        // Own the return type so the trait-defining contract is released here
-                        // instead of staying loaded through the nested call.
-                        (
-                            contract_identifier.clone(),
-                            Some(expected_sig.returns.clone()),
-                        )
+                            let expected_sig = function_to_check.check_trait_expectations(
+                                exec_state.epoch(),
+                                &contract_defining_trait,
+                                &trait_identifier,
+                            )?;
+                            // Own the return type so the trait-defining contract is released here
+                            // instead of staying loaded through the nested call.
+                            (
+                                contract_identifier.clone(),
+                                Some(expected_sig.returns.clone()),
+                            )
+                        }
                     }
                 }
                 _ => return Err(RuntimeCheckErrorKind::ContractCallExpectName.into()),

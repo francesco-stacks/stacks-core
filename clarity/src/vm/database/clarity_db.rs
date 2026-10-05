@@ -14,6 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use stacks_common::bounded_format;
 use stacks_common::consts::{
     BITCOIN_REGTEST_FIRST_BLOCK_HASH, BITCOIN_REGTEST_FIRST_BLOCK_HEIGHT,
@@ -27,24 +30,28 @@ use stacks_common::types::chainstate::{
 use stacks_common::types::{StacksEpoch as GenericStacksEpoch, StacksEpochId};
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum, to_hex};
 
-use super::clarity_store::SpecialCaseHandler;
+use super::clarity_store::{MetadataValue, SpecialCaseHandler};
 use super::key_value_wrapper::ValueResult;
 use crate::vm::analysis::{AnalysisDatabase, ContractAnalysis};
-use crate::vm::contexts::ContractContext;
+use crate::vm::callables::DefinedFunction;
+use crate::vm::contexts::{ContractContext, ContractSharedContext};
 use crate::vm::contracts::Contract;
 use crate::vm::costs::{CostOverflowingMath, ExecutionCost};
-use crate::vm::database::caching::{CachedContract, ClarityExecutionCache};
+use crate::vm::database::caching::{CachedContractPart, ClarityExecutionCache, ContractCachePart};
+use crate::vm::database::contract_storage::{
+    CONTRACT_HEADER_KEY, LoadedContractHeader, function_key, split_contract,
+};
 use crate::vm::database::structures::{
     ClarityDeserializable, ClaritySerializable, DataMapMetadata, DataVariableMetadata,
     FungibleTokenMetadata, NonFungibleTokenMetadata, STXBalance, STXBalanceSnapshot,
 };
 use crate::vm::database::{ClarityBackingStore, RollbackWrapper};
 use crate::vm::errors::{RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError};
-use crate::vm::representations::ClarityName;
+use crate::vm::representations::{ClarityName, SymbolicExpression};
 use crate::vm::types::serialization::NONE_SERIALIZATION_LEN;
 use crate::vm::types::{
-    PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TupleData, TypeSignature,
-    Value, byte_len_of_serialization,
+    PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TraitIdentifier, TupleData,
+    TypeSignature, Value, byte_len_of_serialization,
 };
 
 pub const STORE_CONTRACT_SRC_INTERFACE: bool = true;
@@ -144,6 +151,31 @@ impl TryFrom<&str> for ContractDataVarName {
             _ => Err("Invalid ContractDataVarName".into()),
         }
     }
+}
+
+/// Which executable bodies a caller needs. Metadata-only reads use the header API.
+enum ContractSelection<'a> {
+    All,
+    Function(&'a str),
+    Expression(&'a SymbolicExpression),
+}
+
+/// Explicit implementations need no signature check. Implicit implementations
+/// retain only the requested definition; dependencies are loaded after charging.
+pub(crate) enum TraitCheck {
+    Explicit,
+    NeedsSignatureCheck(Option<DefinedFunction>),
+}
+
+/// Executable loads canonicalize types and may reuse the transaction cache.
+/// RPC reconstruction preserves the original stored types and bypasses that cache.
+#[derive(Clone, Copy)]
+enum ContractLoadMode {
+    Execution {
+        epoch: StacksEpochId,
+        cacheable: bool,
+    },
+    Raw,
 }
 
 pub struct ClarityDatabase<'a> {
@@ -800,53 +832,33 @@ impl<'a> ClarityDatabase<'a> {
             .transpose()
     }
 
-    /// Read and sum the `contract-size` and `contract-data-size` metadata entries for the given
-    /// contract, returning the total size for the contract as needed for `LoadContract` cost
-    /// calculations.
-    ///
-    /// Reads through the rollback-aware metadata layer; does not consult or populate the cache.
-    fn read_contract_size(
-        &mut self,
-        contract_identifier: &QualifiedContractIdentifier,
-    ) -> Result<u64, VmExecutionError> {
-        let contract_size_key = ContractDataVarName::ContractSize.metadata_key();
-        let contract_size: u64 = self
-            .fetch_metadata(contract_identifier, &contract_size_key)?
-            .ok_or_else(|| {
-                VmInternalError::Expect(
-            "Failed to read non-consensus contract metadata, even though contract exists in MARF."
-        .into())
-            })?;
-
-        let data_size_key = ContractDataVarName::ContractDataSize.metadata_key();
-        let data_size: u64 = self
-            .fetch_metadata(contract_identifier, &data_size_key)?
-            .ok_or_else(|| {
-                VmInternalError::Expect(
-            "Failed to read non-consensus contract metadata, even though contract exists in MARF."
-        .into())
-            })?;
-
-        // u64 overflow is _checked_ on insert into contract-data-size
-        Ok(data_size + contract_size)
+    /// Preserve missing-size and overflow errors before any header decoding.
+    fn sum_contract_size(values: Vec<Option<MetadataValue>>) -> Result<u64, VmExecutionError> {
+        let mut size = 0u64;
+        for value in values {
+            let value = value.ok_or_else(|| VmInternalError::Expect(
+                "Failed to read non-consensus contract metadata, even though contract exists in MARF.".into()
+            ))?;
+            size = size.cost_overflow_add(u64::deserialize(&value.into_text()?)?)?;
+        }
+        Ok(size)
     }
 
-    /// `LoadContract` cost size (`contract_size + data_size`).
-    ///
-    /// When a cache is attached to this instance and the store isn't retargeted by e.g. `at-block`,
-    /// this method attempts to serve values via a passive cache lookup. Cache hits do not update
-    /// FIFO counters, and misses fall through to reading from the backing store.
+    /// Historical full-contract size for baseline measurements and accounting tests.
+    #[cfg(any(test, feature = "testing"))]
     pub fn get_contract_size(
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
     ) -> Result<u64, VmExecutionError> {
-        if !self.store.is_retargeted()
-            && let Some(cached) = self.peek_cached_contract(contract_identifier)
-        {
-            return Ok(cached.load_cost_size);
-        }
-
-        self.read_contract_size(contract_identifier)
+        let keys = [
+            ContractDataVarName::ContractSize.metadata_key(),
+            ContractDataVarName::ContractDataSize.metadata_key(),
+        ];
+        Self::sum_contract_size(self.store.get_metadata_batch(
+            contract_identifier,
+            &keys,
+            &mut None,
+        )?)
     }
 
     /// used for adding the memory usage of `define-constant` variables.
@@ -876,14 +888,27 @@ impl<'a> ClarityDatabase<'a> {
         Ok(())
     }
 
+    /// Store the fully initialized context as one header and independent functions.
     pub fn insert_contract(
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
         contract: Contract,
     ) -> Result<(), VmExecutionError> {
-        let key = ContractDataVarName::Contract.metadata_key();
-
-        self.insert_metadata(contract_identifier, &key, &*contract)?;
+        let (header, functions) = split_contract(&contract)?;
+        for (name, function) in functions {
+            let bytes = super::contract_codec::encode_function(&function)?;
+            self.store.insert_metadata_value(
+                contract_identifier,
+                &function_key(&name),
+                super::clarity_store::MetadataValue::Blob(bytes.into()),
+            )?;
+        }
+        let bytes = super::contract_codec::encode_header(&header)?;
+        self.store.insert_metadata_value(
+            contract_identifier,
+            CONTRACT_HEADER_KEY,
+            super::clarity_store::MetadataValue::Blob(bytes.into()),
+        )?;
         Ok(())
     }
 
@@ -891,120 +916,261 @@ impl<'a> ClarityDatabase<'a> {
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
     ) -> Result<bool, VmExecutionError> {
-        let key = ClarityDatabase::make_metadata_key(
-            StoreType::Contract,
-            ContractDataVarName::Contract.as_str(),
-        );
-        self.store.has_metadata_entry(contract_identifier, &key)
-    }
-
-    /// Read and deserialize the contract blob from the backing store, canonicalizing its types to
-    /// the current epoch.
-    ///
-    /// Reads through the rollback-aware metadata layer; does not consult or populate the contract
-    /// cache.
-    fn read_contract(
-        &mut self,
-        contract_identifier: &QualifiedContractIdentifier,
-    ) -> Result<Contract, VmExecutionError> {
-        let contract_key = ContractDataVarName::Contract.metadata_key();
-        let mut contract_context = self
-            .fetch_metadata::<ContractContext>(contract_identifier, &contract_key)?
-            .ok_or_else(|| {
-                VmInternalError::Expect(
-            "Failed to read non-consensus contract metadata, even though contract exists in MARF."
-            .into())
-            })?;
-
-        let epoch = self.get_clarity_epoch_version()?;
-        contract_context.canonicalize_types(&epoch)?;
-
-        Ok(contract_context.into())
-    }
-
-    /// Check for any pending metadata writes to the metadata keys used for loading/materializing a
-    /// [`Contract`] from the backing store and calculating its `LoadContract` costs.
-    ///
-    /// This is used for defensive checks in e.g. [`Self::get_contract`].
-    fn has_pending_metadata_for_contract(
-        &mut self,
-        contract_identifier: &QualifiedContractIdentifier,
-    ) -> bool {
         self.store
-            .has_pending_metadata_for_contract(contract_identifier)
+            .has_metadata_entry(contract_identifier, CONTRACT_HEADER_KEY)
     }
 
-    /// Load a parsed contract, returning a canonicalized [`Contract`].
-    ///
-    /// Consults the attached cache when attached and the store is not retargeted; on a miss the
-    /// contract is read from the backing store and inserted into the cache before being returned.
-    ///
-    /// The cache is bypassed entirely during `(at-block ...)` retargeting; those reads hit the
-    /// backing store and are not cached, since they reflect a different chainstate view.
-    ///
-    /// Reads served from uncommitted pending metadata (e.g. a contract deployed earlier in the same
-    /// rollback layer but not yet committed to the backing store) are not cached.
-    pub fn get_contract(
+    /// Reconstruct the historical metadata RPC representation without epoch
+    /// canonicalization. The monolithic record is no longer kept on disk.
+    pub fn get_serialized_contract(
         &mut self,
-        contract_identifier: &QualifiedContractIdentifier,
-    ) -> Result<Contract, VmExecutionError> {
-        let retargeted = self.store.is_retargeted();
+        id: &QualifiedContractIdentifier,
+    ) -> Result<Option<String>, VmExecutionError> {
+        let mut deployment = None;
+        let header = self
+            .store
+            .get_metadata_batch(id, &[CONTRACT_HEADER_KEY.to_owned()], &mut deployment)?
+            .pop()
+            .flatten();
+        let Some(header) = header else {
+            return Ok(None);
+        };
+        let header = header.decode_header()?;
+        let functions = self.load_contract_functions(
+            id,
+            header.functions.iter().map(|entry| &entry.name).collect(),
+            ContractLoadMode::Raw,
+            &mut deployment,
+        )?;
+        let names: Arc<[_]> = header
+            .functions
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        let mut shared = Arc::unwrap_or_clone(header.shared);
+        shared.function_names = names;
+        let context = ContractContext {
+            shared: Arc::new(shared),
+            functions,
+        };
+        Ok(Some(ClaritySerializable::serialize(&context)))
+    }
 
-        // Attempt to serve from cache ONLY if we are reading at chain tip (not retargeted).
-        if !retargeted && let Some(entry) = self.cached_contract(contract_identifier) {
-            return Ok(entry.contract.clone());
+    /// Fetch header and historical sizes together, charge, then decode. A load
+    /// resolves its deployment once and computes cache eligibility once.
+    fn load_contract_header(
+        &mut self,
+        id: &QualifiedContractIdentifier,
+        charge: impl FnOnce(u64) -> Result<(), VmExecutionError>,
+    ) -> Result<(LoadedContractHeader, ContractLoadMode), VmExecutionError> {
+        let epoch = self.get_clarity_epoch_version()?;
+        let cacheable =
+            !self.store.is_retargeted() && !self.store.has_pending_metadata_for_contract(id);
+        let mode = ContractLoadMode::Execution { epoch, cacheable };
+        let key = (id.clone(), epoch, ContractCachePart::Header);
+        if cacheable
+            && let Some(cache) = self.execution_cache.as_deref_mut()
+            && let Some(CachedContractPart::Header(header)) = cache.contracts.get(&key)
+        {
+            charge(header.load_cost_size)?;
+            return Ok((header.clone(), mode));
         }
-
-        // Miss path: read from store, then (when applicable) populate the cache.
-        let contract = self.read_contract(contract_identifier)?;
-
-        // Defensive check: this is not expected on the ordinary contract-call path, but we include
-        // it conservatively as this is a lower-level DB API which can be reached while a rollback
-        // layer contains pending metadata (e.g., if the cache were ever reused across transaction
-        // boundaries).
-        let is_pending = self.has_pending_metadata_for_contract(contract_identifier);
-
-        // Only populate the cache on reads at tip and when there are no pending writes to relevant
-        // metadata keys.
-        if !retargeted && !is_pending {
-            let load_cost_size = self.read_contract_size(contract_identifier)?;
-
-            self.cache_contract(
-                contract_identifier.clone(),
-                CachedContract {
-                    contract: contract.clone(),
-                    load_cost_size,
-                },
+        let mut deployment = None;
+        let keys = [
+            ContractDataVarName::ContractSize.metadata_key(),
+            ContractDataVarName::ContractDataSize.metadata_key(),
+            CONTRACT_HEADER_KEY.to_owned(),
+        ];
+        let mut records = self.store.get_metadata_batch(id, &keys, &mut deployment)?;
+        let value = records.pop().flatten();
+        let load_cost_size = Self::sum_contract_size(records)?;
+        charge(load_cost_size)?;
+        let value = value.ok_or_else(|| {
+            VmInternalError::Expect(format!(
+                "Missing split contract header for {id}; database migration is required"
+            ))
+        })?;
+        let header_bytes = value.encoded_len();
+        let header = value.decode_header()?;
+        if &header.shared.contract_identifier != id {
+            return Err(VmInternalError::Expect(format!(
+                "Contract header identity mismatch: {id}"
+            ))
+            .into());
+        }
+        let (names, dependencies): (Vec<_>, Vec<_>) = header
+            .functions
+            .into_iter()
+            .map(|entry| (entry.name, entry.dependencies))
+            .unzip();
+        let mut shared = Arc::unwrap_or_clone(header.shared);
+        shared.function_names = names.into();
+        shared.canonicalize_types(&epoch)?;
+        let loaded = LoadedContractHeader {
+            deployment,
+            shared: Arc::new(shared),
+            load_cost_size,
+            dependencies: dependencies.into(),
+        };
+        if cacheable && let Some(cache) = self.execution_cache.as_deref_mut() {
+            cache.contracts.insert(
+                key,
+                CachedContractPart::Header(loaded.clone()),
+                header_bytes,
             );
         }
-
-        Ok(contract)
+        Ok((loaded, mode))
     }
 
-    /// Borrow the cached contract entry for the provided [`QualifiedContractIdentifier`] if a cache
-    /// is attached to this [`ClarityDatabase`] instance and the contract cache contains it.
-    ///
-    /// On cache hit, hit/miss counters are updated, but FIFO ordering is unchanged.
-    ///
-    /// Returns [`None`] if no cache is attached or the cache does not contain the entry.
-    fn cached_contract(&mut self, id: &QualifiedContractIdentifier) -> Option<&CachedContract> {
-        self.execution_cache.as_deref_mut()?.contracts.get(id)
+    /// Read shared metadata without producing an executable Contract.
+    pub fn get_contract_metadata(
+        &mut self,
+        id: &QualifiedContractIdentifier,
+    ) -> Result<Arc<ContractSharedContext>, VmExecutionError> {
+        Ok(self.load_contract_header(id, |_| Ok(()))?.0.shared)
     }
 
-    /// Borrow the cached contract entry for the provided [`QualifiedContractIdentifier`] if a cache
-    /// is attached to this [`ClarityDatabase`] instance, without altering FIFO counters.
-    ///
-    /// Returns [`None`] if no cache is attached or the cache does not contain the entry.
-    fn peek_cached_contract(&self, id: &QualifiedContractIdentifier) -> Option<&CachedContract> {
-        self.execution_cache.as_deref()?.contracts.peek(id)
+    /// Load an entrypoint and its transitive local dependencies without charging.
+    /// VM invocation uses `load_contract_for_call` to charge before decoding.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn get_contract_for_function(
+        &mut self,
+        id: &QualifiedContractIdentifier,
+        name: &str,
+    ) -> Result<Contract, VmExecutionError> {
+        self.load_contract(id, ContractSelection::Function(name), |_| Ok(()))
     }
 
-    /// Insert an entry into the cache if one is attached; otherwise this is a no-op.
-    fn cache_contract(&mut self, id: QualifiedContractIdentifier, entry: CachedContract) {
-        let weight = entry.load_cost_size;
-        if let Some(cache) = self.execution_cache.as_deref_mut() {
-            cache.contracts.insert(id, entry, weight);
+    /// Dynamic dispatch preflight: explicit implementations need only metadata;
+    /// implicit ones also need the selected definition for its signature, without
+    /// loading dependencies before execution has charged LoadContract.
+    pub(crate) fn get_contract_for_trait_check(
+        &mut self,
+        id: &QualifiedContractIdentifier,
+        name: &str,
+        trait_id: &TraitIdentifier,
+    ) -> Result<TraitCheck, VmExecutionError> {
+        let (header, mode) = self.load_contract_header(id, |_| Ok(()))?;
+        if header.shared.is_explicitly_implementing_trait(trait_id) {
+            return Ok(TraitCheck::Explicit);
         }
+        let names = super::contract_storage::function_index(&header.shared.function_names, name)
+            .map(|index| &header.shared.function_names[index])
+            .into_iter()
+            .collect();
+        let mut deployment = header.deployment.clone();
+        let mut functions = self.load_contract_functions(id, names, mode, &mut deployment)?;
+        Ok(TraitCheck::NeedsSignatureCheck(functions.remove(name)))
+    }
+
+    /// Load local dependencies of a read-only expression in this contract.
+    pub fn get_contract_for_expression(
+        &mut self,
+        id: &QualifiedContractIdentifier,
+        expression: &SymbolicExpression,
+    ) -> Result<Contract, VmExecutionError> {
+        self.load_contract(id, ContractSelection::Expression(expression), |_| Ok(()))
+    }
+
+    /// Explicit full materialization for callers that need every function.
+    pub fn get_contract(
+        &mut self,
+        id: &QualifiedContractIdentifier,
+    ) -> Result<Contract, VmExecutionError> {
+        self.load_contract(id, ContractSelection::All, |_| Ok(()))
+    }
+
+    /// Resolve once, charge using the original size, then decode. The mutable
+    /// database borrow prevents the callback from changing its rollback/view state.
+    pub(crate) fn load_contract_for_call(
+        &mut self,
+        id: &QualifiedContractIdentifier,
+        name: &str,
+        charge: impl FnOnce(u64) -> Result<(), VmExecutionError>,
+    ) -> Result<Contract, VmExecutionError> {
+        self.load_contract(id, ContractSelection::Function(name), charge)
+    }
+
+    fn load_contract(
+        &mut self,
+        id: &QualifiedContractIdentifier,
+        selection: ContractSelection,
+        charge: impl FnOnce(u64) -> Result<(), VmExecutionError>,
+    ) -> Result<Contract, VmExecutionError> {
+        let (header, mode) = self.load_contract_header(id, charge)?;
+        let mut deployment = header.deployment.clone();
+        let names = match selection {
+            ContractSelection::All => header.shared.function_names.iter().collect(),
+            ContractSelection::Function(name) => header.dependency_closure(name)?,
+            ContractSelection::Expression(expression) => {
+                header.selection_for_expression(expression)?
+            }
+        };
+        let functions = self.load_contract_functions(id, names, mode, &mut deployment)?;
+        Ok(header.context(functions).into())
+    }
+
+    /// Shared assembly for executable loads and uncanonicalized metadata RPCs.
+    /// Raw RPC reconstruction never canonicalizes or populates the execution cache.
+    fn load_contract_functions(
+        &mut self,
+        id: &QualifiedContractIdentifier,
+        names: Vec<&ClarityName>,
+        mode: ContractLoadMode,
+        deployment: &mut Option<StacksBlockId>,
+    ) -> Result<HashMap<ClarityName, DefinedFunction>, VmExecutionError> {
+        let mut functions = HashMap::with_capacity(names.len());
+        let mut missing = vec![];
+        for name in names {
+            let cache_key = match mode {
+                ContractLoadMode::Execution {
+                    epoch,
+                    cacheable: true,
+                } => Some((id.clone(), epoch, ContractCachePart::Function(name.clone()))),
+                _ => None,
+            };
+            let cached = cache_key
+                .as_ref()
+                .and_then(|key| {
+                    self.execution_cache
+                        .as_deref_mut()
+                        .and_then(|cache| cache.contracts.get(key))
+                })
+                .cloned();
+            if let Some(CachedContractPart::Function(function)) = cached {
+                functions.insert(name.clone(), function);
+            } else {
+                missing.push((name, cache_key));
+            }
+        }
+        let keys: Vec<_> = missing.iter().map(|(name, _)| function_key(name)).collect();
+        let records = self.store.get_metadata_batch(id, &keys, deployment)?;
+        for ((name, cache_key), record) in missing.into_iter().zip(records) {
+            let record = record.ok_or_else(|| {
+                VmInternalError::Expect(format!("Missing function record: {id}.{name}"))
+            })?;
+            let weight = record.encoded_len();
+            let record = record.decode_function()?;
+            if &record.name != name {
+                return Err(VmInternalError::Expect(format!(
+                    "Invalid function record: {id}.{name}"
+                ))
+                .into());
+            }
+            let mut function = record.into_function();
+            if let ContractLoadMode::Execution { epoch, .. } = mode {
+                function.canonicalize_types(&epoch);
+            }
+            if let Some(key) = cache_key
+                && let Some(cache) = self.execution_cache.as_deref_mut()
+            {
+                cache
+                    .contracts
+                    .insert(key, CachedContractPart::Function(function.clone()), weight);
+            }
+            functions.insert(name.clone(), function);
+        }
+        Ok(functions)
     }
 
     pub fn ustx_liquid_supply_key() -> &'static str {
@@ -2793,10 +2959,9 @@ mod tests {
             db.roll_back().unwrap();
             entry
         };
-        // Both `Contract`s should deref to the same underlying `ContractContext`, confirming the
-        // cached entry's Arc was shared rather than deserialized fresh.
+        // Contexts are assembled from shared cached parts without duplicating them.
         assert!(
-            std::ptr::eq(&*first, &*second),
+            std::ptr::eq(&*first.shared, &*second.shared),
             "second call should share the cached Arc, not a fresh deserialization",
         );
         assert_eq!(cache.contracts.hits(), 1);
@@ -2804,7 +2969,7 @@ mod tests {
     }
 
     #[test]
-    fn get_contract_load_cost_size_serves_from_cache() {
+    fn test_size_reader_does_not_consult_execution_cache() {
         let mut cache = ClarityExecutionCache::default();
         let mut store = MemoryBackingStore::new();
         let id = QualifiedContractIdentifier::local("size-cached").unwrap();
@@ -2815,14 +2980,13 @@ mod tests {
             let mut db = store.as_clarity_db().with_cache(&mut cache);
             db.begin();
             let _contract = db.get_contract(&id).expect("prime cache");
-            let s = db.read_contract_size(&id).unwrap();
+            let s = "(define-public (noop) (ok true))".len() as u64;
             db.roll_back().unwrap();
             s
         };
         let counters_after_prime = (cache.contracts.hits(), cache.contracts.misses());
 
-        // Subsequent `get_contract_size` must come from the cache, and being a passive `peek` it
-        // must not bump hit/miss counters.
+        // The baseline helper reads sizes directly without updating cache counters.
         let size = {
             let mut db = store.as_clarity_db().with_cache(&mut cache);
             db.begin();
@@ -2834,12 +2998,12 @@ mod tests {
         assert_eq!(
             (cache.contracts.hits(), cache.contracts.misses()),
             counters_after_prime,
-            "passive size lookup must not alter hit/miss counters",
+            "baseline size read must not alter hit/miss counters",
         );
     }
 
     #[test]
-    fn get_contract_load_cost_size_falls_back_without_cache() {
+    fn test_size_reader_returns_historical_size_without_cache() {
         let mut store = MemoryBackingStore::new();
         let id = QualifiedContractIdentifier::local("no-cache").unwrap();
         deploy_stub_contract(&mut store.as_clarity_db(), &id);
@@ -2847,7 +3011,7 @@ mod tests {
         let mut db = store.as_clarity_db();
         db.begin();
         let size = db.get_contract_size(&id).expect("load_cost_size");
-        let expected = db.read_contract_size(&id).unwrap();
+        let expected = "(define-public (noop) (ok true))".len() as u64;
         assert_eq!(size, expected);
         db.roll_back().unwrap();
     }

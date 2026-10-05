@@ -20,19 +20,27 @@
 //! cache budget; consensus cost and memory accounting retain
 //! the original source-length-plus-constant-data size in every epoch.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::Serialize;
 
+#[cfg(test)]
+use super::ClarityDeserializable;
 #[cfg(any(test, feature = "testing"))]
 use super::ClaritySerializable;
 use super::clarity_store::MetadataValue;
+#[cfg(test)]
+use crate::vm::callables::DefineType;
 use crate::vm::callables::{DefinedFunction, FunctionDefinition};
 use crate::vm::contexts::{ContractContext, ContractSharedContext};
 use crate::vm::errors::{VmExecutionError, VmInternalError};
 use crate::vm::functions::lookup_reserved_functions;
 use crate::vm::representations::{ClarityName, SymbolicExpression};
+#[cfg(test)]
+use crate::vm::types::{QualifiedContractIdentifier, TraitIdentifier};
+#[cfg(test)]
+use crate::vm::types::{TypeSignature, Value};
 use crate::vm::version::ClarityVersion;
 
 /// Shared record key; its presence also identifies an initialized contract.
@@ -207,3 +215,73 @@ pub(crate) fn function_index(names: &[ClarityName], name: &str) -> Option<usize>
         .ok()
 }
 
+/// Parsed shared data and the directory for a single execution epoch.
+#[derive(Clone)]
+pub(crate) struct LoadedContractHeader {
+    /// Committed deployment, valid under the existing per-transaction cache rules.
+    pub deployment: Option<stacks_common::types::chainstate::StacksBlockId>,
+    pub shared: Arc<ContractSharedContext>,
+    pub load_cost_size: u64,
+    pub dependencies: Arc<[Vec<u32>]>,
+}
+
+impl LoadedContractHeader {
+    pub fn context(&self, functions: HashMap<ClarityName, DefinedFunction>) -> ContractContext {
+        ContractContext {
+            shared: self.shared.clone(),
+            functions,
+        }
+    }
+
+    /// Select local calls made by an arbitrary read-only expression, including
+    /// callback positions and both conditional branches, using the same rules as
+    /// the persisted function dependency directory.
+    pub fn selection_for_expression(
+        &self,
+        expression: &SymbolicExpression,
+    ) -> Result<Vec<&ClarityName>, VmExecutionError> {
+        self.select_dependencies(
+            local_dependencies(
+                expression,
+                self.shared.get_clarity_version(),
+                &self.shared.function_names,
+            )
+            .into_iter()
+            .map(|index| index as usize),
+        )
+    }
+
+    pub fn dependency_closure(&self, name: &str) -> Result<Vec<&ClarityName>, VmExecutionError> {
+        self.select_dependencies(function_index(&self.shared.function_names, name))
+    }
+
+    // All roots share one visited set. Names remain borrowed from the directory;
+    // only the final executable map and existing cache keys own copies.
+    fn select_dependencies(
+        &self,
+        roots: impl IntoIterator<Item = usize>,
+    ) -> Result<Vec<&ClarityName>, VmExecutionError> {
+        let directory = &self.shared.function_names;
+        let mut visited = vec![false; directory.len()];
+        let mut pending: Vec<_> = roots.into_iter().collect();
+        while let Some(index) = pending.pop() {
+            let dependencies = self
+                .dependencies
+                .get(index)
+                .ok_or_else(|| invalid("Missing function dependency"))?;
+            if visited[index] {
+                continue;
+            }
+            visited[index] = true;
+            pending.extend(dependencies.iter().map(|index| *index as usize));
+        }
+        Ok(directory
+            .iter()
+            .zip(visited)
+            .filter_map(|(entry, selected)| selected.then_some(entry))
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests;

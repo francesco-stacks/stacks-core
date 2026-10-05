@@ -133,7 +133,9 @@ impl RPCRequestHandler for RPCGetConstantValRequestHandler {
                     &tip,
                     |clarity_tx| {
                         clarity_tx.with_clarity_db_readonly(|clarity_db| {
-                            let contract = clarity_db.get_contract(&contract_identifier).ok()?;
+                            let contract = clarity_db
+                                .get_contract_metadata(&contract_identifier)
+                                .ok()?;
 
                             let cst = contract
                                 .lookup_variable(constant_name.as_str())?

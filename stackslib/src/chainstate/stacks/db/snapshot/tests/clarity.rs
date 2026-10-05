@@ -539,3 +539,92 @@ fn test_unclassified_source_table_is_rejected() {
         "no destination should be produced when the source is rejected"
     );
 }
+
+/// Format markers survive squash; snapshots predating the marker remain accepted.
+#[test]
+fn test_contract_format_marker_and_legacy_snapshot_sources() {
+    let parent = tempdir().unwrap();
+    for version in [None, Some(3u32)] {
+        let dir = tempfile::Builder::new().tempdir_in(parent.path()).unwrap();
+        let src_dir = dir.path().join("src");
+        let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
+        let conn = rusqlite::Connection::open(clarity_marf_db_path(&src_dir)).unwrap();
+        if let Some(version) = version {
+            conn.execute("UPDATE clarity_contract_storage SET version=?1", [version])
+                .unwrap();
+        } else {
+            conn.execute_batch("DROP TABLE clarity_contract_storage")
+                .unwrap();
+        }
+        drop(conn);
+        let dst = squash_clarity_marf(
+            &src_dir,
+            &dir.path().join("squashed"),
+            blocks.last().unwrap(),
+            3,
+        );
+        if let Some(version) = version {
+            let conn = rusqlite::Connection::open(dst).unwrap();
+            let actual: u32 = conn
+                .query_row("SELECT version FROM clarity_contract_storage", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(actual, version);
+        }
+    }
+}
+
+/// Current binary records remain executable after MARF squash and side-table copy.
+#[test]
+fn test_current_contract_executes_after_snapshot_restore() {
+    use clarity::vm::contexts::OwnedEnvironment;
+    use clarity::vm::test_util::{TEST_BURN_STATE_DB, TEST_HEADER_DB};
+    use clarity::vm::types::QualifiedContractIdentifier;
+    use clarity::vm::{ClarityVersion, Value};
+    use stacks_common::consts::CHAIN_ID_TESTNET;
+    use stacks_common::types::StacksEpochId;
+
+    use crate::clarity_vm::clarity::ClarityMarfStore;
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    let restored = dir.path().join("restored");
+    let mut kv = MarfedKV::open(source.to_str().unwrap(), None, None).unwrap();
+    let blocks = [StacksBlockId([1; 32]), StacksBlockId([2; 32])];
+    let mut store = kv.begin(&StacksBlockId::sentinel(), &blocks[0]);
+    let id = QualifiedContractIdentifier::local("restored").unwrap();
+    let mut env = OwnedEnvironment::new_free(
+        false,
+        CHAIN_ID_TESTNET,
+        store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB),
+        StacksEpochId::Epoch41,
+    );
+    env.initialize_versioned_contract(
+        id.clone(),
+        ClarityVersion::Clarity2,
+        "(define-read-only (value) u42)",
+        None,
+    )
+    .unwrap();
+    drop(env);
+    store.commit_to_processed_block(&blocks[0]).unwrap();
+    kv.begin(&blocks[0], &blocks[1])
+        .commit_to_processed_block(&blocks[1])
+        .unwrap();
+    drop(kv);
+    squash_clarity_marf(&source, &restored, &blocks[1], 1);
+    let mut kv = MarfedKV::open(restored.to_str().unwrap(), None, None).unwrap();
+    let mut store = kv.begin_read_only(Some(&blocks[1]));
+    let mut env = OwnedEnvironment::new_free(
+        false,
+        CHAIN_ID_TESTNET,
+        store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB),
+        StacksEpochId::Epoch41,
+    );
+    assert_eq!(
+        env.execute_transaction(id.issuer.clone().into(), None, id, "value", &[])
+            .unwrap()
+            .0,
+        Value::UInt(42)
+    );
+}

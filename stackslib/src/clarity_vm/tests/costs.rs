@@ -914,7 +914,7 @@ fn proptest_cost_fn(cost_fn: &ClarityCostFunction, cost_contract_name: &str) {
             _ => panic!(),
         };
         with_owned_env(epoch, use_mainnet, |mut owned_env| {
-            // Production defaults execute native Rust code.
+            // Production defaults execute native Rust code and only load metadata.
             // This differential test explicitly installs executable Clarity code.
             let boot_id = boot_code_id(cost_contract_name, use_mainnet);
             let (contract, _, _) = owned_env

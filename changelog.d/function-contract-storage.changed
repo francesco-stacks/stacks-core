@@ -1,0 +1,1 @@
+Reduce Clarity contract-loading work by storing and loading functions separately while preserving execution costs and the metadata RPC schema. Metadata existence checks now report storage failures instead of treating them as absent records.

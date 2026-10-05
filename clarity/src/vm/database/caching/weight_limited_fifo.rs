@@ -88,6 +88,7 @@ where
     }
 
     /// Look up `key` without touching counters.
+    #[cfg(test)]
     pub fn peek(&self, key: &K) -> Option<&V> {
         self.entries.get(key).map(|e| &e.value)
     }

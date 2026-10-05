@@ -1973,6 +1973,22 @@ pub fn migrate_chainstate_dbs(
         return Err(DBError::TooOldForEpoch.into());
     }
 
+    // SortitionDBMigrator opens Clarity too, so executable storage must be ready
+    // before constructing it. Opening the header DB commits the downgrade guard
+    // before the executable migration starts.
+    if fs::metadata(chainstate_path).is_ok() {
+        info!("Migrating chainstate DB to the latest schema version");
+        let db_config = StacksChainState::get_db_config_from_path(chainstate_path)?;
+        let _ = StacksChainState::open_and_exec_with_migration(
+            db_config.mainnet,
+            db_config.chain_id,
+            chainstate_path,
+            None,
+            chainstate_marf_opts.clone(),
+            crate::clarity_vm::database::marf::ContractStorageMigration::Allow,
+        )?;
+    }
+
     if fs::metadata(sortdb_path).is_ok() {
         info!("Migrating sortition DB to the latest schema version");
         let migrator = SortitionDBMigrator::new(
@@ -1981,18 +1997,6 @@ pub fn migrate_chainstate_dbs(
             chainstate_marf_opts.clone(),
         )?;
         SortitionDB::migrate_if_exists(sortdb_path, epochs, migrator)?;
-    }
-    if fs::metadata(chainstate_path).is_ok() {
-        info!("Migrating chainstate DB to the latest schema version");
-        let db_config = StacksChainState::get_db_config_from_path(chainstate_path)?;
-
-        // this does the migration internally
-        let _ = StacksChainState::open(
-            db_config.mainnet,
-            db_config.chain_id,
-            chainstate_path,
-            chainstate_marf_opts,
-        )?;
     }
     Ok(())
 }

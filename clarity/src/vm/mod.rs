@@ -232,6 +232,7 @@ fn lookup_variable<'a>(
 /// Resolves `name` to a builtin, or to a user function borrowed from the contract context.
 /// Charges the `LookupFunction` cost, unlike `ContractContext::lookup_function`, and fails
 /// with `UndefinedFunction` when neither matches.
+/// Keep the native-first resolution order aligned with `contract_storage::local_dependencies`.
 pub fn lookup_function<'a>(
     name: &str,
     exec_state: &mut ExecutionState,
@@ -248,7 +249,14 @@ pub fn lookup_function<'a>(
         let user_function = invoke_ctx
             .contract_context
             .lookup_function(name)
-            .ok_or_else(|| RuntimeCheckErrorKind::UndefinedFunction(name.to_string()))?;
+            .ok_or_else(|| -> VmExecutionError {
+                if invoke_ctx.contract_context.has_function(name) {
+                    VmInternalError::Expect(format!("Contract loader omitted function {name}"))
+                        .into()
+                } else {
+                    RuntimeCheckErrorKind::UndefinedFunction(name.to_string()).into()
+                }
+            })?;
         Ok(CallableType::UserFunction(user_function))
     }
 }
