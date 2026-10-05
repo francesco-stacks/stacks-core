@@ -17,7 +17,7 @@ path = "./src/libclarity.rs"
 
 [dependencies]
 clarity-types = { package = "clarity-types", path = "../clarity-types", default-features = false }
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
 regex = "1"

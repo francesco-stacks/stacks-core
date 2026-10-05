@@ -83,6 +83,7 @@ macro_rules! clarity_serializable {
     };
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FungibleTokenMetadata {
     pub total_supply: Option<u128>,
@@ -90,6 +91,7 @@ pub struct FungibleTokenMetadata {
 
 clarity_serializable!(FungibleTokenMetadata);
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NonFungibleTokenMetadata {
     pub key_type: TypeSignature,
@@ -97,6 +99,7 @@ pub struct NonFungibleTokenMetadata {
 
 clarity_serializable!(NonFungibleTokenMetadata);
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataMapMetadata {
     pub key_type: TypeSignature,
@@ -105,6 +108,7 @@ pub struct DataMapMetadata {
 
 clarity_serializable!(DataMapMetadata);
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataVariableMetadata {
     pub value_type: TypeSignature,
@@ -124,7 +128,95 @@ clarity_serializable!(u64);
 /// previously serialized via the `Contract` type. This removes/isolates that dependency and
 /// allows us to work directly with `ContractContext`s.
 mod contract_context {
+    use std::borrow::Cow;
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::sync::Arc;
+
     use super::*;
+    use crate::vm::ClarityVersion;
+    use crate::vm::callables::DefinedFunction;
+    use crate::vm::contexts::ContractSharedContext;
+    use crate::vm::representations::ClarityName;
+    use crate::vm::types::signatures::FunctionSignature;
+    use crate::vm::types::{QualifiedContractIdentifier, TraitIdentifier, Value};
+
+    // Decode the old schema explicitly. Serde flatten buffers through Content,
+    // which cannot deserialize the i128/u128 values found in contract constants.
+    #[derive(Serialize, Deserialize)]
+    struct LegacyContractContext<'a> {
+        contract_identifier: Cow<'a, QualifiedContractIdentifier>,
+        variables: Cow<'a, HashMap<ClarityName, Value>>,
+        functions: Cow<'a, HashMap<ClarityName, DefinedFunction>>,
+        defined_traits: Cow<'a, HashMap<ClarityName, BTreeMap<ClarityName, FunctionSignature>>>,
+        implemented_traits: Cow<'a, HashSet<TraitIdentifier>>,
+        persisted_names: Cow<'a, HashSet<ClarityName>>,
+        meta_data_map: Cow<'a, HashMap<ClarityName, DataMapMetadata>>,
+        meta_data_var: Cow<'a, HashMap<ClarityName, DataVariableMetadata>>,
+        meta_nft: Cow<'a, HashMap<ClarityName, NonFungibleTokenMetadata>>,
+        meta_ft: Cow<'a, HashMap<ClarityName, FungibleTokenMetadata>>,
+        data_size: u64,
+        clarity_version: ClarityVersion,
+    }
+
+    impl serde::Serialize for ContractContext {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            // Exhaustive destructuring catches additions to the shared VM context.
+            let ContractSharedContext {
+                contract_identifier,
+                variables,
+                function_names: _,
+                defined_traits,
+                implemented_traits,
+                persisted_names,
+                meta_data_map,
+                meta_data_var,
+                meta_nft,
+                meta_ft,
+                data_size,
+                clarity_version,
+                is_deploying: _,
+            } = self.shared.as_ref();
+            let legacy = LegacyContractContext {
+                contract_identifier: Cow::Borrowed(contract_identifier),
+                variables: Cow::Borrowed(variables),
+                functions: Cow::Borrowed(&self.functions),
+                defined_traits: Cow::Borrowed(defined_traits),
+                implemented_traits: Cow::Borrowed(implemented_traits),
+                persisted_names: Cow::Borrowed(persisted_names),
+                meta_data_map: Cow::Borrowed(meta_data_map),
+                meta_data_var: Cow::Borrowed(meta_data_var),
+                meta_nft: Cow::Borrowed(meta_nft),
+                meta_ft: Cow::Borrowed(meta_ft),
+                data_size: *data_size,
+                clarity_version: *clarity_version,
+            };
+            serde::Serialize::serialize(&legacy, serializer)
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for ContractContext {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let legacy = LegacyContractContext::deserialize(deserializer)?;
+            Ok(Self {
+                shared: Arc::new(ContractSharedContext {
+                    contract_identifier: legacy.contract_identifier.into_owned(),
+                    variables: legacy.variables.into_owned(),
+                    function_names: Arc::default(),
+                    defined_traits: legacy.defined_traits.into_owned(),
+                    implemented_traits: legacy.implemented_traits.into_owned(),
+                    persisted_names: legacy.persisted_names.into_owned(),
+                    meta_data_map: legacy.meta_data_map.into_owned(),
+                    meta_data_var: legacy.meta_data_var.into_owned(),
+                    meta_nft: legacy.meta_nft.into_owned(),
+                    meta_ft: legacy.meta_ft.into_owned(),
+                    data_size: legacy.data_size,
+                    clarity_version: legacy.clarity_version,
+                    is_deploying: false,
+                }),
+                functions: legacy.functions.into_owned(),
+            })
+        }
+    }
 
     #[derive(Serialize, Deserialize)]
     pub struct Wrapper<T> {

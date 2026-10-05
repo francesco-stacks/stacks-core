@@ -814,7 +814,7 @@ fn special_let(
     finally_drop_memory!( exec_state, memory_use; {
         handle_binding_list::<_, VmExecutionError>(bindings, SyntaxBindingErrorType::Let, |binding_name, var_sexp| {
             if is_reserved(binding_name, invoke_ctx.contract_context.get_clarity_version()) ||
-                invoke_ctx.contract_context.lookup_function(binding_name).is_some() ||
+                invoke_ctx.contract_context.has_function(binding_name) ||
                 inner_context.lookup_variable(binding_name).is_some() {
                     return Err(RuntimeCheckErrorKind::NameAlreadyUsed(binding_name.clone().into()).into())
                 }

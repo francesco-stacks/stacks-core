@@ -15,6 +15,8 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::BTreeMap;
+use std::ops::Deref;
+use std::sync::Arc;
 
 use clarity_types::representations::ClarityName;
 pub use clarity_types::types::FunctionIdentifier;
@@ -24,9 +26,7 @@ use super::ClarityVersion;
 use super::costs::{CostErrors, CostOverflowingMath};
 use super::errors::VmInternalError;
 use super::types::signatures::CallableSubtype;
-use crate::vm::contexts::{
-    ContractContext, ExecutionState, FunctionExecutionOptions, InvocationContext,
-};
+use crate::vm::contexts::{ExecutionState, FunctionExecutionOptions, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
 use crate::vm::costs::runtime_cost;
 use crate::vm::errors::{RuntimeCheckErrorKind, VmExecutionError, check_argument_count};
@@ -99,13 +99,26 @@ pub enum DefineType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DefinedFunction {
-    identifier: FunctionIdentifier,
-    name: ClarityName,
-    arg_types: Vec<TypeSignature>,
+#[serde(transparent)]
+pub struct DefinedFunction(pub(crate) Arc<FunctionDefinition>);
+
+/// Immutable function definition shared by loaded contract bundles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub(crate) identifier: FunctionIdentifier,
+    pub(crate) name: ClarityName,
+    pub(crate) arg_types: Vec<TypeSignature>,
     pub define_type: DefineType,
-    arguments: Vec<ClarityName>,
-    body: SymbolicExpression,
+    pub(crate) arguments: Vec<ClarityName>,
+    pub(crate) body: SymbolicExpression,
+}
+
+impl Deref for DefinedFunction {
+    type Target = FunctionDefinition;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// Native callable that also receives execution state and invocation context.
@@ -174,14 +187,19 @@ impl DefinedFunction {
     ) -> DefinedFunction {
         let (argument_names, types) = arguments.into_iter().unzip();
 
-        DefinedFunction {
+        DefinedFunction(Arc::new(FunctionDefinition {
             identifier: FunctionIdentifier::new_user_function(name, context_name),
             name: name.clone(),
             arguments: argument_names,
             define_type,
             body,
             arg_types: types,
-        }
+        }))
+    }
+
+    /// The executable expression, borrowed without copying its tree.
+    pub fn body(&self) -> &SymbolicExpression {
+        &self.body
     }
 
     /// Clarity source-level function name.
@@ -395,7 +413,7 @@ impl DefinedFunction {
     pub fn check_trait_expectations<'t>(
         &self,
         epoch: &StacksEpochId,
-        contract_defining_trait: &'t ContractContext,
+        contract_defining_trait: &'t crate::vm::contexts::ContractSharedContext,
         trait_identifier: &TraitIdentifier,
     ) -> Result<&'t FunctionSignature, VmExecutionError> {
         let trait_name = trait_identifier.name.to_string();
@@ -462,8 +480,9 @@ impl DefinedFunction {
     }
 
     pub fn canonicalize_types(&mut self, epoch: &StacksEpochId) {
-        for i in 0..self.arguments.len() {
-            self.arg_types[i] = self.arg_types[i].canonicalize(epoch);
+        let definition = Arc::make_mut(&mut self.0);
+        for arg_type in &mut definition.arg_types {
+            *arg_type = arg_type.canonicalize(epoch);
         }
     }
 

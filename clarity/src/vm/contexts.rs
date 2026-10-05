@@ -15,6 +15,8 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Deref;
+use std::sync::Arc;
 
 pub use clarity_types::effects::{AssetMap, AssetMapEntry};
 use clarity_types::representations::ClarityName;
@@ -220,14 +222,24 @@ pub struct GlobalContext<'a, 'hooks> {
     pub execution_resource_limiter: ResourceLimiter,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 pub struct ContractContext {
+    /// Immutable contract data shared across function bundles. Deployment uses copy-on-write.
+    pub(crate) shared: Arc<ContractSharedContext>,
+    /// The function bodies available to this invocation.
+    pub(crate) functions: HashMap<ClarityName, DefinedFunction>,
+}
+
+/// Contract data independent of which function bodies are currently loaded.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ContractSharedContext {
     /// The identifier of this contract
     pub contract_identifier: QualifiedContractIdentifier,
     /// Despite being called `variables`, these are actually the constants defined in the contract
     pub variables: HashMap<ClarityName, Value>,
-    /// The functions defined in this contract, mapped by their name
-    pub functions: HashMap<ClarityName, DefinedFunction>,
+    /// Complete function namespace for partially materialized contracts.
+    #[serde(skip)]
+    pub(crate) function_names: Arc<[ClarityName]>,
     /// The traits defined in this contract, mapped by their name, to a map of the trait's function
     /// signatures
     pub defined_traits: HashMap<ClarityName, BTreeMap<ClarityName, FunctionSignature>>,
@@ -246,12 +258,37 @@ pub struct ContractContext {
     /// The total size of constants stored by this contract
     pub data_size: u64,
     /// The clarity version of this contract
-    clarity_version: ClarityVersion,
+    pub(crate) clarity_version: ClarityVersion,
     /// True while the contract is being deployed (inside `initialize_from_ast`).
     /// Constants may only be used as `contract-call?` dispatch targets
     /// after deployment, when their values are frozen.
     #[serde(skip)]
     pub is_deploying: bool,
+}
+
+impl Deref for ContractContext {
+    type Target = ContractSharedContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
+
+impl ContractContext {
+    /// Build a metadata-only context. Expression evaluation must load its selected
+    /// function definitions before using this context to execute contract code.
+    pub fn from_shared(shared: Arc<ContractSharedContext>) -> Self {
+        Self {
+            shared,
+            functions: HashMap::new(),
+        }
+    }
+
+    /// Mutate shared contract metadata, explicitly copying it when another owner
+    /// (such as the execution cache) still holds the previous value.
+    pub fn shared_mut(&mut self) -> &mut ContractSharedContext {
+        Arc::make_mut(&mut self.shared)
+    }
 }
 
 pub struct LocalContext<'a> {
@@ -1694,29 +1731,71 @@ impl ContractContext {
         clarity_version: ClarityVersion,
     ) -> Self {
         Self {
-            contract_identifier,
-            variables: HashMap::new(),
+            shared: Arc::new(ContractSharedContext {
+                contract_identifier,
+                variables: HashMap::new(),
+                function_names: Arc::default(),
+                defined_traits: HashMap::new(),
+                implemented_traits: HashSet::new(),
+                persisted_names: HashSet::new(),
+                data_size: 0,
+                meta_data_map: HashMap::new(),
+                meta_data_var: HashMap::new(),
+                meta_nft: HashMap::new(),
+                meta_ft: HashMap::new(),
+                clarity_version,
+                is_deploying: false,
+            }),
             functions: HashMap::new(),
-            defined_traits: HashMap::new(),
-            implemented_traits: HashSet::new(),
-            persisted_names: HashSet::new(),
-            data_size: 0,
-            meta_data_map: HashMap::new(),
-            meta_data_var: HashMap::new(),
-            meta_nft: HashMap::new(),
-            meta_ft: HashMap::new(),
-            clarity_version,
-            is_deploying: false,
         }
     }
 
-    /// Lookup a contract constant by name
-    pub fn lookup_variable(&self, name: &str) -> Option<&Value> {
-        self.variables.get(name)
+    /// Bodies available in this context; selective loads may omit other declared functions.
+    /// Use `has_function` for namespace checks.
+    pub fn loaded_functions(&self) -> &HashMap<ClarityName, DefinedFunction> {
+        &self.functions
     }
 
     pub fn lookup_function(&self, name: &str) -> Option<&DefinedFunction> {
         self.functions.get(name)
+    }
+
+    /// Check the function namespace without materializing a function body.
+    pub fn has_function(&self, name: &str) -> bool {
+        self.functions.contains_key(name)
+            || self
+                .function_names
+                .binary_search_by(|entry| entry.as_str().cmp(name))
+                .is_ok()
+    }
+
+    /// Whether the contract itself defines `name`, ignoring reserved natives.
+    pub fn is_name_defined_by_contract(&self, name: &str) -> bool {
+        self.variables.contains_key(name)
+            || self.has_function(name)
+            || self.persisted_names.contains(name)
+            || self.defined_traits.contains_key(name)
+    }
+
+    pub fn is_name_used(&self, name: &str) -> bool {
+        is_reserved(name, self.get_clarity_version()) || self.is_name_defined_by_contract(name)
+    }
+
+    /// Canonicalize the types for the specified epoch. Only functions and
+    /// defined traits are exposed externally, so other types are not
+    /// canonicalized.
+    pub fn canonicalize_types(&mut self, epoch: &StacksEpochId) -> Result<(), VmExecutionError> {
+        for function in self.functions.values_mut() {
+            function.canonicalize_types(epoch);
+        }
+
+        Arc::make_mut(&mut self.shared).canonicalize_types(epoch)
+    }
+}
+
+impl ContractSharedContext {
+    pub fn lookup_variable(&self, name: &str) -> Option<&Value> {
+        self.variables.get(name)
     }
 
     pub fn lookup_trait_definition(
@@ -1730,30 +1809,15 @@ impl ContractContext {
         self.implemented_traits.contains(trait_identifier)
     }
 
-    /// Whether the contract itself defines `name`, ignoring reserved natives.
-    pub fn is_name_defined_by_contract(&self, name: &str) -> bool {
-        self.variables.contains_key(name)
-            || self.functions.contains_key(name)
-            || self.persisted_names.contains(name)
-            || self.defined_traits.contains_key(name)
-    }
-
-    pub fn is_name_used(&self, name: &str) -> bool {
-        is_reserved(name, self.get_clarity_version()) || self.is_name_defined_by_contract(name)
-    }
-
     pub fn get_clarity_version(&self) -> &ClarityVersion {
         &self.clarity_version
     }
 
-    /// Canonicalize the types for the specified epoch. Only functions and
-    /// defined traits are exposed externally, so other types are not
-    /// canonicalized.
-    pub fn canonicalize_types(&mut self, epoch: &StacksEpochId) -> Result<(), VmExecutionError> {
-        for function in self.functions.values_mut() {
-            function.canonicalize_types(epoch);
-        }
-
+    /// Canonicalize shared trait types and constants for the execution epoch.
+    pub(crate) fn canonicalize_types(
+        &mut self,
+        epoch: &StacksEpochId,
+    ) -> Result<(), VmExecutionError> {
         for trait_def in self.defined_traits.values_mut() {
             for function in trait_def.values_mut() {
                 *function = function.canonicalize(epoch);
@@ -2000,6 +2064,7 @@ mod test {
             },
         );
         contract_context
+            .shared_mut()
             .defined_traits
             .insert(ClarityName::from_literal("bar"), trait_functions);
 
