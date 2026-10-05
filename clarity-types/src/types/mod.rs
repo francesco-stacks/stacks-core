@@ -69,6 +69,7 @@ pub const MAX_ERROR_VALUE_DISPLAY_LEN: usize = 512;
 /// construction (see [`Value::to_error_string`]).
 pub type BoundedValueString = BoundedString<MAX_ERROR_VALUE_DISPLAY_LEN>;
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Clone, Eq, Serialize, Deserialize)]
 pub struct TupleData {
     // todo: remove type_signature
@@ -76,11 +77,14 @@ pub struct TupleData {
     pub data_map: BTreeMap<ClarityName, Value>,
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuffData {
+    #[serde(with = "serialization::serde_byte_vec")]
     pub data: Vec<u8>,
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Clone, Eq, Serialize, Deserialize)]
 pub struct ListData {
     pub data: Vec<Value>,
@@ -239,17 +243,20 @@ pub enum ContractIdentifier {
     Qualified(QualifiedContractIdentifier),
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OptionalData {
     pub data: Option<Box<Value>>,
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseData {
     pub committed: bool,
     pub data: Box<Value>,
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallableData {
     pub contract_identifier: QualifiedContractIdentifier,
@@ -321,6 +328,7 @@ impl TraitIdentifier {
     }
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
     Int(i128),
@@ -766,8 +774,10 @@ impl fmt::Debug for CharType {
     }
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ASCIIData {
+    #[serde(with = "serialization::serde_byte_vec")]
     pub data: Vec<u8>,
 }
 
@@ -782,6 +792,7 @@ impl fmt::Display for ASCIIData {
     }
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UTF8Data {
     pub data: Vec<Vec<u8>>,

@@ -93,11 +93,19 @@ execution costs, events, and writes are not cached.
 
 ## Constants and types
 
-All constants are decoded and sanitized using the execution epoch's rules. Trait
-and argument types use the existing canonicalization rules, including the epoch
-2.2 exception. Recursive decoding retains stack protection. The header reserves
-a false sanitizer flag for a later compatible optimization; readers do not skip
-sanitization.
+All constants are decoded. Buffer and ASCII payloads use bulk byte reads, with
+unchanged binary bytes and strict JSON number-array behavior. Tuple type maps
+remain owned. Argument and trait types canonicalize in place using the existing
+epoch rules, including the epoch 2.2 exception. Recursive decoding retains stack
+protection.
+
+The header records whether constant sanitization leaves the complete serialized
+values unchanged, including nested type metadata. Value equality and the
+sanitizer's change flag alone cannot establish this. The writer checks the epoch
+3.4 rules. The reader skips sanitization only in epochs 3.4 and 4.0.
+Epoch 4.1 remains under development and runs the sanitizer, as do future epochs. The writer and reader policy live
+together in `contract_storage.rs`. Failed validation and changed values retain
+the ordinary load-time behavior, including errors in unused constants.
 
 ## Migration and recovery
 

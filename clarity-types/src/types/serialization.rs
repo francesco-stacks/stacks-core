@@ -1436,3 +1436,47 @@ impl StacksMessageCodec for Value {
         })
     }
 }
+
+/// Serde representation for raw byte vectors. Postcard and JSON keep the same
+/// bytes/number-array representation, while binary reads can copy a slice once
+/// instead of invoking a visitor per byte. Consensus Value encoding is separate.
+pub(crate) mod serde_byte_vec {
+    use serde::de::{SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        // JSON's byte visitor also accepts strings; retain Vec<u8>'s strict
+        // sequence semantics for all human-readable formats.
+        if deserializer.is_human_readable() {
+            return serde::Deserialize::deserialize(deserializer);
+        }
+        struct Bytes;
+        impl<'de> Visitor<'de> for Bytes {
+            type Value = Vec<u8>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a byte array")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+                Ok(bytes.to_vec())
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(bytes)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut bytes = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(4096));
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_byte_buf(Bytes)
+    }
+}
