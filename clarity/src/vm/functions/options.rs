@@ -133,10 +133,7 @@ fn eval_with_new_binding(
     if vm::is_reserved(
         &bind_name,
         invoke_ctx.contract_context.get_clarity_version(),
-    ) || invoke_ctx
-        .contract_context
-        .lookup_function(&bind_name)
-        .is_some()
+    ) || invoke_ctx.contract_context.has_function(&bind_name)
         || inner_context.lookup_variable(&bind_name).is_some()
     {
         return Err(RuntimeCheckErrorKind::NameAlreadyUsed(bind_name.into()).into());

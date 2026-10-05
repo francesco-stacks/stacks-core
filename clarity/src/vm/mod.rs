@@ -678,7 +678,7 @@ pub fn eval_all(
                     global_context.add_memory(value_memory_use)?;
                     total_memory_use += value_memory_use;
 
-                    contract_context.variables.insert(name, value);
+                    contract_context.shared_mut().variables.insert(name, value);
                 },
                 DefineResult::Function(name, value) => {
                     runtime_cost(ClarityCostFunction::BindName, global_context, 0)?;
@@ -687,7 +687,7 @@ pub fn eval_all(
                 },
                 DefineResult::PersistedVariable(name, value_type, value) => {
                     runtime_cost(ClarityCostFunction::CreateVar, global_context, value_type.size()?)?;
-                    contract_context.persisted_names.insert(name.clone());
+                    contract_context.shared_mut().persisted_names.insert(name.clone());
 
                     global_context.add_memory(value_type.type_size()
                                               .map_err(|_| VmInternalError::Expect("Type size should be realizable".into()))?.into())?;
@@ -697,13 +697,13 @@ pub fn eval_all(
                     let data_type = global_context.database.create_variable(&contract_context.contract_identifier, &name, value_type)?;
                     global_context.database.set_variable(&contract_context.contract_identifier, &name, value, &data_type, &global_context.epoch_id)?;
 
-                    contract_context.meta_data_var.insert(name, data_type);
+                    contract_context.shared_mut().meta_data_var.insert(name, data_type);
                 },
                 DefineResult::Map(name, key_type, value_type) => {
                     runtime_cost(ClarityCostFunction::CreateMap, global_context,
                                   u64::from(key_type.size()?).cost_overflow_add(
                                       u64::from(value_type.size()?))?)?;
-                    contract_context.persisted_names.insert(name.clone());
+                    contract_context.shared_mut().persisted_names.insert(name.clone());
 
                     global_context.add_memory(key_type.type_size()
                                               .map_err(|_| VmInternalError::Expect("Type size should be realizable".into()))?.into())?;
@@ -712,36 +712,36 @@ pub fn eval_all(
 
                     let data_type = global_context.database.create_map(&contract_context.contract_identifier, &name, key_type, value_type)?;
 
-                    contract_context.meta_data_map.insert(name, data_type);
+                    contract_context.shared_mut().meta_data_map.insert(name, data_type);
                 },
                 DefineResult::FungibleToken(name, total_supply) => {
                     runtime_cost(ClarityCostFunction::CreateFt, global_context, 0)?;
-                    contract_context.persisted_names.insert(name.clone());
+                    contract_context.shared_mut().persisted_names.insert(name.clone());
 
                     global_context.add_memory(TypeSignature::UIntType.type_size()
                                               .map_err(|_| VmInternalError::Expect("Type size should be realizable".into()))?.into())?;
 
                     let data_type = global_context.database.create_fungible_token(&contract_context.contract_identifier, &name, &total_supply)?;
 
-                    contract_context.meta_ft.insert(name, data_type);
+                    contract_context.shared_mut().meta_ft.insert(name, data_type);
                 },
                 DefineResult::NonFungibleAsset(name, asset_type) => {
                     runtime_cost(ClarityCostFunction::CreateNft, global_context, asset_type.size()?)?;
-                    contract_context.persisted_names.insert(name.clone());
+                    contract_context.shared_mut().persisted_names.insert(name.clone());
 
                     global_context.add_memory(asset_type.type_size()
                                               .map_err(|_| VmInternalError::Expect("Type size should be realizable".into()))?.into())?;
 
                     let data_type = global_context.database.create_non_fungible_token(&contract_context.contract_identifier, &name, &asset_type)?;
 
-                    contract_context.meta_nft.insert(name, data_type);
+                    contract_context.shared_mut().meta_nft.insert(name, data_type);
                 },
                 DefineResult::Trait(name, trait_type) => {
-                    contract_context.defined_traits.insert(name, trait_type);
+                    contract_context.shared_mut().defined_traits.insert(name, trait_type);
                 },
                 DefineResult::UseTrait(_name, _trait_identifier) => {},
                 DefineResult::ImplTrait(trait_identifier) => {
-                    contract_context.implemented_traits.insert(trait_identifier);
+                    contract_context.shared_mut().implemented_traits.insert(trait_identifier);
                 },
                 DefineResult::NoDefine => {
                     // not a define function, evaluate normally.
@@ -765,7 +765,7 @@ pub fn eval_all(
             }
         }
 
-        contract_context.data_size = total_memory_use;
+        contract_context.shared_mut().data_size = total_memory_use;
         Ok(last_executed)
     })
 }
@@ -994,6 +994,7 @@ mod test {
         );
 
         contract_context
+            .shared_mut()
             .variables
             .insert(ClarityName::from_literal("a"), Value::Int(59));
         contract_context
