@@ -1152,7 +1152,14 @@ impl StacksChainState {
 
                 // can't be instantiated already -- if this fails, then the transaction is invalid
                 // (because this can be checked statically by the miner before mining the block).
-                if StacksChainState::get_contract(clarity_tx, &contract_id)?.is_some() {
+                // Historical loads can fail while sanitizing constants deployed in older
+                // epochs. Preserve that error before the next consensus boundary.
+                let already_exists = if epoch_id < StacksEpochId::Epoch41 {
+                    StacksChainState::get_contract(clarity_tx, &contract_id)?.is_some()
+                } else {
+                    clarity_tx.with_clarity_db_readonly(|db| db.has_contract(&contract_id))?
+                };
+                if already_exists {
                     let msg = format!("Duplicate contract '{}'", &contract_id);
                     info!("{}", &msg);
 
@@ -1857,6 +1864,114 @@ pub mod test {
 
         assert_eq!(receipt.result, Value::err_none());
         assert!(receipt.vm_error.unwrap().starts_with("DivisionByZero"));
+    }
+
+    /// Deploy real 2.3 values through transaction processing, then retry the same
+    /// identifier. Loading those constants must still fail before the 4.1 gate.
+    #[rstest]
+    #[case(StacksEpochId::Epoch34)]
+    #[case(StacksEpochId::Epoch40)]
+    #[case(StacksEpochId::Epoch41)]
+    fn duplicate_deploy_preserves_historical_sanitizer_error(#[case] epoch: StacksEpochId) {
+        use clarity::vm::database::MemoryBackingStore;
+
+        use crate::chainstate::tests::consensus::{ConsensusUtils, FAUCET_ADDRESS};
+        use crate::clarity_vm::clarity::ClarityTransactionConnection;
+
+        let mut store = MemoryBackingStore::new();
+        let origin = StacksAccount {
+            principal: FAUCET_ADDRESS.clone().into(),
+            nonce: 0,
+            stx_balance: STXBalance::Unlocked { amount: 1_000_000 },
+        };
+        let setup = [
+            (
+                "contract-traits",
+                "(define-trait trait-a ((ping () (response bool uint))))
+                               (define-trait trait-b ((pong () (response bool uint))))",
+            ),
+            (
+                "trait-impl",
+                "(impl-trait .contract-traits.trait-a)
+                            (impl-trait .contract-traits.trait-b)
+                            (define-public (ping) (ok true)) (define-public (pong) (ok true))",
+            ),
+            (
+                "mixed-constant",
+                "(use-trait trait-a .contract-traits.trait-a)
+                (use-trait trait-b .contract-traits.trait-b)
+                (define-private (cast-a (target <trait-a>)) target)
+                (define-private (cast-b (target <trait-b>)) target)
+                (define-constant mixed (list (cast-a .trait-impl) (cast-b .trait-impl)))
+                (define-public (trigger-error) (ok mixed))",
+            ),
+        ];
+        for (nonce, (name, source)) in setup.into_iter().enumerate() {
+            let mut cost = Some(LimitedCostTracker::new_free());
+            let mut conn = ClarityTransactionConnection::new(
+                &mut store,
+                &TEST_HEADER_DB,
+                &TEST_BURN_STATE_DB,
+                &mut cost,
+                false,
+                0x80000000,
+                StacksEpochId::Epoch23,
+            );
+            conn.with_clarity_db(|db| Ok(db.set_clarity_epoch_version(StacksEpochId::Epoch23)?))
+                .unwrap();
+            let tx = ConsensusUtils::new_deploy_tx(
+                nonce as u64,
+                name,
+                source,
+                Some(ClarityVersion::Clarity2),
+            );
+            let receipt = StacksChainState::process_transaction_payload(
+                &mut conn,
+                &tx,
+                &origin,
+                &TransactionResourceBudgets::unlimited(),
+            )
+            .unwrap();
+            assert!(receipt.vm_error.is_none(), "{name}: {:?}", receipt.vm_error);
+            conn.commit().unwrap();
+        }
+        let mut cost = Some(LimitedCostTracker::new_free());
+        let mut conn = ClarityTransactionConnection::new(
+            &mut store,
+            &TEST_HEADER_DB,
+            &TEST_BURN_STATE_DB,
+            &mut cost,
+            false,
+            0x80000000,
+            epoch,
+        );
+        conn.with_clarity_db(|db| Ok(db.set_clarity_epoch_version(epoch)?))
+            .unwrap();
+        let tx = ConsensusUtils::new_deploy_tx(
+            3,
+            "mixed-constant",
+            "(define-public (run) (ok true))",
+            None,
+        );
+        let error = StacksChainState::process_transaction_payload(
+            &mut conn,
+            &tx,
+            &origin,
+            &TransactionResourceBudgets::unlimited(),
+        )
+        .unwrap_err();
+        if epoch < StacksEpochId::Epoch41 {
+            assert_eq!(
+                expect_runtime_check_error(error),
+                RuntimeCheckErrorKind::CouldNotDetermineType
+            );
+        } else {
+            assert!(
+                matches!(error, Error::InvalidStacksTransaction(ref message, false)
+                if message == &format!("Duplicate contract '{}.mixed-constant'", *FAUCET_ADDRESS)),
+                "{error:?}"
+            );
+        }
     }
 
     fn run_process_transaction_payload_at_epoch(
