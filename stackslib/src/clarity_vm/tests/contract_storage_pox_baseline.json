@@ -1,0 +1,1327 @@
+{
+  "Epoch21/pox-2/delegate-stack-stx": {
+    "balances": [
+      "LockedPoxTwo { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 41,
+      "read_length": 69423,
+      "runtime": 450401,
+      "write_count": 4,
+      "write_length": 527
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-2",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000070964656c656761746f72051aebc0ee0b2ab9e8277a600c251475e22a3241a1c10b6c6f636b2d616d6f756e7401000000000000000000000000000f42400b6c6f636b2d706572696f64010000000000000000000000000000000208706f782d616464720c0000000209686173686279746573020000001401010101010101010101010101010101010101010776657273696f6e02000000010007737461636b6572051a79b000887626b294a914501a4cd226b58b2359831173746172742d6275726e2d686569676874010000000000000000000000000000000012756e6c6f636b2d6275726e2d686569676874010000000000000000000000000000001e066c6f636b65640100000000000000000000000000000000046e616d650d0000001264656c65676174652d737461636b2d73747807737461636b6572051a79b000887626b294a914501a4cd226b58b235983",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      },
+      {
+        "committed": true,
+        "event_index": 1,
+        "stx_lock_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-2",
+          "locked_address": "ST1WV0048ERKB55592H81MK6J4TTRP8TSGE8VSTHJ",
+          "locked_amount": "1000000",
+          "unlock_height": "30"
+        },
+        "txid": "0x0",
+        "type": "stx_lock_event"
+      }
+    ],
+    "memory": 523,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Tuple": {
+            "data_map": {
+              "lock-amount": {
+                "UInt": 1000000
+              },
+              "stacker": {
+                "Principal": {
+                  "Standard": [
+                    26,
+                    [
+                      121,
+                      176,
+                      0,
+                      136,
+                      118,
+                      38,
+                      178,
+                      148,
+                      169,
+                      20,
+                      80,
+                      26,
+                      76,
+                      210,
+                      38,
+                      181,
+                      139,
+                      35,
+                      89,
+                      131
+                    ]
+                  ]
+                }
+              },
+              "unlock-burn-height": {
+                "UInt": 30
+              }
+            },
+            "type_signature": {
+              "type_map": {
+                "lock-amount": "UIntType",
+                "stacker": "PrincipalType",
+                "unlock-burn-height": "UIntType"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "Epoch21/pox-2/delegate-stx": {
+    "balances": [
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 7,
+      "read_length": 67464,
+      "runtime": 142966,
+      "write_count": 1,
+      "write_length": 131
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-2",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000040b616d6f756e742d7573747801000000000000000000000000000f42400b64656c65676174652d746f051aebc0ee0b2ab9e8277a600c251475e22a3241a1c108706f782d616464720912756e6c6f636b2d6275726e2d68656967687409066c6f636b65640100000000000000000000000000000000046e616d650d0000000c64656c65676174652d73747807737461636b6572051a79b000887626b294a914501a4cd226b58b235983",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      }
+    ],
+    "memory": 130,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Bool": true
+        }
+      }
+    }
+  },
+  "Epoch21/pox-2/stack-stx": {
+    "balances": [
+      "LockedPoxTwo { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "LockedPoxTwo { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }"
+    ],
+    "cost": {
+      "read_count": 35,
+      "read_length": 67900,
+      "runtime": 719932,
+      "write_count": 8,
+      "write_length": 869
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-2",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000050b6c6f636b2d616d6f756e7401000000000000000000000000000f42400b6c6f636b2d706572696f64010000000000000000000000000000000208706f782d616464720c0000000209686173686279746573020000001401010101010101010101010101010101010101010776657273696f6e0200000001001173746172742d6275726e2d686569676874010000000000000000000000000000000012756e6c6f636b2d6275726e2d686569676874010000000000000000000000000000001e066c6f636b65640100000000000000000000000000000000046e616d650d00000009737461636b2d73747807737461636b6572051a417d4be90d35363267b8f2afafc9531111c41ae4",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      },
+      {
+        "committed": true,
+        "event_index": 1,
+        "stx_lock_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-2",
+          "locked_address": "ST10QTJZ91MTKCCK7Q3SAZBY9AC8H3H0TWKH6JV5P",
+          "locked_amount": "1000000",
+          "unlock_height": "30"
+        },
+        "txid": "0x0",
+        "type": "stx_lock_event"
+      }
+    ],
+    "memory": 861,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Tuple": {
+            "data_map": {
+              "lock-amount": {
+                "UInt": 1000000
+              },
+              "stacker": {
+                "Principal": {
+                  "Standard": [
+                    26,
+                    [
+                      65,
+                      125,
+                      75,
+                      233,
+                      13,
+                      53,
+                      54,
+                      50,
+                      103,
+                      184,
+                      242,
+                      175,
+                      175,
+                      201,
+                      83,
+                      17,
+                      17,
+                      196,
+                      26,
+                      228
+                    ]
+                  ]
+                }
+              },
+              "unlock-burn-height": {
+                "UInt": 30
+              }
+            },
+            "type_signature": {
+              "type_map": {
+                "lock-amount": "UIntType",
+                "stacker": "PrincipalType",
+                "unlock-burn-height": "UIntType"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "Epoch21/pox-2/state-root": "6c4f9a2de65f9cae1895d76521464a5da0ff30140e76528df2e52340541cad23",
+  "Epoch24/pox-3/delegate-stack-stx": {
+    "balances": [
+      "LockedPoxThree { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 41,
+      "read_length": 70132,
+      "runtime": 451489,
+      "write_count": 4,
+      "write_length": 563
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-3",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000070964656c656761746f72051aebc0ee0b2ab9e8277a600c251475e22a3241a1c10b6c6f636b2d616d6f756e7401000000000000000000000000000f42400b6c6f636b2d706572696f64010000000000000000000000000000000208706f782d616464720c0000000209686173686279746573020000001401010101010101010101010101010101010101010776657273696f6e02000000010007737461636b6572051a79b000887626b294a914501a4cd226b58b2359831173746172742d6275726e2d686569676874010000000000000000000000000000000012756e6c6f636b2d6275726e2d686569676874010000000000000000000000000000001e066c6f636b65640100000000000000000000000000000000046e616d650d0000001264656c65676174652d737461636b2d73747807737461636b6572051a79b000887626b294a914501a4cd226b58b235983",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      },
+      {
+        "committed": true,
+        "event_index": 1,
+        "stx_lock_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-3",
+          "locked_address": "ST1WV0048ERKB55592H81MK6J4TTRP8TSGE8VSTHJ",
+          "locked_amount": "1000000",
+          "unlock_height": "30"
+        },
+        "txid": "0x0",
+        "type": "stx_lock_event"
+      }
+    ],
+    "memory": 559,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Tuple": {
+            "data_map": {
+              "lock-amount": {
+                "UInt": 1000000
+              },
+              "stacker": {
+                "Principal": {
+                  "Standard": [
+                    26,
+                    [
+                      121,
+                      176,
+                      0,
+                      136,
+                      118,
+                      38,
+                      178,
+                      148,
+                      169,
+                      20,
+                      80,
+                      26,
+                      76,
+                      210,
+                      38,
+                      181,
+                      139,
+                      35,
+                      89,
+                      131
+                    ]
+                  ]
+                }
+              },
+              "unlock-burn-height": {
+                "UInt": 30
+              }
+            },
+            "type_signature": {
+              "type_map": {
+                "lock-amount": "UIntType",
+                "stacker": "PrincipalType",
+                "unlock-burn-height": "UIntType"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "Epoch24/pox-3/delegate-stx": {
+    "balances": [
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 7,
+      "read_length": 68173,
+      "runtime": 143675,
+      "write_count": 1,
+      "write_length": 131
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-3",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000040b616d6f756e742d7573747801000000000000000000000000000f42400b64656c65676174652d746f051aebc0ee0b2ab9e8277a600c251475e22a3241a1c108706f782d616464720912756e6c6f636b2d6275726e2d68656967687409066c6f636b65640100000000000000000000000000000000046e616d650d0000000c64656c65676174652d73747807737461636b6572051a79b000887626b294a914501a4cd226b58b235983",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      }
+    ],
+    "memory": 130,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Bool": true
+        }
+      }
+    }
+  },
+  "Epoch24/pox-3/stack-stx": {
+    "balances": [
+      "LockedPoxThree { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "LockedPoxThree { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }"
+    ],
+    "cost": {
+      "read_count": 35,
+      "read_length": 68609,
+      "runtime": 720717,
+      "write_count": 8,
+      "write_length": 883
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-3",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000050b6c6f636b2d616d6f756e7401000000000000000000000000000f42400b6c6f636b2d706572696f64010000000000000000000000000000000208706f782d616464720c0000000209686173686279746573020000001401010101010101010101010101010101010101010776657273696f6e0200000001001173746172742d6275726e2d686569676874010000000000000000000000000000000012756e6c6f636b2d6275726e2d686569676874010000000000000000000000000000001e066c6f636b65640100000000000000000000000000000000046e616d650d00000009737461636b2d73747807737461636b6572051a417d4be90d35363267b8f2afafc9531111c41ae4",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      },
+      {
+        "committed": true,
+        "event_index": 1,
+        "stx_lock_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-3",
+          "locked_address": "ST10QTJZ91MTKCCK7Q3SAZBY9AC8H3H0TWKH6JV5P",
+          "locked_amount": "1000000",
+          "unlock_height": "30"
+        },
+        "txid": "0x0",
+        "type": "stx_lock_event"
+      }
+    ],
+    "memory": 875,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Tuple": {
+            "data_map": {
+              "lock-amount": {
+                "UInt": 1000000
+              },
+              "stacker": {
+                "Principal": {
+                  "Standard": [
+                    26,
+                    [
+                      65,
+                      125,
+                      75,
+                      233,
+                      13,
+                      53,
+                      54,
+                      50,
+                      103,
+                      184,
+                      242,
+                      175,
+                      175,
+                      201,
+                      83,
+                      17,
+                      17,
+                      196,
+                      26,
+                      228
+                    ]
+                  ]
+                }
+              },
+              "unlock-burn-height": {
+                "UInt": 30
+              }
+            },
+            "type_signature": {
+              "type_map": {
+                "lock-amount": "UIntType",
+                "stacker": "PrincipalType",
+                "unlock-burn-height": "UIntType"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "Epoch24/pox-3/state-root": "e40d7928584ba09c873f3c278a14cc23f4f6cc9cd8ad510d1d58149b4b013335",
+  "Epoch25/pox-4/delegate-stack-stx": {
+    "balances": [
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 33,
+      "read_length": 78829,
+      "runtime": 376081,
+      "write_count": 4,
+      "write_length": 563
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000090964656c656761746f72051aebc0ee0b2ab9e8277a600c251475e22a3241a1c10c656e642d6379636c652d69640a01000000000000000000000000000000030b6c6f636b2d616d6f756e7401000000000000000000000000000f42400b6c6f636b2d706572696f64010000000000000000000000000000000208706f782d616464720c0000000209686173686279746573020000001401010101010101010101010101010101010101010776657273696f6e02000000010007737461636b6572051a79b000887626b294a914501a4cd226b58b2359831173746172742d6275726e2d68656967687401000000000000000000000000000000000e73746172742d6379636c652d6964010000000000000000000000000000000112756e6c6f636b2d6275726e2d686569676874010000000000000000000000000000001e066c6f636b65640100000000000000000000000000000000046e616d650d0000001264656c65676174652d737461636b2d73747807737461636b6572051a79b000887626b294a914501a4cd226b58b235983",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      },
+      {
+        "committed": true,
+        "event_index": 1,
+        "stx_lock_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "locked_address": "ST1WV0048ERKB55592H81MK6J4TTRP8TSGE8VSTHJ",
+          "locked_amount": "1000000",
+          "unlock_height": "30"
+        },
+        "txid": "0x0",
+        "type": "stx_lock_event"
+      }
+    ],
+    "memory": 559,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Tuple": {
+            "data_map": {
+              "lock-amount": {
+                "UInt": 1000000
+              },
+              "stacker": {
+                "Principal": {
+                  "Standard": [
+                    26,
+                    [
+                      121,
+                      176,
+                      0,
+                      136,
+                      118,
+                      38,
+                      178,
+                      148,
+                      169,
+                      20,
+                      80,
+                      26,
+                      76,
+                      210,
+                      38,
+                      181,
+                      139,
+                      35,
+                      89,
+                      131
+                    ]
+                  ]
+                }
+              },
+              "unlock-burn-height": {
+                "UInt": 30
+              }
+            },
+            "type_signature": {
+              "type_map": {
+                "lock-amount": "UIntType",
+                "stacker": "PrincipalType",
+                "unlock-burn-height": "UIntType"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "Epoch25/pox-4/delegate-stx": {
+    "balances": [
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 5,
+      "read_length": 77010,
+      "runtime": 90663,
+      "write_count": 1,
+      "write_length": 131
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000060b616d6f756e742d7573747801000000000000000000000000000f42400b64656c65676174652d746f051aebc0ee0b2ab9e8277a600c251475e22a3241a1c10c656e642d6379636c652d69640908706f782d61646472090e73746172742d6379636c652d6964010000000000000000000000000000000112756e6c6f636b2d6275726e2d68656967687409066c6f636b65640100000000000000000000000000000000046e616d650d0000000c64656c65676174652d73747807737461636b6572051a79b000887626b294a914501a4cd226b58b235983",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      }
+    ],
+    "memory": 130,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Bool": true
+        }
+      }
+    }
+  },
+  "Epoch25/pox-4/set-signer-key-authorization": {
+    "balances": [
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 8,
+      "read_length": 77014,
+      "runtime": 90230,
+      "write_count": 1,
+      "write_length": 247
+    },
+    "events": [],
+    "memory": 246,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Bool": true
+        }
+      }
+    }
+  },
+  "Epoch25/pox-4/stack-stx": {
+    "balances": [
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }"
+    ],
+    "cost": {
+      "read_count": 30,
+      "read_length": 77798,
+      "runtime": 741037,
+      "write_count": 9,
+      "write_length": 1220
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c0000000b07617574682d696401000000000000000000000000000000010c656e642d6379636c652d69640a01000000000000000000000000000000030b6c6f636b2d616d6f756e7401000000000000000000000000000f42400b6c6f636b2d706572696f6401000000000000000000000000000000020a6d61782d616d6f756e7401000000000000000000000000000f424008706f782d616464720c0000000209686173686279746573020000001401010101010101010101010101010101010101010776657273696f6e0200000001000a7369676e65722d6b6579020000002102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3370a7369676e65722d736967091173746172742d6275726e2d68656967687401000000000000000000000000000000000e73746172742d6379636c652d6964010000000000000000000000000000000112756e6c6f636b2d6275726e2d686569676874010000000000000000000000000000001e066c6f636b65640100000000000000000000000000000000046e616d650d00000009737461636b2d73747807737461636b6572051a417d4be90d35363267b8f2afafc9531111c41ae4",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      },
+      {
+        "committed": true,
+        "event_index": 1,
+        "stx_lock_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "locked_address": "ST10QTJZ91MTKCCK7Q3SAZBY9AC8H3H0TWKH6JV5P",
+          "locked_amount": "1000000",
+          "unlock_height": "30"
+        },
+        "txid": "0x0",
+        "type": "stx_lock_event"
+      }
+    ],
+    "memory": 1211,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Tuple": {
+            "data_map": {
+              "lock-amount": {
+                "UInt": 1000000
+              },
+              "signer-key": {
+                "Sequence": {
+                  "Buffer": {
+                    "data": [
+                      2,
+                      83,
+                      31,
+                      230,
+                      6,
+                      129,
+                      52,
+                      80,
+                      61,
+                      39,
+                      35,
+                      19,
+                      50,
+                      39,
+                      200,
+                      103,
+                      172,
+                      143,
+                      166,
+                      200,
+                      60,
+                      83,
+                      126,
+                      154,
+                      68,
+                      195,
+                      197,
+                      189,
+                      189,
+                      203,
+                      31,
+                      227,
+                      55
+                    ]
+                  }
+                }
+              },
+              "stacker": {
+                "Principal": {
+                  "Standard": [
+                    26,
+                    [
+                      65,
+                      125,
+                      75,
+                      233,
+                      13,
+                      53,
+                      54,
+                      50,
+                      103,
+                      184,
+                      242,
+                      175,
+                      175,
+                      201,
+                      83,
+                      17,
+                      17,
+                      196,
+                      26,
+                      228
+                    ]
+                  ]
+                }
+              },
+              "unlock-burn-height": {
+                "UInt": 30
+              }
+            },
+            "type_signature": {
+              "type_map": {
+                "lock-amount": "UIntType",
+                "signer-key": {
+                  "SequenceType": {
+                    "BufferType": 33
+                  }
+                },
+                "stacker": "PrincipalType",
+                "unlock-burn-height": "UIntType"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "Epoch25/pox-4/state-root": "254508460c122dea537a8ad460b3d785695f93b6f28fe9ef3671e3d260b5b14f",
+  "Epoch30/pox-4/delegate-stack-stx": {
+    "balances": [
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 33,
+      "read_length": 78829,
+      "runtime": 376081,
+      "write_count": 4,
+      "write_length": 563
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000090964656c656761746f72051aebc0ee0b2ab9e8277a600c251475e22a3241a1c10c656e642d6379636c652d69640a01000000000000000000000000000000030b6c6f636b2d616d6f756e7401000000000000000000000000000f42400b6c6f636b2d706572696f64010000000000000000000000000000000208706f782d616464720c0000000209686173686279746573020000001401010101010101010101010101010101010101010776657273696f6e02000000010007737461636b6572051a79b000887626b294a914501a4cd226b58b2359831173746172742d6275726e2d68656967687401000000000000000000000000000000010e73746172742d6379636c652d6964010000000000000000000000000000000112756e6c6f636b2d6275726e2d686569676874010000000000000000000000000000001e066c6f636b65640100000000000000000000000000000000046e616d650d0000001264656c65676174652d737461636b2d73747807737461636b6572051a79b000887626b294a914501a4cd226b58b235983",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      },
+      {
+        "committed": true,
+        "event_index": 1,
+        "stx_lock_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "locked_address": "ST1WV0048ERKB55592H81MK6J4TTRP8TSGE8VSTHJ",
+          "locked_amount": "1000000",
+          "unlock_height": "30"
+        },
+        "txid": "0x0",
+        "type": "stx_lock_event"
+      }
+    ],
+    "memory": 559,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Tuple": {
+            "data_map": {
+              "lock-amount": {
+                "UInt": 1000000
+              },
+              "stacker": {
+                "Principal": {
+                  "Standard": [
+                    26,
+                    [
+                      121,
+                      176,
+                      0,
+                      136,
+                      118,
+                      38,
+                      178,
+                      148,
+                      169,
+                      20,
+                      80,
+                      26,
+                      76,
+                      210,
+                      38,
+                      181,
+                      139,
+                      35,
+                      89,
+                      131
+                    ]
+                  ]
+                }
+              },
+              "unlock-burn-height": {
+                "UInt": 30
+              }
+            },
+            "type_signature": {
+              "type_map": {
+                "lock-amount": "UIntType",
+                "stacker": "PrincipalType",
+                "unlock-burn-height": "UIntType"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "Epoch30/pox-4/delegate-stx": {
+    "balances": [
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 5,
+      "read_length": 77010,
+      "runtime": 90663,
+      "write_count": 1,
+      "write_length": 131
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000060b616d6f756e742d7573747801000000000000000000000000000f42400b64656c65676174652d746f051aebc0ee0b2ab9e8277a600c251475e22a3241a1c10c656e642d6379636c652d69640908706f782d61646472090e73746172742d6379636c652d6964010000000000000000000000000000000112756e6c6f636b2d6275726e2d68656967687409066c6f636b65640100000000000000000000000000000000046e616d650d0000000c64656c65676174652d73747807737461636b6572051a79b000887626b294a914501a4cd226b58b235983",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      }
+    ],
+    "memory": 130,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Bool": true
+        }
+      }
+    }
+  },
+  "Epoch30/pox-4/set-signer-key-authorization": {
+    "balances": [
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 8,
+      "read_length": 77014,
+      "runtime": 90230,
+      "write_count": 1,
+      "write_length": 247
+    },
+    "events": [],
+    "memory": 246,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Bool": true
+        }
+      }
+    }
+  },
+  "Epoch30/pox-4/stack-stx": {
+    "balances": [
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }"
+    ],
+    "cost": {
+      "read_count": 30,
+      "read_length": 77798,
+      "runtime": 741037,
+      "write_count": 9,
+      "write_length": 1220
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c0000000b07617574682d696401000000000000000000000000000000010c656e642d6379636c652d69640a01000000000000000000000000000000030b6c6f636b2d616d6f756e7401000000000000000000000000000f42400b6c6f636b2d706572696f6401000000000000000000000000000000020a6d61782d616d6f756e7401000000000000000000000000000f424008706f782d616464720c0000000209686173686279746573020000001401010101010101010101010101010101010101010776657273696f6e0200000001000a7369676e65722d6b6579020000002102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3370a7369676e65722d736967091173746172742d6275726e2d68656967687401000000000000000000000000000000010e73746172742d6379636c652d6964010000000000000000000000000000000112756e6c6f636b2d6275726e2d686569676874010000000000000000000000000000001e066c6f636b65640100000000000000000000000000000000046e616d650d00000009737461636b2d73747807737461636b6572051a417d4be90d35363267b8f2afafc9531111c41ae4",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      },
+      {
+        "committed": true,
+        "event_index": 1,
+        "stx_lock_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "locked_address": "ST10QTJZ91MTKCCK7Q3SAZBY9AC8H3H0TWKH6JV5P",
+          "locked_amount": "1000000",
+          "unlock_height": "30"
+        },
+        "txid": "0x0",
+        "type": "stx_lock_event"
+      }
+    ],
+    "memory": 1211,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Tuple": {
+            "data_map": {
+              "lock-amount": {
+                "UInt": 1000000
+              },
+              "signer-key": {
+                "Sequence": {
+                  "Buffer": {
+                    "data": [
+                      2,
+                      83,
+                      31,
+                      230,
+                      6,
+                      129,
+                      52,
+                      80,
+                      61,
+                      39,
+                      35,
+                      19,
+                      50,
+                      39,
+                      200,
+                      103,
+                      172,
+                      143,
+                      166,
+                      200,
+                      60,
+                      83,
+                      126,
+                      154,
+                      68,
+                      195,
+                      197,
+                      189,
+                      189,
+                      203,
+                      31,
+                      227,
+                      55
+                    ]
+                  }
+                }
+              },
+              "stacker": {
+                "Principal": {
+                  "Standard": [
+                    26,
+                    [
+                      65,
+                      125,
+                      75,
+                      233,
+                      13,
+                      53,
+                      54,
+                      50,
+                      103,
+                      184,
+                      242,
+                      175,
+                      175,
+                      201,
+                      83,
+                      17,
+                      17,
+                      196,
+                      26,
+                      228
+                    ]
+                  ]
+                }
+              },
+              "unlock-burn-height": {
+                "UInt": 30
+              }
+            },
+            "type_signature": {
+              "type_map": {
+                "lock-amount": "UIntType",
+                "signer-key": {
+                  "SequenceType": {
+                    "BufferType": 33
+                  }
+                },
+                "stacker": "PrincipalType",
+                "unlock-burn-height": "UIntType"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "Epoch30/pox-4/state-root": "eaa9a36fbaf6b8f8bcc2e84b7e9c27dbeaac827e1d543b11a8835b705696ecef",
+  "Epoch34/pox-4/delegate-stack-stx": {
+    "balances": [
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 33,
+      "read_length": 78829,
+      "runtime": 374647,
+      "write_count": 4,
+      "write_length": 563
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000090964656c656761746f72051aebc0ee0b2ab9e8277a600c251475e22a3241a1c10c656e642d6379636c652d69640a01000000000000000000000000000000030b6c6f636b2d616d6f756e7401000000000000000000000000000f42400b6c6f636b2d706572696f64010000000000000000000000000000000208706f782d616464720c0000000209686173686279746573020000001401010101010101010101010101010101010101010776657273696f6e02000000010007737461636b6572051a79b000887626b294a914501a4cd226b58b2359831173746172742d6275726e2d68656967687401000000000000000000000000000000010e73746172742d6379636c652d6964010000000000000000000000000000000112756e6c6f636b2d6275726e2d686569676874010000000000000000000000000000001e066c6f636b65640100000000000000000000000000000000046e616d650d0000001264656c65676174652d737461636b2d73747807737461636b6572051a79b000887626b294a914501a4cd226b58b235983",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      },
+      {
+        "committed": true,
+        "event_index": 1,
+        "stx_lock_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "locked_address": "ST1WV0048ERKB55592H81MK6J4TTRP8TSGE8VSTHJ",
+          "locked_amount": "1000000",
+          "unlock_height": "30"
+        },
+        "txid": "0x0",
+        "type": "stx_lock_event"
+      }
+    ],
+    "memory": 559,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Tuple": {
+            "data_map": {
+              "lock-amount": {
+                "UInt": 1000000
+              },
+              "stacker": {
+                "Principal": {
+                  "Standard": [
+                    26,
+                    [
+                      121,
+                      176,
+                      0,
+                      136,
+                      118,
+                      38,
+                      178,
+                      148,
+                      169,
+                      20,
+                      80,
+                      26,
+                      76,
+                      210,
+                      38,
+                      181,
+                      139,
+                      35,
+                      89,
+                      131
+                    ]
+                  ]
+                }
+              },
+              "unlock-burn-height": {
+                "UInt": 30
+              }
+            },
+            "type_signature": {
+              "type_map": {
+                "lock-amount": "UIntType",
+                "stacker": "PrincipalType",
+                "unlock-burn-height": "UIntType"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "Epoch34/pox-4/delegate-stx": {
+    "balances": [
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 5,
+      "read_length": 77010,
+      "runtime": 90453,
+      "write_count": 1,
+      "write_length": 131
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c000000060b616d6f756e742d7573747801000000000000000000000000000f42400b64656c65676174652d746f051aebc0ee0b2ab9e8277a600c251475e22a3241a1c10c656e642d6379636c652d69640908706f782d61646472090e73746172742d6379636c652d6964010000000000000000000000000000000112756e6c6f636b2d6275726e2d68656967687409066c6f636b65640100000000000000000000000000000000046e616d650d0000000c64656c65676174652d73747807737461636b6572051a79b000887626b294a914501a4cd226b58b235983",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      }
+    ],
+    "memory": 130,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Bool": true
+        }
+      }
+    }
+  },
+  "Epoch34/pox-4/set-signer-key-authorization": {
+    "balances": [
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "Unlocked { amount: 10000000 }"
+    ],
+    "cost": {
+      "read_count": 8,
+      "read_length": 77014,
+      "runtime": 90130,
+      "write_count": 1,
+      "write_length": 247
+    },
+    "events": [],
+    "memory": 246,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Bool": true
+        }
+      }
+    }
+  },
+  "Epoch34/pox-4/stack-stx": {
+    "balances": [
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }",
+      "Unlocked { amount: 10000000 }",
+      "LockedPoxFour { amount_unlocked: 9000000, amount_locked: 1000000, unlock_height: 30 }"
+    ],
+    "cost": {
+      "read_count": 30,
+      "read_length": 77798,
+      "runtime": 734678,
+      "write_count": 9,
+      "write_length": 1220
+    },
+    "events": [
+      {
+        "committed": true,
+        "contract_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "raw_value": "0x070c000000060762616c616e63650100000000000000000000000000989680176275726e636861696e2d756e6c6f636b2d686569676874010000000000000000000000000000000004646174610c0000000b07617574682d696401000000000000000000000000000000010c656e642d6379636c652d69640a01000000000000000000000000000000030b6c6f636b2d616d6f756e7401000000000000000000000000000f42400b6c6f636b2d706572696f6401000000000000000000000000000000020a6d61782d616d6f756e7401000000000000000000000000000f424008706f782d616464720c0000000209686173686279746573020000001401010101010101010101010101010101010101010776657273696f6e0200000001000a7369676e65722d6b6579020000002102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3370a7369676e65722d736967091173746172742d6275726e2d68656967687401000000000000000000000000000000010e73746172742d6379636c652d6964010000000000000000000000000000000112756e6c6f636b2d6275726e2d686569676874010000000000000000000000000000001e066c6f636b65640100000000000000000000000000000000046e616d650d00000009737461636b2d73747807737461636b6572051a417d4be90d35363267b8f2afafc9531111c41ae4",
+          "topic": "print"
+        },
+        "event_index": 0,
+        "txid": "0x0",
+        "type": "contract_event"
+      },
+      {
+        "committed": true,
+        "event_index": 1,
+        "stx_lock_event": {
+          "contract_identifier": "ST000000000000000000002AMW42H.pox-4",
+          "locked_address": "ST10QTJZ91MTKCCK7Q3SAZBY9AC8H3H0TWKH6JV5P",
+          "locked_amount": "1000000",
+          "unlock_height": "30"
+        },
+        "txid": "0x0",
+        "type": "stx_lock_event"
+      }
+    ],
+    "memory": 1211,
+    "value": {
+      "Response": {
+        "committed": true,
+        "data": {
+          "Tuple": {
+            "data_map": {
+              "lock-amount": {
+                "UInt": 1000000
+              },
+              "signer-key": {
+                "Sequence": {
+                  "Buffer": {
+                    "data": [
+                      2,
+                      83,
+                      31,
+                      230,
+                      6,
+                      129,
+                      52,
+                      80,
+                      61,
+                      39,
+                      35,
+                      19,
+                      50,
+                      39,
+                      200,
+                      103,
+                      172,
+                      143,
+                      166,
+                      200,
+                      60,
+                      83,
+                      126,
+                      154,
+                      68,
+                      195,
+                      197,
+                      189,
+                      189,
+                      203,
+                      31,
+                      227,
+                      55
+                    ]
+                  }
+                }
+              },
+              "stacker": {
+                "Principal": {
+                  "Standard": [
+                    26,
+                    [
+                      65,
+                      125,
+                      75,
+                      233,
+                      13,
+                      53,
+                      54,
+                      50,
+                      103,
+                      184,
+                      242,
+                      175,
+                      175,
+                      201,
+                      83,
+                      17,
+                      17,
+                      196,
+                      26,
+                      228
+                    ]
+                  ]
+                }
+              },
+              "unlock-burn-height": {
+                "UInt": 30
+              }
+            },
+            "type_signature": {
+              "type_map": {
+                "lock-amount": "UIntType",
+                "signer-key": {
+                  "SequenceType": {
+                    "BufferType": 33
+                  }
+                },
+                "stacker": "PrincipalType",
+                "unlock-burn-height": "UIntType"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "Epoch34/pox-4/state-root": "b87409412662dc856b8f2197edfbbccb6c22ec99e3e0d7387f6b645265e781d1"
+}

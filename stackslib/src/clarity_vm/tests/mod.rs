@@ -25,3 +25,7 @@ pub mod forking;
 pub mod large_contract;
 pub mod smoke;
 pub mod utils;
+
+mod contract_storage_baseline;
+mod contract_storage_fixtures;
+mod contract_storage_pox_baseline;
