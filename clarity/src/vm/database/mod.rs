@@ -33,6 +33,8 @@ pub use self::structures::{
 mod caching;
 pub mod clarity_db;
 pub mod clarity_store;
+pub mod contract_codec;
+pub mod contract_storage;
 mod key_value_wrapper;
 #[cfg(feature = "rusqlite")]
 pub mod sqlite;
