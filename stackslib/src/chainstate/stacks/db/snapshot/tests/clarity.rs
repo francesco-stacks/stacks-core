@@ -279,7 +279,7 @@ fn test_metadata_exclusions() {
         &MetadataRow {
             key: "clr-meta::ST000000000000000000002AMW42H.ghost::source",
             block_id: &blocks[0].to_hex(),
-            value: "ghost",
+            value: "ghost".into(),
         },
     )
     .unwrap();
@@ -318,7 +318,7 @@ fn test_malformed_metadata_key_is_corruption() {
         &MetadataRow {
             key: "not-a-metadata-key",
             block_id: &blocks[0].to_hex(),
-            value: "junk",
+            value: "junk".into(),
         },
     )
     .unwrap();

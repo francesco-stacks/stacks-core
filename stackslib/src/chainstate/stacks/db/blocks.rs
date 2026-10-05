@@ -6844,7 +6844,10 @@ impl StacksChainState {
                     QualifiedContractIdentifier::new(tx.origin_address().into(), name.clone());
 
                 let exists = clarity_connection
-                    .with_analysis_db_readonly(|db| db.has_contract(&contract_identifier));
+                    .with_analysis_db_readonly(|db| db.has_contract(&contract_identifier))
+                    .map_err(|e| {
+                        MemPoolRejection::FailedToValidate(Error::ClarityError(e.into()))
+                    })?;
 
                 if exists {
                     return Err(MemPoolRejection::ContractAlreadyExists(contract_identifier));

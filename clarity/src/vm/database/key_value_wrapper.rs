@@ -21,7 +21,7 @@ use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
-use super::clarity_store::SpecialCaseHandler;
+use super::clarity_store::{MetadataValue, SpecialCaseHandler};
 use super::{ClarityBackingStore, ClarityDeserializable};
 use crate::vm::Value;
 use crate::vm::database::clarity_store::{ContractCommitment, make_contract_hash_key};
@@ -29,75 +29,49 @@ use crate::vm::errors::{VmExecutionError, VmInternalError};
 use crate::vm::types::serialization::SerializationError;
 use crate::vm::types::{QualifiedContractIdentifier, TypeSignature};
 
-#[cfg(feature = "rollback_value_check")]
-type RollbackValueCheck = String;
-#[cfg(not(feature = "rollback_value_check"))]
-type RollbackValueCheck = ();
-
-#[cfg(not(feature = "rollback_value_check"))]
-fn rollback_value_check(_value: &str, _check: &RollbackValueCheck) {}
-
-#[cfg(not(feature = "rollback_value_check"))]
-fn rollback_edits_push<T>(edits: &mut Vec<(T, RollbackValueCheck)>, key: T, _value: &str) {
-    edits.push((key, ()));
+/// Debug builds optionally retain the expected value to verify rollback ordering.
+struct RollbackValueCheck<V> {
+    #[cfg(feature = "rollback_value_check")]
+    value: V,
+    #[cfg(not(feature = "rollback_value_check"))]
+    marker: std::marker::PhantomData<V>,
 }
-// this function is used to check the lookup map when committing at the "bottom" of the
-//   wrapper -- i.e., when committing to the underlying store. for the _unchecked_ implementation
-//   this is used to get the edit _value_ out of the lookupmap, for used in the subsequent `put_all`
-//   command.
-#[cfg(not(feature = "rollback_value_check"))]
-fn rollback_check_pre_bottom_commit<T>(
-    edits: Vec<(T, RollbackValueCheck)>,
-    lookup_map: &mut HashMap<T, Vec<String>>,
-) -> Result<Vec<(T, String)>, VmInternalError>
+
+impl<V: Clone + PartialEq + std::fmt::Debug> RollbackValueCheck<V> {
+    fn new(_value: &V) -> Self {
+        Self {
+            #[cfg(feature = "rollback_value_check")]
+            value: _value.clone(),
+            #[cfg(not(feature = "rollback_value_check"))]
+            marker: std::marker::PhantomData,
+        }
+    }
+    fn check(&self, _value: &V) {
+        #[cfg(feature = "rollback_value_check")]
+        assert_eq!(&self.value, _value);
+    }
+}
+
+fn rollback_check_pre_bottom_commit<T, V>(
+    edits: Vec<(T, RollbackValueCheck<V>)>,
+    lookup_map: &mut HashMap<T, Vec<V>>,
+) -> Result<Vec<(T, V)>, VmInternalError>
 where
     T: Eq + Hash + Clone,
+    V: Clone + PartialEq + std::fmt::Debug,
 {
     for edit_history in lookup_map.values_mut() {
         edit_history.reverse();
     }
-
     let output = edits
         .into_iter()
-        .map(|(key, _)| {
-            let value = rollback_lookup_map(&key, &(), lookup_map)?;
+        .map(|(key, check)| {
+            let value = rollback_lookup_map(&key, &check, lookup_map)?;
             Ok((key, value))
         })
         .collect();
-
     assert!(lookup_map.is_empty());
     output
-}
-
-#[cfg(feature = "rollback_value_check")]
-fn rollback_value_check(value: &String, check: &RollbackValueCheck) {
-    assert_eq!(value, check)
-}
-#[cfg(feature = "rollback_value_check")]
-fn rollback_edits_push<T>(edits: &mut Vec<(T, RollbackValueCheck)>, key: T, value: &str)
-where
-    T: Eq + Hash + Clone,
-{
-    edits.push((key, value.to_owned()));
-}
-// this function is used to check the lookup map when committing at the "bottom" of the
-//   wrapper -- i.e., when committing to the underlying store.
-#[cfg(feature = "rollback_value_check")]
-fn rollback_check_pre_bottom_commit<T>(
-    edits: Vec<(T, RollbackValueCheck)>,
-    lookup_map: &mut HashMap<T, Vec<String>>,
-) -> Result<Vec<(T, String)>, VmInternalError>
-where
-    T: Eq + Hash + Clone,
-{
-    for edit_history in lookup_map.values_mut() {
-        edit_history.reverse();
-    }
-    for (key, value) in edits.iter() {
-        let _ = rollback_lookup_map(key, value, lookup_map);
-    }
-    assert!(lookup_map.is_empty());
-    Ok(edits)
 }
 
 /// Result structure for fetched values from the
@@ -109,8 +83,11 @@ pub struct ValueResult {
 }
 
 pub struct RollbackContext {
-    edits: Vec<(String, RollbackValueCheck)>,
-    metadata_edits: Vec<((QualifiedContractIdentifier, String), RollbackValueCheck)>,
+    edits: Vec<(String, RollbackValueCheck<String>)>,
+    metadata_edits: Vec<(
+        (QualifiedContractIdentifier, String),
+        RollbackValueCheck<MetadataValue>,
+    )>,
 }
 
 pub struct RollbackWrapper<'a> {
@@ -120,7 +97,9 @@ pub struct RollbackWrapper<'a> {
     //   in order of least-recent to most-recent at the tail.
     //   this allows ~ O(1) lookups, and ~ O(1) commits, roll-backs (amortized by # of PUTs).
     lookup_map: HashMap<String, Vec<String>>,
-    metadata_lookup_map: HashMap<(QualifiedContractIdentifier, String), Vec<String>>,
+    metadata_lookup_map: HashMap<(QualifiedContractIdentifier, String), Vec<MetadataValue>>,
+    // Count pending edits per contract, including nested rollback contexts.
+    pending_metadata_contracts: HashMap<QualifiedContractIdentifier, usize>,
     // stack keeps track of the most recent rollback context, which tells us which
     //   edits were performed by which context. at the moment, each context's edit history
     //   is a separate Vec which must be drained into the parent on commits, meaning that
@@ -138,7 +117,9 @@ pub struct RollbackWrapper<'a> {
 //   and eval code.
 pub struct RollbackWrapperPersistedLog {
     lookup_map: HashMap<String, Vec<String>>,
-    metadata_lookup_map: HashMap<(QualifiedContractIdentifier, String), Vec<String>>,
+    metadata_lookup_map: HashMap<(QualifiedContractIdentifier, String), Vec<MetadataValue>>,
+    // Count pending edits per contract, including nested rollback contexts.
+    pending_metadata_contracts: HashMap<QualifiedContractIdentifier, usize>,
     stack: Vec<RollbackContext>,
 }
 
@@ -147,6 +128,7 @@ impl From<RollbackWrapper<'_>> for RollbackWrapperPersistedLog {
         RollbackWrapperPersistedLog {
             lookup_map: o.lookup_map,
             metadata_lookup_map: o.metadata_lookup_map,
+            pending_metadata_contracts: o.pending_metadata_contracts,
             stack: o.stack,
         }
     }
@@ -163,6 +145,7 @@ impl RollbackWrapperPersistedLog {
         RollbackWrapperPersistedLog {
             lookup_map: HashMap::new(),
             metadata_lookup_map: HashMap::new(),
+            pending_metadata_contracts: HashMap::new(),
             stack: Vec::new(),
         }
     }
@@ -175,13 +158,14 @@ impl RollbackWrapperPersistedLog {
     }
 }
 
-fn rollback_lookup_map<T>(
+fn rollback_lookup_map<T, V>(
     key: &T,
-    value: &RollbackValueCheck,
-    lookup_map: &mut HashMap<T, Vec<String>>,
-) -> Result<String, VmInternalError>
+    value: &RollbackValueCheck<V>,
+    lookup_map: &mut HashMap<T, Vec<V>>,
+) -> Result<V, VmInternalError>
 where
     T: Eq + Hash + Clone,
+    V: Clone + PartialEq + std::fmt::Debug,
 {
     let popped_value;
     let remove_edit_deque = {
@@ -193,7 +177,7 @@ where
         popped_value = key_edit_history.pop().ok_or_else(|| {
             VmInternalError::Expect("ERROR: expected value in edit history".into())
         })?;
-        rollback_value_check(&popped_value, value);
+        value.check(&popped_value);
         key_edit_history.is_empty()
     };
     if remove_edit_deque {
@@ -208,6 +192,7 @@ impl<'a> RollbackWrapper<'a> {
             store,
             lookup_map: HashMap::new(),
             metadata_lookup_map: HashMap::new(),
+            pending_metadata_contracts: HashMap::new(),
             stack: Vec::new(),
             query_pending_data: true,
         }
@@ -221,6 +206,7 @@ impl<'a> RollbackWrapper<'a> {
             store,
             lookup_map: log.lookup_map,
             metadata_lookup_map: log.metadata_lookup_map,
+            pending_metadata_contracts: log.pending_metadata_contracts,
             stack: log.stack,
             query_pending_data: true,
         }
@@ -254,6 +240,16 @@ impl<'a> RollbackWrapper<'a> {
 
         for (key, value) in last_item.metadata_edits.drain(..) {
             rollback_lookup_map(&key, &value, &mut self.metadata_lookup_map)?;
+            let count = self
+                .pending_metadata_contracts
+                .get_mut(&key.0)
+                .ok_or_else(|| {
+                    VmInternalError::Expect("Missing pending metadata edit count".into())
+                })?;
+            *count -= 1;
+            if *count == 0 {
+                self.pending_metadata_contracts.remove(&key.0);
+            }
         }
 
         Ok(())
@@ -293,6 +289,7 @@ impl<'a> RollbackWrapper<'a> {
                 last_item.metadata_edits,
                 &mut self.metadata_lookup_map,
             )?;
+            self.pending_metadata_contracts.clear();
             if !metadata_edits.is_empty() {
                 self.store.put_all_metadata(metadata_edits).map_err(|e| {
                     VmInternalError::Expect(format!(
@@ -306,16 +303,17 @@ impl<'a> RollbackWrapper<'a> {
     }
 }
 
-fn inner_put_data<T>(
-    lookup_map: &mut HashMap<T, Vec<String>>,
-    edits: &mut Vec<(T, RollbackValueCheck)>,
+fn inner_put_data<T, V>(
+    lookup_map: &mut HashMap<T, Vec<V>>,
+    edits: &mut Vec<(T, RollbackValueCheck<V>)>,
     key: T,
-    value: String,
+    value: V,
 ) where
     T: Eq + Hash + Clone,
+    V: Clone + PartialEq + std::fmt::Debug,
 {
     let key_edit_deque = lookup_map.entry(key.clone()).or_default();
-    rollback_edits_push(edits, key, &value);
+    edits.push((key, RollbackValueCheck::new(&value)));
     key_edit_deque.push(value);
 }
 
@@ -334,8 +332,7 @@ impl RollbackWrapper<'_> {
         Ok(())
     }
 
-    /// Returns whether or not the wrapper is currently retargeted to another block by e.g. an
-    /// `at-block` scope.
+    /// Whether the wrapper is reading a historical view instead of pending data.
     pub fn is_retargeted(&self) -> bool {
         !self.query_pending_data
     }
@@ -509,17 +506,30 @@ impl RollbackWrapper<'_> {
         key: &str,
         value: &str,
     ) -> Result<(), VmInternalError> {
+        self.insert_metadata_value(contract, key, MetadataValue::Text(value.to_owned()))
+    }
+
+    pub fn insert_metadata_value(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        key: &str,
+        value: MetadataValue,
+    ) -> Result<(), VmInternalError> {
         let current = self.stack.last_mut().ok_or_else(|| {
             VmInternalError::Expect("ERROR: Clarity VM attempted PUT on non-nested context.".into())
         })?;
 
         let metadata_key = (contract.clone(), key.to_string());
+        *self
+            .pending_metadata_contracts
+            .entry(contract.clone())
+            .or_default() += 1;
 
         inner_put_data(
             &mut self.metadata_lookup_map,
             &mut current.metadata_edits,
             metadata_key,
-            value.to_string(),
+            value,
         );
         Ok(())
     }
@@ -547,9 +557,54 @@ impl RollbackWrapper<'_> {
         };
 
         match lookup_result {
-            Some(x) => Ok(Some(x)),
+            Some(x) => x.into_text().map(Some),
             None => self.store.get_metadata(contract, key),
         }
+    }
+
+    /// Batch reads retain the same pending-write and historical-view semantics
+    /// as individual metadata reads. Reuse one committed deployment lookup across
+    /// the size, header and body reads of one uninterrupted contract load.
+    pub(crate) fn get_metadata_batch(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        keys: &[String],
+        deployment: &mut Option<StacksBlockId>,
+    ) -> Result<Vec<Option<MetadataValue>>, VmExecutionError> {
+        self.stack.last().ok_or_else(|| {
+            VmInternalError::Expect("ERROR: Clarity VM attempted GET on non-nested context.".into())
+        })?;
+        let mut values: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                if self.query_pending_data && !self.metadata_lookup_map.is_empty() {
+                    self.metadata_lookup_map
+                        .get(&(contract.clone(), key.clone()))
+                        .and_then(|versions| versions.last().cloned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let missing: Vec<_> = keys
+            .iter()
+            .zip(&values)
+            .filter_map(|(key, value)| value.is_none().then_some(key.clone()))
+            .collect();
+        if !missing.is_empty() {
+            let mut fetched = self
+                .store
+                .get_metadata_batch(contract, &missing, deployment)?
+                .into_iter();
+            for value in &mut values {
+                if value.is_none() {
+                    *value = fetched.next().ok_or_else(|| {
+                        VmInternalError::Expect("Incomplete metadata batch".into())
+                    })?;
+                }
+            }
+        }
+        Ok(values)
     }
 
     // Throws a NoSuchContract error if contract doesn't exist,
@@ -576,7 +631,7 @@ impl RollbackWrapper<'_> {
         };
 
         match lookup_result {
-            Some(x) => Ok(Some(x)),
+            Some(x) => x.into_text().map(Some),
             None => self.store.get_metadata_manual(at_height, contract, key),
         }
     }
@@ -592,34 +647,27 @@ impl RollbackWrapper<'_> {
         }
     }
 
+    /// Check raw metadata without decoding executable records or converting them to JSON.
+    /// A missing deployment is absence; other storage errors must propagate.
     pub fn has_metadata_entry(
         &mut self,
         contract: &QualifiedContractIdentifier,
         key: &str,
-    ) -> bool {
-        matches!(self.get_metadata(contract, key), Ok(Some(_)))
+    ) -> Result<bool, VmExecutionError> {
+        match self.get_metadata_batch(contract, &[key.to_owned()], &mut None) {
+            Ok(mut values) => Ok(values.pop().flatten().is_some()),
+            Err(VmExecutionError::RuntimeCheck(
+                crate::vm::errors::RuntimeCheckErrorKind::NoSuchContract(_),
+            )) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
-    /// Returns `true` if any of the given metadata keys for `contract` has an uncommitted edit in
-    /// the rollback stack (i.e. would be served from pending data rather than the backing store on
-    /// a `get_metadata` call).
-    ///
-    /// Used by caching implementations to avoid caching reads whose metadata could later be rolled
-    /// back.
-    pub fn has_pending_metadata(
+    /// A cached executable bundle must not hide changes to any of its records.
+    pub fn has_pending_metadata_for_contract(
         &self,
         contract: &QualifiedContractIdentifier,
-        keys: &[&str],
     ) -> bool {
-        // Retargeted wrappers always read from the backing store, so pending metadata is
-        // irrelevant.
-        if self.is_retargeted() {
-            return false;
-        }
-
-        keys.iter().any(|key| {
-            let metadata_key = (contract.clone(), (*key).to_string());
-            self.metadata_lookup_map.contains_key(&metadata_key)
-        })
+        !self.is_retargeted() && self.pending_metadata_contracts.contains_key(contract)
     }
 }

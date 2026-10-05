@@ -901,7 +901,7 @@ fn special_contract_of(
             if !exec_state
                 .global_context
                 .database
-                .has_contract(&trait_data.contract_identifier)
+                .has_contract(&trait_data.contract_identifier)?
             {
                 return Err(RuntimeCheckErrorKind::NoSuchContract(
                     trait_data.contract_identifier.to_string(),

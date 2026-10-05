@@ -737,7 +737,7 @@ impl<'a> ClarityDatabase<'a> {
         key: &str,
         data: &T,
     ) -> Result<(), VmExecutionError> {
-        if self.store.has_metadata_entry(contract_identifier, key) {
+        if self.store.has_metadata_entry(contract_identifier, key)? {
             Err(VmInternalError::Expect(format!(
                 "Metadata entry '{key}' already exists for contract: {contract_identifier}"
             ))
@@ -887,7 +887,10 @@ impl<'a> ClarityDatabase<'a> {
         Ok(())
     }
 
-    pub fn has_contract(&mut self, contract_identifier: &QualifiedContractIdentifier) -> bool {
+    pub fn has_contract(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+    ) -> Result<bool, VmExecutionError> {
         let key = ClarityDatabase::make_metadata_key(
             StoreType::Contract,
             ContractDataVarName::Contract.as_str(),
@@ -927,14 +930,8 @@ impl<'a> ClarityDatabase<'a> {
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
     ) -> bool {
-        let contract_key = ContractDataVarName::Contract.metadata_key();
-        let size_key = ContractDataVarName::ContractSize.metadata_key();
-        let data_size_key = ContractDataVarName::ContractDataSize.metadata_key();
-
-        self.store.has_pending_metadata(
-            contract_identifier,
-            &[&contract_key, &size_key, &data_size_key],
-        )
+        self.store
+            .has_pending_metadata_for_contract(contract_identifier)
     }
 
     /// Load a parsed contract, returning a canonicalized [`Contract`].
