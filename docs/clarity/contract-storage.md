@@ -148,7 +148,9 @@ Standalone databases have no node schema version; do not reopen them with older
 Clarity tools after migration. Both commands resume interrupted conversion and
 refuse missing files, unrelated databases, and unsupported formats. Retain an
 original snapshot for rollback and benchmark comparisons. Snapshot export and
-import preserve executable BLOBs and the completion marker.
+import preserve executable BLOBs and the completion marker. See the
+[node benchmark guide](contract-node-benchmark.md) for clone and measurement
+commands.
 
 ## Compatibility validation
 

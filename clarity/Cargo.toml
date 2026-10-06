@@ -71,6 +71,10 @@ name = "contract_loading"
 harness = false
 required-features = ["testing"]
 
+[[example]]
+name = "contract_storage_snapshot"
+required-features = ["testing"]
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 serde_stacker = "0.1"
 
