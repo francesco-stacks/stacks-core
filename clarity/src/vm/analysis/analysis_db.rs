@@ -91,7 +91,10 @@ impl<'a> AnalysisDatabase<'a> {
             .unwrap();
     }
 
-    pub fn has_contract(&mut self, contract_identifier: &QualifiedContractIdentifier) -> bool {
+    pub fn has_contract(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+    ) -> Result<bool, crate::vm::errors::VmExecutionError> {
         self.store
             .has_metadata_entry(contract_identifier, AnalysisDatabase::storage_key())
     }
@@ -145,7 +148,11 @@ impl<'a> AnalysisDatabase<'a> {
         contract: &ContractAnalysis,
     ) -> Result<(), StaticCheckError> {
         let key = AnalysisDatabase::storage_key();
-        if self.store.has_metadata_entry(contract_identifier, key) {
+        if self
+            .store
+            .has_metadata_entry(contract_identifier, key)
+            .map_err(|e| StaticCheckErrorKind::Unreachable(BoundedErrorString::from_debug(&e)))?
+        {
             return Err(StaticCheckErrorKind::ContractAlreadyExists(
                 contract_identifier.to_string(),
             )

@@ -1046,7 +1046,7 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
             if self
                 .global_context
                 .database
-                .has_contract(&contract_identifier)
+                .has_contract(&contract_identifier)?
             {
                 return Err(RuntimeCheckErrorKind::Unreachable(bounded_format!(
                     "Contract already exists: {contract_identifier}"

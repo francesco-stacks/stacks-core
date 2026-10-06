@@ -3,6 +3,7 @@ use std::ops::{Deref, DerefMut};
 use clarity::types::chainstate::TrieHash;
 use clarity::util::hash::Sha512Trunc256Sum;
 use clarity::vm::analysis::AnalysisDatabase;
+use clarity::vm::database::clarity_store::MetadataValue;
 use clarity::vm::database::sqlite::{
     sqlite_get_contract_hash, sqlite_get_metadata, sqlite_get_metadata_manual,
     sqlite_insert_metadata,
@@ -1349,12 +1350,30 @@ impl ClarityBackingStore for MemoryBackingStore {
         sqlite_insert_metadata(self, contract, key, value)
     }
 
+    fn insert_metadata_value(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        key: &str,
+        value: &MetadataValue,
+    ) -> Result<(), VmExecutionError> {
+        clarity::vm::database::sqlite::sqlite_insert_metadata_value(self, contract, key, value)
+    }
+
     fn get_metadata(
         &mut self,
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
         sqlite_get_metadata(self, contract, key)
+    }
+
+    fn get_metadata_batch(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        keys: &[String],
+        deployment: &mut Option<StacksBlockId>,
+    ) -> Result<Vec<Option<MetadataValue>>, VmExecutionError> {
+        clarity::vm::database::sqlite::sqlite_get_metadata_batch(self, contract, keys, deployment)
     }
 
     fn get_metadata_manual(

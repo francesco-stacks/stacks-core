@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use clarity::util::hash::Sha512Trunc256Sum;
+use clarity::vm::database::clarity_store::MetadataValue;
 use clarity::vm::database::sqlite::{
     sqlite_get_contract_hash, sqlite_get_metadata, sqlite_get_metadata_manual,
     sqlite_insert_metadata,
@@ -767,12 +768,30 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
         panic!("BUG: attempted metadata commit to read-only MARF");
     }
 
+    fn insert_metadata_value(
+        &mut self,
+        _: &QualifiedContractIdentifier,
+        _: &str,
+        _: &MetadataValue,
+    ) -> Result<(), VmExecutionError> {
+        panic!("BUG: attempted metadata commit to read-only MARF");
+    }
+
     fn get_metadata(
         &mut self,
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
         sqlite_get_metadata(self, contract, key)
+    }
+
+    fn get_metadata_batch(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        keys: &[String],
+        deployment: &mut Option<StacksBlockId>,
+    ) -> Result<Vec<Option<MetadataValue>>, VmExecutionError> {
+        clarity::vm::database::sqlite::sqlite_get_metadata_batch(self, contract, keys, deployment)
     }
 
     fn get_metadata_manual(
@@ -1032,12 +1051,30 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
         sqlite_insert_metadata(self, contract, key, value)
     }
 
+    fn insert_metadata_value(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        key: &str,
+        value: &MetadataValue,
+    ) -> Result<(), VmExecutionError> {
+        clarity::vm::database::sqlite::sqlite_insert_metadata_value(self, contract, key, value)
+    }
+
     fn get_metadata(
         &mut self,
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
         sqlite_get_metadata(self, contract, key)
+    }
+
+    fn get_metadata_batch(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        keys: &[String],
+        deployment: &mut Option<StacksBlockId>,
+    ) -> Result<Vec<Option<MetadataValue>>, VmExecutionError> {
+        clarity::vm::database::sqlite::sqlite_get_metadata_batch(self, contract, keys, deployment)
     }
 
     fn get_metadata_manual(
@@ -1158,6 +1195,13 @@ impl<'a> ClarityMarfStoreTransaction for Box<dyn WritableMarfStore + 'a> {
 }
 
 impl<'a> ClarityBackingStore for Box<dyn WritableMarfStore + 'a> {
+    fn put_all_metadata(
+        &mut self,
+        items: Vec<((QualifiedContractIdentifier, String), MetadataValue)>,
+    ) -> Result<(), VmExecutionError> {
+        ClarityBackingStore::put_all_metadata(self.deref_mut(), items)
+    }
+
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
         ClarityBackingStore::put_all_data(self.deref_mut(), items)
     }
@@ -1228,12 +1272,30 @@ impl<'a> ClarityBackingStore for Box<dyn WritableMarfStore + 'a> {
         ClarityBackingStore::insert_metadata(self.deref_mut(), contract, key, value)
     }
 
+    fn insert_metadata_value(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        key: &str,
+        value: &MetadataValue,
+    ) -> Result<(), VmExecutionError> {
+        ClarityBackingStore::insert_metadata_value(self.deref_mut(), contract, key, value)
+    }
+
     fn get_metadata(
         &mut self,
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
         ClarityBackingStore::get_metadata(self.deref_mut(), contract, key)
+    }
+
+    fn get_metadata_batch(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        keys: &[String],
+        deployment: &mut Option<StacksBlockId>,
+    ) -> Result<Vec<Option<MetadataValue>>, VmExecutionError> {
+        ClarityBackingStore::get_metadata_batch(self.deref_mut(), contract, keys, deployment)
     }
 
     fn get_metadata_manual(

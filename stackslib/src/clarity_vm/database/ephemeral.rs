@@ -16,6 +16,7 @@
 use std::mem;
 
 use clarity::util::hash::Sha512Trunc256Sum;
+use clarity::vm::database::clarity_store::MetadataValue;
 use clarity::vm::database::sqlite::{
     sqlite_get_contract_hash, sqlite_get_metadata, sqlite_get_metadata_manual,
     sqlite_insert_metadata,
@@ -195,6 +196,18 @@ impl EphemeralTip {
     }
 }
 
+/// Filter both UNION branches explicitly. SQLite 3.45 does not push key-IN
+/// predicates through the view, so reading it can copy an entire deployment.
+const METADATA_BATCH_QUERY: &str = "WITH selected_metadata AS (
+    SELECT key, value FROM main.ephemeral_metadata_table
+        WHERE blockhash = ?2 AND key IN (SELECT value FROM json_each(?1))
+    UNION ALL SELECT disk.key, disk.value FROM read_only_marf.metadata_table AS disk
+        WHERE disk.blockhash = ?2 AND disk.key IN (SELECT value FROM json_each(?1))
+        AND NOT EXISTS (SELECT 1 FROM main.ephemeral_metadata_table AS pending
+            WHERE pending.key = disk.key AND pending.blockhash = disk.blockhash)
+    ) SELECT requested.key, metadata.value FROM json_each(?1) AS requested
+    LEFT JOIN selected_metadata AS metadata ON metadata.key = requested.value";
+
 impl<'a> EphemeralMarfStore<'a> {
     /// Attach the sqlite DB of the given read-only MARF store to the ephemeral MARF, so that reads
     /// on the ephemeral MARF for non-ephemeral data will automatically fall back to the read-only
@@ -274,8 +287,15 @@ impl<'a> EphemeralMarfStore<'a> {
         .expect("FATAL: failed to rename metadata_table to ephemeral_metadata_table");
         conn.execute("CREATE TEMP VIEW data_table(key, value) AS SELECT * FROM main.ephemeral_data_table UNION SELECT * FROM read_only_marf.data_table", NO_PARAMS)
             .expect("FATAL: failed to setup temp view data_table on ephemeral MARF DB");
-        conn.execute("CREATE TEMP VIEW metadata_table(key, blockhash, value) AS SELECT * FROM main.ephemeral_metadata_table UNION SELECT * FROM read_only_marf.metadata_table", NO_PARAMS)
-            .expect("FATAL: failed to setup temp view metadata_table on ephemeral MARF DB");
+        conn.execute(
+            "CREATE TEMP VIEW metadata_table(key, blockhash, value) AS
+            SELECT * FROM main.ephemeral_metadata_table
+            UNION ALL SELECT disk.* FROM read_only_marf.metadata_table AS disk
+            WHERE NOT EXISTS (SELECT 1 FROM main.ephemeral_metadata_table AS pending
+                WHERE pending.key = disk.key AND pending.blockhash = disk.blockhash)",
+            NO_PARAMS,
+        )
+        .expect("FATAL: failed to setup temp view metadata_table on ephemeral MARF DB");
     }
 
     /// Delete temporary views `data_table` and `metadata_table`, and restore
@@ -745,6 +765,37 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
         res
     }
 
+    fn put_all_metadata(
+        &mut self,
+        items: Vec<((QualifiedContractIdentifier, String), MetadataValue)>,
+    ) -> Result<(), VmExecutionError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.teardown_views();
+        let result = items.into_iter().try_for_each(|((contract, key), value)| {
+            clarity::vm::database::sqlite::sqlite_insert_metadata_value(
+                self, &contract, &key, &value,
+            )
+        });
+        // Restore the views on errors as well; the caller owns transaction rollback.
+        self.setup_views();
+        result
+    }
+
+    fn insert_metadata_value(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        key: &str,
+        value: &MetadataValue,
+    ) -> Result<(), VmExecutionError> {
+        self.teardown_views();
+        let res =
+            clarity::vm::database::sqlite::sqlite_insert_metadata_value(self, contract, key, value);
+        self.setup_views();
+        res
+    }
+
     /// Load up metadata from the metadata table (materialized view) in the ephemeral MARF
     /// for a given contract and metadata key.
     /// Returns Ok(Some(value)) if the metadata exists
@@ -758,11 +809,22 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
         sqlite_get_metadata(self, contract, key)
     }
 
-    /// Load up metadata at a specific block height from the metadata table (materialized view) in
-    /// the ephemeral MARF for a given contract and metadata key.
-    /// Returns Ok(Some(value)) if the metadata exists
-    /// Returns Ok(None) if the metadata does not exist
-    /// Returns Err(..) on failure
+    fn get_metadata_batch(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        keys: &[String],
+        deployment: &mut Option<StacksBlockId>,
+    ) -> Result<Vec<Option<MetadataValue>>, VmExecutionError> {
+        clarity::vm::database::sqlite::sqlite_get_metadata_batch_with_query(
+            self,
+            contract,
+            keys,
+            deployment,
+            METADATA_BATCH_QUERY,
+        )
+    }
+
+    /// Load metadata at a specific block height from the ephemeral MARF view.
     fn get_metadata_manual(
         &mut self,
         at_height: u32,
@@ -774,3 +836,165 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
 }
 
 impl WritableMarfStore for EphemeralMarfStore<'_> {}
+
+#[cfg(test)]
+mod metadata_batch_tests {
+    use clarity::vm::database::clarity_store::MetadataValue;
+
+    use super::*;
+    use crate::chainstate::stacks::index::ClarityMarfTrieId;
+    use crate::clarity_vm::database::marf::MarfedKV;
+
+    #[test]
+    fn ephemeral_metadata_batch_uses_both_key_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut marf = MarfedKV::open(dir.path().to_str().unwrap(), None, None).unwrap();
+        let parent = StacksBlockId([1; 32]);
+        let tip = StacksBlockId([2; 32]);
+        let id = QualifiedContractIdentifier::local("batch").unwrap();
+        let mut store = marf.begin(&StacksBlockId::sentinel(), &parent);
+        store
+            .insert_metadata_value(
+                &id,
+                "binary",
+                &MetadataValue::Blob(b"parent".as_slice().into()),
+            )
+            .unwrap();
+        store.insert_metadata(&id, "override", "disk").unwrap();
+        store.commit_to_processed_block(&parent).unwrap();
+        let mut store: Box<dyn WritableMarfStore> =
+            Box::new(marf.begin_ephemeral(&parent, &tip).unwrap());
+        store
+            .insert_metadata_value(
+                &id,
+                "binary",
+                &MetadataValue::Blob(b"ephemeral".as_slice().into()),
+            )
+            .unwrap();
+        let schema_version = |store: &mut Box<dyn WritableMarfStore>| -> i64 {
+            store
+                .get_side_store()
+                .query_row("PRAGMA temp.schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        // Replay can write the same key/deployment with different encoded bytes.
+        // Both scalar and batch reads must consistently prefer the ephemeral row.
+        let collision = format!("clr-meta::{id}::override");
+        store.get_side_store().execute(
+            "INSERT INTO main.ephemeral_metadata_table(key,blockhash,value) VALUES(?1,?2,'ephemeral')",
+            rusqlite::params![collision, parent],
+        ).unwrap();
+        assert_eq!(
+            SqliteConnection::get_metadata(
+                store.get_side_store(),
+                &parent,
+                &id.to_string(),
+                "override"
+            )
+            .unwrap(),
+            Some("ephemeral".into())
+        );
+        assert_eq!(
+            store
+                .get_metadata_batch(
+                    &id,
+                    &["override".into(), "override".into()],
+                    &mut Some(parent.clone())
+                )
+                .unwrap(),
+            vec![Some(MetadataValue::Text("ephemeral".into())); 2]
+        );
+        let before_schema = schema_version(&mut store);
+        store.put_all_metadata(vec![]).unwrap();
+        assert_eq!(schema_version(&mut store), before_schema);
+        store
+            .put_all_metadata(
+                (0..10)
+                    .map(|i| {
+                        (
+                            (id.clone(), format!("batch-{i}")),
+                            MetadataValue::Text("ok".into()),
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(
+            schema_version(&mut store) - before_schema,
+            4,
+            "two views dropped and recreated once per batch"
+        );
+        assert!(store
+            .put_all_metadata(vec![(
+                (id.clone(), "batch-0".into()),
+                MetadataValue::Text("duplicate".into())
+            )])
+            .is_err());
+        assert_eq!(
+            store
+                .get_metadata_batch(&id, &["batch-0".into()], &mut Some(tip.clone()))
+                .unwrap()[0],
+            Some(MetadataValue::Text("ok".into()))
+        );
+        // Query work must depend on the requested rows, not unrelated metadata
+        // in the same deployment block. Count VM operations rather than wall time.
+        fn steps(conn: &Connection, block: &StacksBlockId, key: &str) -> i32 {
+            let mut statement = conn.prepare(METADATA_BATCH_QUERY).unwrap();
+            let mut rows = statement
+                .query(rusqlite::params![
+                    serde_json::to_string(&[key]).unwrap(),
+                    block
+                ])
+                .unwrap();
+            assert!(rows.next().unwrap().is_some());
+            assert!(rows.next().unwrap().is_none());
+            drop(rows);
+            statement.get_status(rusqlite::StatementStatus::VmStep)
+        }
+        let before = steps(
+            store.get_side_store(),
+            &tip,
+            &format!("clr-meta::{id}::binary"),
+        );
+        for index in 0..1000 {
+            store
+                .insert_metadata_value(
+                    &id,
+                    &format!("unrelated-{index}"),
+                    &MetadataValue::Blob(vec![42; 1024].into()),
+                )
+                .unwrap();
+        }
+        let after = steps(
+            store.get_side_store(),
+            &tip,
+            &format!("clr-meta::{id}::binary"),
+        );
+        // An index-range boundary can add a few operations. A scan of the
+        // thousand new rows would instead increase the count by thousands.
+        assert!(
+            after < 2 * before,
+            "unrelated metadata caused query growth: {before} -> {after}"
+        );
+        let keys: Vec<String> = ["binary", "absent", "binary"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for (block, bytes) in [
+            (parent, b"parent".as_slice()),
+            (tip, b"ephemeral".as_slice()),
+        ] {
+            let rows = store
+                .get_metadata_batch(&id, &keys, &mut Some(block))
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    Some(MetadataValue::Blob(bytes.into())),
+                    None,
+                    Some(MetadataValue::Blob(bytes.into()))
+                ]
+            );
+        }
+    }
+}

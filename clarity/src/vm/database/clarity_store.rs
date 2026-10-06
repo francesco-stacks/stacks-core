@@ -47,6 +47,37 @@ pub type SpecialCaseHandler = &'static dyn Fn(
     &Value,
 ) -> Result<(), VmExecutionError>;
 
+/// Ordinary metadata remains text; executable records are encoded once before
+/// entering the rollback log and committed as BLOBs without reparsing JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetadataValue {
+    /// Ordinary UTF-8 metadata.
+    Text(String),
+    /// Pre-encoded executable metadata shared with the rollback log.
+    Blob(std::sync::Arc<[u8]>),
+}
+
+impl MetadataValue {
+    /// Bytes stored on disk, used for the execution cache budget.
+    pub fn encoded_len(&self) -> u64 {
+        match self {
+            Self::Text(s) => s.len() as u64,
+            Self::Blob(bytes) => bytes.len() as u64,
+        }
+    }
+
+    /// Read ordinary text metadata. Executable BLOBs require the contract loader.
+    pub fn into_text(self) -> Result<String, VmExecutionError> {
+        match self {
+            Self::Text(s) => Ok(s),
+            Self::Blob(_) => Err(VmInternalError::Expect(
+                "Expected text metadata, found executable BLOB".into(),
+            )
+            .into()),
+        }
+    }
+}
+
 // These functions generally _do not_ return errors, rather, any errors in the underlying storage
 //    will _panic_. The rationale for this is that under no condition should the interpreter
 //    attempt to continue processing in the event of an unexpected storage error.
@@ -120,11 +151,30 @@ pub trait ClarityBackingStore {
         value: &str,
     ) -> Result<(), VmExecutionError>;
 
+    /// Preserve the supplied metadata representation, including executable BLOBs.
+    fn insert_metadata_value(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        key: &str,
+        value: &MetadataValue,
+    ) -> Result<(), VmExecutionError>;
+
     fn get_metadata(
         &mut self,
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError>;
+
+    /// Fetch raw records in caller order, preserving duplicates and missing entries.
+    /// Reuse the deployment lookup across batches within one load. The caller must
+    /// discard `deployment` before changing the contract or chain view. Stores
+    /// without deployment-based metadata can ignore this hint.
+    fn get_metadata_batch(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        keys: &[String],
+        deployment: &mut Option<StacksBlockId>,
+    ) -> Result<Vec<Option<MetadataValue>>, VmExecutionError>;
 
     fn get_metadata_manual(
         &mut self,
@@ -135,10 +185,10 @@ pub trait ClarityBackingStore {
 
     fn put_all_metadata(
         &mut self,
-        items: Vec<((QualifiedContractIdentifier, String), String)>,
+        items: Vec<((QualifiedContractIdentifier, String), MetadataValue)>,
     ) -> Result<(), VmExecutionError> {
         for ((contract, key), value) in items.into_iter() {
-            self.insert_metadata(&contract, &key, &value)?;
+            self.insert_metadata_value(&contract, &key, &value)?;
         }
         Ok(())
     }
@@ -266,6 +316,24 @@ impl ClarityBackingStore for NullBackingStore {
         _value: &str,
     ) -> Result<(), VmExecutionError> {
         panic!("NullBackingStore cannot insert_metadata")
+    }
+
+    fn insert_metadata_value(
+        &mut self,
+        _: &QualifiedContractIdentifier,
+        _: &str,
+        _: &MetadataValue,
+    ) -> Result<(), VmExecutionError> {
+        panic!("NullBackingStore cannot insert metadata")
+    }
+
+    fn get_metadata_batch(
+        &mut self,
+        _: &QualifiedContractIdentifier,
+        _: &[String],
+        _: &mut Option<StacksBlockId>,
+    ) -> Result<Vec<Option<MetadataValue>>, VmExecutionError> {
+        panic!("NullBackingStore cannot retrieve metadata")
     }
 
     fn get_metadata(

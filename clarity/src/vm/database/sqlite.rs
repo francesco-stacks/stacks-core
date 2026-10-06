@@ -21,7 +21,7 @@ use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::db::tx_busy_handler;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
-use super::clarity_store::{ContractCommitment, make_contract_hash_key};
+use super::clarity_store::{ContractCommitment, MetadataValue, make_contract_hash_key};
 use super::{
     ClarityBackingStore, ClarityDatabase, ClarityDeserializable, NULL_BURN_STATE_DB,
     NULL_HEADER_DB, SpecialCaseHandler,
@@ -29,6 +29,11 @@ use super::{
 use crate::vm::analysis::{AnalysisDatabase, RuntimeCheckErrorKind};
 use crate::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
 use crate::vm::types::QualifiedContractIdentifier;
+
+/// Indexed reads of the persistent metadata table.
+const METADATA_BATCH_QUERY: &str = "SELECT requested.key, metadata.value
+    FROM json_each(?1) AS requested LEFT JOIN metadata_table AS metadata
+    ON metadata.blockhash = ?2 AND metadata.key = requested.value";
 
 const SQL_FAIL_MESSAGE: &str = "PANIC: SQL Failure in Smart Contract VM.";
 
@@ -45,7 +50,7 @@ pub struct MetadataRow<'a> {
     /// The `blockhash` column: a hex-encoded [`StacksBlockId`].
     pub block_id: &'a str,
     /// The stored metadata value.
-    pub value: &'a str,
+    pub value: rusqlite::types::ValueRef<'a>,
 }
 
 /// Stateless storage operations on caller-owned SQLite connections.
@@ -131,6 +136,124 @@ pub fn sqlite_get_metadata(
     SqliteConnection::get_metadata(store.get_side_store(), &bhh, &contract.to_string(), key)
 }
 
+/// Copy a SQLite value into rollback-aware metadata storage.
+fn metadata_value(value: rusqlite::types::ValueRef<'_>) -> Result<MetadataValue, VmExecutionError> {
+    match value {
+        rusqlite::types::ValueRef::Text(bytes) => String::from_utf8(bytes.to_vec())
+            .map(MetadataValue::Text)
+            .map_err(|e| VmInternalError::DBError(e.to_string()).into()),
+        rusqlite::types::ValueRef::Blob(bytes) => Ok(MetadataValue::Blob(bytes.into())),
+        _ => Err(VmInternalError::DBError("Invalid metadata storage type".into()).into()),
+    }
+}
+
+/// Commit an already-encoded executable row at the open deployment tip.
+pub fn sqlite_insert_metadata_value(
+    store: &mut dyn ClarityBackingStore,
+    contract: &QualifiedContractIdentifier,
+    key: &str,
+    value: &MetadataValue,
+) -> Result<(), VmExecutionError> {
+    let block = store.get_open_chain_tip();
+    match value {
+        MetadataValue::Text(value) => SqliteConnection::insert_metadata(
+            store.get_side_store(),
+            &block,
+            &contract.to_string(),
+            key,
+            value,
+        ),
+        MetadataValue::Blob(bytes) => SqliteConnection::insert_metadata_bytes(
+            store.get_side_store(),
+            &block,
+            &contract.to_string(),
+            key,
+            bytes,
+        ),
+    }
+}
+
+/// Ordinary metadata is text. Executable records are read through the raw batch API.
+fn metadata_text(value: rusqlite::types::ValueRef<'_>) -> Result<String, VmExecutionError> {
+    match value {
+        rusqlite::types::ValueRef::Text(bytes) => String::from_utf8(bytes.to_vec())
+            .map_err(|e| VmInternalError::DBError(e.to_string()).into()),
+        rusqlite::types::ValueRef::Blob(_) => Err(VmInternalError::DBError(
+            "Expected text metadata, found executable BLOB".into(),
+        )
+        .into()),
+        _ => Err(VmInternalError::DBError("Invalid metadata storage type".into()).into()),
+    }
+}
+
+/// Read raw records in caller order with one deployment resolution.
+/// Reuse a deployment only within the caller's unchanged contract/view scope.
+pub fn sqlite_get_metadata_batch(
+    store: &mut dyn ClarityBackingStore,
+    contract: &QualifiedContractIdentifier,
+    keys: &[String],
+    deployment: &mut Option<StacksBlockId>,
+) -> Result<Vec<Option<MetadataValue>>, VmExecutionError> {
+    sqlite_get_metadata_batch_with_query(store, contract, keys, deployment, METADATA_BATCH_QUERY)
+}
+
+/// Run a store-specific indexed query. `query` must return (requested array index,
+/// raw value), with JSON keys bound as ?1 and deployment block bound as ?2.
+/// Ephemeral stores must push these predicates into both UNION branches;
+/// SQLite 3.45 does not push a key-IN subquery through their metadata view.
+pub fn sqlite_get_metadata_batch_with_query(
+    store: &mut dyn ClarityBackingStore,
+    contract: &QualifiedContractIdentifier,
+    keys: &[String],
+    deployment: &mut Option<StacksBlockId>,
+    query: &str,
+) -> Result<Vec<Option<MetadataValue>>, VmExecutionError> {
+    if keys.is_empty() {
+        return Ok(vec![]);
+    }
+    let bhh = match deployment.as_ref() {
+        Some(block) => block.clone(),
+        None => {
+            let (block, _) = store.get_contract_hash(contract)?;
+            *deployment = Some(block.clone());
+            block
+        }
+    };
+    let contract_id = contract.to_string();
+    let metadata_keys: Vec<_> = keys
+        .iter()
+        .map(|key| SqliteConnection::make_metadata_key(&contract_id, key))
+        .collect();
+    let requested = serde_json::to_string(&metadata_keys)
+        .map_err(|e| VmInternalError::DBError(e.to_string()))?;
+    let conn = store.get_side_store();
+    let mut statement = conn
+        .prepare_cached(query)
+        .map_err(|e| VmInternalError::DBError(e.to_string()))?;
+    let mut rows = statement
+        .query(params![requested, bhh])
+        .map_err(|e| VmInternalError::DBError(e.to_string()))?;
+    let mut values = vec![None; keys.len()];
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| VmInternalError::DBError(e.to_string()))?
+    {
+        let index: usize = row
+            .get(0)
+            .map_err(|e| VmInternalError::DBError(e.to_string()))?;
+        let value = values
+            .get_mut(index)
+            .ok_or_else(|| VmInternalError::Expect("Invalid metadata batch index".into()))?;
+        let raw = row
+            .get_ref(1)
+            .map_err(|e| VmInternalError::DBError(e.to_string()))?;
+        if raw != rusqlite::types::ValueRef::Null {
+            *value = Some(metadata_value(raw)?);
+        }
+    }
+    Ok(values)
+}
+
 pub fn sqlite_get_metadata_manual(
     store: &mut dyn ClarityBackingStore,
     at_height: u32,
@@ -181,9 +304,23 @@ impl SqliteConnection {
             .prepare_cached("INSERT INTO metadata_table (blockhash, key, value) VALUES (?, ?, ?)")
             .and_then(|mut stmt| stmt.execute(params))
         {
-            error!("Failed to insert ({bhh},{key},{value}): {e:?}");
+            error!("Failed to insert metadata ({bhh},{key}): {e:?}");
             return Err(VmInternalError::DBError(SQL_FAIL_MESSAGE.into()).into());
         }
+        Ok(())
+    }
+
+    pub fn insert_metadata_bytes(
+        conn: &Connection,
+        bhh: &StacksBlockId,
+        contract_id: &str,
+        key: &str,
+        value: &[u8],
+    ) -> Result<(), VmExecutionError> {
+        let key = Self::make_metadata_key(contract_id, key);
+        conn.prepare_cached("INSERT INTO metadata_table (blockhash, key, value) VALUES (?, ?, ?)")
+            .and_then(|mut stmt| stmt.execute(params![bhh, key, value]))
+            .map_err(|e| VmInternalError::DBError(e.to_string()))?;
         Ok(())
     }
 
@@ -194,7 +331,11 @@ impl SqliteConnection {
         row: &MetadataRow,
     ) -> Result<(), rusqlite::Error> {
         conn.prepare_cached("INSERT INTO metadata_table (blockhash, key, value) VALUES (?, ?, ?)")?
-            .execute(params![row.block_id, row.key, row.value])?;
+            .execute(params![
+                row.block_id,
+                row.key,
+                rusqlite::types::ToSqlOutput::Borrowed(row.value)
+            ])?;
         Ok(())
     }
 
@@ -209,7 +350,7 @@ impl SqliteConnection {
         while let Some(row) = rows.next()? {
             let key = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
             let block_id = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
-            let value = row.get_ref(2)?.as_str().map_err(rusqlite::Error::from)?;
+            let value = row.get_ref(2)?;
             visit(&MetadataRow {
                 key,
                 block_id,
@@ -282,10 +423,10 @@ impl SqliteConnection {
 
         match conn
             .prepare_cached("SELECT value FROM metadata_table WHERE blockhash = ? AND key = ?")
-            .and_then(|mut stmt| stmt.query_row(params, |row| row.get(0)))
+            .and_then(|mut stmt| stmt.query_row(params, |row| Ok(metadata_text(row.get_ref(0)?))))
             .optional()
         {
-            Ok(x) => Ok(x),
+            Ok(x) => x.transpose(),
             Err(e) => {
                 error!("Failed to query ({bhh},{key}): {e:?}");
                 Err(VmInternalError::DBError(SQL_FAIL_MESSAGE.into()).into())
@@ -362,6 +503,16 @@ impl SqliteConnection {
 
 pub struct MemoryBackingStore {
     side_store: Connection,
+    /// Instrumentation for tests/benchmarks; these are backing-store calls, not
+    /// physical I/O counts or a substitute for measuring the actual MARF.
+    #[cfg(any(test, feature = "testing"))]
+    pub metadata_resolutions: usize,
+    #[cfg(any(test, feature = "testing"))]
+    pub metadata_batches: usize,
+    #[cfg(any(test, feature = "testing"))]
+    pub data_reads: usize,
+    #[cfg(any(test, feature = "testing"))]
+    pub block_height_reads: usize,
 }
 
 impl Default for MemoryBackingStore {
@@ -375,7 +526,17 @@ impl MemoryBackingStore {
     pub fn new() -> MemoryBackingStore {
         let side_store = SqliteConnection::memory().unwrap();
 
-        let mut memory_marf = MemoryBackingStore { side_store };
+        let mut memory_marf = MemoryBackingStore {
+            side_store,
+            #[cfg(any(test, feature = "testing"))]
+            metadata_resolutions: 0,
+            #[cfg(any(test, feature = "testing"))]
+            metadata_batches: 0,
+            #[cfg(any(test, feature = "testing"))]
+            data_reads: 0,
+            #[cfg(any(test, feature = "testing"))]
+            block_height_reads: 0,
+        };
 
         memory_marf.as_clarity_db().initialize();
 
@@ -397,6 +558,10 @@ impl ClarityBackingStore for MemoryBackingStore {
     }
 
     fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.data_reads += 1;
+        }
         SqliteConnection::get(self.get_side_store(), key)
     }
 
@@ -423,6 +588,10 @@ impl ClarityBackingStore for MemoryBackingStore {
     }
 
     fn get_block_at_height(&mut self, height: u32) -> Option<StacksBlockId> {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.block_height_reads += 1;
+        }
         if height == 0 {
             Some(StacksBlockId([255; 32]))
         } else {
@@ -457,6 +626,10 @@ impl ClarityBackingStore for MemoryBackingStore {
         &mut self,
         contract: &QualifiedContractIdentifier,
     ) -> Result<(StacksBlockId, Sha512Trunc256Sum), VmExecutionError> {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.metadata_resolutions += 1;
+        }
         sqlite_get_contract_hash(self, contract)
     }
 
@@ -469,12 +642,37 @@ impl ClarityBackingStore for MemoryBackingStore {
         sqlite_insert_metadata(self, contract, key, value)
     }
 
+    fn insert_metadata_value(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        key: &str,
+        value: &crate::vm::database::clarity_store::MetadataValue,
+    ) -> Result<(), VmExecutionError> {
+        crate::vm::database::sqlite::sqlite_insert_metadata_value(self, contract, key, value)
+    }
+
     fn get_metadata(
         &mut self,
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
         sqlite_get_metadata(self, contract, key)
+    }
+
+    fn get_metadata_batch(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        keys: &[String],
+        deployment: &mut Option<StacksBlockId>,
+    ) -> Result<Vec<Option<crate::vm::database::clarity_store::MetadataValue>>, VmExecutionError>
+    {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            if !keys.is_empty() {
+                self.metadata_batches += 1;
+            }
+        }
+        sqlite_get_metadata_batch(self, contract, keys, deployment)
     }
 
     fn get_metadata_manual(
@@ -490,6 +688,39 @@ impl ClarityBackingStore for MemoryBackingStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_batch_preserves_order_absent_keys_and_duplicates() {
+        let mut store = MemoryBackingStore::new();
+        let id = QualifiedContractIdentifier::local("batch").unwrap();
+        let mut db = store.as_clarity_db();
+        db.begin();
+        db.insert_contract_hash(&id, "source").unwrap();
+        db.set_metadata(&id, "a", "first").unwrap();
+        db.set_metadata(&id, "b", "second").unwrap();
+        db.commit().unwrap();
+        db.begin();
+        db.set_metadata(&id, "a", "pending").unwrap();
+        let keys: Vec<_> = ["b", "absent", "a", "b"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            db.store
+                .get_metadata_batch(&id, &keys, &mut None)
+                .unwrap()
+                .into_iter()
+                .map(|v| v.map(|v| v.into_text().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![
+                Some("second".into()),
+                None,
+                Some("pending".into()),
+                Some("second".into())
+            ]
+        );
+        db.roll_back().unwrap();
+    }
 
     #[test]
     fn trigger_bad_block_height() {
@@ -513,6 +744,46 @@ mod tests {
     }
 
     #[test]
+    fn metadata_copy_preserves_binary_and_text_types() {
+        let source = SqliteConnection::memory().unwrap();
+        let destination = SqliteConnection::memory().unwrap();
+        source
+            .execute(
+                "INSERT INTO metadata_table VALUES ('text','block','json')",
+                [],
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO metadata_table VALUES ('binary','block',?1)",
+                [vec![0u8, 255, 42]],
+            )
+            .unwrap();
+        SqliteConnection::visit_metadata_rows(&source, |row| {
+            SqliteConnection::insert_metadata_row(&destination, row)
+        })
+        .unwrap();
+        let (kind, bytes): (String, Vec<u8>) = destination
+            .query_row(
+                "SELECT typeof(value),value FROM metadata_table WHERE key='binary'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "blob");
+        assert_eq!(bytes, vec![0, 255, 42]);
+        let (kind, value): (String, String) = destination
+            .query_row(
+                "SELECT typeof(value),value FROM metadata_table WHERE key='text'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "text");
+        assert_eq!(value, "json");
+    }
+
+    #[test]
     fn metadata_keys_visited_in_order() {
         let conn = SqliteConnection::memory().unwrap();
         let block_id = StacksBlockId([0x11; 32]).to_hex();
@@ -529,7 +800,7 @@ mod tests {
                 &MetadataRow {
                     key,
                     block_id: &block_id,
-                    value: "v",
+                    value: "v".into(),
                 },
             )
             .unwrap();
