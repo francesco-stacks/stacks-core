@@ -284,7 +284,7 @@ pub enum LimitedCostTracker {
 #[cfg(any(test, feature = "testing"))]
 impl LimitedCostTracker {
     /// Supply executable code explicitly for native-versus-Clarity differential tests.
-    /// Normal tracker initialization selects native Rust evaluators.
+    /// Normal tracker initialization only needs the boot contract's metadata.
     pub fn set_cost_contract_for_testing(&mut self, contract: Contract) {
         match self {
             Self::Free => panic!("Cannot set a cost contract on a free tracker"),
@@ -485,7 +485,7 @@ impl TrackerData {
     /// Load the default cost functions for this tracker's epoch.
     ///
     /// All default evaluators use native Rust implementations. Before Epoch 4.0,
-    /// retain the boot contract load and its missing-contract error.
+    /// retain the boot contract metadata load and its missing-contract error.
     fn load_costs(&mut self, clarity_db: &mut ClarityDatabase) -> Result<(), CostErrors> {
         clarity_db.begin();
         let epoch_id = clarity_db
@@ -513,7 +513,7 @@ impl TrackerData {
         }
 
         if epoch_id < StacksEpochId::Epoch40 {
-            match clarity_db.get_contract(&boot_costs_id) {
+            match clarity_db.get_contract_metadata(&boot_costs_id) {
                 Ok(_) => (),
                 Err(e) => {
                     error!("Failed to load intended Clarity cost contract";

@@ -250,6 +250,17 @@ pub enum Command {
         key: String,
     },
 
+    /// Explicitly migrate executable contract storage (cannot be downgraded)
+    #[command(name = "migrate-contract-storage")]
+    MigrateContractStorage {
+        /// Existing chainstate directory, or a standalone SQLite file with --standalone
+        #[arg(value_name = "PATH")]
+        db_path: String,
+        /// Migrate a standalone Clarity/Clarinet database without a node chainstate
+        #[arg(long)]
+        standalone: bool,
+    },
+
     /// Deserialize values from Clarity database
     #[command(name = "deserialize-db")]
     DeserializeDb {
@@ -507,6 +518,35 @@ mod tests {
     fn verify_cli_structure() {
         // Validates that all clap attributes are correct
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_migrate_contract_storage_parsing() {
+        let cli = Cli::try_parse_from([
+            "stacks-inspect",
+            "migrate-contract-storage",
+            "/copy/chainstate",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::MigrateContractStorage { db_path, standalone: false }
+            if db_path == "/copy/chainstate")
+        );
+        let standalone = Cli::try_parse_from([
+            "stacks-inspect",
+            "migrate-contract-storage",
+            "--standalone",
+            "/copy/marf.sqlite",
+        ])
+        .unwrap();
+        assert!(matches!(
+            standalone.command,
+            Command::MigrateContractStorage {
+                standalone: true,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["stacks-inspect", "migrate-contract-storage"]).is_err());
     }
 
     #[test]

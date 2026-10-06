@@ -3703,6 +3703,27 @@ mod tests {
                 tx.cache.contracts.hits() > hits_after_first,
                 "second call should hit the cache",
             );
+
+            // The same epoch is in effect at genesis, but this contract had not
+            // been deployed there. Cached code must not leak into that view.
+            tx.with_clarity_db_readonly(|db| {
+                let current = db
+                    .get_contract_for_function(&contract_identifier, "noop")
+                    .unwrap();
+                let prior = db.set_block_hash(StacksBlockId([0; 32]), false).unwrap();
+                assert!(db
+                    .get_contract_for_function(&contract_identifier, "noop")
+                    .is_err());
+                db.set_block_hash(prior, true).unwrap();
+                let restored = db
+                    .get_contract_for_function(&contract_identifier, "noop")
+                    .unwrap();
+                assert!(std::ptr::eq(&current.variables, &restored.variables));
+                assert!(std::ptr::eq(
+                    current.lookup_function("noop").unwrap().body(),
+                    restored.lookup_function("noop").unwrap().body(),
+                ));
+            });
         });
 
         // tx3: fresh tx must see counters reset and still work.

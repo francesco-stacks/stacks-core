@@ -16,7 +16,7 @@
 #[cfg(feature = "rusqlite")]
 pub use sqlite::MemoryBackingStore;
 
-pub use self::caching::ClarityExecutionCache;
+pub use self::caching::{ClarityExecutionCache, ContractCache};
 pub use self::clarity_db::{
     BurnStateDB, ClarityDatabase, HeadersDB, NULL_BURN_STATE_DB, NULL_HEADER_DB,
     STORE_CONTRACT_SRC_INTERFACE, StoreType,
@@ -34,6 +34,8 @@ mod caching;
 pub mod clarity_db;
 pub mod clarity_store;
 pub mod contract_codec;
+#[cfg(feature = "rusqlite")]
+pub mod contract_migration;
 pub mod contract_storage;
 mod key_value_wrapper;
 #[cfg(feature = "rusqlite")]

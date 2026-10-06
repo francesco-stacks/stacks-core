@@ -1,0 +1,87 @@
+{
+  "data": [
+    [
+      "clarity-contract::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich",
+      "2ae5df2ba7370be657dac10c8ec9278054b3845bdd8a094c8e4f1e895486740d00000000"
+    ],
+    [
+      "clarity-contract::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rpc",
+      "d21e24b66da28bb8b0bba492540a642e0addc0e7811b87c2e5e2e9f02df3a14a00000000"
+    ],
+    [
+      "vm-epoch::epoch-version",
+      "00004000"
+    ],
+    [
+      "vm::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich::1::counter",
+      "0100000000000000000000000000000000"
+    ],
+    [
+      "vm::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich::3::token",
+      "0"
+    ]
+  ],
+  "metadata": [
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich::vm-metadata::5::entries",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "{\"key_type\":\"UIntType\",\"value_type\":{\"TupleType\":{\"type_map\":{\"n\":\"IntType\"}}}}"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich::vm-metadata::6::counter",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "{\"value_type\":\"UIntType\"}"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich::vm-metadata::7::token",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "{\"total_supply\":100}"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich::vm-metadata::8::nft",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "{\"key_type\":\"UIntType\"}"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich::vm-metadata::9::contract",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "{\"contract_context\":{\"contract_identifier\":{\"issuer\":[1,[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]],\"name\":\"legacy-rich\"},\"variables\":{\"extremes\":{\"Tuple\":{\"type_signature\":{\"type_map\":{\"signed\":\"IntType\",\"unsigned\":\"UIntType\"}},\"data_map\":{\"signed\":{\"Int\":-170141183460469231731687303715884105728},\"unsigned\":{\"UInt\":340282366920938463463374607431768211455}}}}},\"functions\":{\"run\":{\"identifier\":{\"identifier\":\"S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich:run\"},\"name\":\"run\",\"arg_types\":[],\"define_type\":\"Public\",\"arguments\":[],\"body\":{\"expr\":{\"List\":[{\"expr\":{\"Atom\":\"ok\"},\"id\":53},{\"expr\":{\"List\":[{\"expr\":{\"Atom\":\"get\"},\"id\":55},{\"expr\":{\"Atom\":\"unsigned\"},\"id\":56},{\"expr\":{\"Atom\":\"extremes\"},\"id\":57}]},\"id\":54}]},\"id\":52}}},\"defined_traits\":{\"interface\":{\"run\":{\"args\":[],\"returns\":{\"ResponseType\":[\"UIntType\",\"UIntType\"]}}}},\"implemented_traits\":[{\"name\":\"interface\",\"contract_identifier\":{\"issuer\":[1,[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]],\"name\":\"legacy-rich\"}}],\"persisted_names\":[\"nft\",\"entries\",\"token\",\"counter\"],\"meta_data_map\":{\"entries\":{\"key_type\":\"UIntType\",\"value_type\":{\"TupleType\":{\"type_map\":{\"n\":\"IntType\"}}}}},\"meta_data_var\":{\"counter\":{\"value_type\":\"UIntType\"}},\"meta_nft\":{\"nft\":{\"key_type\":\"UIntType\"}},\"meta_ft\":{\"token\":{\"total_supply\":100}},\"data_size\":70,\"clarity_version\":\"Clarity1\"}}"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich::vm-metadata::9::contract-data-size",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "70"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich::vm-metadata::9::contract-size",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "518"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rich::vm-metadata::9::contract-src",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "\n            (define-constant extremes {signed: -170141183460469231731687303715884105728, unsigned: u340282366920938463463374607431768211455})\n            (define-trait interface ((run () (response uint uint))))\n            (impl-trait .legacy-rich.interface)\n            (define-map entries uint (tuple (n int)))\n            (define-data-var counter uint u0)\n            (define-fungible-token token u100)\n            (define-non-fungible-token nft uint)\n            (define-public (run) (ok (get unsigned extremes)))"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rpc::vm-metadata::9::contract",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "{\"contract_context\":{\"contract_identifier\":{\"issuer\":[1,[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]],\"name\":\"legacy-rpc\"},\"variables\":{\"extremes\":{\"Tuple\":{\"type_signature\":{\"type_map\":{\"signed\":\"IntType\",\"unsigned\":\"UIntType\"}},\"data_map\":{\"signed\":{\"Int\":-170141183460469231731687303715884105728},\"unsigned\":{\"UInt\":340282366920938463463374607431768211455}}}}},\"functions\":{\"run\":{\"identifier\":{\"identifier\":\"S1G2081040G2081040G2081040G208105NK8PE5.legacy-rpc:run\"},\"name\":\"run\",\"arg_types\":[],\"define_type\":\"ReadOnly\",\"arguments\":[],\"body\":{\"expr\":{\"Atom\":\"extremes\"},\"id\":16}}},\"defined_traits\":{},\"implemented_traits\":[],\"persisted_names\":[],\"meta_data_map\":{},\"meta_data_var\":{},\"meta_nft\":{},\"meta_ft\":{},\"data_size\":70,\"clarity_version\":\"Clarity2\"}}"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rpc::vm-metadata::9::contract-data-size",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "70"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rpc::vm-metadata::9::contract-size",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "188"
+    ],
+    [
+      "clr-meta::S1G2081040G2081040G2081040G208105NK8PE5.legacy-rpc::vm-metadata::9::contract-src",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "\n            (define-constant extremes {signed: -170141183460469231731687303715884105728, unsigned: u340282366920938463463374607431768211455})\n            (define-read-only (run) extremes)"
+    ]
+  ],
+  "writer_commit": "3fd5d990f4d53562dd1def3eb7849ae801c2d807"
+}

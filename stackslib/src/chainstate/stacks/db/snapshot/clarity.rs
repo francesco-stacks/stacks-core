@@ -34,6 +34,8 @@ use crate::util_lib::db::sqlite_open;
 
 /// Clarity side-storage tables copied by [`copy_clarity_side_tables`].
 const CLARITY_SIDE_TABLES: &[&str] = &[DATA_TABLE_NAME, METADATA_TABLE_NAME];
+/// Optional on older databases; preserve completed/interrupted executable migrations.
+const CONTRACT_FORMAT_TABLE: &str = "clarity_contract_storage";
 
 /// Every table the Clarity snapshot accounts for: side-storage copied by
 /// [`copy_clarity_side_tables`] ([`CLARITY_SIDE_TABLES`]) or owned by the MARF
@@ -42,6 +44,7 @@ fn known_clarity_tables() -> Vec<&'static str> {
     CLARITY_SIDE_TABLES
         .iter()
         .chain(MARF_INFRA_TABLES)
+        .chain(std::iter::once(&CONTRACT_FORMAT_TABLE))
         .copied()
         .collect()
 }
@@ -97,6 +100,15 @@ pub fn copy_clarity_side_tables(
         "",
         |conn| -> Result<ClaritySideTableStats, Error> {
             clone_schemas_from_source(conn, CLARITY_SIDE_TABLES)?;
+            let has_format: bool = src_conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [CONTRACT_FORMAT_TABLE],
+                |row| row.get(0),
+            )?;
+            if has_format {
+                clone_schemas_from_source(conn, &[CONTRACT_FORMAT_TABLE])?;
+                conn.execute("INSERT OR REPLACE INTO clarity_contract_storage SELECT * FROM src.clarity_contract_storage", [])?;
+            }
 
             let t = Instant::now();
             let src_data_count = SqliteConnection::count_data_rows(&src_conn)?;

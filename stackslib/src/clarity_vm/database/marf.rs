@@ -27,7 +27,7 @@ use clarity::vm::database::sqlite::{
 use clarity::vm::database::{ClarityBackingStore, SpecialCaseHandler, SqliteConnection};
 use clarity::vm::errors::{IncomparableError, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::types::QualifiedContractIdentifier;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
 
@@ -62,12 +62,40 @@ pub struct MarfedKV {
     ephemeral_marf: Option<MARF<StacksBlockId>>,
 }
 
+/// Whether opening an existing database may convert its executable records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContractStorageMigration {
+    /// Refuse a database that has not completed the storage migration.
+    RequireCurrent,
+    /// Migrate legacy records before opening the VM. Older builds cannot reopen it.
+    Allow,
+}
+
 impl MarfedKV {
+    /// Check an existing database before opening any writable storage handles.
+    /// A missing file is allowed so callers can initialize a new database.
+    pub fn check_contract_storage(path_str: &str) -> Result<(), VmExecutionError> {
+        let path = PathBuf::from(path_str).join("marf.sqlite");
+        if !path
+            .try_exists()
+            .map_err(|e| VmInternalError::DBError(e.to_string()))?
+        {
+            return Ok(());
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| VmInternalError::SqliteError(IncomparableError { err: e }))?;
+        clarity::vm::database::contract_migration::check_contract_storage(&conn)
+    }
+
     fn setup_db(
         path_str: &str,
         unconfirmed: bool,
         marf_opts: Option<MARFOpenOpts>,
+        migration: ContractStorageMigration,
     ) -> Result<MARF<StacksBlockId>, VmExecutionError> {
+        if migration == ContractStorageMigration::RequireCurrent {
+            Self::check_contract_storage(path_str)?;
+        }
         let mut path = PathBuf::from(path_str);
 
         std::fs::create_dir_all(&path).map_err(|_| VmInternalError::FailedToCreateDataDirectory)?;
@@ -92,7 +120,15 @@ impl MarfedKV {
         };
 
         if SqliteConnection::check_schema(marf.sqlite_conn()).is_ok() {
-            // no need to initialize
+            if migration == ContractStorageMigration::Allow {
+                clarity::vm::database::contract_migration::migrate_contract_storage(
+                    marf.sqlite_conn(),
+                )?;
+            } else {
+                clarity::vm::database::contract_migration::check_contract_storage(
+                    marf.sqlite_conn(),
+                )?;
+            }
             return Ok(marf);
         }
 
@@ -104,15 +140,33 @@ impl MarfedKV {
         tx.commit()
             .map_err(|err| VmInternalError::SqliteError(IncomparableError { err }))?;
 
+        clarity::vm::database::contract_migration::migrate_contract_storage(marf.sqlite_conn())?;
         Ok(marf)
     }
 
+    /// Open current storage or initialize a new database. Existing legacy
+    /// databases require an explicit migration through `open_with_migration`.
     pub fn open(
         path_str: &str,
         miner_tip: Option<&StacksBlockId>,
         marf_opts: Option<MARFOpenOpts>,
     ) -> Result<MarfedKV, VmExecutionError> {
-        let marf = MarfedKV::setup_db(path_str, false, marf_opts)?;
+        Self::open_with_migration(
+            path_str,
+            miner_tip,
+            marf_opts,
+            ContractStorageMigration::RequireCurrent,
+        )
+    }
+
+    /// Open storage with an explicit decision about converting legacy records.
+    pub fn open_with_migration(
+        path_str: &str,
+        miner_tip: Option<&StacksBlockId>,
+        marf_opts: Option<MARFOpenOpts>,
+        migration: ContractStorageMigration,
+    ) -> Result<MarfedKV, VmExecutionError> {
+        let marf = MarfedKV::setup_db(path_str, false, marf_opts, migration)?;
         let chain_tip = match miner_tip {
             Some(miner_tip) => miner_tip.clone(),
             None => StacksBlockId::sentinel(),
@@ -125,12 +179,29 @@ impl MarfedKV {
         })
     }
 
+    /// Open current unconfirmed storage with the same checks as `open`.
     pub fn open_unconfirmed(
         path_str: &str,
         miner_tip: Option<&StacksBlockId>,
         marf_opts: Option<MARFOpenOpts>,
     ) -> Result<MarfedKV, VmExecutionError> {
-        let marf = MarfedKV::setup_db(path_str, true, marf_opts)?;
+        Self::open_unconfirmed_with_migration(
+            path_str,
+            miner_tip,
+            marf_opts,
+            ContractStorageMigration::RequireCurrent,
+        )
+    }
+
+    /// Explicitly allow or refuse migration when opening unconfirmed storage.
+    /// Allowing migration does not depend on a confirmed opener running first.
+    pub fn open_unconfirmed_with_migration(
+        path_str: &str,
+        miner_tip: Option<&StacksBlockId>,
+        marf_opts: Option<MARFOpenOpts>,
+        migration: ContractStorageMigration,
+    ) -> Result<MarfedKV, VmExecutionError> {
+        let marf = MarfedKV::setup_db(path_str, true, marf_opts, migration)?;
         let chain_tip = match miner_tip {
             Some(miner_tip) => miner_tip.clone(),
             None => StacksBlockId::sentinel(),
@@ -164,6 +235,7 @@ impl MarfedKV {
                 .expect("Inexplicably non-UTF-8 character in filename"),
             false,
             None,
+            ContractStorageMigration::RequireCurrent,
         )
         .unwrap();
 

@@ -74,7 +74,7 @@ use crate::clarity_vm::clarity::{
     ClarityBlockConnection, ClarityConnection, ClarityError, ClarityInstance,
     ClarityReadOnlyConnection, PreCommitClarityBlock,
 };
-use crate::clarity_vm::database::marf::MarfedKV;
+use crate::clarity_vm::database::marf::{ContractStorageMigration, MarfedKV};
 use crate::clarity_vm::database::{HeadersDBConn, MarfHeadersDB};
 use crate::core::*;
 use crate::monitoring;
@@ -688,8 +688,8 @@ impl<'a> DerefMut for ChainstateTx<'a> {
     }
 }
 
-pub const CHAINSTATE_VERSION: &str = "14";
-pub const CHAINSTATE_VERSION_NUMBER: u32 = 14;
+pub const CHAINSTATE_VERSION: &str = "15";
+pub const CHAINSTATE_VERSION_NUMBER: u32 = 15;
 
 const CHAINSTATE_INITIAL_SCHEMA: &[&str] = &[
     "PRAGMA foreign_keys = ON;",
@@ -1221,6 +1221,13 @@ impl StacksChainState {
                     for cmd in NAKAMOTO_CHAINSTATE_SCHEMA_9.iter() {
                         tx.execute_batch(cmd)?;
                     }
+                }
+                "14" => {
+                    // Commit the downgrade guard before converting executable records
+                    // in the separate Clarity database. It also protects interrupted
+                    // migrations; their completion marker is written only after conversion.
+                    info!("Migrating chainstate schema from version 14 to 15: split executable storage");
+                    tx.execute("UPDATE db_config SET version = '15'", [])?;
                 }
                 _ => {
                     error!(
@@ -1962,6 +1969,67 @@ impl StacksChainState {
         boot_data: Option<&mut ChainStateBootData>,
         marf_opts: Option<MARFOpenOpts>,
     ) -> Result<(StacksChainState, Vec<StacksTransactionReceipt>), Error> {
+        Self::open_and_exec_with_migration(
+            mainnet,
+            chain_id,
+            path_str,
+            boot_data,
+            marf_opts,
+            ContractStorageMigration::RequireCurrent,
+        )
+    }
+
+    /// Convert an existing node database, committing its downgrade guard first.
+    /// Standalone Clarity stores do not have a chainstate version and must use
+    /// the lower-level executable-record migrator explicitly.
+    pub fn migrate_contract_storage(path_str: &str) -> Result<u64, Error> {
+        let root = PathBuf::from(path_str);
+        let headers = Self::header_index_root_path(root.clone());
+        // Validate existing files without letting MARF create a missing index.
+        let header_conn =
+            Connection::open_with_flags(&headers, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let config =
+            query_row::<DBConfig, _>(&header_conn, "SELECT * FROM db_config LIMIT 1", NO_PARAMS)?
+                .ok_or(Error::InvalidChainstateDB)?;
+        drop(header_conn);
+        let conn = Connection::open_with_flags(
+            Self::vm_state_index_marf_path(root.clone()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        conn.busy_handler(Some(crate::util_lib::db::tx_busy_handler))?;
+        clarity::vm::database::SqliteConnection::check_schema(&conn)
+            .map_err(|e| Error::ClarityError(e.into()))?;
+        let _headers = Self::open_db(
+            config.mainnet,
+            config.chain_id,
+            headers
+                .to_str()
+                .ok_or(Error::DBError(db_error::ParseError))?,
+            None,
+        )?;
+        clarity::vm::database::contract_migration::migrate_contract_storage(&conn)
+            .map_err(|e| Error::ClarityError(e.into()))
+    }
+
+    /// Open chainstate with an explicit decision about executable-record migration.
+    /// Node startup allows migration; ordinary opens require a current database.
+    pub fn open_and_exec_with_migration(
+        mainnet: bool,
+        chain_id: u32,
+        path_str: &str,
+        boot_data: Option<&mut ChainStateBootData>,
+        marf_opts: Option<MARFOpenOpts>,
+        migration: ContractStorageMigration,
+    ) -> Result<(StacksChainState, Vec<StacksTransactionReceipt>), Error> {
+        if migration == ContractStorageMigration::RequireCurrent {
+            let vm_path = Self::vm_state_index_root_path(PathBuf::from(path_str));
+            MarfedKV::check_contract_storage(
+                vm_path
+                    .to_str()
+                    .ok_or(Error::DBError(db_error::ParseError))?,
+            )
+            .map_err(|e| Error::ClarityError(e.into()))?;
+        }
         StacksChainState::make_chainstate_dirs(path_str)?;
         let path = PathBuf::from(path_str);
         let blocks_path = StacksChainState::blocks_path(path.clone());
@@ -2000,13 +2068,14 @@ impl StacksChainState {
         let state_db =
             StacksChainState::open_db(mainnet, chain_id, &header_index_root, marf_opts.clone())?;
 
-        let vm_state = MarfedKV::open(
+        let vm_state = MarfedKV::open_with_migration(
             &clarity_state_index_root,
             Some(&StacksBlockHeader::make_index_block_hash(
                 &MINER_BLOCK_CONSENSUS_HASH,
                 &MINER_BLOCK_HEADER_HASH,
             )),
             marf_opts.clone(),
+            migration,
         )
         .map_err(|e| Error::ClarityError(e.into()))?;
 

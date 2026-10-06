@@ -189,11 +189,17 @@ impl RPCRequestHandler for RPCGetClarityMetadataRequestHandler {
                 &tip,
                 |clarity_tx| {
                     clarity_tx.with_clarity_db_readonly(|clarity_db| {
-                        let data = clarity_db
-                            .store
-                            .get_metadata(&contract_identifier, &clarity_metadata_key)
-                            .ok()
-                            .flatten()?;
+                        let data = if clarity_metadata_key
+                            == clarity::vm::database::contract_storage::LEGACY_CONTRACT_KEY
+                        {
+                            clarity_db.get_serialized_contract(&contract_identifier)
+                        } else {
+                            clarity_db
+                                .store
+                                .get_metadata(&contract_identifier, &clarity_metadata_key)
+                        }
+                        .ok()
+                        .flatten()?;
 
                         Some(ClarityMetadataResponse { data })
                     })

@@ -22,12 +22,14 @@ use std::{fs, io, process};
 
 use clarity::types::chainstate::SortitionId;
 use clarity::util::hash::{Sha512Trunc256Sum, to_hex};
+use clarity::vm::database::SqliteConnection;
+use clarity::vm::errors::{IncomparableError, VmExecutionError, VmInternalError};
 use clarity_cli::read_file_or_stdin;
 pub use cli::{
     ContractHashArgs, ReplayMockMiningArgs, TryMineArgs, ValidateBlockArgs, ValidateBlockMode,
 };
 use regex::Regex;
-use rusqlite::OpenFlags;
+use rusqlite::{Connection, OpenFlags};
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::hash::Hash160;
@@ -62,6 +64,33 @@ use stackslib::util_lib::db::{IndexDBTx, sqlite_open};
 pub struct CommonOpts {
     pub config: Option<Config>,
 }
+
+/// Convert an existing Clarity database without opening the rest of chainstate.
+/// This never creates a missing file. Inspection should migrate a disposable copy,
+/// because older node builds cannot reopen the converted executable records.
+pub fn migrate_standalone_contract_storage(path: &str) -> Result<u64, VmExecutionError> {
+    // A node database needs its header version updated as well. Require callers
+    // to use the chainstate operation when that companion database is present.
+    let headers = std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("index.sqlite"));
+    if headers.is_some_and(|path| path.exists()) {
+        return Err(VmInternalError::DBError(
+            "Use migrate-contract-storage on the chainstate directory for a node database".into(),
+        )
+        .into());
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|err| VmInternalError::SqliteError(IncomparableError { err }))?;
+    conn.busy_handler(Some(stacks_common::util::db::tx_busy_handler))
+        .map_err(|err| VmInternalError::SqliteError(IncomparableError { err }))?;
+    SqliteConnection::check_schema(&conn)?;
+    clarity::vm::database::contract_migration::migrate_contract_storage(&conn)
+}
+
+#[cfg(test)]
+mod contract_storage_tests;
 
 /// Options controlling how strict block replay is
 #[derive(Clone, Copy, Debug, Default)]

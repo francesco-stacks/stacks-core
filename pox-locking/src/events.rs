@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use clarity::vm::contexts::GlobalContext;
+use clarity::vm::contexts::{ContractContext, GlobalContext};
 use clarity::vm::costs::LimitedCostTracker;
 use clarity::vm::errors::ClarityEvalError;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, ResponseData, TupleData};
@@ -645,7 +645,8 @@ fn inner_synthesize_pox_event_info(
     test_debug!("Evaluate snippet:\n{}", &code_snippet);
     test_debug!("Evaluate data code:\n{}", &data_snippet);
 
-    let pox_contract = global_context.database.get_contract(contract_id)?;
+    let pox_contract =
+        ContractContext::from_shared(global_context.database.get_contract_metadata(contract_id)?);
 
     let event_info = global_context
         .special_cc_handler_execute_read_only(

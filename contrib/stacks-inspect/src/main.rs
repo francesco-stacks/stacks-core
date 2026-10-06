@@ -25,7 +25,7 @@ use stacks_common::alloc_tracker::TrackingAllocator;
 use stacks_inspect::cli::{Cli, Command};
 use stacks_inspect::{
     CommonOpts, command_contract_hash, command_replay_mock_mining, command_try_mine,
-    command_validate_block,
+    command_validate_block, migrate_standalone_contract_storage,
 };
 use stackslib::chainstate::stacks::miner::BlockBuilderSettings;
 use stackslib::chainstate::stacks::{
@@ -673,6 +673,20 @@ fn main() {
             process::exit(0);
         }
 
+        Command::MigrateContractStorage {
+            db_path,
+            standalone,
+        } => match if standalone {
+            migrate_standalone_contract_storage(&db_path).map_err(|e| e.to_string())
+        } else {
+            StacksChainState::migrate_contract_storage(&db_path).map_err(|e| e.to_string())
+        } {
+            Ok(count) => println!("Migrated {count} contracts"),
+            Err(error) => {
+                eprintln!("Contract storage migration failed: {error}");
+                process::exit(1);
+            }
+        },
         Command::DeserializeDb {
             db_path,
             byte_prefix,
