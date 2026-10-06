@@ -16,6 +16,7 @@ name = "clarity"
 path = "./src/libclarity.rs"
 
 [dependencies]
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 clarity-types = { package = "clarity-types", path = "../clarity-types", default-features = false }
 serde = { workspace = true, features = ["rc"] }
 serde_derive = { workspace = true }
