@@ -59,8 +59,8 @@ load shared metadata and, for implicit implementations, the selected definition
 without dependencies. Normal execution subsequently charges and loads the
 needed bodies. PoX event synthesis also starts with shared metadata; each event
 expression selects its own function bodies. Existence checks inspect raw metadata
-without interpreting it. The duplicate-deployment probe retains full loading
-to preserve historical constant-sanitization errors.
+without interpreting it, except the duplicate-deployment probe before epoch 4.1:
+that probe retains full loading to preserve historical constant-sanitization errors.
 
 Persistent stores use indexed batch reads. Ephemeral stores filter both
 underlying tables before combining their results; pending ephemeral rows override
