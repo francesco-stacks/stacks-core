@@ -914,6 +914,17 @@ fn proptest_cost_fn(cost_fn: &ClarityCostFunction, cost_contract_name: &str) {
             _ => panic!(),
         };
         with_owned_env(epoch, use_mainnet, |mut owned_env| {
+            // Production defaults execute native Rust code.
+            // This differential test explicitly installs executable Clarity code.
+            let boot_id = boot_code_id(cost_contract_name, use_mainnet);
+            let (contract, _, _) = owned_env
+                .execute_in_env(boot_id.issuer.clone().into(), None, None, |env, _| {
+                    env.global_context.database.get_contract(&boot_id)
+                })
+                .unwrap();
+            owned_env
+                .mut_cost_tracker()
+                .set_cost_contract_for_testing(contract);
             for i in inputs.iter() {
                 eprintln!("Evaluating {cost_contract_name}.{cost_fn}({i})");
                 let clar_evaled = eval_cost_fn(&mut owned_env, cost_contract_name, cost_fn, *i);

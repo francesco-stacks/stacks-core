@@ -28,17 +28,25 @@ use stacks_common::types::StacksEpochId;
 
 use super::errors::{RuntimeCheckErrorKind, RuntimeError};
 use crate::boot_util::boot_code_id;
+use crate::vm::Value;
+#[cfg(any(test, feature = "testing"))]
 use crate::vm::contexts::{ExecutionState, GlobalContext, InvocationContext};
+#[cfg(any(test, feature = "testing"))]
 use crate::vm::contracts::Contract;
 use crate::vm::costs::cost_functions::ClarityCostFunction;
 pub use crate::vm::costs::errors::CostErrors;
 pub use crate::vm::costs::execution_cost::{CostOverflowingMath, ExecutionCost};
 use crate::vm::database::ClarityDatabase;
+#[cfg(any(test, feature = "testing"))]
 use crate::vm::database::clarity_store::NullBackingStore;
 use crate::vm::errors::VmExecutionError;
+#[cfg(any(test, feature = "testing"))]
+use crate::vm::types::PrincipalData;
+#[cfg(any(test, feature = "testing"))]
 use crate::vm::types::Value::UInt;
-use crate::vm::types::{PrincipalData, QualifiedContractIdentifier, TypeSignature};
-use crate::vm::{CallStack, LocalContext, SymbolicExpression, Value};
+use crate::vm::types::{QualifiedContractIdentifier, TypeSignature};
+#[cfg(any(test, feature = "testing"))]
+use crate::vm::{CallStack, LocalContext, SymbolicExpression};
 pub mod constants;
 pub mod cost_functions;
 #[allow(unused_variables)]
@@ -233,6 +241,8 @@ pub enum ClarityCostFunctionEvaluator {
         ClarityCostFunction,
         DefaultVersion,
     ),
+    /// Interpreted reference used to check native cost functions in tests.
+    #[cfg(any(test, feature = "testing"))]
     Clarity(ClarityCostFunctionReference),
 }
 
@@ -249,6 +259,7 @@ impl ClarityCostFunctionReference {
 /// This struct holds all of the data required for non-free LimitedCostTracker instances
 pub struct TrackerData {
     cost_function_references: HashMap<&'static ClarityCostFunction, ClarityCostFunctionEvaluator>,
+    #[cfg(any(test, feature = "testing"))]
     cost_contracts: HashMap<QualifiedContractIdentifier, Contract>,
     total: ExecutionCost,
     limit: ExecutionCost,
@@ -259,6 +270,7 @@ pub struct TrackerData {
     ///  evaluated, so no epoch identifier is necessary.
     pub epoch: StacksEpochId,
     mainnet: bool,
+    #[cfg(any(test, feature = "testing"))]
     chain_id: u32,
 }
 
@@ -271,6 +283,18 @@ pub enum LimitedCostTracker {
 
 #[cfg(any(test, feature = "testing"))]
 impl LimitedCostTracker {
+    /// Supply executable code explicitly for native-versus-Clarity differential tests.
+    /// Normal tracker initialization selects native Rust evaluators.
+    pub fn set_cost_contract_for_testing(&mut self, contract: Contract) {
+        match self {
+            Self::Free => panic!("Cannot set a cost contract on a free tracker"),
+            Self::Limited(data) => {
+                data.cost_contracts
+                    .insert(contract.contract_identifier.clone(), contract);
+            }
+        }
+    }
+
     pub fn cost_function_references(
         &self,
     ) -> HashMap<&'static ClarityCostFunction, ClarityCostFunctionEvaluator> {
@@ -323,13 +347,14 @@ impl PartialEq for LimitedCostTracker {
 impl LimitedCostTracker {
     pub fn new(
         mainnet: bool,
-        chain_id: u32,
+        _chain_id: u32,
         limit: ExecutionCost,
         clarity_db: &mut ClarityDatabase,
         epoch: StacksEpochId,
     ) -> Result<LimitedCostTracker, CostErrors> {
         let mut cost_tracker = TrackerData {
             cost_function_references: HashMap::new(),
+            #[cfg(any(test, feature = "testing"))]
             cost_contracts: HashMap::new(),
             limit,
             memory_limit: CLARITY_MEMORY_LIMIT,
@@ -337,7 +362,8 @@ impl LimitedCostTracker {
             memory: 0,
             epoch,
             mainnet,
-            chain_id,
+            #[cfg(any(test, feature = "testing"))]
+            chain_id: _chain_id,
         };
         assert!(clarity_db.is_stack_empty());
         cost_tracker.load_costs(clarity_db)?;
@@ -346,13 +372,14 @@ impl LimitedCostTracker {
 
     pub fn new_mid_block(
         mainnet: bool,
-        chain_id: u32,
+        _chain_id: u32,
         limit: ExecutionCost,
         clarity_db: &mut ClarityDatabase,
         epoch: StacksEpochId,
     ) -> Result<LimitedCostTracker, CostErrors> {
         let mut cost_tracker = TrackerData {
             cost_function_references: HashMap::new(),
+            #[cfg(any(test, feature = "testing"))]
             cost_contracts: HashMap::new(),
             limit,
             memory_limit: CLARITY_MEMORY_LIMIT,
@@ -360,7 +387,8 @@ impl LimitedCostTracker {
             memory: 0,
             epoch,
             mainnet,
-            chain_id,
+            #[cfg(any(test, feature = "testing"))]
+            chain_id: _chain_id,
         };
         cost_tracker.load_costs(clarity_db)?;
         Ok(Self::Limited(cost_tracker))
@@ -456,8 +484,8 @@ impl LimitedCostTracker {
 impl TrackerData {
     /// Load the default cost functions for this tracker's epoch.
     ///
-    /// Before Epoch 4.0, this also loads the corresponding boot cost contract.
-    /// Epoch 4.0 and later use the native Rust cost implementation.
+    /// All default evaluators use native Rust implementations. Before Epoch 4.0,
+    /// retain the boot contract load and its missing-contract error.
     fn load_costs(&mut self, clarity_db: &mut ClarityDatabase) -> Result<(), CostErrors> {
         clarity_db.begin();
         let epoch_id = clarity_db
@@ -484,10 +512,9 @@ impl TrackerData {
             );
         }
 
-        let mut cost_contracts = HashMap::with_capacity(1);
         if epoch_id < StacksEpochId::Epoch40 {
-            let boot_cost_contract = match clarity_db.get_contract(&boot_costs_id) {
-                Ok(contract) => contract,
+            match clarity_db.get_contract(&boot_costs_id) {
+                Ok(_) => (),
                 Err(e) => {
                     error!("Failed to load intended Clarity cost contract";
                            "contract" => %boot_costs_id,
@@ -498,11 +525,11 @@ impl TrackerData {
                     return Err(CostErrors::CostContractLoadFailure);
                 }
             };
-            cost_contracts.insert(boot_costs_id, boot_cost_contract);
         }
 
         self.cost_function_references = m;
-        self.cost_contracts = cost_contracts;
+        #[cfg(any(test, feature = "testing"))]
+        self.cost_contracts.clear();
 
         clarity_db
             .commit()
@@ -548,6 +575,7 @@ impl LimitedCostTracker {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 pub fn parse_cost(
     cost_function_name: &str,
     eval_result: Result<Value, VmExecutionError>,
@@ -592,6 +620,7 @@ pub fn parse_cost(
 
 // TODO: add tests from mutation testing results #4832
 #[cfg_attr(test, mutants::skip)]
+#[cfg(any(test, feature = "testing"))]
 pub fn compute_cost(
     cost_tracker: &TrackerData,
     cost_function_reference: ClarityCostFunctionReference,
@@ -715,6 +744,7 @@ impl CostTracker for LimitedCostTracker {
                         clarity_cost_function,
                         default_version,
                     ) => default_version.evaluate(cost_function_ref, clarity_cost_function, input),
+                    #[cfg(any(test, feature = "testing"))]
                     ClarityCostFunctionEvaluator::Clarity(cost_function_ref) => {
                         compute_cost(data, cost_function_ref.clone(), input, data.epoch)
                     }
