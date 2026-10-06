@@ -998,6 +998,7 @@ impl<'a> ClarityDatabase<'a> {
             ))
             .into());
         }
+        let constants_sanitized = header.constants_are_sanitized_at(epoch);
         let (names, dependencies): (Vec<_>, Vec<_>) = header
             .functions
             .into_iter()
@@ -1005,7 +1006,7 @@ impl<'a> ClarityDatabase<'a> {
             .unzip();
         let mut shared = Arc::unwrap_or_clone(header.shared);
         shared.function_names = names.into();
-        shared.canonicalize_types(&epoch)?;
+        shared.canonicalize_types_with_known_constants(&epoch, constants_sanitized)?;
         let loaded = LoadedContractHeader {
             deployment,
             shared: Arc::new(shared),

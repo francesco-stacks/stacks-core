@@ -39,7 +39,6 @@ use crate::vm::functions::lookup_reserved_functions;
 use crate::vm::representations::{ClarityName, SymbolicExpression};
 #[cfg(test)]
 use crate::vm::types::{QualifiedContractIdentifier, TraitIdentifier};
-#[cfg(test)]
 use crate::vm::types::{TypeSignature, Value};
 use crate::vm::version::ClarityVersion;
 
@@ -86,12 +85,22 @@ pub struct ContractHeader {
     #[serde(with = "super::contract_codec::shared")]
     pub shared: Arc<ContractSharedContext>,
     pub functions: Vec<FunctionEntry>,
-    /// Reserved for a validated no-op sanitizer result. Writers currently set
-    /// false and readers always perform the normal epoch-specific sanitization.
+    /// True only if sanitization preserves the complete serialized values,
+    /// including list/tuple type metadata. Valid for the checked 3.4/4.0 rules.
     pub constants_sanitized: bool,
 }
 
 impl ContractHeader {
+    /// The writer compares exact values under Epoch34 sanitization. Only these
+    /// audited epochs share that rule. New epochs revalidate until audited here.
+    pub(crate) fn constants_are_sanitized_at(
+        &self,
+        epoch: stacks_common::types::StacksEpochId,
+    ) -> bool {
+        use stacks_common::types::StacksEpochId;
+        self.constants_sanitized && matches!(epoch, StacksEpochId::Epoch34 | StacksEpochId::Epoch40)
+    }
+
     pub(crate) fn validate_directory(&self) -> Result<(), VmExecutionError> {
         if self
             .functions
@@ -175,9 +184,34 @@ pub fn split_contract(
     let header = ContractHeader {
         shared: contract.shared.clone(),
         functions: directory,
-        constants_sanitized: false,
+        constants_sanitized: constants_are_sanitized(contract),
     };
     Ok((header, records))
+}
+
+/// The sanitizer's bool and Value equality both ignore some list type changes.
+/// Compare complete binary values instead, only at deployment/migration. Failed
+/// validation leaves the original load-time error path in place.
+fn constants_are_sanitized(contract: &ContractContext) -> bool {
+    contract.variables.values().all(|value| {
+        let Ok(expected) = TypeSignature::type_of(value) else {
+            return false;
+        };
+        let Some((sanitized, _)) = Value::sanitize_value(
+            &stacks_common::types::StacksEpochId::Epoch34,
+            &expected,
+            value.clone(),
+        ) else {
+            return false;
+        };
+        match (
+            postcard::to_allocvec(value),
+            postcard::to_allocvec(&sanitized),
+        ) {
+            (Ok(original), Ok(normalized)) => original == normalized,
+            _ => false,
+        }
+    })
 }
 
 /// Conservatively include every non-reserved local-function atom, regardless of

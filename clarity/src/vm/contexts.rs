@@ -1823,20 +1823,35 @@ impl ContractSharedContext {
         &self.clarity_version
     }
 
-    /// Canonicalize shared trait types and constants for the execution epoch.
+    /// Full-context reference canonicalization for tests and corpus tools.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn canonicalize_types(
         &mut self,
         epoch: &StacksEpochId,
     ) -> Result<(), VmExecutionError> {
+        self.canonicalize_types_with_known_constants(epoch, false)
+    }
+
+    /// Stored headers may certify that the known epoch's constant sanitizer is
+    /// an exact no-op. Trait canonicalization always runs; unverified constants
+    /// retain the original validation and error behavior.
+    pub(crate) fn canonicalize_types_with_known_constants(
+        &mut self,
+        epoch: &StacksEpochId,
+        constants_sanitized: bool,
+    ) -> Result<(), VmExecutionError> {
         for trait_def in self.defined_traits.values_mut() {
             for function in trait_def.values_mut() {
-                *function = function.canonicalize(epoch);
+                for arg in &mut function.args {
+                    arg.canonicalize_in_place(epoch);
+                }
+                function.returns.canonicalize_in_place(epoch);
             }
         }
 
         // In pre-sanitized-variable epochs, sanitize all contract
         // variables at load time so lookups can borrow directly.
-        if epoch.uses_pre_sanitized_variables() {
+        if epoch.uses_pre_sanitized_variables() && !constants_sanitized {
             for value in self.variables.values_mut() {
                 let owned = std::mem::replace(value, Value::none());
                 let (sanitized, _) =

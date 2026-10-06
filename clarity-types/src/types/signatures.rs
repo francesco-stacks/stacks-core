@@ -65,6 +65,7 @@ impl AssetIdentifier {
     }
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TupleTypeSignature {
     #[serde(with = "tuple_type_map_serde")]
@@ -268,6 +269,7 @@ impl TryFrom<i128> for StringUTF8Length {
 //   2. The only methods which may be called on TypeSignatures that are too large
 //        (i.e., the only function that can be called by the constructor before
 //         it fails) is the `.size()` method, which may be used to check the size.
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypeSignature {
     NoType,
@@ -296,6 +298,7 @@ pub enum TypeSignature {
     TraitReferenceType(TraitIdentifier),
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SequenceSubtype {
     BufferType(BufferLength),
@@ -318,12 +321,14 @@ impl SequenceSubtype {
     }
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StringSubtype {
     ASCII(BufferLength),
     UTF8(StringUTF8Length),
 }
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash, PartialOrd, Ord)]
 pub enum CallableSubtype {
     Principal(QualifiedContractIdentifier),
@@ -335,6 +340,7 @@ use self::TypeSignature::{
     ResponseType, SequenceType, TraitReferenceType, TupleType, UIntType,
 };
 
+// Serde field/variant order is persisted; see clarity/src/vm/database/contract_codec/tests.rs fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListTypeData {
     max_len: u32,
@@ -641,38 +647,49 @@ impl TypeSignature {
     /// This method will convert types from previous epochs with the appropriate
     /// types for the specified epoch.
     pub fn canonicalize(&self, epoch: &StacksEpochId) -> TypeSignature {
-        // Epoch-2.2 had a regression in canonicalization, so it must be preserved here.
-        if *epoch < StacksEpochId::Epoch21 || *epoch == StacksEpochId::Epoch22 {
-            self.clone()
-        } else {
-            self.canonicalize_v2_1()
+        let mut canonicalized = self.clone();
+        canonicalized.canonicalize_in_place(epoch);
+        canonicalized
+    }
+
+    /// Canonicalize an owned type without rebuilding boxes or unique tuple maps.
+    /// In particular, epochs before 2.1 and epoch 2.2 leave it untouched.
+    pub fn canonicalize_in_place(&mut self, epoch: &StacksEpochId) {
+        // Epoch-2.2 had a regression in canonicalization, so preserve it here.
+        if *epoch >= StacksEpochId::Epoch21 && *epoch != StacksEpochId::Epoch22 {
+            self.canonicalize_v2_1_in_place();
         }
     }
 
     pub fn canonicalize_v2_1(&self) -> TypeSignature {
+        let mut canonicalized = self.clone();
+        canonicalized.canonicalize_v2_1_in_place();
+        canonicalized
+    }
+
+    fn canonicalize_v2_1_in_place(&mut self) {
         match self {
             SequenceType(SequenceSubtype::ListType(list_type)) => {
-                SequenceType(SequenceSubtype::ListType(ListTypeData {
-                    max_len: list_type.max_len,
-                    entry_type: Box::new(list_type.entry_type.canonicalize_v2_1()),
-                }))
+                list_type.entry_type.canonicalize_v2_1_in_place();
             }
-            OptionalType(inner_type) => OptionalType(Box::new(inner_type.canonicalize_v2_1())),
-            ResponseType(inner_type) => ResponseType(Box::new((
-                inner_type.0.canonicalize_v2_1(),
-                inner_type.1.canonicalize_v2_1(),
-            ))),
+            OptionalType(inner_type) => inner_type.canonicalize_v2_1_in_place(),
+            ResponseType(inner_type) => {
+                inner_type.0.canonicalize_v2_1_in_place();
+                inner_type.1.canonicalize_v2_1_in_place();
+            }
             TupleType(tuple_sig) => {
-                let mut canonicalized_fields = BTreeMap::new();
-                for (field_name, field_type) in tuple_sig.get_type_map() {
-                    canonicalized_fields.insert(field_name.clone(), field_type.canonicalize_v2_1());
+                for field_type in Arc::make_mut(&mut tuple_sig.type_map).values_mut() {
+                    field_type.canonicalize_v2_1_in_place();
                 }
-                TypeSignature::from(TupleTypeSignature {
-                    type_map: Arc::new(canonicalized_fields),
-                })
             }
-            TraitReferenceType(trait_id) => CallableType(CallableSubtype::Trait(trait_id.clone())),
-            _ => self.clone(),
+            TraitReferenceType(_) => {
+                // Move the identifier rather than cloning it a second time in
+                // the borrowed canonicalize() API, which already cloned self.
+                if let TraitReferenceType(trait_id) = std::mem::replace(self, NoType) {
+                    *self = CallableType(CallableSubtype::Trait(trait_id));
+                }
+            }
+            _ => (),
         }
     }
 
@@ -1692,5 +1709,56 @@ impl fmt::Display for BufferLength {
 impl fmt::Display for StringUTF8Length {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod canonicalization_tests {
+    use super::*;
+
+    fn nested(inner: TypeSignature) -> TypeSignature {
+        TypeSignature::TupleType(TupleTypeSignature {
+            type_map: Arc::new(BTreeMap::from([(
+                ClarityName::from_literal("item"),
+                TypeSignature::ResponseType(Box::new((
+                    TypeSignature::SequenceType(SequenceSubtype::ListType(ListTypeData {
+                        max_len: 4,
+                        entry_type: Box::new(TypeSignature::OptionalType(Box::new(inner))),
+                    })),
+                    TypeSignature::UIntType,
+                ))),
+            )])),
+        })
+    }
+
+    #[test]
+    fn owned_canonicalization_preserves_epochs_and_shared_input() {
+        let trait_id = TraitIdentifier {
+            name: ClarityName::from_literal("trait"),
+            contract_identifier: QualifiedContractIdentifier::local("types").unwrap(),
+        };
+        let legacy = nested(TypeSignature::TraitReferenceType(trait_id.clone()));
+        let modern = nested(TypeSignature::CallableType(CallableSubtype::Trait(
+            trait_id,
+        )));
+        for (epoch, expected) in [
+            (StacksEpochId::Epoch20, &legacy),
+            (StacksEpochId::Epoch2_05, &legacy),
+            (StacksEpochId::Epoch21, &modern),
+            (StacksEpochId::Epoch22, &legacy),
+            (StacksEpochId::Epoch23, &modern),
+            (StacksEpochId::Epoch34, &modern),
+            (StacksEpochId::Epoch40, &modern),
+            (StacksEpochId::Epoch41, &modern),
+        ] {
+            let mut owned = legacy.clone();
+            owned.canonicalize_in_place(&epoch);
+            assert_eq!(&owned, expected);
+            assert_eq!(&legacy.canonicalize(&epoch), expected);
+            owned.canonicalize_in_place(&epoch);
+            assert_eq!(&owned, expected);
+            // Mutation must not change the tuple map shared with the input.
+            assert_ne!(legacy, modern);
+        }
     }
 }

@@ -90,6 +90,63 @@ fn every_native_name_matches_runtime_resolution_in_every_clarity_version() {
     }
 }
 
+#[test]
+fn sanitizer_shortcut_matches_all_audited_epochs() {
+    use crate::vm::types::{CallableData, TupleData};
+    let id = QualifiedContractIdentifier::local("sanitizer").unwrap();
+    let callable = Value::CallableContract(CallableData {
+        contract_identifier: id.clone(),
+        trait_identifier: Some(Box::new(TraitIdentifier {
+            contract_identifier: id.clone(),
+            name: ClarityName::from_literal("t"),
+        })),
+    });
+    let tuple = Value::Tuple(
+        TupleData::from_data(vec![(
+            ClarityName::from_literal("target"),
+            callable.clone(),
+        )])
+        .unwrap(),
+    );
+    let list = Value::cons_list_unsanitized(vec![tuple.clone(), tuple.clone()]).unwrap();
+    let nested = Value::some(Value::okay(list.clone()).unwrap()).unwrap();
+    for value in [
+        callable,
+        tuple,
+        list,
+        nested,
+        Value::buff_from(vec![7; 256]).unwrap(),
+    ] {
+        let expected_type = TypeSignature::type_of(&value).unwrap();
+        let reference =
+            Value::sanitize_value(&StacksEpochId::Epoch34, &expected_type, value.clone());
+        let mut context = ContractContext::new(id.clone(), ClarityVersion::Clarity2);
+        context
+            .shared_mut()
+            .variables
+            .insert(ClarityName::from_literal("constant"), value.clone());
+        let (header, _) = split_contract(&context).unwrap();
+        assert!(
+            Arc::ptr_eq(&header.shared, &context.shared),
+            "deployment must borrow shared values"
+        );
+        assert!(!header.constants_are_sanitized_at(StacksEpochId::Epoch41));
+        for epoch in [StacksEpochId::Epoch34, StacksEpochId::Epoch40] {
+            let actual = Value::sanitize_value(&epoch, &expected_type, value.clone());
+            assert_eq!(
+                postcard::to_allocvec(&reference).unwrap(),
+                postcard::to_allocvec(&actual).unwrap()
+            );
+            if header.constants_are_sanitized_at(epoch) {
+                assert_eq!(
+                    postcard::to_allocvec(&value).unwrap(),
+                    postcard::to_allocvec(&actual.unwrap().0).unwrap()
+                );
+            }
+        }
+    }
+}
+
 const SOURCE: &str = "
     (define-constant answer u42)
     (define-private (leaf (x uint)) (+ x answer))

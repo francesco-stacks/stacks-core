@@ -482,7 +482,7 @@ impl DefinedFunction {
     pub fn canonicalize_types(&mut self, epoch: &StacksEpochId) {
         let definition = Arc::make_mut(&mut self.0);
         for arg_type in &mut definition.arg_types {
-            *arg_type = arg_type.canonicalize(epoch);
+            arg_type.canonicalize_in_place(epoch);
         }
     }
 
